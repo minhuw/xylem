@@ -1,0 +1,22 @@
+# Clippy configuration for Xylem
+# This file is read by `cargo clippy`
+
+# Minimum Supported Rust Version
+msrv = "1.75"
+
+# Complexity thresholds
+cognitive-complexity-threshold = 30
+type-complexity-threshold = 250
+too-many-arguments-threshold = 7
+too-many-lines-threshold = 150
+
+# Documentation
+doc-valid-idents = ["Xylem", "Lancet", "Redis", "Memcached", "Masstree", "RESP", "HTTP", "TCP", "UDP", "TLS"]
+
+# Performance and style
+excessive-nesting-threshold = 5
+single-char-binding-names-threshold = 4
+
+# Enable additional lint groups (commented out - enable as needed)
+# Note: These would be command-line flags like: cargo clippy -- -W clippy::pedantic
+# warn-groups = ["clippy::pedantic", "clippy::perf", "clippy::cargo"]

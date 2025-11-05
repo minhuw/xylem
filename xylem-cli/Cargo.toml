@@ -1,0 +1,25 @@
+[package]
+name = "xylem-cli"
+version = "0.1.0"
+edition = "2021"
+authors = ["xylem contributors"]
+description = "CLI interface for Xylem latency measurement tool"
+license = "MIT"
+repository = "https://github.com/minhuw/xylem"
+
+[[bin]]
+name = "xylem"
+path = "src/main.rs"
+
+[dependencies]
+xylem-core = { path = "../xylem-core" }
+xylem-protocols = { path = "../xylem-protocols" }
+
+clap = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+humantime = { workspace = true }

@@ -1,0 +1,55 @@
+# Rust
+/target
+**/*.rs.bk
+*.pdb
+
+# Note: Cargo.lock IS committed for binary crates (applications)
+# For reproducible builds with Nix, we need Cargo.lock tracked
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Nix
+result
+result-*
+
+# Generated files
+*.o
+*.a
+*.so
+*.dll
+*.exe
+
+# Test artifacts
+*.prof
+*.log
+/results/
+/output/
+
+# Flamegraph
+flamegraph.svg
+perf.data
+perf.data.old
+
+# Coverage
+*.profraw
+*.profdata
+/coverage/
+
+# Pre-commit
+.pre-commit-config.yaml.backup
+
+# Temporary files
+*.tmp
+*.temp
+.env
+.env.local
+
+# Build artifacts
+/dist/
+/build/

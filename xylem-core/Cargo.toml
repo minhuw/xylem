@@ -1,0 +1,27 @@
+[package]
+name = "xylem-core"
+version = "0.1.0"
+edition = "2021"
+authors = ["xylem contributors"]
+description = "Core library for Xylem latency measurement tool"
+license = "MIT"
+repository = "https://github.com/minhuw/xylem"
+
+[dependencies]
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+rand_distr = { workspace = true }
+statrs = { workspace = true }
+core_affinity = { workspace = true }
+humantime-serde = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
