@@ -20,14 +20,25 @@ impl Default for MemcachedBinaryProtocol {
 }
 
 impl Protocol for MemcachedBinaryProtocol {
-    fn generate_request(&mut self, _key: u64, _value_size: usize) -> Vec<u8> {
+    type RequestId = (usize, u64);
+
+    fn generate_request(
+        &mut self,
+        conn_id: usize,
+        _key: u64,
+        _value_size: usize,
+    ) -> (Vec<u8>, Self::RequestId) {
         // TODO: Implement
-        Vec::new()
+        (Vec::new(), (conn_id, 0))
     }
 
-    fn parse_response(&mut self, _data: &[u8]) -> Result<()> {
+    fn parse_response(
+        &mut self,
+        conn_id: usize,
+        data: &[u8],
+    ) -> Result<(usize, Option<Self::RequestId>)> {
         // TODO: Implement
-        Ok(())
+        Ok((data.len(), Some((conn_id, 0))))
     }
 
     fn name(&self) -> &'static str {

@@ -72,12 +72,23 @@ impl<P: xylem_protocols::Protocol> ProtocolAdapter<P> {
 }
 
 impl<P: xylem_protocols::Protocol> xylem_core::threading::worker::Protocol for ProtocolAdapter<P> {
-    fn generate_request(&mut self, key: u64, value_size: usize) -> Vec<u8> {
-        self.inner.generate_request(key, value_size)
+    type RequestId = P::RequestId;
+
+    fn generate_request(
+        &mut self,
+        conn_id: usize,
+        key: u64,
+        value_size: usize,
+    ) -> (Vec<u8>, Self::RequestId) {
+        self.inner.generate_request(conn_id, key, value_size)
     }
 
-    fn parse_response(&mut self, data: &[u8]) -> anyhow::Result<()> {
-        self.inner.parse_response(data)
+    fn parse_response(
+        &mut self,
+        conn_id: usize,
+        data: &[u8],
+    ) -> anyhow::Result<(usize, Option<Self::RequestId>)> {
+        self.inner.parse_response(conn_id, data)
     }
 
     fn name(&self) -> &'static str {

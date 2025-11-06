@@ -16,17 +16,31 @@ impl HttpProtocol {
 }
 
 impl Protocol for HttpProtocol {
-    fn generate_request(&mut self, _key: u64, _value_size: usize) -> Vec<u8> {
-        format!(
+    type RequestId = (usize, u64);
+
+    fn generate_request(
+        &mut self,
+        conn_id: usize,
+        _key: u64,
+        _value_size: usize,
+    ) -> (Vec<u8>, Self::RequestId) {
+        let data = format!(
             "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: keep-alive\r\n\r\n",
             self.method, self.path, self.host
         )
-        .into_bytes()
+        .into_bytes();
+        // TODO: Implement proper sequence tracking per connection
+        (data, (conn_id, 0))
     }
 
-    fn parse_response(&mut self, data: &[u8]) -> Result<()> {
+    fn parse_response(
+        &mut self,
+        conn_id: usize,
+        data: &[u8],
+    ) -> Result<(usize, Option<Self::RequestId>)> {
         if data.starts_with(b"HTTP/1.1 ") || data.starts_with(b"HTTP/1.0 ") {
-            Ok(())
+            // TODO: Implement proper sequence tracking per connection
+            Ok((data.len(), Some((conn_id, 0))))
         } else {
             Err(anyhow!("Invalid HTTP response"))
         }

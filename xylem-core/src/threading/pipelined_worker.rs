@@ -29,7 +29,7 @@ pub struct PipelinedWorkerConfig {
 
 /// Worker with connection pooling and request pipelining
 pub struct PipelinedWorker<T: Transport, P: Protocol> {
-    pool: ConnectionPool<T>,
+    pool: ConnectionPool<T, P::RequestId>,
     protocol: P,
     generator: RequestGenerator,
     stats: StatsCollector,
@@ -79,10 +79,12 @@ impl<T: Transport, P: Protocol> PipelinedWorker<T, P> {
 
                 // Generate request
                 let (key, value_size) = self.generator.next_request();
-                let request_data = self.protocol.generate_request(key, value_size);
+                let conn_id = conn.idx();
+                let (request_data, req_id) =
+                    self.protocol.generate_request(conn_id, key, value_size);
 
                 // Send request
-                conn.send(&request_data)?;
+                conn.send(&request_data, req_id)?;
                 self.stats.record_tx_bytes(request_data.len());
 
                 // Mark request sent for rate control
@@ -131,17 +133,20 @@ impl<T: Transport, P: Protocol> PipelinedWorker<T, P> {
                 continue;
             }
 
-            let latencies = conn.recv_responses(|data| {
-                if protocol.parse_response(data).is_ok() {
-                    stats.record_rx_bytes(data.len());
-                    Ok(data.len())
-                } else {
-                    Ok(0)
-                }
-            })?;
+            let conn_id = conn.idx();
+            let latencies =
+                conn.recv_responses(|data| match protocol.parse_response(conn_id, data) {
+                    Ok((bytes_consumed, req_id_opt)) => {
+                        if bytes_consumed > 0 {
+                            stats.record_rx_bytes(bytes_consumed);
+                        }
+                        Ok((bytes_consumed, req_id_opt))
+                    }
+                    Err(e) => Err(e.into()),
+                })?;
 
             // Record all latencies
-            for (_bytes, latency) in latencies {
+            for (_req_id, latency) in latencies {
                 stats.record_latency(latency);
             }
         }
@@ -177,13 +182,15 @@ impl<T: Transport, P: Protocol> PipelinedWorker<T, P> {
                 continue;
             }
 
-            let _ = conn.recv_responses(|data| {
-                if protocol.parse_response(data).is_ok() {
-                    stats.record_rx_bytes(data.len());
-                    Ok(data.len())
-                } else {
-                    Ok(0)
+            let conn_id = conn.idx();
+            let _ = conn.recv_responses(|data| match protocol.parse_response(conn_id, data) {
+                Ok((bytes_consumed, req_id_opt)) => {
+                    if bytes_consumed > 0 {
+                        stats.record_rx_bytes(bytes_consumed);
+                    }
+                    Ok((bytes_consumed, req_id_opt))
                 }
+                Err(e) => Err(e.into()),
             })?;
         }
 
@@ -222,12 +229,23 @@ mod tests {
     }
 
     impl<P: xylem_protocols::Protocol> Protocol for ProtocolAdapter<P> {
-        fn generate_request(&mut self, key: u64, value_size: usize) -> Vec<u8> {
-            self.inner.generate_request(key, value_size)
+        type RequestId = P::RequestId;
+
+        fn generate_request(
+            &mut self,
+            conn_id: usize,
+            key: u64,
+            value_size: usize,
+        ) -> (Vec<u8>, Self::RequestId) {
+            self.inner.generate_request(conn_id, key, value_size)
         }
 
-        fn parse_response(&mut self, data: &[u8]) -> anyhow::Result<()> {
-            self.inner.parse_response(data)
+        fn parse_response(
+            &mut self,
+            conn_id: usize,
+            data: &[u8],
+        ) -> anyhow::Result<(usize, Option<Self::RequestId>)> {
+            self.inner.parse_response(conn_id, data)
         }
 
         fn name(&self) -> &'static str {

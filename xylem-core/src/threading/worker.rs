@@ -10,13 +10,28 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use xylem_transport::Transport;
 
-/// Protocol trait for generating requests and parsing responses
+/// Protocol trait for generating requests and parsing responses with request ID tracking
 pub trait Protocol: Send {
-    /// Generate a request
-    fn generate_request(&mut self, key: u64, value_size: usize) -> Vec<u8>;
+    /// Type of request ID used by this protocol
+    type RequestId: Eq + std::hash::Hash + Clone + Copy + std::fmt::Debug;
 
-    /// Parse a response (returns Ok(()) if valid)
-    fn parse_response(&mut self, data: &[u8]) -> anyhow::Result<()>;
+    /// Generate a request with an ID
+    /// Returns (request_data, request_id)
+    fn generate_request(
+        &mut self,
+        conn_id: usize,
+        key: u64,
+        value_size: usize,
+    ) -> (Vec<u8>, Self::RequestId);
+
+    /// Parse a response and return the request ID it corresponds to
+    /// Returns Ok((bytes_consumed, Some(request_id))) if complete response found
+    /// Returns Ok((0, None)) if response is incomplete
+    fn parse_response(
+        &mut self,
+        conn_id: usize,
+        data: &[u8],
+    ) -> anyhow::Result<(usize, Option<Self::RequestId>)>;
 
     /// Protocol name
     fn name(&self) -> &'static str;
@@ -84,9 +99,9 @@ impl<T: Transport, P: Protocol> Worker<T, P> {
 
             // Send phase - busy wait until next send time
             if now_ns >= next_send_ns && last_send_ts.is_none() {
-                // Generate request
+                // Generate request (single connection, so conn_id = 0)
                 let (key, value_size) = self.generator.next_request();
-                let request_data = self.protocol.generate_request(key, value_size);
+                let (request_data, _req_id) = self.protocol.generate_request(0, key, value_size);
 
                 // Send request and capture timestamp
                 let send_ts = self.transport.send(&request_data)?;
@@ -114,8 +129,15 @@ impl<T: Transport, P: Protocol> Worker<T, P> {
                     continue;
                 }
 
-                self.stats.record_rx_bytes(response_data.len());
-                self.protocol.parse_response(&response_data)?;
+                // Parse response (single connection, so conn_id = 0)
+                let (bytes_consumed, _req_id_opt) =
+                    self.protocol.parse_response(0, &response_data)?;
+
+                if bytes_consumed == 0 {
+                    continue; // Incomplete response
+                }
+
+                self.stats.record_rx_bytes(bytes_consumed);
 
                 // Calculate and record latency
                 let Some(send_ts) = last_send_ts.take() else {
@@ -143,8 +165,11 @@ impl<T: Transport, P: Protocol> Worker<T, P> {
                 continue;
             }
 
-            self.stats.record_rx_bytes(response_data.len());
-            let _ = self.protocol.parse_response(&response_data);
+            if let Ok((bytes_consumed, _)) = self.protocol.parse_response(0, &response_data) {
+                if bytes_consumed > 0 {
+                    self.stats.record_rx_bytes(bytes_consumed);
+                }
+            }
 
             std::thread::sleep(Duration::from_micros(100));
         }
@@ -187,12 +212,23 @@ mod tests {
     }
 
     impl<P: xylem_protocols::Protocol> Protocol for ProtocolAdapter<P> {
-        fn generate_request(&mut self, key: u64, value_size: usize) -> Vec<u8> {
-            self.inner.generate_request(key, value_size)
+        type RequestId = P::RequestId;
+
+        fn generate_request(
+            &mut self,
+            conn_id: usize,
+            key: u64,
+            value_size: usize,
+        ) -> (Vec<u8>, Self::RequestId) {
+            self.inner.generate_request(conn_id, key, value_size)
         }
 
-        fn parse_response(&mut self, data: &[u8]) -> anyhow::Result<()> {
-            self.inner.parse_response(data)
+        fn parse_response(
+            &mut self,
+            conn_id: usize,
+            data: &[u8],
+        ) -> anyhow::Result<(usize, Option<Self::RequestId>)> {
+            self.inner.parse_response(conn_id, data)
         }
 
         fn name(&self) -> &'static str {

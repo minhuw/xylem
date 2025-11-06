@@ -4,7 +4,8 @@
 //! outstanding requests per connection for higher throughput.
 
 use crate::Result;
-use std::collections::VecDeque;
+use std::collections::HashMap;
+use std::hash::Hash;
 use std::net::SocketAddr;
 use xylem_transport::{Timestamp, Transport};
 
@@ -19,19 +20,17 @@ struct PendingRequest {
 }
 
 /// A single TCP connection with pipelining support
-pub struct Connection<T: Transport> {
+pub struct Connection<T: Transport, ReqId: Eq + Hash + Clone> {
     /// Transport layer (TCP socket)
     transport: T,
     /// Connection index
     idx: usize,
     /// Target address
     target: SocketAddr,
-    /// Number of pending (in-flight) requests
-    pending_requests: usize,
     /// Maximum pending requests allowed
     max_pending_requests: usize,
-    /// Queue of pending request timestamps (FIFO)
-    pending_queue: VecDeque<PendingRequest>,
+    /// Map of request ID to pending request timestamps
+    pending_map: HashMap<ReqId, PendingRequest>,
     /// Receive buffer for partial responses
     recv_buffer: Vec<u8>,
     /// Current position in receive buffer
@@ -40,7 +39,7 @@ pub struct Connection<T: Transport> {
     closed: bool,
 }
 
-impl<T: Transport> Connection<T> {
+impl<T: Transport, ReqId: Eq + Hash + Clone + std::fmt::Debug> Connection<T, ReqId> {
     /// Create a new connection
     pub fn new(
         mut transport: T,
@@ -54,9 +53,8 @@ impl<T: Transport> Connection<T> {
             transport,
             idx,
             target,
-            pending_requests: 0,
             max_pending_requests,
-            pending_queue: VecDeque::with_capacity(max_pending_requests),
+            pending_map: HashMap::with_capacity(max_pending_requests),
             recv_buffer: vec![0u8; MAX_PAYLOAD],
             buffer_pos: 0,
             closed: false,
@@ -65,11 +63,14 @@ impl<T: Transport> Connection<T> {
 
     /// Check if this connection can accept more requests
     pub fn can_send(&self) -> bool {
-        !self.closed && self.pending_requests < self.max_pending_requests
+        !self.closed && self.pending_map.len() < self.max_pending_requests
     }
 
-    /// Send a request on this connection
-    pub fn send(&mut self, data: &[u8]) -> Result<()> {
+    /// Send a request on this connection with a request ID
+    pub fn send(&mut self, data: &[u8], req_id: ReqId) -> Result<()>
+    where
+        ReqId: Clone,
+    {
         if !self.can_send() {
             return Err(crate::Error::Connection(
                 "Connection cannot accept more requests".to_string(),
@@ -77,8 +78,7 @@ impl<T: Transport> Connection<T> {
         }
 
         let send_ts = self.transport.send(data)?;
-        self.pending_queue.push_back(PendingRequest { send_ts });
-        self.pending_requests += 1;
+        self.pending_map.insert(req_id, PendingRequest { send_ts });
 
         Ok(())
     }
@@ -88,16 +88,16 @@ impl<T: Transport> Connection<T> {
         Ok(self.transport.poll_readable()?)
     }
 
-    /// Receive and process responses, returning (completed_count, latencies)
+    /// Receive and process responses, returning (request_id, latency) pairs
     ///
-    /// Returns the number of complete responses received and their latencies.
-    /// Each response consumes one pending request from the queue.
+    /// Processes all complete responses in the receive buffer and matches them
+    /// with pending requests using the request ID returned by the protocol parser.
     pub fn recv_responses<F>(
         &mut self,
         mut process_fn: F,
-    ) -> Result<Vec<(usize, std::time::Duration)>>
+    ) -> Result<Vec<(ReqId, std::time::Duration)>>
     where
-        F: FnMut(&[u8]) -> Result<usize>,
+        F: FnMut(&[u8]) -> Result<(usize, Option<ReqId>)>,
     {
         // Read data into buffer
         let (data, recv_ts) = self.transport.recv()?;
@@ -120,22 +120,27 @@ impl<T: Transport> Connection<T> {
         let mut latencies = Vec::new();
         loop {
             // Try to parse response from buffer
-            let consumed = process_fn(&self.recv_buffer[..self.buffer_pos])?;
+            let (consumed, req_id_opt) = process_fn(&self.recv_buffer[..self.buffer_pos])?;
 
             if consumed == 0 {
                 // No complete response yet
                 break;
             }
 
-            // Pop the corresponding pending request and calculate latency
-            if let Some(pending) = self.pending_queue.pop_front() {
-                self.pending_requests -= 1;
+            // Protocol must return a request ID
+            let req_id = req_id_opt.ok_or_else(|| {
+                crate::Error::Protocol("Protocol returned None for request ID".to_string())
+            })?;
+
+            // Look up the corresponding pending request and calculate latency
+            if let Some(pending) = self.pending_map.remove(&req_id) {
                 let latency = recv_ts.duration_since(&pending.send_ts);
-                latencies.push((consumed, latency));
+                latencies.push((req_id, latency));
             } else {
-                return Err(crate::Error::Protocol(
-                    "Received response without pending request".to_string(),
-                ));
+                return Err(crate::Error::Protocol(format!(
+                    "Received response for unknown request ID: {:?}",
+                    req_id
+                )));
             }
 
             // Remove consumed bytes from buffer
@@ -170,7 +175,7 @@ impl<T: Transport> Connection<T> {
 
     /// Get pending request count
     pub fn pending_count(&self) -> usize {
-        self.pending_requests
+        self.pending_map.len()
     }
 
     /// Check if connection is closed
@@ -186,14 +191,14 @@ impl<T: Transport> Connection<T> {
 }
 
 /// Connection pool managing multiple connections with round-robin selection
-pub struct ConnectionPool<T: Transport> {
+pub struct ConnectionPool<T: Transport, ReqId: Eq + Hash + Clone> {
     /// All connections in the pool
-    connections: Vec<Connection<T>>,
+    connections: Vec<Connection<T, ReqId>>,
     /// Next connection index for round-robin
     next_idx: usize,
 }
 
-impl<T: Transport> ConnectionPool<T> {
+impl<T: Transport, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionPool<T, ReqId> {
     /// Create a new connection pool
     pub fn new(
         transport_factory: impl Fn() -> T,
@@ -213,7 +218,7 @@ impl<T: Transport> ConnectionPool<T> {
     }
 
     /// Pick a connection that can accept more requests (round-robin)
-    pub fn pick_connection(&mut self) -> Option<&mut Connection<T>> {
+    pub fn pick_connection(&mut self) -> Option<&mut Connection<T, ReqId>> {
         let conn_count = self.connections.len();
 
         for _ in 0..conn_count {
@@ -229,7 +234,7 @@ impl<T: Transport> ConnectionPool<T> {
     }
 
     /// Get all connections for polling
-    pub fn connections_mut(&mut self) -> &mut [Connection<T>] {
+    pub fn connections_mut(&mut self) -> &mut [Connection<T, ReqId>] {
         &mut self.connections
     }
 
