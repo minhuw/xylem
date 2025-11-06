@@ -1,15 +1,19 @@
 //! Threading runtime and worker management
+//!
+//! Uses native OS threads (std::thread) for maximum control and performance.
 
 use crate::stats::StatsCollector;
 use crate::Result;
-use std::sync::Arc;
-use tokio::sync::Barrier;
+use std::sync::{Arc, Barrier};
+use std::thread;
 
 pub mod affinity;
 pub mod barrier;
+pub mod pipelined_worker;
 pub mod worker;
 
 // Re-export main types
+pub use pipelined_worker::{PipelinedWorker, PipelinedWorkerConfig};
 pub use worker::{Worker, WorkerConfig};
 
 /// Multi-threaded runtime for spawning and managing workers
@@ -24,26 +28,28 @@ impl ThreadingRuntime {
     }
 
     /// Run multiple workers in parallel and aggregate results
-    pub async fn run_workers<F, Fut>(&self, worker_factory: F) -> Result<Vec<StatsCollector>>
+    ///
+    /// Uses native OS threads with a barrier for synchronization.
+    /// All threads start execution simultaneously after the barrier.
+    pub fn run_workers<F>(&self, worker_factory: F) -> Result<Vec<StatsCollector>>
     where
-        F: Fn(usize) -> Fut + Send + Sync + Clone + 'static,
-        Fut: std::future::Future<Output = Result<StatsCollector>> + Send + 'static,
+        F: Fn(usize) -> Result<StatsCollector> + Send + Sync + Clone + 'static,
     {
         // Create synchronization barrier for all threads
         let barrier = Arc::new(Barrier::new(self.num_threads));
         let mut handles = Vec::new();
 
-        // Spawn worker tasks
+        // Spawn worker threads
         for thread_id in 0..self.num_threads {
             let worker_factory = worker_factory.clone();
             let barrier = barrier.clone();
 
-            let handle = tokio::spawn(async move {
+            let handle = thread::spawn(move || {
                 // Wait for all threads to be ready
-                barrier.wait().await;
+                barrier.wait();
 
                 // Run the worker
-                worker_factory(thread_id).await
+                worker_factory(thread_id)
             });
 
             handles.push(handle);
@@ -52,7 +58,9 @@ impl ThreadingRuntime {
         // Collect results from all workers
         let mut results = Vec::new();
         for handle in handles {
-            let stats = handle.await??;
+            let stats = handle
+                .join()
+                .map_err(|e| crate::Error::Other(format!("Thread panicked: {:?}", e)))??;
             results.push(stats);
         }
 
@@ -68,16 +76,17 @@ impl ThreadingRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread;
     use std::time::Duration;
 
-    #[tokio::test]
-    async fn test_threading_runtime_basic() {
+    #[test]
+    fn test_threading_runtime_basic() {
         let runtime = ThreadingRuntime::new(4);
 
         let results = runtime
-            .run_workers(|thread_id| async move {
+            .run_workers(|thread_id| {
                 // Simulate some work
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                thread::sleep(Duration::from_millis(10));
 
                 // Create a collector with thread-specific data
                 let mut collector = StatsCollector::new(100, 1.0);
@@ -85,7 +94,6 @@ mod tests {
 
                 Ok(collector)
             })
-            .await
             .unwrap();
 
         assert_eq!(results.len(), 4);
@@ -98,17 +106,16 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_threading_runtime_single_thread() {
+    #[test]
+    fn test_threading_runtime_single_thread() {
         let runtime = ThreadingRuntime::new(1);
 
         let results = runtime
-            .run_workers(|_thread_id| async move {
+            .run_workers(|_thread_id| {
                 let mut collector = StatsCollector::default();
                 collector.record_latency(Duration::from_micros(100));
                 Ok(collector)
             })
-            .await
             .unwrap();
 
         assert_eq!(results.len(), 1);

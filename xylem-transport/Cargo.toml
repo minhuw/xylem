@@ -1,0 +1,28 @@
+[package]
+name = "xylem-transport"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Transport layer implementations for Xylem latency measurement tool"
+
+[dependencies]
+# Event loop and networking
+mio = { workspace = true }
+socket2 = { workspace = true }
+libc = { workspace = true }
+
+# TLS support
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Tracing
+tracing = { workspace = true }
+
+[lints]
+workspace = true

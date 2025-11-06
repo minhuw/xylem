@@ -2,7 +2,6 @@
 
 use crate::Protocol;
 use anyhow::{anyhow, Result};
-use async_trait::async_trait;
 
 pub struct EchoProtocol {
     payload_size: usize,
@@ -14,7 +13,6 @@ impl EchoProtocol {
     }
 }
 
-#[async_trait]
 impl Protocol for EchoProtocol {
     fn generate_request(&mut self, _key: u64, _value_size: usize) -> Vec<u8> {
         vec![0u8; self.payload_size]

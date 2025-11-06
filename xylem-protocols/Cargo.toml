@@ -13,10 +13,6 @@ workspace = true
 [dependencies]
 xylem-core = { path = "../xylem-core" }
 anyhow = { workspace = true }
-async-trait = { workspace = true }
 serde = { workspace = true }
 bytes = { workspace = true }
 httparse = { workspace = true }
-
-[dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }

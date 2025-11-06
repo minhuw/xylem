@@ -17,9 +17,9 @@ workspace = true
 [dependencies]
 xylem-core = { path = "../xylem-core" }
 xylem-protocols = { path = "../xylem-protocols" }
+xylem-transport = { path = "../xylem-transport" }
 
 clap = { workspace = true }
-tokio = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

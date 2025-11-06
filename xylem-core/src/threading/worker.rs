@@ -1,15 +1,17 @@
 //! Worker thread implementation
+//!
+//! Implements Lancet-style busy-waiting event loop for nanosecond-precision latency measurement.
 
 use crate::stats::StatsCollector;
-use crate::transport::Transport;
+use crate::timing;
 use crate::workload::RequestGenerator;
 use crate::Result;
 use std::net::SocketAddr;
-use std::time::Duration;
-use tokio::time::sleep;
+use std::time::{Duration, Instant};
+use xylem_transport::Transport;
 
 /// Protocol trait for generating requests and parsing responses
-pub trait Protocol: Send + Sync {
+pub trait Protocol: Send {
     /// Generate a request
     fn generate_request(&mut self, key: u64, value_size: usize) -> Vec<u8>;
 
@@ -57,48 +59,98 @@ impl<T: Transport, P: Protocol> Worker<T, P> {
         }
     }
 
-    /// Run the measurement loop
-    pub async fn run(&mut self) -> Result<()> {
+    /// Run the measurement loop using Lancet-style busy-waiting
+    pub fn run(&mut self) -> Result<()> {
         // Connect to target
-        self.transport.connect(&self.config.target).await?;
+        self.transport.connect(&self.config.target)?;
 
-        let start = tokio::time::Instant::now();
+        let _start = Instant::now();
+        let start_ns = timing::time_ns();
         let duration = self.config.duration;
+        let duration_ns = duration.as_nanos() as u64;
 
-        // Main measurement loop
-        while start.elapsed() < duration {
-            // Check if we need to delay before next request
-            if let Some(delay) = self.generator.delay_until_next() {
-                if delay > Duration::ZERO {
-                    sleep(delay).await;
+        // Calculate next send time based on rate control
+        let mut next_send_ns = start_ns;
+        let mut last_send_ts = None;
+
+        // Main measurement loop - Lancet style
+        loop {
+            let now_ns = timing::time_ns();
+
+            // Check if we've exceeded the duration
+            if now_ns - start_ns >= duration_ns {
+                break;
+            }
+
+            // Send phase - busy wait until next send time
+            if now_ns >= next_send_ns && last_send_ts.is_none() {
+                // Generate request
+                let (key, value_size) = self.generator.next_request();
+                let request_data = self.protocol.generate_request(key, value_size);
+
+                // Send request and capture timestamp
+                let send_ts = self.transport.send(&request_data)?;
+                self.stats.record_tx_bytes(request_data.len());
+
+                // Store send timestamp for latency calculation
+                last_send_ts = Some(send_ts);
+
+                // Mark request as sent for rate control
+                self.generator.mark_request_sent();
+
+                // Update next send time based on rate control
+                if let Some(delay) = self.generator.delay_until_next() {
+                    next_send_ns = timing::time_ns() + delay.as_nanos() as u64;
+                } else {
+                    next_send_ns = timing::time_ns();
                 }
             }
 
-            // Generate request
-            let (key, value_size) = self.generator.next_request();
-            let request_data = self.protocol.generate_request(key, value_size);
+            // Receive phase - non-blocking poll
+            if self.transport.poll_readable()? {
+                let (response_data, recv_ts) = self.transport.recv()?;
 
-            // Send request and capture timestamp
-            let send_ts = self.transport.send(&request_data).await?;
-            self.stats.record_tx_bytes(request_data.len());
+                if response_data.is_empty() {
+                    continue;
+                }
 
-            // Mark request as sent for rate control
-            self.generator.mark_request_sent();
+                self.stats.record_rx_bytes(response_data.len());
+                self.protocol.parse_response(&response_data)?;
 
-            // Receive response and capture timestamp
-            let (response_data, recv_ts) = self.transport.recv().await?;
+                // Calculate and record latency
+                let Some(send_ts) = last_send_ts.take() else {
+                    continue;
+                };
+                let latency = recv_ts.duration_since(&send_ts);
+                self.stats.record_latency(latency);
+            }
+
+            // Yield to OS scheduler without sleeping
+            std::hint::spin_loop();
+        }
+
+        // Drain any remaining responses
+        for _ in 0..100 {
+            if !self.transport.poll_readable()? {
+                break;
+            }
+
+            let Ok((response_data, _)) = self.transport.recv() else {
+                continue;
+            };
+
+            if response_data.is_empty() {
+                continue;
+            }
+
             self.stats.record_rx_bytes(response_data.len());
+            let _ = self.protocol.parse_response(&response_data);
 
-            // Validate response
-            self.protocol.parse_response(&response_data)?;
-
-            // Calculate and record latency
-            let latency = recv_ts.duration_since(&send_ts);
-            self.stats.record_latency(latency);
+            std::thread::sleep(Duration::from_micros(100));
         }
 
         // Close connection
-        self.transport.close().await?;
+        self.transport.close()?;
 
         Ok(())
     }
@@ -117,10 +169,11 @@ impl<T: Transport, P: Protocol> Worker<T, P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::tcp::TcpTransport;
     use crate::workload::{KeyGeneration, RateControl};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+    use xylem_transport::TcpTransport;
 
     // Adapter to make xylem_protocols::Protocol work with our Protocol trait
     struct ProtocolAdapter<P: xylem_protocols::Protocol> {
@@ -151,33 +204,32 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_worker_basic() {
+    #[test]
+    fn test_worker_basic() {
         // Start a simple echo server
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
 
-        tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
+        thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
             let mut buf = vec![0u8; 4096];
 
             loop {
-                let n = match socket.read(&mut buf).await {
+                let n = match socket.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => n,
                     Err(_) => break,
                 };
 
                 // Echo back
-                #[allow(clippy::excessive_nesting)]
-                if socket.write_all(&buf[..n]).await.is_err() {
+                if socket.write_all(&buf[..n]).is_err() {
                     break;
                 }
             }
         });
 
         // Wait for server to start
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        thread::sleep(Duration::from_millis(50));
 
         // Create worker components
         let transport = TcpTransport::new();
@@ -195,7 +247,7 @@ mod tests {
         let mut worker = Worker::new(transport, protocol, generator, stats, config);
 
         // Run worker
-        let result = worker.run().await;
+        let result = worker.run();
 
         // Worker should complete successfully
         if let Err(e) = &result {

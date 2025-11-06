@@ -60,6 +60,9 @@
             pkgs.hyperfine
             pkgs.redis # For integration tests
 
+            # Profiling
+            pkgs.linuxPackages.perf # For flamegraph on Linux
+
             # Additional utilities
             pkgs.tokei # Code statistics
             pkgs.just # Command runner
@@ -78,12 +81,15 @@
             echo "Cargo version: $(cargo --version)"
             echo ""
             echo "Available commands:"
-            echo "  cargo build          - Build the project"
-            echo "  cargo test           - Run tests"
-            echo "  cargo clippy         - Run linter"
-            echo "  cargo fmt            - Format code"
-            echo "  pre-commit install   - Install git hooks"
-            echo "  bacon                - Watch and build"
+            echo "  cargo build                    - Build the project"
+            echo "  cargo test                     - Run tests"
+            echo "  cargo clippy                   - Run linter"
+            echo "  cargo fmt                      - Format code"
+            echo "  cargo flamegraph --profile profiling -- <args>  - Profile with flamegraph"
+            echo "  pre-commit install             - Install git hooks"
+            echo "  bacon                          - Watch and build"
+            echo ""
+            echo "See PROFILING.md for profiling guide"
             echo ""
 
             # Setup pre-commit hooks if not already installed

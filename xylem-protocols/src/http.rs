@@ -2,7 +2,6 @@
 
 use crate::Protocol;
 use anyhow::{anyhow, Result};
-use async_trait::async_trait;
 
 pub struct HttpProtocol {
     method: String,
@@ -16,7 +15,6 @@ impl HttpProtocol {
     }
 }
 
-#[async_trait]
 impl Protocol for HttpProtocol {
     fn generate_request(&mut self, _key: u64, _value_size: usize) -> Vec<u8> {
         format!(

@@ -8,8 +8,8 @@ use std::thread::sleep;
 use std::time::Duration;
 use xylem_core::stats::StatsCollector;
 use xylem_core::threading::{ThreadingRuntime, Worker, WorkerConfig};
-use xylem_core::transport::TcpTransport;
 use xylem_core::workload::{KeyGeneration, RateControl, RequestGenerator};
+use xylem_transport::TcpTransport;
 
 // Global state to track Redis server process
 static REDIS_SERVER: Mutex<Option<Child>> = Mutex::new(None);
@@ -142,9 +142,9 @@ fn stop_redis() {
     println!("✓ Redis server stopped");
 }
 
-#[tokio::test]
+#[test]
 #[ignore] // Run with: cargo test --test redis_integration -- --ignored --test-threads=1
-async fn test_redis_single_thread() {
+fn test_redis_single_thread() {
     // Start Redis server (will auto-cleanup on drop)
     let _guard = setup_redis().expect("Failed to start Redis");
 
@@ -179,7 +179,7 @@ async fn test_redis_single_thread() {
 
     // Run the worker
     println!("Starting single-threaded Redis test...");
-    let result = worker.run().await;
+    let result = worker.run();
 
     assert!(result.is_ok(), "Worker should complete successfully: {:?}", result.err());
 
@@ -234,9 +234,9 @@ async fn test_redis_single_thread() {
     );
 }
 
-#[tokio::test]
+#[test]
 #[ignore] // Run with: cargo test --test redis_integration -- --ignored --test-threads=1
-async fn test_redis_multi_thread() {
+fn test_redis_multi_thread() {
     // Start Redis server (will auto-cleanup on drop)
     let _guard = setup_redis().expect("Failed to start Redis");
 
@@ -253,31 +253,29 @@ async fn test_redis_multi_thread() {
 
     println!("Starting {}-threaded Redis test...", num_threads);
 
-    let results = runtime
-        .run_workers(move |thread_id| {
-            let protocol =
-                xylem_protocols::redis::RedisProtocol::new(xylem_protocols::redis::RedisOp::Get);
-            let protocol = ProtocolAdapter::new(protocol);
-            let transport = TcpTransport::new();
-            let generator = RequestGenerator::new(
-                KeyGeneration::sequential(thread_id as u64 * 10000),
-                RateControl::ClosedLoop,
-                64,
-            );
-            let stats = StatsCollector::default();
-            let worker_config = WorkerConfig {
-                target: target_addr,
-                duration,
-                value_size: 64,
-            };
-            let mut worker = Worker::new(transport, protocol, generator, stats, worker_config);
+    let results = runtime.run_workers(move |thread_id| {
+        let protocol =
+            xylem_protocols::redis::RedisProtocol::new(xylem_protocols::redis::RedisOp::Get);
+        let protocol = ProtocolAdapter::new(protocol);
+        let transport = TcpTransport::new();
+        let generator = RequestGenerator::new(
+            KeyGeneration::sequential(thread_id as u64 * 10000),
+            RateControl::ClosedLoop,
+            64,
+        );
+        let stats = StatsCollector::default();
+        let worker_config = WorkerConfig {
+            target: target_addr,
+            duration,
+            value_size: 64,
+        };
+        let mut worker = Worker::new(transport, protocol, generator, stats, worker_config);
 
-            async move {
-                worker.run().await?;
-                Ok(worker.into_stats())
-            }
-        })
-        .await;
+        {
+            worker.run()?;
+            Ok(worker.into_stats())
+        }
+    });
 
     assert!(
         results.is_ok(),
@@ -338,9 +336,9 @@ async fn test_redis_multi_thread() {
     );
 }
 
-#[tokio::test]
+#[test]
 #[ignore] // Run with: cargo test --test redis_integration -- --ignored --test-threads=1
-async fn test_redis_rate_limited() {
+fn test_redis_rate_limited() {
     // Start Redis server (will auto-cleanup on drop)
     let _guard = setup_redis().expect("Failed to start Redis");
 
@@ -368,7 +366,7 @@ async fn test_redis_rate_limited() {
     let mut worker = Worker::new(transport, protocol, generator, stats, worker_config);
 
     println!("Starting rate-limited test (target: {} req/s)...", target_rate);
-    let result = worker.run().await;
+    let result = worker.run();
 
     assert!(result.is_ok(), "Worker should complete successfully");
 

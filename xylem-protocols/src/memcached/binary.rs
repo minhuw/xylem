@@ -2,7 +2,6 @@
 
 use crate::Protocol;
 use anyhow::Result;
-use async_trait::async_trait;
 
 pub struct MemcachedBinaryProtocol {
     // TODO: Add fields
@@ -20,7 +19,6 @@ impl Default for MemcachedBinaryProtocol {
     }
 }
 
-#[async_trait]
 impl Protocol for MemcachedBinaryProtocol {
     fn generate_request(&mut self, _key: u64, _value_size: usize) -> Vec<u8> {
         // TODO: Implement

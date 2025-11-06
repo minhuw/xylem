@@ -4,11 +4,9 @@
 //! for latency measurement.
 
 use anyhow::Result;
-use async_trait::async_trait;
 
 /// Application protocol trait
-#[async_trait]
-pub trait Protocol: Send + Sync {
+pub trait Protocol: Send {
     /// Generate a request
     fn generate_request(&mut self, key: u64, value_size: usize) -> Vec<u8>;
 

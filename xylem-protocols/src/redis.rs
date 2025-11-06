@@ -2,7 +2,6 @@
 
 use crate::Protocol;
 use anyhow::{anyhow, Result};
-use async_trait::async_trait;
 
 #[derive(Debug, Clone, Copy)]
 pub enum RedisOp {
@@ -21,7 +20,6 @@ impl RedisProtocol {
     }
 }
 
-#[async_trait]
 impl Protocol for RedisProtocol {
     fn generate_request(&mut self, key: u64, value_size: usize) -> Vec<u8> {
         match self.operation {

@@ -5,11 +5,15 @@
 //! runtime, and workload generation.
 
 pub mod config;
+pub mod connection;
 pub mod error;
 pub mod request;
 pub mod stats;
 pub mod threading;
-pub mod transport;
+pub mod timing;
 pub mod workload;
+
+// Re-export transport types from xylem-transport
+pub use xylem_transport::{Timestamp as TransportTimestamp, Transport};
 
 pub use error::{Error, Result};

@@ -3,8 +3,8 @@ use std::time::Duration;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use xylem_core::stats::StatsCollector;
 use xylem_core::threading::{ThreadingRuntime, Worker, WorkerConfig};
-use xylem_core::transport::TcpTransport;
 use xylem_core::workload::{KeyGeneration, RateControl, RequestGenerator};
+use xylem_transport::TcpTransport;
 
 mod config;
 mod output;
@@ -89,8 +89,7 @@ impl<P: xylem_protocols::Protocol> xylem_core::threading::worker::Protocol for P
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // Initialize tracing
@@ -163,30 +162,22 @@ async fn main() -> anyhow::Result<()> {
             // Clone values that will be moved into closures
             let value_size = cli.value_size;
 
-            let results = runtime
-                .run_workers(move |_thread_id| {
-                    let protocol = ProtocolAdapter::new($protocol_expr);
-                    let transport = TcpTransport::new();
-                    let generator = RequestGenerator::new(
-                        key_gen.clone(),
-                        thread_rate_control.clone(),
-                        value_size,
-                    );
-                    let stats = StatsCollector::default();
-                    let worker_config = WorkerConfig {
-                        target: target_addr,
-                        duration,
-                        value_size,
-                    };
-                    let mut worker =
-                        Worker::new(transport, protocol, generator, stats, worker_config);
+            let results = runtime.run_workers(move |_thread_id| {
+                let protocol = ProtocolAdapter::new($protocol_expr);
+                let transport = TcpTransport::new();
+                let generator =
+                    RequestGenerator::new(key_gen.clone(), thread_rate_control.clone(), value_size);
+                let stats = StatsCollector::default();
+                let worker_config = WorkerConfig {
+                    target: target_addr,
+                    duration,
+                    value_size,
+                };
+                let mut worker = Worker::new(transport, protocol, generator, stats, worker_config);
 
-                    async move {
-                        worker.run().await?;
-                        Ok(worker.into_stats())
-                    }
-                })
-                .await?;
+                worker.run()?;
+                Ok(worker.into_stats())
+            })?;
 
             tracing::info!("Experiment completed successfully");
             StatsCollector::merge(results)

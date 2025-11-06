@@ -52,8 +52,12 @@ impl From<anyhow::Error> for Error {
     }
 }
 
-impl From<tokio::task::JoinError> for Error {
-    fn from(err: tokio::task::JoinError) -> Self {
-        Error::Other(format!("Task join error: {err}"))
+impl From<xylem_transport::Error> for Error {
+    fn from(err: xylem_transport::Error) -> Self {
+        match err {
+            xylem_transport::Error::Io(e) => Error::Io(e),
+            xylem_transport::Error::Connection(msg) => Error::Connection(msg),
+            xylem_transport::Error::Other(msg) => Error::Other(msg),
+        }
     }
 }

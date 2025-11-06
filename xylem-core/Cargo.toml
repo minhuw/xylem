@@ -11,14 +11,10 @@ repository = "https://github.com/minhuw/xylem"
 workspace = true
 
 [dependencies]
-tokio = { workspace = true }
-tokio-rustls = { workspace = true }
-rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
+xylem-transport = { path = "../xylem-transport" }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-async-trait = { workspace = true }
 tracing = { workspace = true }
 rand = { workspace = true }
 rand_distr = { workspace = true }
@@ -27,5 +23,4 @@ core_affinity = { workspace = true }
 humantime-serde = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }
 xylem-protocols = { path = "../xylem-protocols" }

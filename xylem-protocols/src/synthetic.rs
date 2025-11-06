@@ -2,7 +2,6 @@
 
 use crate::Protocol;
 use anyhow::Result;
-use async_trait::async_trait;
 
 pub struct SyntheticProtocol {
     service_time_ns: u64,
@@ -14,7 +13,6 @@ impl SyntheticProtocol {
     }
 }
 
-#[async_trait]
 impl Protocol for SyntheticProtocol {
     fn generate_request(&mut self, _key: u64, _value_size: usize) -> Vec<u8> {
         format!("{}\n", self.service_time_ns).into_bytes()
