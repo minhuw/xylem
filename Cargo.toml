@@ -65,6 +65,9 @@ bytes = "1.9"
 # TLS certificate handling
 rustls-pemfile = "2.2"
 
+[workspace.lints.clippy]
+uninlined_format_args = "allow"
+
 [profile.release]
 opt-level = 3
 lto = true

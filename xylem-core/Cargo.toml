@@ -7,6 +7,9 @@ description = "Core library for Xylem latency measurement tool"
 license = "MIT"
 repository = "https://github.com/minhuw/xylem"
 
+[lints]
+workspace = true
+
 [dependencies]
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
@@ -25,3 +28,4 @@ humantime-serde = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+xylem-protocols = { path = "../xylem-protocols" }

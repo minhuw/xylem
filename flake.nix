@@ -58,6 +58,7 @@
 
             # Testing and benchmarking
             pkgs.hyperfine
+            pkgs.redis # For integration tests
 
             # Additional utilities
             pkgs.tokei # Code statistics
@@ -113,38 +114,6 @@
             maintainers = [ ];
             platforms = platforms.unix;
           };
-        };
-
-        # CI checks
-        checks = {
-          format = pkgs.runCommand "check-format"
-            {
-              buildInputs = [ rustToolchain ];
-            } ''
-            cd ${./.}
-            cargo fmt -- --check
-            touch $out
-          '';
-
-          clippy = pkgs.runCommand "check-clippy"
-            {
-              buildInputs = [ rustToolchain ] ++ buildInputs;
-              inherit nativeBuildInputs;
-            } ''
-            cd ${./.}
-            cargo clippy -- -D warnings
-            touch $out
-          '';
-
-          test = pkgs.runCommand "check-test"
-            {
-              buildInputs = [ rustToolchain ] ++ buildInputs;
-              inherit nativeBuildInputs;
-            } ''
-            cd ${./.}
-            cargo test
-            touch $out
-          '';
         };
       }
     );

@@ -17,6 +17,8 @@
 # Nix
 result
 result-*
+.direnv/
+.envrc
 
 # Generated files
 *.o

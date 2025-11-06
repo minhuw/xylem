@@ -7,6 +7,9 @@ description = "Protocol implementations for Xylem latency measurement tool"
 license = "MIT"
 repository = "https://github.com/minhuw/xylem"
 
+[lints]
+workspace = true
+
 [dependencies]
 xylem-core = { path = "../xylem-core" }
 anyhow = { workspace = true }

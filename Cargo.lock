@@ -1334,6 +1334,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "xylem-protocols",
 ]
 
 [[package]]

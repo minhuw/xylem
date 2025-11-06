@@ -11,6 +11,9 @@ repository = "https://github.com/minhuw/xylem"
 name = "xylem"
 path = "src/main.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 xylem-core = { path = "../xylem-core" }
 xylem-protocols = { path = "../xylem-protocols" }
