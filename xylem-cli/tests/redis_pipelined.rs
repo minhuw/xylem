@@ -164,7 +164,7 @@ fn test_redis_pipelined_single_connection() {
 
     // With pipelining, we should get much higher throughput
     let throughput = stats.tx_requests() as f64 / duration.as_secs_f64();
-    println!("✓ Pipelined throughput: {:.0} req/s", throughput);
+    println!("✓ Pipelined throughput: {throughput:.0} req/s");
 }
 
 #[test]
@@ -213,7 +213,7 @@ fn test_redis_pipelined_multiple_connections() {
 
     // With 4 connections and pipelining, throughput should be very high
     let throughput = stats.tx_requests() as f64 / duration.as_secs_f64();
-    println!("✓ Multi-connection pipelined throughput: {:.0} req/s", throughput);
+    println!("✓ Multi-connection pipelined throughput: {throughput:.0} req/s");
 }
 
 #[test]
@@ -246,7 +246,7 @@ fn test_redis_pipelined_rate_limited() {
     let mut worker =
         PipelinedWorker::new(TcpTransport::new, protocol, generator, stats, config).unwrap();
 
-    println!("Starting rate-limited test (target: {} req/s)...", target_rate);
+    println!("Starting rate-limited test (target: {target_rate} req/s)...");
     let result = worker.run();
 
     assert!(result.is_ok(), "Worker should complete: {:?}", result.err());
@@ -255,16 +255,15 @@ fn test_redis_pipelined_rate_limited() {
     let actual_rate = stats.tx_requests() as f64 / duration.as_secs_f64();
 
     println!("Results:");
-    println!("  Target rate: {:.2} req/s", target_rate);
-    println!("  Actual rate: {:.2} req/s", actual_rate);
+    println!("  Target rate: {target_rate:.2} req/s");
+    println!("  Actual rate: {actual_rate:.2} req/s");
     println!("  Total requests: {}", stats.tx_requests());
 
     // Verify rate is close to target (within 20%)
     let rate_ratio = actual_rate / target_rate;
     assert!(
         rate_ratio > 0.8 && rate_ratio < 1.2,
-        "Actual rate should be within 20% of target, got {:.2}x",
-        rate_ratio
+        "Actual rate should be within 20% of target, got {rate_ratio:.2}x"
     );
 
     println!("✓ Rate control working ({}% of target)", (rate_ratio * 100.0) as i32);

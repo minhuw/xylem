@@ -19,7 +19,7 @@ struct Cli {
     #[arg(short, long)]
     target: String,
 
-    /// Protocol to use (echo, redis, memcached-binary, memcached-ascii, http, synthetic, masstree)
+    /// Protocol to use (echo, redis, memcached-binary, memcached-ascii, http, synthetic, masstree, xylem-echo)
     #[arg(short, long)]
     protocol: String,
 
@@ -215,9 +215,27 @@ fn main() -> anyhow::Result<()> {
                 target_string.clone()
             ))
         }
+        "memcached-binary" => {
+            run_protocol!(xylem_protocols::memcached::MemcachedBinaryProtocol::new(
+                xylem_protocols::memcached::MemcachedOp::Get
+            ))
+        }
+        "memcached-ascii" => {
+            run_protocol!(xylem_protocols::memcached::MemcachedAsciiProtocol::new(
+                xylem_protocols::memcached::ascii::MemcachedOp::Get
+            ))
+        }
+        "masstree" => {
+            run_protocol!(xylem_protocols::masstree::MasstreeProtocol::new(
+                xylem_protocols::masstree::MasstreeOp::Get
+            ))
+        }
+        "xylem-echo" => {
+            run_protocol!(xylem_protocols::xylem_echo::XylemEchoProtocol::new(0))
+        }
         _ => {
             anyhow::bail!(
-                "Unsupported protocol: {}. Supported: echo, redis, synthetic, http",
+                "Unsupported protocol: {}. Supported: echo, redis, synthetic, http, memcached-binary, memcached-ascii, masstree, xylem-echo",
                 cli.protocol
             );
         }

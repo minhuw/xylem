@@ -213,7 +213,7 @@ fn test_redis_single_thread() {
     println!("\nRedis server validation:");
     println!("  Commands before: {}", stats_before.total_commands_processed);
     println!("  Commands after: {}", stats_after.total_commands_processed);
-    println!("  Commands processed: {}", redis_commands_processed);
+    println!("  Commands processed: {redis_commands_processed}");
     println!("  Client tx_requests: {}", stats.tx_requests());
 
     // Verify we got some requests through
@@ -235,7 +235,7 @@ fn test_redis_single_thread() {
         discrepancy
     );
 
-    println!("✓ Redis stats validation passed (discrepancy: {} commands)", discrepancy);
+    println!("✓ Redis stats validation passed (discrepancy: {discrepancy} commands)");
 
     // Sanity check on latency (should be < 10ms for local Redis)
     assert!(
@@ -262,7 +262,7 @@ fn test_redis_multi_thread() {
 
     let runtime = ThreadingRuntime::new(num_threads);
 
-    println!("Starting {}-threaded Redis test...", num_threads);
+    println!("Starting {num_threads}-threaded Redis test...");
 
     let results = runtime.run_workers(move |thread_id| {
         let protocol =
@@ -301,7 +301,7 @@ fn test_redis_multi_thread() {
     let merged_stats = StatsCollector::merge(results);
     let basic_stats = merged_stats.calculate_basic_stats();
 
-    println!("Results ({} threads):", num_threads);
+    println!("Results ({num_threads} threads):");
     println!("  Total requests: {}", merged_stats.tx_requests());
     println!(
         "  Throughput: {:.2} req/s",
@@ -317,7 +317,7 @@ fn test_redis_multi_thread() {
         stats_after.total_commands_processed - stats_before.total_commands_processed;
 
     println!("\nRedis server validation:");
-    println!("  Commands processed by Redis: {}", redis_commands_processed);
+    println!("  Commands processed by Redis: {redis_commands_processed}");
     println!("  Client tx_requests: {}", merged_stats.tx_requests());
 
     // Verify we got some requests through
@@ -336,14 +336,13 @@ fn test_redis_multi_thread() {
         discrepancy
     );
 
-    println!("✓ Redis stats validation passed (discrepancy: {} commands)", discrepancy);
+    println!("✓ Redis stats validation passed (discrepancy: {discrepancy} commands)");
 
     // With 4 threads, we should get more throughput than single-threaded
     // (though this depends on Redis and system capacity)
     assert!(
         merged_stats.tx_requests() > 1000,
-        "Should have reasonable throughput with {} threads",
-        num_threads
+        "Should have reasonable throughput with {num_threads} threads"
     );
 }
 
@@ -376,7 +375,7 @@ fn test_redis_rate_limited() {
 
     let mut worker = Worker::new(transport, protocol, generator, stats, worker_config);
 
-    println!("Starting rate-limited test (target: {} req/s)...", target_rate);
+    println!("Starting rate-limited test (target: {target_rate} req/s)...");
     let result = worker.run();
 
     assert!(result.is_ok(), "Worker should complete successfully");
@@ -385,8 +384,8 @@ fn test_redis_rate_limited() {
     let actual_rate = stats.tx_requests() as f64 / duration.as_secs_f64();
 
     println!("Results:");
-    println!("  Target rate: {:.2} req/s", target_rate);
-    println!("  Actual rate: {:.2} req/s", actual_rate);
+    println!("  Target rate: {target_rate:.2} req/s");
+    println!("  Actual rate: {actual_rate:.2} req/s");
     println!("  Total requests: {}", stats.tx_requests());
 
     // Verify we're close to target rate (within 40% tolerance)
@@ -394,8 +393,7 @@ fn test_redis_rate_limited() {
     let rate_ratio = actual_rate / target_rate;
     assert!(
         rate_ratio > 0.6 && rate_ratio < 1.4,
-        "Actual rate should be within 40% of target rate, got {:.2}x",
-        rate_ratio
+        "Actual rate should be within 40% of target rate, got {rate_ratio:.2}x"
     );
 }
 

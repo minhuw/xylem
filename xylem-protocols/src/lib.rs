@@ -55,3 +55,4 @@ pub mod memcached;
 pub mod protocol;
 pub mod redis;
 pub mod synthetic;
+pub mod xylem_echo;

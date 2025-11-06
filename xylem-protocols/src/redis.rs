@@ -138,10 +138,10 @@ impl RedisProtocol {
                 // Bulk string: $<length>\r\n<data>\r\n
                 if let Some(first_crlf) = data.windows(2).position(|w| w == b"\r\n") {
                     let length_str = std::str::from_utf8(&data[1..first_crlf])
-                        .map_err(|e| anyhow!("Invalid bulk string length: {}", e))?;
+                        .map_err(|e| anyhow!("Invalid bulk string length: {e}"))?;
                     let length: i64 = length_str
                         .parse()
-                        .map_err(|e| anyhow!("Failed to parse bulk string length: {}", e))?;
+                        .map_err(|e| anyhow!("Failed to parse bulk string length: {e}"))?;
 
                     if length == -1 {
                         // Null bulk string

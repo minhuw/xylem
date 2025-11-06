@@ -59,6 +59,7 @@
             # Testing and benchmarking
             pkgs.hyperfine
             pkgs.redis # For integration tests
+            pkgs.memcached # For integration tests
 
             # Profiling
             pkgs.linuxPackages.perf # For flamegraph on Linux

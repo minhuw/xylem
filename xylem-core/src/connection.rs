@@ -138,8 +138,7 @@ impl<T: Transport, ReqId: Eq + Hash + Clone + std::fmt::Debug> Connection<T, Req
                 latencies.push((req_id, latency));
             } else {
                 return Err(crate::Error::Protocol(format!(
-                    "Received response for unknown request ID: {:?}",
-                    req_id
+                    "Received response for unknown request ID: {req_id:?}"
                 )));
             }
 

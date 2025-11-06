@@ -60,7 +60,7 @@ impl Transport for TcpTransport {
 
             // Connection established - check for errors
             if let Some(err) = stream.take_error()? {
-                return Err(Error::Connection(format!("Connection failed: {}", err)));
+                return Err(Error::Connection(format!("Connection failed: {err}")));
             }
 
             // Re-register for read events only

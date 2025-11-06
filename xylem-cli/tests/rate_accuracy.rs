@@ -160,19 +160,16 @@ fn test_rate_accuracy_low_rate() {
     println!("\n=== Testing Low Rate (100 req/s) ===");
     let (target, actual, error) = run_rate_experiment(100.0, 5, 1);
 
-    println!("Target rate: {:.2} req/s", target);
-    println!("Actual rate: {:.2} req/s", actual);
-    println!("Error: {:.2}%", error);
+    println!("Target rate: {target:.2} req/s");
+    println!("Actual rate: {actual:.2} req/s");
+    println!("Error: {error:.2}%");
 
     // Low rates should be very accurate (within 5%)
     assert!(
         error < 5.0,
-        "Low rate error too high: {:.2}% (target: {:.2}, actual: {:.2})",
-        error,
-        target,
-        actual
+        "Low rate error too high: {error:.2}% (target: {target:.2}, actual: {actual:.2})"
     );
-    println!("✓ Low rate accuracy: {:.2}%", error);
+    println!("✓ Low rate accuracy: {error:.2}%");
 }
 
 #[test]
@@ -183,19 +180,16 @@ fn test_rate_accuracy_medium_rate() {
     println!("\n=== Testing Medium Rate (1000 req/s) ===");
     let (target, actual, error) = run_rate_experiment(1000.0, 5, 1);
 
-    println!("Target rate: {:.2} req/s", target);
-    println!("Actual rate: {:.2} req/s", actual);
-    println!("Error: {:.2}%", error);
+    println!("Target rate: {target:.2} req/s");
+    println!("Actual rate: {actual:.2} req/s");
+    println!("Error: {error:.2}%");
 
     // Medium rates should be accurate within 10%
     assert!(
         error < 10.0,
-        "Medium rate error too high: {:.2}% (target: {:.2}, actual: {:.2})",
-        error,
-        target,
-        actual
+        "Medium rate error too high: {error:.2}% (target: {target:.2}, actual: {actual:.2})"
     );
-    println!("✓ Medium rate accuracy: {:.2}%", error);
+    println!("✓ Medium rate accuracy: {error:.2}%");
 }
 
 #[test]
@@ -206,20 +200,17 @@ fn test_rate_accuracy_high_rate() {
     println!("\n=== Testing High Rate (10000 req/s) ===");
     let (target, actual, error) = run_rate_experiment(10000.0, 5, 2);
 
-    println!("Target rate: {:.2} req/s", target);
-    println!("Actual rate: {:.2} req/s", actual);
-    println!("Error: {:.2}%", error);
+    println!("Target rate: {target:.2} req/s");
+    println!("Actual rate: {actual:.2} req/s");
+    println!("Error: {error:.2}%");
 
     // High rates may have more variation due to latency effects
     // Relaxed threshold: within 50% for CI/test environments
     assert!(
         error < 50.0 || actual > 5000.0,
-        "High rate too far off: {:.2}% (target: {:.2}, actual: {:.2})",
-        error,
-        target,
-        actual
+        "High rate too far off: {error:.2}% (target: {target:.2}, actual: {actual:.2})"
     );
-    println!("✓ High rate attempted: {:.2} req/s ({:.2}% error)", actual, error);
+    println!("✓ High rate attempted: {actual:.2} req/s ({error:.2}% error)");
 }
 
 #[test]
@@ -230,14 +221,14 @@ fn test_rate_accuracy_very_high_rate() {
     println!("\n=== Testing Very High Rate (50000 req/s) ===");
     let (target, actual, error) = run_rate_experiment(50000.0, 5, 4);
 
-    println!("Target rate: {:.2} req/s", target);
-    println!("Actual rate: {:.2} req/s", actual);
-    println!("Error: {:.2}%", error);
+    println!("Target rate: {target:.2} req/s");
+    println!("Actual rate: {actual:.2} req/s");
+    println!("Error: {error:.2}%");
 
     // Very high rates are limited by server capacity
     // Test environments may only achieve 10-20k req/s
-    println!("✓ Very high rate attempted: {:.2} req/s achieved", actual);
-    assert!(actual > 10000.0, "Should achieve at least 10k req/s (got {:.2})", actual);
+    println!("✓ Very high rate attempted: {actual:.2} req/s achieved");
+    assert!(actual > 10000.0, "Should achieve at least 10k req/s (got {actual:.2})");
 }
 
 #[test]
@@ -259,14 +250,14 @@ fn test_rate_sweep() {
         let (target, actual, error) = run_rate_experiment(rate, 3, 1);
         let status = if error < 10.0 { "✓" } else { "⚠" };
 
-        println!("{:<15.2} {:<15.2} {:<15.2} {:<15}", target, actual, error, status);
+        println!("{target:<15.2} {actual:<15.2} {error:<15.2} {status:<15}");
 
         results.push((target, actual, error));
     }
 
     println!("\n=== Summary ===");
     let avg_error: f64 = results.iter().map(|(_, _, e)| e).sum::<f64>() / results.len() as f64;
-    println!("Average error across all rates: {:.2}%", avg_error);
+    println!("Average error across all rates: {avg_error:.2}%");
 
     // Check that most rates are within tolerance (25% for CI environments)
     let accurate_count = results.iter().filter(|(_, _, e)| *e < 25.0).count();
@@ -300,7 +291,7 @@ fn test_rate_consistency() {
 
     for run in 1..=5 {
         let (_target, actual, error) = run_rate_experiment(target_rate, 3, 1);
-        println!("Run {}: {:.2} req/s (error: {:.2}%)", run, actual, error);
+        println!("Run {run}: {actual:.2} req/s (error: {error:.2}%)");
         rates.push(actual);
     }
 
@@ -311,13 +302,13 @@ fn test_rate_consistency() {
     let cv = (std_dev / mean) * 100.0; // Coefficient of variation
 
     println!("\nStatistics:");
-    println!("  Mean rate: {:.2} req/s", mean);
-    println!("  Std dev: {:.2} req/s", std_dev);
-    println!("  Coefficient of variation: {:.2}%", cv);
+    println!("  Mean rate: {mean:.2} req/s");
+    println!("  Std dev: {std_dev:.2} req/s");
+    println!("  Coefficient of variation: {cv:.2}%");
 
     // Rate should be consistent (CV < 10%)
-    assert!(cv < 10.0, "Rate control should be consistent across runs (CV: {:.2}%)", cv);
-    println!("✓ Rate control is consistent (CV: {:.2}%)", cv);
+    assert!(cv < 10.0, "Rate control should be consistent across runs (CV: {cv:.2}%)");
+    println!("✓ Rate control is consistent (CV: {cv:.2}%)");
 }
 
 #[test]
@@ -341,10 +332,10 @@ fn test_rate_with_multiple_connections() {
     for (conn_count, desc) in configs {
         let (target, actual, error) = run_rate_experiment(target_rate, 3, conn_count);
 
-        println!("{:<20} {:<15.2} {:<15.2} {:<15.2}", desc, target, actual, error);
+        println!("{desc:<20} {target:<15.2} {actual:<15.2} {error:<15.2}");
 
         // All configurations should achieve target within 15%
-        assert!(error < 15.0, "{} error too high: {:.2}%", desc, error);
+        assert!(error < 15.0, "{desc} error too high: {error:.2}%");
     }
 
     println!("✓ Rate control works correctly with multiple connections");
@@ -381,7 +372,7 @@ fn test_rate_vs_throughput_saturation() {
     worker.run().unwrap();
     let max_throughput = worker.stats().tx_requests() as f64 / duration.as_secs_f64();
 
-    println!("Maximum throughput (closed-loop): {:.0} req/s\n", max_throughput);
+    println!("Maximum throughput (closed-loop): {max_throughput:.0} req/s\n");
 
     // Test rates below and above saturation point
     let test_rates = vec![
@@ -398,7 +389,7 @@ fn test_rate_vs_throughput_saturation() {
         let (_t, actual, _e) = run_rate_experiment(target, 3, 4);
         let saturation = if actual < target * 0.9 { "Yes" } else { "No" };
 
-        println!("{:<20.0} {:<20.0} {:<15}", target, actual, saturation);
+        println!("{target:<20.0} {actual:<20.0} {saturation:<15}");
     }
 
     println!("\n✓ Rate control behaves correctly at saturation");

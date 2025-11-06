@@ -60,7 +60,7 @@ impl ThreadingRuntime {
         for handle in handles {
             let stats = handle
                 .join()
-                .map_err(|e| crate::Error::Other(format!("Thread panicked: {:?}", e)))??;
+                .map_err(|e| crate::Error::Other(format!("Thread panicked: {e:?}")))??;
             results.push(stats);
         }
 

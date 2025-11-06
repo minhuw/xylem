@@ -287,7 +287,7 @@ mod tests {
 
         // Worker should complete successfully
         if let Err(e) = &result {
-            eprintln!("Worker error: {:?}", e);
+            eprintln!("Worker error: {e:?}");
         }
         assert!(result.is_ok());
 

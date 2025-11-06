@@ -1,7 +1,7 @@
 [workspace]
 members = [
     "xylem-cli",
-    "xylem-core",
+    "xylem-core", "xylem-echo-server",
     "xylem-protocols", "xylem-transport",
 ]
 resolver = "2"
