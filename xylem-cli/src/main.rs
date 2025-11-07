@@ -241,17 +241,15 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    let basic_stats = stats.calculate_basic_stats();
+    // Aggregate statistics with percentiles and confidence intervals
+    let aggregated_stats = xylem_core::stats::aggregate_stats(&stats, duration, 0.95);
 
     // Create results
-    let results = ExperimentResults::from_stats(
+    let results = ExperimentResults::from_aggregated_stats(
         cli.protocol.clone(),
         cli.target.clone(),
         duration,
-        stats.tx_requests(),
-        stats.tx_bytes(),
-        stats.rx_bytes(),
-        basic_stats,
+        aggregated_stats,
     );
 
     // Output results

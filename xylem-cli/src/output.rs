@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::Write;
 use std::time::Duration;
-use xylem_core::stats::BasicStats;
+use xylem_core::stats::{AggregatedStats, BasicStats};
 
 /// Experiment results
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,11 +26,51 @@ pub struct LatencyStats {
     pub min_us: f64,
     pub max_us: f64,
     pub mean_us: f64,
+    pub p50_us: f64,
+    pub p95_us: f64,
+    pub p99_us: f64,
+    pub p999_us: f64,
+    pub std_dev_us: f64,
+    pub confidence_interval_us: f64,
     pub sample_count: usize,
 }
 
 impl ExperimentResults {
-    /// Create results from stats collector
+    /// Create results from aggregated stats
+    pub fn from_aggregated_stats(
+        protocol: String,
+        target: String,
+        duration: Duration,
+        stats: AggregatedStats,
+    ) -> Self {
+        let duration_secs = duration.as_secs_f64();
+
+        Self {
+            protocol,
+            target,
+            duration_secs,
+            total_requests: stats.total_requests,
+            total_tx_bytes: 0, // Not tracked in AggregatedStats currently
+            total_rx_bytes: 0, // Not tracked in AggregatedStats currently
+            throughput_rps: stats.throughput_rps,
+            throughput_mbps: stats.throughput_mbps,
+            latency: LatencyStats {
+                min_us: 0.0, // Could be tracked separately if needed
+                max_us: 0.0, // Could be tracked separately if needed
+                mean_us: stats.mean_latency.as_secs_f64() * 1_000_000.0,
+                p50_us: stats.latency_p50.as_secs_f64() * 1_000_000.0,
+                p95_us: stats.latency_p95.as_secs_f64() * 1_000_000.0,
+                p99_us: stats.latency_p99.as_secs_f64() * 1_000_000.0,
+                p999_us: stats.latency_p999.as_secs_f64() * 1_000_000.0,
+                std_dev_us: stats.std_dev.as_secs_f64() * 1_000_000.0,
+                confidence_interval_us: stats.confidence_interval.as_secs_f64() * 1_000_000.0,
+                sample_count: 0, // Not tracked in AggregatedStats currently
+            },
+        }
+    }
+
+    /// Create results from basic stats (legacy)
+    #[allow(dead_code)]
     pub fn from_stats(
         protocol: String,
         target: String,
@@ -65,6 +105,12 @@ impl ExperimentResults {
                 min_us: stats.min.as_secs_f64() * 1_000_000.0,
                 max_us: stats.max.as_secs_f64() * 1_000_000.0,
                 mean_us: stats.mean.as_secs_f64() * 1_000_000.0,
+                p50_us: 0.0,
+                p95_us: 0.0,
+                p99_us: 0.0,
+                p999_us: 0.0,
+                std_dev_us: 0.0,
+                confidence_interval_us: 0.0,
                 sample_count: stats.count,
             },
         }
@@ -85,14 +131,34 @@ impl ExperimentResults {
         println!("  Requests:        {} total", self.total_requests);
         println!("  Rate:            {:.2} req/s", self.throughput_rps);
         println!("  Bandwidth:       {:.2} MB/s", self.throughput_mbps);
-        println!("  TX Bytes:        {}", self.total_tx_bytes);
-        println!("  RX Bytes:        {}", self.total_rx_bytes);
+        if self.total_tx_bytes > 0 || self.total_rx_bytes > 0 {
+            println!("  TX Bytes:        {}", self.total_tx_bytes);
+            println!("  RX Bytes:        {}", self.total_rx_bytes);
+        }
         println!();
         println!("Latency (microseconds):");
-        println!("  Samples:         {}", self.latency.sample_count);
-        println!("  Min:             {:.2} μs", self.latency.min_us);
+        if self.latency.sample_count > 0 {
+            println!("  Samples:         {}", self.latency.sample_count);
+        }
+        if self.latency.min_us > 0.0 {
+            println!("  Min:             {:.2} μs", self.latency.min_us);
+        }
         println!("  Mean:            {:.2} μs", self.latency.mean_us);
-        println!("  Max:             {:.2} μs", self.latency.max_us);
+        if self.latency.max_us > 0.0 {
+            println!("  Max:             {:.2} μs", self.latency.max_us);
+        }
+        if self.latency.p50_us > 0.0 {
+            println!("  p50:             {:.2} μs", self.latency.p50_us);
+            println!("  p95:             {:.2} μs", self.latency.p95_us);
+            println!("  p99:             {:.2} μs", self.latency.p99_us);
+            println!("  p999:            {:.2} μs", self.latency.p999_us);
+        }
+        if self.latency.std_dev_us > 0.0 {
+            println!("  Std Dev:         {:.2} μs", self.latency.std_dev_us);
+        }
+        if self.latency.confidence_interval_us > 0.0 {
+            println!("  95% CI:          ±{:.2} μs", self.latency.confidence_interval_us);
+        }
         println!();
         println!("{}", "=".repeat(60));
     }

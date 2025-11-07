@@ -8,6 +8,7 @@ pub mod collector;
 pub mod sampler;
 
 // Re-export main types
+pub use analysis::aggregate_stats;
 pub use collector::{BasicStats, StatsCollector};
 
 /// Aggregated statistics
