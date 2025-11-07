@@ -7,7 +7,7 @@ use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
 use xylem_core::connection::ConnectionPool;
-use xylem_core::scheduler::{ClosedLoopTiming, RoundRobinSelector, UnifiedScheduler};
+use xylem_core::scheduler::UniformPolicyScheduler;
 use xylem_protocols::xylem_echo::XylemEchoProtocol;
 use xylem_transport::{Transport, UdpTransport};
 
@@ -77,16 +77,14 @@ fn test_udp_transport_echo() {
 
     // Create connection pool with UDP transport
     let addr = format!("127.0.0.1:{}", port).parse().unwrap();
-    let timing = Box::new(ClosedLoopTiming::new());
-    let selector = Box::new(RoundRobinSelector::new());
-    let scheduler = UnifiedScheduler::new(timing, selector);
+    let policy_scheduler = Box::new(UniformPolicyScheduler::closed_loop());
 
     let pool = ConnectionPool::new(
         UdpTransport::new,
         addr,
         2,  // 2 connections
         10, // 10 max pending per connection
-        scheduler,
+        policy_scheduler,
     );
 
     assert!(pool.is_ok(), "Failed to create UDP connection pool");
@@ -94,7 +92,7 @@ fn test_udp_transport_echo() {
 
     // Send a few packets
     for i in 0..5 {
-        if let Some(conn) = pool.pick_connection(i) {
+        if let Some(conn) = pool.pick_connection() {
             let test_data = format!("UDP test {}", i);
             assert!(conn.send(test_data.as_bytes(), i).is_ok());
         }
@@ -188,12 +186,10 @@ fn test_udp_xylem_echo_protocol() {
     let _protocol = XylemEchoProtocol::new(0); // 0us delay
     let addr = format!("127.0.0.1:{}", port).parse().unwrap();
 
-    let timing = Box::new(ClosedLoopTiming::new());
-    let selector = Box::new(RoundRobinSelector::new());
-    let scheduler = UnifiedScheduler::new(timing, selector);
+    let policy_scheduler = Box::new(UniformPolicyScheduler::closed_loop());
 
     let pool: Result<ConnectionPool<UdpTransport, u64>, _> =
-        ConnectionPool::new(UdpTransport::new, addr, 1, 5, scheduler);
+        ConnectionPool::new(UdpTransport::new, addr, 1, 5, policy_scheduler);
 
     assert!(pool.is_ok(), "Failed to create connection pool");
 

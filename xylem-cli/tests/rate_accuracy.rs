@@ -140,7 +140,7 @@ fn run_rate_experiment(target_rate: f64, duration_secs: u64, conn_count: usize) 
     };
 
     let mut worker =
-        PipelinedWorker::with_round_robin(TcpTransport::new, protocol, generator, stats, config)
+        PipelinedWorker::with_closed_loop(TcpTransport::new, protocol, generator, stats, config)
             .unwrap();
 
     let result = worker.run();
@@ -368,7 +368,7 @@ fn test_rate_vs_throughput_saturation() {
     };
 
     let mut worker =
-        PipelinedWorker::with_round_robin(TcpTransport::new, protocol, generator, stats, config)
+        PipelinedWorker::with_closed_loop(TcpTransport::new, protocol, generator, stats, config)
             .unwrap();
 
     worker.run().unwrap();

@@ -142,7 +142,7 @@ fn test_redis_pipelined_single_connection() {
     };
 
     let mut worker =
-        PipelinedWorker::with_round_robin(TcpTransport::new, protocol, generator, stats, config)
+        PipelinedWorker::with_closed_loop(TcpTransport::new, protocol, generator, stats, config)
             .unwrap();
 
     println!("Starting pipelined test (1 conn, 16 max pending)...");
@@ -192,7 +192,7 @@ fn test_redis_pipelined_multiple_connections() {
     };
 
     let mut worker =
-        PipelinedWorker::with_round_robin(TcpTransport::new, protocol, generator, stats, config)
+        PipelinedWorker::with_closed_loop(TcpTransport::new, protocol, generator, stats, config)
             .unwrap();
 
     println!("Starting pipelined test (4 conns, 16 max pending each)...");
@@ -246,7 +246,7 @@ fn test_redis_pipelined_rate_limited() {
     };
 
     let mut worker =
-        PipelinedWorker::with_round_robin(TcpTransport::new, protocol, generator, stats, config)
+        PipelinedWorker::with_closed_loop(TcpTransport::new, protocol, generator, stats, config)
             .unwrap();
 
     println!("Starting rate-limited test (target: {target_rate} req/s)...");

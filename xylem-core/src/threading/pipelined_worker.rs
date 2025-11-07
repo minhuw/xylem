@@ -39,21 +39,21 @@ pub struct PipelinedWorker<T: Transport, P: Protocol> {
 }
 
 impl<T: Transport, P: Protocol> PipelinedWorker<T, P> {
-    /// Create a new pipelined worker with a unified scheduler
+    /// Create a new pipelined worker with per-connection policies
     pub fn new(
         transport_factory: impl Fn() -> T,
         protocol: P,
         generator: RequestGenerator,
         stats: StatsCollector,
         config: PipelinedWorkerConfig,
-        scheduler: crate::scheduler::UnifiedScheduler,
+        policy_scheduler: Box<dyn crate::scheduler::PolicyScheduler>,
     ) -> Result<Self> {
         let pool = ConnectionPool::new(
             transport_factory,
             config.target,
             config.conn_count,
             config.max_pending_per_conn,
-            scheduler,
+            policy_scheduler,
         )?;
 
         Ok(Self {
@@ -66,19 +66,16 @@ impl<T: Transport, P: Protocol> PipelinedWorker<T, P> {
         })
     }
 
-    /// Create a new pipelined worker with closed-loop + round-robin scheduler
-    pub fn with_round_robin(
+    /// Create a new pipelined worker with closed-loop policy (max throughput)
+    pub fn with_closed_loop(
         transport_factory: impl Fn() -> T,
         protocol: P,
         generator: RequestGenerator,
         stats: StatsCollector,
         config: PipelinedWorkerConfig,
     ) -> Result<Self> {
-        let timing = Box::new(crate::scheduler::ClosedLoopTiming::new());
-        let selector = Box::new(crate::scheduler::RoundRobinSelector::new());
-        let scheduler = crate::scheduler::UnifiedScheduler::new(timing, selector);
-
-        Self::new(transport_factory, protocol, generator, stats, config, scheduler)
+        let policy_scheduler = Box::new(crate::scheduler::UniformPolicyScheduler::closed_loop());
+        Self::new(transport_factory, protocol, generator, stats, config, policy_scheduler)
     }
 
     /// Run the pipelined measurement loop (Lancet symmetric_tcp_main style)
@@ -102,7 +99,7 @@ impl<T: Transport, P: Protocol> PipelinedWorker<T, P> {
                 self.current_key = key;
 
                 // Pick a connection that can accept more requests
-                let conn = match self.pool.pick_connection(key) {
+                let conn = match self.pool.pick_connection() {
                     Some(c) => c,
                     None => break, // No available connections, move to receive phase
                 };
@@ -111,12 +108,11 @@ impl<T: Transport, P: Protocol> PipelinedWorker<T, P> {
                 let (request_data, req_id) =
                     self.protocol.generate_request(conn_id, key, value_size);
 
-                // Send request
+                // Send request and notify policy
+                let sent_time_ns = timing::time_ns();
                 conn.send(&request_data, req_id)?;
+                conn.on_request_sent(sent_time_ns);
                 self.stats.record_tx_bytes(request_data.len());
-
-                // Notify scheduler that request was sent
-                self.pool.on_request_sent(conn_id, key);
 
                 // Mark request sent for rate control
                 self.generator.mark_request_sent();
@@ -158,10 +154,6 @@ impl<T: Transport, P: Protocol> PipelinedWorker<T, P> {
     fn process_responses(&mut self) -> Result<()> {
         let protocol = &mut self.protocol;
         let stats = &mut self.stats;
-        let current_key = self.current_key;
-
-        // Collect latency feedback for scheduler
-        let mut feedback: Vec<(usize, Duration)> = Vec::new();
 
         for conn in self.pool.connections_mut() {
             if !conn.poll_readable()? {
@@ -183,16 +175,11 @@ impl<T: Transport, P: Protocol> PipelinedWorker<T, P> {
             // Record all latencies
             for (_req_id, latency) in latencies {
                 stats.record_latency(latency);
-                feedback.push((conn_id, latency));
             }
         }
 
-        // Notify scheduler after releasing the borrow on connections
-        for (conn_id, latency) in feedback {
-            // Note: We use current_key as approximation - for precise key tracking,
-            // would need to maintain req_id -> key mapping
-            self.pool.on_response_received(conn_id, current_key, latency);
-        }
+        // Per-connection policies don't need global feedback
+        // Each connection manages its own timing independently
 
         Ok(())
     }
@@ -340,7 +327,7 @@ mod tests {
             max_pending_per_conn: 1,
         };
 
-        let mut worker = PipelinedWorker::with_round_robin(
+        let mut worker = PipelinedWorker::with_closed_loop(
             TcpTransport::new,
             protocol,
             generator,
@@ -357,363 +344,82 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::excessive_nesting)]
-    fn test_open_loop_scheduler_time_driven() {
-        use crate::scheduler::{FixedRateTiming, RoundRobinSelector, UnifiedScheduler};
-        use std::sync::{Arc, Mutex};
+    fn test_fixed_rate_policy() {
+        use crate::scheduler::UniformPolicyScheduler;
         use std::time::Instant;
 
-        // Track request arrival times at server
-        let request_times = Arc::new(Mutex::new(Vec::new()));
-        let request_times_clone = request_times.clone();
-
-        // Start server that tracks request timing and adds delay
+        // Start echo server
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
 
         thread::spawn(move || {
-            let mut connections = Vec::new();
-            // Accept all connections
-            for _ in 0..2 {
-                if let Ok((socket, _)) = listener.accept() {
-                    connections.push(socket);
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = vec![0u8; 4096];
+
+            loop {
+                let n = match socket.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(_) => break,
+                };
+
+                if socket.write_all(&buf[..n]).is_err() {
+                    break;
                 }
-            }
-
-            let start_time = Instant::now();
-
-            // Handle connections in parallel
-            let handles: Vec<_> = connections
-                .into_iter()
-                .map(|mut socket| {
-                    let times = request_times_clone.clone();
-                    thread::spawn(move || {
-                        let mut buf = vec![0u8; 4096];
-                        loop {
-                            let n = match socket.read(&mut buf) {
-                                Ok(0) => break,
-                                Ok(n) => n,
-                                Err(_) => break,
-                            };
-
-                            // Record when request arrived
-                            times.lock().unwrap().push(start_time.elapsed());
-
-                            // Add 50ms delay before responding (simulating slow server)
-                            thread::sleep(Duration::from_millis(50));
-
-                            if socket.write_all(&buf[..n]).is_err() {
-                                break;
-                            }
-                        }
-                    })
-                })
-                .collect();
-
-            for h in handles {
-                let _ = h.join();
             }
         });
 
         thread::sleep(Duration::from_millis(50));
 
-        // Create worker with open-loop scheduler (fixed rate + round robin)
+        // Create worker with fixed-rate policy
         let echo_protocol = xylem_protocols::echo::EchoProtocol::new(64);
         let protocol = ProtocolAdapter::new(echo_protocol);
 
-        // Fixed rate: 100 req/s = 10ms per request
         let generator = RequestGenerator::new(
             KeyGeneration::sequential(0),
-            RateControl::Fixed { rate: 100.0 },
+            RateControl::ClosedLoop, // Let policy control rate
             64,
         );
         let stats = StatsCollector::default();
         let config = PipelinedWorkerConfig {
             target: addr,
-            duration: Duration::from_millis(500), // 500ms = ~50 requests
+            duration: Duration::from_millis(200),
             value_size: 64,
-            conn_count: 2,
-            max_pending_per_conn: 10, // Allow pipelining
+            conn_count: 1,
+            max_pending_per_conn: 10,
         };
 
-        // Create open-loop scheduler: FixedRate timing + RoundRobin selector
-        let timing = Box::new(FixedRateTiming::new(100.0)); // 100 req/s
-        let selector = Box::new(RoundRobinSelector::new());
-        let scheduler = UnifiedScheduler::new(timing, selector);
+        // Fixed rate: 100 req/s = 10ms per request
+        let policy_scheduler = Box::new(UniformPolicyScheduler::fixed_rate(100.0));
 
-        let mut worker =
-            PipelinedWorker::new(TcpTransport::new, protocol, generator, stats, config, scheduler)
-                .unwrap();
+        let start = Instant::now();
+        let mut worker = PipelinedWorker::new(
+            TcpTransport::new,
+            protocol,
+            generator,
+            stats,
+            config,
+            policy_scheduler,
+        )
+        .unwrap();
 
         let result = worker.run();
         assert!(result.is_ok(), "Worker should complete: {:?}", result.err());
 
-        // Verify time-driven behavior
-        // Expected: 100 req/s * 0.5s = 50 requests
-        // But limited by: 2 conns * 10 pipeline = 20 max in-flight
-        // With 50ms response time and 10ms inter-arrival: fills pipeline quickly
-        // So we expect ~20-25 requests (pipeline limit reached)
-        let times = request_times.lock().unwrap();
+        let elapsed = start.elapsed();
+        let stats = worker.stats();
+
+        // At 100 req/s for 200ms, expect ~20 requests
+        let expected = 20;
+        let actual = stats.tx_requests();
         assert!(
-            times.len() >= 15,
-            "Should have sent ~20 requests (pipeline limited) despite slow server (got {})",
-            times.len()
+            actual >= expected - 5 && actual <= expected + 5,
+            "Expected ~{} requests at 100 req/s for {:?}, got {}",
+            expected,
+            elapsed,
+            actual
         );
 
-        // Key verification: With 50ms response time and open-loop sending,
-        // we should have multiple requests in-flight (pipelined)
-        // If it were closed-loop with 50ms responses, we'd only get ~10 requests in 500ms
-        // But with open-loop + pipelining, we can send more despite slow server
-
-        println!(
-            "✓ Open-loop sent {} requests with 50ms server delay (expected ~20 due to pipeline limit)",
-            times.len()
-        );
-
-        // The KEY insight: open-loop continues sending despite slow responses
-        // Compare: closed-loop would be limited to ~10 reqs (500ms / 50ms per req)
-        // But open-loop with pipelining can achieve ~20 (pipeline fills up)
-        assert!(times.len() >= 15, "Open-loop should pipeline requests despite slow server");
-    }
-
-    #[test]
-    #[allow(clippy::excessive_nesting)]
-    fn test_closed_loop_per_connection_scheduler() {
-        use crate::scheduler::{ClosedLoopSelector, ClosedLoopTiming, UnifiedScheduler};
-        use std::sync::{Arc, Mutex};
-
-        // Track concurrent requests per connection
-        #[derive(Debug)]
-        struct ConnectionTracker {
-            conn_id: usize,
-            max_concurrent: usize,
-            current_concurrent: usize,
-        }
-
-        let trackers = Arc::new(Mutex::new(vec![
-            ConnectionTracker {
-                conn_id: 0,
-                max_concurrent: 0,
-                current_concurrent: 0,
-            },
-            ConnectionTracker {
-                conn_id: 1,
-                max_concurrent: 0,
-                current_concurrent: 0,
-            },
-        ]));
-        let trackers_clone = trackers.clone();
-
-        // Start server that tracks per-connection concurrency
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        thread::spawn(move || {
-            let mut connections = Vec::new();
-            // Accept both connections
-            for conn_id in 0..2 {
-                if let Ok((socket, _)) = listener.accept() {
-                    connections.push((conn_id, socket));
-                }
-            }
-
-            // Handle connections in parallel
-            let handles: Vec<_> = connections
-                .into_iter()
-                .map(|(conn_id, mut socket)| {
-                    let trackers = trackers_clone.clone();
-                    thread::spawn(move || {
-                        let mut buf = vec![0u8; 4096];
-                        loop {
-                            let n = match socket.read(&mut buf) {
-                                Ok(0) => break,
-                                Ok(n) => n,
-                                Err(_) => break,
-                            };
-
-                            // Track concurrent request
-                            {
-                                let mut t = trackers.lock().unwrap();
-                                t[conn_id].current_concurrent += 1;
-                                t[conn_id].max_concurrent =
-                                    t[conn_id].max_concurrent.max(t[conn_id].current_concurrent);
-                            }
-
-                            // Small delay
-                            thread::sleep(Duration::from_micros(500));
-
-                            // Echo response
-                            if socket.write_all(&buf[..n]).is_err() {
-                                break;
-                            }
-
-                            // Decrement concurrent
-                            {
-                                let mut t = trackers.lock().unwrap();
-                                t[conn_id].current_concurrent -= 1;
-                            }
-                        }
-                    })
-                })
-                .collect();
-
-            for h in handles {
-                let _ = h.join();
-            }
-        });
-
-        thread::sleep(Duration::from_millis(100));
-
-        // Create worker with closed-loop per-connection scheduler
-        let echo_protocol = xylem_protocols::echo::EchoProtocol::new(64);
-        let protocol = ProtocolAdapter::new(echo_protocol);
-        let generator =
-            RequestGenerator::new(KeyGeneration::sequential(0), RateControl::ClosedLoop, 64);
-        let stats = StatsCollector::default();
-        let config = PipelinedWorkerConfig {
-            target: addr,
-            duration: Duration::from_millis(200),
-            value_size: 64,
-            conn_count: 2,
-            max_pending_per_conn: 1, // Per-connection limit
-        };
-
-        // Create closed-loop scheduler with per-connection limit
-        let timing = Box::new(ClosedLoopTiming::new());
-        let selector = Box::new(ClosedLoopSelector::per_connection(2, 1));
-        let scheduler = UnifiedScheduler::new(timing, selector);
-
-        let mut worker =
-            PipelinedWorker::new(TcpTransport::new, protocol, generator, stats, config, scheduler)
-                .unwrap();
-
-        let result = worker.run();
-        assert!(result.is_ok(), "Worker should complete: {:?}", result.err());
-
-        // Verify per-connection behavior: max 1 concurrent per connection
-        let final_trackers = trackers.lock().unwrap();
-        for tracker in final_trackers.iter() {
-            assert_eq!(
-                tracker.max_concurrent, 1,
-                "Connection {} should have max 1 concurrent request (got {})",
-                tracker.conn_id, tracker.max_concurrent
-            );
-        }
-
-        let stats = worker.stats();
-        println!(
-            "✓ Closed-loop per-connection sent {} requests across 2 connections (max 1 per conn verified)",
-            stats.tx_requests()
-        );
-    }
-
-    #[test]
-    #[allow(clippy::excessive_nesting)]
-    fn test_closed_loop_global_scheduler() {
-        use crate::scheduler::{ClosedLoopSelector, ClosedLoopTiming, UnifiedScheduler};
-        use std::sync::{Arc, Mutex};
-
-        // Track global concurrent requests across all connections
-        let global_concurrent = Arc::new(Mutex::new((0usize, 0usize))); // (current, max)
-        let global_concurrent_clone = global_concurrent.clone();
-
-        // Start server that tracks global concurrency
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        thread::spawn(move || {
-            let mut connections = Vec::new();
-            // Accept all connections
-            for _ in 0..3 {
-                if let Ok((socket, _)) = listener.accept() {
-                    connections.push(socket);
-                }
-            }
-
-            // Handle connections in parallel
-            let handles: Vec<_> = connections
-                .into_iter()
-                .map(|mut socket| {
-                    let global = global_concurrent_clone.clone();
-                    thread::spawn(move || {
-                        let mut buf = vec![0u8; 4096];
-                        loop {
-                            let n = match socket.read(&mut buf) {
-                                Ok(0) => break,
-                                Ok(n) => n,
-                                Err(_) => break,
-                            };
-
-                            // Track global concurrent request
-                            {
-                                let mut g = global.lock().unwrap();
-                                g.0 += 1;
-                                g.1 = g.1.max(g.0);
-                            }
-
-                            // Small delay
-                            thread::sleep(Duration::from_micros(500));
-
-                            // Echo response
-                            if socket.write_all(&buf[..n]).is_err() {
-                                break;
-                            }
-
-                            // Decrement global concurrent
-                            {
-                                let mut g = global.lock().unwrap();
-                                g.0 -= 1;
-                            }
-                        }
-                    })
-                })
-                .collect();
-
-            for h in handles {
-                let _ = h.join();
-            }
-        });
-
-        thread::sleep(Duration::from_millis(100));
-
-        // Create worker with closed-loop global scheduler
-        let echo_protocol = xylem_protocols::echo::EchoProtocol::new(64);
-        let protocol = ProtocolAdapter::new(echo_protocol);
-        let generator =
-            RequestGenerator::new(KeyGeneration::sequential(0), RateControl::ClosedLoop, 64);
-        let stats = StatsCollector::default();
-        let config = PipelinedWorkerConfig {
-            target: addr,
-            duration: Duration::from_millis(200),
-            value_size: 64,
-            conn_count: 3,
-            max_pending_per_conn: 1,
-        };
-
-        // Create closed-loop scheduler with global limit of 1
-        let timing = Box::new(ClosedLoopTiming::new());
-        let selector = Box::new(ClosedLoopSelector::global(3, 1)); // Global limit: 1 request
-        let scheduler = UnifiedScheduler::new(timing, selector);
-
-        let mut worker =
-            PipelinedWorker::new(TcpTransport::new, protocol, generator, stats, config, scheduler)
-                .unwrap();
-
-        let result = worker.run();
-        assert!(result.is_ok(), "Worker should complete: {:?}", result.err());
-
-        // Verify global behavior: max 1 concurrent across ALL connections
-        let (_, max_global) = *global_concurrent.lock().unwrap();
-        assert_eq!(
-            max_global, 1,
-            "Should have max 1 concurrent request globally (got {})",
-            max_global
-        );
-
-        let stats = worker.stats();
-        println!(
-            "✓ Closed-loop global sent {} requests across 3 connections (max 1 global verified)",
-            stats.tx_requests()
-        );
+        println!("✓ Fixed-rate policy sent {} requests in {:?}", actual, elapsed);
     }
 }
