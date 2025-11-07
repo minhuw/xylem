@@ -43,7 +43,7 @@ struct Cli {
     #[arg(long, default_value = "tcp")]
     transport: String,
 
-    /// Key distribution (sequential, random, round-robin)
+    /// Key distribution (sequential, random, round-robin, zipfian)
     #[arg(long, default_value = "sequential")]
     key_dist: String,
 
@@ -143,6 +143,7 @@ fn main() -> anyhow::Result<()> {
         "sequential" => KeyGeneration::sequential(0),
         "random" => KeyGeneration::random(),
         "round-robin" => KeyGeneration::round_robin(10000),
+        "zipfian" => KeyGeneration::zipfian(10000, 0.99)?,
         _ => {
             anyhow::bail!("Unsupported key distribution: {}", cli.key_dist);
         }
