@@ -13,18 +13,28 @@ pub mod pipelined_worker;
 pub mod worker;
 
 // Re-export main types
+pub use affinity::{get_core_count, pin_thread, CpuPinning};
 pub use pipelined_worker::{PipelinedWorker, PipelinedWorkerConfig};
 pub use worker::{Worker, WorkerConfig};
 
 /// Multi-threaded runtime for spawning and managing workers
 pub struct ThreadingRuntime {
     num_threads: usize,
+    cpu_pinning: CpuPinning,
 }
 
 impl ThreadingRuntime {
     /// Create a new threading runtime
     pub fn new(num_threads: usize) -> Self {
-        Self { num_threads }
+        Self {
+            num_threads,
+            cpu_pinning: CpuPinning::None,
+        }
+    }
+
+    /// Create a new threading runtime with CPU pinning
+    pub fn with_cpu_pinning(num_threads: usize, cpu_pinning: CpuPinning) -> Self {
+        Self { num_threads, cpu_pinning }
     }
 
     /// Run multiple workers in parallel and aggregate results
@@ -43,8 +53,14 @@ impl ThreadingRuntime {
         for thread_id in 0..self.num_threads {
             let worker_factory = worker_factory.clone();
             let barrier = barrier.clone();
+            let cpu_pinning = self.cpu_pinning.clone();
 
             let handle = thread::spawn(move || {
+                // Pin thread to CPU core if requested
+                if let Err(e) = affinity::pin_thread(thread_id, &cpu_pinning) {
+                    tracing::warn!("Failed to pin thread {} to CPU: {}", thread_id, e);
+                }
+
                 // Wait for all threads to be ready
                 barrier.wait();
 

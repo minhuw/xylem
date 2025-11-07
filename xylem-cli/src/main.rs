@@ -2,7 +2,7 @@ use clap::Parser;
 use std::time::Duration;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use xylem_core::stats::StatsCollector;
-use xylem_core::threading::{ThreadingRuntime, Worker, WorkerConfig};
+use xylem_core::threading::{CpuPinning, ThreadingRuntime, Worker, WorkerConfig};
 use xylem_core::workload::{KeyGeneration, RateControl, RequestGenerator};
 use xylem_transport::TcpTransport;
 
@@ -58,6 +58,14 @@ struct Cli {
     /// Log level (trace, debug, info, warn, error)
     #[arg(short, long, default_value = "info")]
     log_level: String,
+
+    /// Pin worker threads to CPU cores (thread N -> core N)
+    #[arg(long)]
+    pin_cpus: bool,
+
+    /// Starting CPU core offset for pinning (used with --pin-cpus)
+    #[arg(long, default_value = "0")]
+    cpu_start: usize,
 }
 
 // Protocol adapter to bridge xylem_protocols::Protocol with xylem_core Protocol trait
@@ -156,12 +164,39 @@ fn main() -> anyhow::Result<()> {
         RateControl::ClosedLoop
     };
 
+    // Configure CPU pinning
+    let cpu_pinning = if cli.pin_cpus {
+        if cli.cpu_start > 0 {
+            tracing::info!("CPU pinning enabled with offset {}", cli.cpu_start);
+            CpuPinning::Offset(cli.cpu_start)
+        } else {
+            tracing::info!("CPU pinning enabled (auto mode)");
+            CpuPinning::Auto
+        }
+    } else {
+        CpuPinning::None
+    };
+
+    // Validate CPU pinning configuration
+    if cli.pin_cpus {
+        if let Some(core_count) = xylem_core::threading::get_core_count() {
+            let max_core_needed = cli.cpu_start + cli.threads - 1;
+            if max_core_needed >= core_count {
+                tracing::warn!(
+                    "CPU pinning may fail: need {} cores but only {} available",
+                    max_core_needed + 1,
+                    core_count
+                );
+            }
+        }
+    }
+
     tracing::info!("Starting experiment...");
 
     // Helper macro to run workers for a specific protocol
     macro_rules! run_protocol {
         ($protocol_expr:expr) => {{
-            let runtime = ThreadingRuntime::new(cli.threads);
+            let runtime = ThreadingRuntime::with_cpu_pinning(cli.threads, cpu_pinning.clone());
 
             // Calculate per-thread rate if rate limiting is enabled
             let thread_rate_control = match rate_control {
