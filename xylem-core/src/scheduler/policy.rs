@@ -155,7 +155,7 @@ pub struct PoissonPolicy {
 }
 
 impl PoissonPolicy {
-    /// Create a new Poisson policy
+    /// Create a new Poisson policy with entropy-based seed
     ///
     /// # Parameters
     /// - `lambda`: Average arrival rate in requests per second
@@ -163,7 +163,19 @@ impl PoissonPolicy {
     /// # Returns
     /// Error if lambda <= 0
     pub fn new(lambda: f64) -> anyhow::Result<Self> {
-        let dist = ExponentialDistribution::new(lambda)?;
+        Self::with_seed(lambda, None)
+    }
+
+    /// Create a new Poisson policy with explicit seed
+    ///
+    /// # Parameters
+    /// - `lambda`: Average arrival rate in requests per second
+    /// - `seed`: Optional seed for reproducibility (None = use entropy)
+    ///
+    /// # Returns
+    /// Error if lambda <= 0
+    pub fn with_seed(lambda: f64, seed: Option<u64>) -> anyhow::Result<Self> {
+        let dist = ExponentialDistribution::with_seed(lambda, seed)?;
         Ok(Self { dist, last_send_time_ns: None })
     }
 

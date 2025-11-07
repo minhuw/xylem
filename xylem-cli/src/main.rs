@@ -149,7 +149,7 @@ fn main() -> anyhow::Result<()> {
     // Create key generation strategy
     let key_gen = match cli.key_dist.as_str() {
         "sequential" => KeyGeneration::sequential(0),
-        "random" => KeyGeneration::random(),
+        "random" => KeyGeneration::random(10000),
         "round-robin" => KeyGeneration::round_robin(10000),
         "zipfian" => KeyGeneration::zipfian(10000, 0.99)?,
         _ => {

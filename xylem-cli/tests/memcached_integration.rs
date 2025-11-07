@@ -224,7 +224,7 @@ fn test_memcached_binary_multi_thread() {
             );
             let transport = TcpTransport::new();
             let generator =
-                RequestGenerator::new(KeyGeneration::random(), RateControl::ClosedLoop, 64);
+                RequestGenerator::new(KeyGeneration::random(10000), RateControl::ClosedLoop, 64);
             let stats = StatsCollector::default();
             let config = WorkerConfig {
                 target: target_addr,

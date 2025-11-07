@@ -21,6 +21,7 @@ rand_distr = { workspace = true }
 statrs = { workspace = true }
 core_affinity = { workspace = true }
 humantime-serde = { workspace = true }
+sha2 = "0.10"
 
 [dev-dependencies]
 xylem-protocols = { path = "../xylem-protocols" }

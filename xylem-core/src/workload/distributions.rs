@@ -48,7 +48,7 @@ pub struct ZipfianDistribution {
 }
 
 impl ZipfianDistribution {
-    /// Create a new Zipfian distribution
+    /// Create a new Zipfian distribution with entropy-based seed
     ///
     /// # Parameters
     /// - `n`: Number of unique items in range [0, n-1]
@@ -61,6 +61,19 @@ impl ZipfianDistribution {
     /// # Returns
     /// Error if n == 0 or s < 0.0
     pub fn new(n: u64, s: f64) -> anyhow::Result<Self> {
+        Self::with_seed(n, s, None)
+    }
+
+    /// Create a new Zipfian distribution with explicit seed
+    ///
+    /// # Parameters
+    /// - `n`: Number of unique items in range [0, n-1]
+    /// - `s`: Exponent (theta) controlling skewness
+    /// - `seed`: Optional seed for reproducibility (None = use entropy)
+    ///
+    /// # Returns
+    /// Error if n == 0 or s < 0.0
+    pub fn with_seed(n: u64, s: f64, seed: Option<u64>) -> anyhow::Result<Self> {
         if n == 0 {
             anyhow::bail!("Zipfian n must be > 0");
         }
@@ -68,7 +81,10 @@ impl ZipfianDistribution {
             anyhow::bail!("Zipfian s (exponent) must be >= 0.0");
         }
 
-        let rng = SmallRng::from_entropy();
+        let rng = match seed {
+            Some(s) => SmallRng::seed_from_u64(s),
+            None => SmallRng::from_entropy(),
+        };
         let dist = Zipf::new(n, s)?;
 
         Ok(Self { n, s, rng, dist })
@@ -127,7 +143,7 @@ pub struct ExponentialDistribution {
 }
 
 impl ExponentialDistribution {
-    /// Create a new exponential distribution
+    /// Create a new exponential distribution with entropy-based seed
     ///
     /// # Parameters
     /// - `lambda`: Rate parameter (arrivals per second). Must be > 0.
@@ -135,11 +151,26 @@ impl ExponentialDistribution {
     /// # Returns
     /// Error if lambda <= 0
     pub fn new(lambda: f64) -> anyhow::Result<Self> {
+        Self::with_seed(lambda, None)
+    }
+
+    /// Create a new exponential distribution with explicit seed
+    ///
+    /// # Parameters
+    /// - `lambda`: Rate parameter (arrivals per second). Must be > 0.
+    /// - `seed`: Optional seed for reproducibility (None = use entropy)
+    ///
+    /// # Returns
+    /// Error if lambda <= 0
+    pub fn with_seed(lambda: f64, seed: Option<u64>) -> anyhow::Result<Self> {
         if lambda <= 0.0 {
             anyhow::bail!("Exponential lambda must be > 0");
         }
 
-        let rng = SmallRng::from_entropy();
+        let rng = match seed {
+            Some(s) => SmallRng::seed_from_u64(s),
+            None => SmallRng::from_entropy(),
+        };
         let dist = Exp::new(lambda)?;
 
         Ok(Self { lambda, rng, dist })
@@ -190,7 +221,7 @@ pub struct UniformDistribution {
 }
 
 impl UniformDistribution {
-    /// Create a new uniform distribution
+    /// Create a new uniform distribution with entropy-based seed
     ///
     /// # Parameters
     /// - `min`: Minimum value (inclusive)
@@ -199,11 +230,27 @@ impl UniformDistribution {
     /// # Returns
     /// Error if min >= max
     pub fn new(min: f64, max: f64) -> anyhow::Result<Self> {
+        Self::with_seed(min, max, None)
+    }
+
+    /// Create a new uniform distribution with explicit seed
+    ///
+    /// # Parameters
+    /// - `min`: Minimum value (inclusive)
+    /// - `max`: Maximum value (exclusive)
+    /// - `seed`: Optional seed for reproducibility (None = use entropy)
+    ///
+    /// # Returns
+    /// Error if min >= max
+    pub fn with_seed(min: f64, max: f64, seed: Option<u64>) -> anyhow::Result<Self> {
         if min >= max {
             anyhow::bail!("Uniform min must be < max");
         }
 
-        let rng = SmallRng::from_entropy();
+        let rng = match seed {
+            Some(s) => SmallRng::seed_from_u64(s),
+            None => SmallRng::from_entropy(),
+        };
         let dist = Uniform::new(min, max);
 
         Ok(Self { min, max, rng, dist })
@@ -247,7 +294,7 @@ pub struct NormalDistribution {
 }
 
 impl NormalDistribution {
-    /// Create a new normal distribution
+    /// Create a new normal distribution with entropy-based seed
     ///
     /// # Parameters
     /// - `mean`: Mean value (μ)
@@ -256,11 +303,27 @@ impl NormalDistribution {
     /// # Returns
     /// Error if std_dev <= 0
     pub fn new(mean: f64, std_dev: f64) -> anyhow::Result<Self> {
+        Self::with_seed(mean, std_dev, None)
+    }
+
+    /// Create a new normal distribution with explicit seed
+    ///
+    /// # Parameters
+    /// - `mean`: Mean value (μ)
+    /// - `std_dev`: Standard deviation (σ). Must be > 0.
+    /// - `seed`: Optional seed for reproducibility (None = use entropy)
+    ///
+    /// # Returns
+    /// Error if std_dev <= 0
+    pub fn with_seed(mean: f64, std_dev: f64, seed: Option<u64>) -> anyhow::Result<Self> {
         if std_dev <= 0.0 {
             anyhow::bail!("Normal std_dev must be > 0");
         }
 
-        let rng = SmallRng::from_entropy();
+        let rng = match seed {
+            Some(s) => SmallRng::seed_from_u64(s),
+            None => SmallRng::from_entropy(),
+        };
         let dist = Normal::new(mean, std_dev)?;
 
         Ok(Self { mean, std_dev, rng, dist })

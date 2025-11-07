@@ -1,6 +1,8 @@
 //! Request generation
 
 use super::distributions::{Distribution, ZipfianDistribution};
+use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng};
 use std::time::{Duration, Instant};
 
 /// Key generation strategy
@@ -8,8 +10,8 @@ use std::time::{Duration, Instant};
 pub enum KeyGeneration {
     /// Sequential keys starting from a value
     Sequential { start: u64, current: u64 },
-    /// Random keys
-    Random,
+    /// Random keys in range [0, max)
+    Random { max: u64, rng: SmallRng },
     /// Round-robin over a range
     RoundRobin { max: u64, current: u64 },
     /// Zipfian distribution (hot-key pattern)
@@ -23,7 +25,10 @@ impl Clone for KeyGeneration {
             Self::Sequential { start, current } => {
                 Self::Sequential { start: *start, current: *current }
             }
-            Self::Random => Self::Random,
+            Self::Random { max, .. } => {
+                // Create new RNG with entropy (cloning doesn't preserve RNG state)
+                Self::Random { max: *max, rng: SmallRng::from_entropy() }
+            }
             Self::RoundRobin { max, current } => Self::RoundRobin { max: *max, current: *current },
             Self::Zipfian(dist) => {
                 // Recreate distribution with same parameters
@@ -47,12 +52,28 @@ impl KeyGeneration {
         Self::RoundRobin { max, current: 0 }
     }
 
-    /// Create a random key generator
-    pub fn random() -> Self {
-        Self::Random
+    /// Create a random key generator with entropy-based seed
+    ///
+    /// # Parameters
+    /// - `max`: Maximum key value (keys will be in range [0, max))
+    pub fn random(max: u64) -> Self {
+        Self::random_with_seed(max, None)
     }
 
-    /// Create a Zipfian key generator
+    /// Create a random key generator with explicit seed
+    ///
+    /// # Parameters
+    /// - `max`: Maximum key value (keys will be in range [0, max))
+    /// - `seed`: Optional seed for reproducibility (None = use entropy)
+    pub fn random_with_seed(max: u64, seed: Option<u64>) -> Self {
+        let rng = match seed {
+            Some(s) => SmallRng::seed_from_u64(s),
+            None => SmallRng::from_entropy(),
+        };
+        Self::Random { max, rng }
+    }
+
+    /// Create a Zipfian key generator with entropy-based seed
     ///
     /// # Parameters
     /// - `n`: Number of unique keys in the range [0, n-1]
@@ -65,7 +86,20 @@ impl KeyGeneration {
     /// # Returns
     /// Returns an error if n == 0 or s < 0.0
     pub fn zipfian(n: u64, s: f64) -> anyhow::Result<Self> {
-        let dist = ZipfianDistribution::new(n, s)?;
+        Self::zipfian_with_seed(n, s, None)
+    }
+
+    /// Create a Zipfian key generator with explicit seed
+    ///
+    /// # Parameters
+    /// - `n`: Number of unique keys in the range [0, n-1]
+    /// - `s`: Exponent (theta) controlling skewness
+    /// - `seed`: Optional seed for reproducibility (None = use entropy)
+    ///
+    /// # Returns
+    /// Returns an error if n == 0 or s < 0.0
+    pub fn zipfian_with_seed(n: u64, s: f64, seed: Option<u64>) -> anyhow::Result<Self> {
+        let dist = ZipfianDistribution::with_seed(n, s, seed)?;
         Ok(Self::Zipfian(dist))
     }
 
@@ -77,11 +111,9 @@ impl KeyGeneration {
                 *current = current.wrapping_add(1);
                 key
             }
-            Self::Random => {
-                // Simple pseudo-random using current time
-                // TODO: Use proper RNG (rand crate)
-                let now = Instant::now();
-                now.elapsed().as_nanos() as u64
+            Self::Random { max, rng } => {
+                // Generate random key in range [0, max)
+                rng.gen_range(0..*max)
             }
             Self::RoundRobin { max, current } => {
                 let key = *current;
@@ -98,7 +130,9 @@ impl KeyGeneration {
             Self::Sequential { start, current } => {
                 *current = *start;
             }
-            Self::Random => {}
+            Self::Random { .. } => {
+                // RNG state cannot be easily reset, continues from current state
+            }
             Self::RoundRobin { current, .. } => {
                 *current = 0;
             }
@@ -222,10 +256,14 @@ mod tests {
 
     #[test]
     fn test_random_keys() {
-        let mut keygen = KeyGeneration::random();
+        let mut keygen = KeyGeneration::random(10000);
 
         let k1 = keygen.next_key();
         let k2 = keygen.next_key();
+
+        // Keys should be in range
+        assert!(k1 < 10000);
+        assert!(k2 < 10000);
 
         // They should be different (very high probability)
         assert_ne!(k1, k2);
