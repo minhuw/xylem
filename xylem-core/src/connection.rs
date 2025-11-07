@@ -189,24 +189,24 @@ impl<T: Transport, ReqId: Eq + Hash + Clone + std::fmt::Debug> Connection<T, Req
     }
 }
 
-/// Connection pool managing multiple connections with pluggable scheduler
+/// Connection pool managing multiple connections with unified scheduler
 pub struct ConnectionPool<T: Transport, ReqId: Eq + Hash + Clone> {
     /// All connections in the pool
     connections: Vec<Connection<T, ReqId>>,
-    /// Scheduler for selecting connections
-    scheduler: Box<dyn crate::scheduler::Scheduler>,
+    /// Unified scheduler for timing and connection selection
+    scheduler: crate::scheduler::UnifiedScheduler,
     /// Maximum pending requests per connection
     max_pending_per_conn: usize,
 }
 
 impl<T: Transport, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionPool<T, ReqId> {
-    /// Create a new connection pool with a scheduler
+    /// Create a new connection pool with a unified scheduler
     pub fn new(
         transport_factory: impl Fn() -> T,
         target: SocketAddr,
         conn_count: usize,
         max_pending_per_conn: usize,
-        scheduler: Box<dyn crate::scheduler::Scheduler>,
+        scheduler: crate::scheduler::UnifiedScheduler,
     ) -> Result<Self> {
         let mut connections = Vec::with_capacity(conn_count);
 
@@ -223,20 +223,18 @@ impl<T: Transport, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionPool<T,
         })
     }
 
-    /// Create a new connection pool with default round-robin scheduler
+    /// Create a new connection pool with closed-loop + round-robin scheduler
     pub fn with_round_robin(
         transport_factory: impl Fn() -> T,
         target: SocketAddr,
         conn_count: usize,
         max_pending_per_conn: usize,
     ) -> Result<Self> {
-        Self::new(
-            transport_factory,
-            target,
-            conn_count,
-            max_pending_per_conn,
-            Box::new(crate::scheduler::RoundRobinScheduler::new()),
-        )
+        let timing = Box::new(crate::scheduler::ClosedLoopTiming::new());
+        let selector = Box::new(crate::scheduler::RoundRobinSelector::new());
+        let scheduler = crate::scheduler::UnifiedScheduler::new(timing, selector);
+
+        Self::new(transport_factory, target, conn_count, max_pending_per_conn, scheduler)
     }
 
     /// Pick a connection that can accept more requests using the scheduler
@@ -245,10 +243,10 @@ impl<T: Transport, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionPool<T,
     /// - `key`: The key being requested (used by affinity-based schedulers)
     pub fn pick_connection(&mut self, key: u64) -> Option<&mut Connection<T, ReqId>> {
         // Build connection states for scheduler
-        let conn_states: Vec<crate::scheduler::ConnectionState> = self
+        let conn_states: Vec<crate::scheduler::ConnState> = self
             .connections
             .iter()
-            .map(|conn| crate::scheduler::ConnectionState {
+            .map(|conn| crate::scheduler::ConnState {
                 idx: conn.idx(),
                 pending_count: conn.pending_count(),
                 closed: conn.is_closed(),
@@ -257,22 +255,20 @@ impl<T: Transport, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionPool<T,
             })
             .collect();
 
-        // Build scheduler context
-        let context = crate::scheduler::SchedulerContext {
+        // Use unified scheduler to select connection
+        let idx = self.scheduler.select_connection(
             key,
-            connections: &conn_states,
-            max_pending_per_conn: self.max_pending_per_conn,
-        };
-
-        // Use scheduler to select connection
-        let idx = self.scheduler.select_connection(&context)?;
+            &conn_states,
+            self.max_pending_per_conn,
+            crate::timing::time_ns(),
+        )?;
 
         Some(&mut self.connections[idx])
     }
 
     /// Notify scheduler that a request was sent
     pub fn on_request_sent(&mut self, conn_idx: usize, key: u64) {
-        self.scheduler.on_request_sent(conn_idx, key);
+        self.scheduler.on_request_sent(conn_idx, key, crate::timing::time_ns());
     }
 
     /// Notify scheduler that a response was received

@@ -39,14 +39,14 @@ pub struct PipelinedWorker<T: Transport, P: Protocol> {
 }
 
 impl<T: Transport, P: Protocol> PipelinedWorker<T, P> {
-    /// Create a new pipelined worker with a scheduler
+    /// Create a new pipelined worker with a unified scheduler
     pub fn new(
         transport_factory: impl Fn() -> T,
         protocol: P,
         generator: RequestGenerator,
         stats: StatsCollector,
         config: PipelinedWorkerConfig,
-        scheduler: Box<dyn crate::scheduler::Scheduler>,
+        scheduler: crate::scheduler::UnifiedScheduler,
     ) -> Result<Self> {
         let pool = ConnectionPool::new(
             transport_factory,
@@ -66,7 +66,7 @@ impl<T: Transport, P: Protocol> PipelinedWorker<T, P> {
         })
     }
 
-    /// Create a new pipelined worker with default round-robin scheduler
+    /// Create a new pipelined worker with closed-loop + round-robin scheduler
     pub fn with_round_robin(
         transport_factory: impl Fn() -> T,
         protocol: P,
@@ -74,14 +74,11 @@ impl<T: Transport, P: Protocol> PipelinedWorker<T, P> {
         stats: StatsCollector,
         config: PipelinedWorkerConfig,
     ) -> Result<Self> {
-        Self::new(
-            transport_factory,
-            protocol,
-            generator,
-            stats,
-            config,
-            Box::new(crate::scheduler::RoundRobinScheduler::new()),
-        )
+        let timing = Box::new(crate::scheduler::ClosedLoopTiming::new());
+        let selector = Box::new(crate::scheduler::RoundRobinSelector::new());
+        let scheduler = crate::scheduler::UnifiedScheduler::new(timing, selector);
+
+        Self::new(transport_factory, protocol, generator, stats, config, scheduler)
     }
 
     /// Run the pipelined measurement loop (Lancet symmetric_tcp_main style)
@@ -362,7 +359,7 @@ mod tests {
     #[test]
     #[allow(clippy::excessive_nesting)]
     fn test_open_loop_scheduler_time_driven() {
-        use crate::scheduler::OpenLoopRoundRobinScheduler;
+        use crate::scheduler::{FixedRateTiming, RoundRobinSelector, UnifiedScheduler};
         use std::sync::{Arc, Mutex};
         use std::time::Instant;
 
@@ -420,7 +417,7 @@ mod tests {
 
         thread::sleep(Duration::from_millis(50));
 
-        // Create worker with open-loop scheduler
+        // Create worker with open-loop scheduler (fixed rate + round robin)
         let echo_protocol = xylem_protocols::echo::EchoProtocol::new(64);
         let protocol = ProtocolAdapter::new(echo_protocol);
 
@@ -439,7 +436,11 @@ mod tests {
             max_pending_per_conn: 10, // Allow pipelining
         };
 
-        let scheduler = Box::new(OpenLoopRoundRobinScheduler::new());
+        // Create open-loop scheduler: FixedRate timing + RoundRobin selector
+        let timing = Box::new(FixedRateTiming::new(100.0)); // 100 req/s
+        let selector = Box::new(RoundRobinSelector::new());
+        let scheduler = UnifiedScheduler::new(timing, selector);
+
         let mut worker =
             PipelinedWorker::new(TcpTransport::new, protocol, generator, stats, config, scheduler)
                 .unwrap();
@@ -478,7 +479,7 @@ mod tests {
     #[test]
     #[allow(clippy::excessive_nesting)]
     fn test_closed_loop_per_connection_scheduler() {
-        use crate::scheduler::ClosedLoopRoundRobinScheduler;
+        use crate::scheduler::{ClosedLoopSelector, ClosedLoopTiming, UnifiedScheduler};
         use std::sync::{Arc, Mutex};
 
         // Track concurrent requests per connection
@@ -577,7 +578,11 @@ mod tests {
             max_pending_per_conn: 1, // Per-connection limit
         };
 
-        let scheduler = Box::new(ClosedLoopRoundRobinScheduler::per_connection(2, 1));
+        // Create closed-loop scheduler with per-connection limit
+        let timing = Box::new(ClosedLoopTiming::new());
+        let selector = Box::new(ClosedLoopSelector::per_connection(2, 1));
+        let scheduler = UnifiedScheduler::new(timing, selector);
+
         let mut worker =
             PipelinedWorker::new(TcpTransport::new, protocol, generator, stats, config, scheduler)
                 .unwrap();
@@ -605,7 +610,7 @@ mod tests {
     #[test]
     #[allow(clippy::excessive_nesting)]
     fn test_closed_loop_global_scheduler() {
-        use crate::scheduler::ClosedLoopRoundRobinScheduler;
+        use crate::scheduler::{ClosedLoopSelector, ClosedLoopTiming, UnifiedScheduler};
         use std::sync::{Arc, Mutex};
 
         // Track global concurrent requests across all connections
@@ -685,8 +690,11 @@ mod tests {
             max_pending_per_conn: 1,
         };
 
-        // Global limit of 1: only 1 request across all connections
-        let scheduler = Box::new(ClosedLoopRoundRobinScheduler::global(3, 1));
+        // Create closed-loop scheduler with global limit of 1
+        let timing = Box::new(ClosedLoopTiming::new());
+        let selector = Box::new(ClosedLoopSelector::global(3, 1)); // Global limit: 1 request
+        let scheduler = UnifiedScheduler::new(timing, selector);
+
         let mut worker =
             PipelinedWorker::new(TcpTransport::new, protocol, generator, stats, config, scheduler)
                 .unwrap();
