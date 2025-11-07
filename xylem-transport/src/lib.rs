@@ -142,7 +142,13 @@ pub mod tcp;
 pub mod tls;
 pub mod udp;
 
+#[cfg(unix)]
+pub mod unix;
+
 // Re-export transport implementations
 pub use tcp::TcpTransport;
 pub use tls::TlsTransport;
 pub use udp::UdpTransport;
+
+#[cfg(unix)]
+pub use unix::UnixTransport;

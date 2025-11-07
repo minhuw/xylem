@@ -3,9 +3,8 @@
 //! This test verifies that the RoundRobin scheduler properly distributes requests
 //! across multiple Redis connections.
 
-use std::process::Child;
-use std::process::Command;
-use std::thread::sleep;
+mod common;
+
 use std::time::Duration;
 use xylem_core::stats::StatsCollector;
 use xylem_core::threading::worker::{Protocol, Worker, WorkerConfig};
@@ -53,51 +52,15 @@ impl<P: xylem_protocols::Protocol> Protocol for ProtocolAdapter<P> {
     }
 }
 
-/// Start a Redis server for testing
-fn start_redis() -> Result<RedisServerGuard, Box<dyn std::error::Error>> {
-    // Check if Redis is already running
-    if std::net::TcpStream::connect_timeout(
-        &"127.0.0.1:6379".parse().unwrap(),
-        Duration::from_secs(1),
-    )
-    .is_ok()
-    {
-        return Ok(RedisServerGuard { process: None });
-    }
-
-    // Start a new Redis instance
-    let process = Command::new("redis-server")
-        .args(["--port", "6379", "--save", "", "--appendonly", "no"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
-
-    // Wait for Redis to start
-    sleep(Duration::from_millis(200));
-
-    Ok(RedisServerGuard { process: Some(process) })
-}
-
-/// Guard to ensure Redis server is cleaned up
-struct RedisServerGuard {
-    process: Option<Child>,
-}
-
-impl Drop for RedisServerGuard {
-    fn drop(&mut self) {
-        if let Some(mut process) = self.process.take() {
-            let _ = process.kill();
-            let _ = process.wait();
-        }
-    }
-}
+// Use common::start_redis() instead of local implementation
 
 /// Test that RoundRobin scheduler distributes requests across multiple connections
 #[test]
 fn test_round_robin_scheduler_with_multiple_connections() {
-    let _redis = start_redis().expect("Failed to start Redis");
+    let redis = common::start_redis().expect("Failed to start Redis");
+    let port = redis.port();
 
-    let target_addr = "127.0.0.1:6379".parse().unwrap();
+    let target_addr = format!("127.0.0.1:{}", port).parse().unwrap();
     let duration = Duration::from_secs(2);
 
     let protocol = xylem_protocols::redis::RedisProtocol::new(RedisOp::Get);
@@ -148,9 +111,10 @@ fn test_round_robin_scheduler_with_multiple_connections() {
 /// Test that RoundRobin scheduler handles sequential workload correctly
 #[test]
 fn test_round_robin_scheduler_with_sequential_workload() {
-    let _redis = start_redis().expect("Failed to start Redis");
+    let redis = common::start_redis().expect("Failed to start Redis");
+    let port = redis.port();
 
-    let target_addr = "127.0.0.1:6379".parse().unwrap();
+    let target_addr = format!("127.0.0.1:{}", port).parse().unwrap();
     let duration = Duration::from_secs(1);
 
     let protocol = xylem_protocols::redis::RedisProtocol::new(RedisOp::Set);
