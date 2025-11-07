@@ -3,6 +3,7 @@
 //! This module implements Lancet-style connection pooling, allowing multiple
 //! outstanding requests per connection for higher throughput.
 
+use crate::scheduler::Policy;
 use crate::Result;
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -37,15 +38,29 @@ pub struct Connection<T: Transport, ReqId: Eq + Hash + Clone> {
     buffer_pos: usize,
     /// Whether connection is closed
     closed: bool,
+    /// Traffic policy for this connection (per-connection model)
+    ///
+    /// Each connection has its own independent traffic policy that determines
+    /// when it should send its next request. The scheduler will pick whichever
+    /// connection's next request is due soonest.
+    policy: Box<dyn Policy>,
 }
 
 impl<T: Transport, ReqId: Eq + Hash + Clone + std::fmt::Debug> Connection<T, ReqId> {
-    /// Create a new connection
+    /// Create a new connection with a traffic policy
+    ///
+    /// # Parameters
+    /// - `transport`: Transport implementation (TCP, UDP, etc.)
+    /// - `idx`: Connection index in the pool
+    /// - `target`: Target server address
+    /// - `max_pending_requests`: Maximum number of pending requests allowed
+    /// - `policy`: Traffic policy that controls when this connection should send
     pub fn new(
         mut transport: T,
         idx: usize,
         target: SocketAddr,
         max_pending_requests: usize,
+        policy: Box<dyn Policy>,
     ) -> Result<Self> {
         transport.connect(&target)?;
 
@@ -58,6 +73,7 @@ impl<T: Transport, ReqId: Eq + Hash + Clone + std::fmt::Debug> Connection<T, Req
             recv_buffer: vec![0u8; MAX_PAYLOAD],
             buffer_pos: 0,
             closed: false,
+            policy,
         })
     }
 
@@ -187,20 +203,44 @@ impl<T: Transport, ReqId: Eq + Hash + Clone + std::fmt::Debug> Connection<T, Req
         self.closed = true;
         Ok(self.transport.close()?)
     }
+
+    /// Get the time (in nanoseconds) when this connection should send its next request
+    ///
+    /// Returns `None` if the connection is ready to send immediately (closed-loop policy).
+    pub fn next_send_time(&mut self, current_time_ns: u64) -> Option<u64> {
+        self.policy.next_send_time(current_time_ns)
+    }
+
+    /// Notify the policy that a request was sent on this connection
+    pub fn on_request_sent(&mut self, sent_time_ns: u64) {
+        self.policy.on_request_sent(sent_time_ns);
+    }
+
+    /// Reset the policy state
+    pub fn reset_policy(&mut self) {
+        self.policy.reset();
+    }
+
+    /// Get the policy name (for debugging)
+    pub fn policy_name(&self) -> &'static str {
+        self.policy.name()
+    }
 }
 
-/// Connection pool managing multiple connections with unified scheduler
+/// Connection pool managing multiple connections with policy scheduler
 pub struct ConnectionPool<T: Transport, ReqId: Eq + Hash + Clone> {
     /// All connections in the pool
     connections: Vec<Connection<T, ReqId>>,
-    /// Unified scheduler for timing and connection selection
+    /// Unified scheduler for timing and connection selection (TODO: Remove after migration)
     scheduler: crate::scheduler::UnifiedScheduler,
     /// Maximum pending requests per connection
     max_pending_per_conn: usize,
 }
 
 impl<T: Transport, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionPool<T, ReqId> {
-    /// Create a new connection pool with a unified scheduler
+    /// Create a new connection pool with a unified scheduler (old API)
+    ///
+    /// TODO: This is deprecated. Use `with_policy_scheduler()` instead for the new per-connection model.
     pub fn new(
         transport_factory: impl Fn() -> T,
         target: SocketAddr,
@@ -210,11 +250,53 @@ impl<T: Transport, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionPool<T,
     ) -> Result<Self> {
         let mut connections = Vec::with_capacity(conn_count);
 
+        // For backwards compatibility, use ClosedLoopPolicy for all connections
         for idx in 0..conn_count {
             let transport = transport_factory();
-            let conn = Connection::new(transport, idx, target, max_pending_per_conn)?;
+            let policy = Box::new(crate::scheduler::ClosedLoopPolicy::new());
+            let conn = Connection::new(transport, idx, target, max_pending_per_conn, policy)?;
             connections.push(conn);
         }
+
+        Ok(Self {
+            connections,
+            scheduler,
+            max_pending_per_conn,
+        })
+    }
+
+    /// Create a new connection pool with a policy scheduler (new API)
+    ///
+    /// This is the new per-connection traffic model where each connection has its own
+    /// independent policy that determines when it should send requests.
+    ///
+    /// # Parameters
+    /// - `transport_factory`: Function to create a new transport instance
+    /// - `target`: Target server address
+    /// - `conn_count`: Number of connections to create
+    /// - `max_pending_per_conn`: Maximum pending requests per connection
+    /// - `policy_scheduler`: Scheduler that assigns policies to connections
+    pub fn with_policy_scheduler(
+        transport_factory: impl Fn() -> T,
+        target: SocketAddr,
+        conn_count: usize,
+        max_pending_per_conn: usize,
+        mut policy_scheduler: Box<dyn crate::scheduler::PolicyScheduler>,
+    ) -> Result<Self> {
+        let mut connections = Vec::with_capacity(conn_count);
+
+        for idx in 0..conn_count {
+            let transport = transport_factory();
+            let policy = policy_scheduler.assign_policy(idx);
+            let conn = Connection::new(transport, idx, target, max_pending_per_conn, policy)?;
+            connections.push(conn);
+        }
+
+        // Create a temporary UnifiedScheduler for backwards compatibility
+        // TODO: Remove this after full migration to TemporalScheduler
+        let timing = Box::new(crate::scheduler::ClosedLoopTiming::new());
+        let selector = Box::new(crate::scheduler::RoundRobinSelector::new());
+        let scheduler = crate::scheduler::UnifiedScheduler::new(timing, selector);
 
         Ok(Self {
             connections,
@@ -237,7 +319,32 @@ impl<T: Transport, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionPool<T,
         Self::new(transport_factory, target, conn_count, max_pending_per_conn, scheduler)
     }
 
-    /// Pick a connection that can accept more requests using the scheduler
+    /// Pick a connection using the new temporal scheduler (per-connection policies)
+    ///
+    /// This uses the true per-connection traffic model where each connection's policy
+    /// determines when it should send. The scheduler picks the connection whose next
+    /// request is due soonest.
+    pub fn pick_connection_temporal(&mut self) -> Option<&mut Connection<T, ReqId>> {
+        let current_time_ns = crate::timing::time_ns();
+        let mut temporal_scheduler = crate::scheduler::TemporalScheduler::new();
+
+        // Build heap: query each connection for its next send time
+        for conn in &mut self.connections {
+            if conn.can_send() {
+                let next_time = conn.next_send_time(current_time_ns);
+                temporal_scheduler.update_connection(conn.idx(), next_time);
+            }
+        }
+
+        // Pick the connection that is ready soonest
+        if let Some(conn_idx) = temporal_scheduler.pick_ready_connection(current_time_ns) {
+            Some(&mut self.connections[conn_idx])
+        } else {
+            None
+        }
+    }
+
+    /// Pick a connection that can accept more requests using the scheduler (old API)
     ///
     /// # Parameters
     /// - `key`: The key being requested (used by affinity-based schedulers)

@@ -35,7 +35,9 @@
 use std::time::Duration;
 
 pub mod connection_selector;
-pub mod timing_policy;
+pub mod policy;
+pub mod temporal;
+pub mod timing_policy; // TODO: Deprecated, use policy.rs instead
 
 /// Timing policy trait - decides WHEN to send the next request
 ///
@@ -107,6 +109,15 @@ pub use connection_selector::{
 };
 
 pub use timing_policy::{AdaptiveTiming, ClosedLoopTiming, FixedRateTiming, PoissonTiming};
+
+// Re-export new per-connection policy types
+pub use policy::{
+    AdaptivePolicy, ClosedLoopPolicy, FactoryPolicyScheduler, FixedRatePolicy,
+    PerConnectionPolicyScheduler, PoissonPolicy, Policy, PolicyScheduler, UniformPolicyScheduler,
+};
+
+// Re-export temporal scheduler
+pub use temporal::TemporalScheduler;
 
 /// Context for timing policy decisions
 #[derive(Debug, Clone)]

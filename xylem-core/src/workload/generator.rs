@@ -1,8 +1,6 @@
 //! Request generation
 
-use rand::rngs::SmallRng;
-use rand::SeedableRng;
-use rand_distr::{Distribution, Zipf};
+use super::distributions::{Distribution, ZipfianDistribution};
 use std::time::{Duration, Instant};
 
 /// Key generation strategy
@@ -15,15 +13,10 @@ pub enum KeyGeneration {
     /// Round-robin over a range
     RoundRobin { max: u64, current: u64 },
     /// Zipfian distribution (hot-key pattern)
-    Zipfian {
-        n: u64,          // number of unique keys
-        s: f64,          // exponent (theta)
-        rng: SmallRng,   // thread-local RNG
-        dist: Zipf<f64>, // Zipf distribution
-    },
+    Zipfian(ZipfianDistribution),
 }
 
-// Manual Clone implementation since SmallRng and Zipf don't implement Clone
+// Manual Clone implementation
 impl Clone for KeyGeneration {
     fn clone(&self) -> Self {
         match self {
@@ -32,11 +25,12 @@ impl Clone for KeyGeneration {
             }
             Self::Random => Self::Random,
             Self::RoundRobin { max, current } => Self::RoundRobin { max: *max, current: *current },
-            Self::Zipfian { n, s, .. } => {
-                // Recreate RNG and distribution with same parameters
-                let rng = SmallRng::from_entropy();
-                let dist = Zipf::new(*n, *s).expect("Invalid Zipf parameters");
-                Self::Zipfian { n: *n, s: *s, rng, dist }
+            Self::Zipfian(dist) => {
+                // Recreate distribution with same parameters
+                Self::Zipfian(
+                    ZipfianDistribution::new(dist.n(), dist.exponent())
+                        .expect("Invalid Zipf parameters"),
+                )
             }
         }
     }
@@ -71,17 +65,8 @@ impl KeyGeneration {
     /// # Returns
     /// Returns an error if n == 0 or s < 0.0
     pub fn zipfian(n: u64, s: f64) -> anyhow::Result<Self> {
-        if n == 0 {
-            anyhow::bail!("Zipfian n must be > 0");
-        }
-        if s < 0.0 {
-            anyhow::bail!("Zipfian s (exponent) must be >= 0.0");
-        }
-
-        let rng = SmallRng::from_entropy();
-        let dist = Zipf::new(n, s)?;
-
-        Ok(Self::Zipfian { n, s, rng, dist })
+        let dist = ZipfianDistribution::new(n, s)?;
+        Ok(Self::Zipfian(dist))
     }
 
     /// Generate the next key
@@ -103,12 +88,7 @@ impl KeyGeneration {
                 *current = (*current + 1) % *max;
                 key
             }
-            Self::Zipfian { rng, dist, .. } => {
-                // Sample from Zipf distribution (returns 1..=n)
-                // Convert to 0-indexed: subtract 1
-                let sample = dist.sample(rng);
-                sample as u64 - 1
-            }
+            Self::Zipfian(dist) => dist.sample_key(),
         }
     }
 
@@ -122,9 +102,8 @@ impl KeyGeneration {
             Self::RoundRobin { current, .. } => {
                 *current = 0;
             }
-            Self::Zipfian { .. } => {
-                // Zipfian is stateless (RNG continues from current state)
-                // No reset needed
+            Self::Zipfian(dist) => {
+                dist.reset();
             }
         }
     }
