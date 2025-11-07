@@ -189,21 +189,24 @@ impl<T: Transport, ReqId: Eq + Hash + Clone + std::fmt::Debug> Connection<T, Req
     }
 }
 
-/// Connection pool managing multiple connections with round-robin selection
+/// Connection pool managing multiple connections with pluggable scheduler
 pub struct ConnectionPool<T: Transport, ReqId: Eq + Hash + Clone> {
     /// All connections in the pool
     connections: Vec<Connection<T, ReqId>>,
-    /// Next connection index for round-robin
-    next_idx: usize,
+    /// Scheduler for selecting connections
+    scheduler: Box<dyn crate::scheduler::Scheduler>,
+    /// Maximum pending requests per connection
+    max_pending_per_conn: usize,
 }
 
 impl<T: Transport, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionPool<T, ReqId> {
-    /// Create a new connection pool
+    /// Create a new connection pool with a scheduler
     pub fn new(
         transport_factory: impl Fn() -> T,
         target: SocketAddr,
         conn_count: usize,
         max_pending_per_conn: usize,
+        scheduler: Box<dyn crate::scheduler::Scheduler>,
     ) -> Result<Self> {
         let mut connections = Vec::with_capacity(conn_count);
 
@@ -213,23 +216,73 @@ impl<T: Transport, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionPool<T,
             connections.push(conn);
         }
 
-        Ok(Self { connections, next_idx: 0 })
+        Ok(Self {
+            connections,
+            scheduler,
+            max_pending_per_conn,
+        })
     }
 
-    /// Pick a connection that can accept more requests (round-robin)
-    pub fn pick_connection(&mut self) -> Option<&mut Connection<T, ReqId>> {
-        let conn_count = self.connections.len();
+    /// Create a new connection pool with default round-robin scheduler
+    pub fn with_round_robin(
+        transport_factory: impl Fn() -> T,
+        target: SocketAddr,
+        conn_count: usize,
+        max_pending_per_conn: usize,
+    ) -> Result<Self> {
+        Self::new(
+            transport_factory,
+            target,
+            conn_count,
+            max_pending_per_conn,
+            Box::new(crate::scheduler::RoundRobinScheduler::new()),
+        )
+    }
 
-        for _ in 0..conn_count {
-            let idx = self.next_idx;
-            self.next_idx = (self.next_idx + 1) % conn_count;
+    /// Pick a connection that can accept more requests using the scheduler
+    ///
+    /// # Parameters
+    /// - `key`: The key being requested (used by affinity-based schedulers)
+    pub fn pick_connection(&mut self, key: u64) -> Option<&mut Connection<T, ReqId>> {
+        // Build connection states for scheduler
+        let conn_states: Vec<crate::scheduler::ConnectionState> = self
+            .connections
+            .iter()
+            .map(|conn| crate::scheduler::ConnectionState {
+                idx: conn.idx(),
+                pending_count: conn.pending_count(),
+                closed: conn.is_closed(),
+                avg_latency: None, // TODO: Track if needed for latency-aware scheduling
+                ready: conn.pending_count() == 0, // Ready if no pending requests (for closed-loop)
+            })
+            .collect();
 
-            if self.connections[idx].can_send() {
-                return Some(&mut self.connections[idx]);
-            }
-        }
+        // Build scheduler context
+        let context = crate::scheduler::SchedulerContext {
+            key,
+            connections: &conn_states,
+            max_pending_per_conn: self.max_pending_per_conn,
+        };
 
-        None
+        // Use scheduler to select connection
+        let idx = self.scheduler.select_connection(&context)?;
+
+        Some(&mut self.connections[idx])
+    }
+
+    /// Notify scheduler that a request was sent
+    pub fn on_request_sent(&mut self, conn_idx: usize, key: u64) {
+        self.scheduler.on_request_sent(conn_idx, key);
+    }
+
+    /// Notify scheduler that a response was received
+    pub fn on_response_received(
+        &mut self,
+        conn_idx: usize,
+        key: u64,
+        latency: std::time::Duration,
+    ) {
+        self.scheduler.on_response_received(conn_idx, key, latency);
     }
 
     /// Get all connections for polling

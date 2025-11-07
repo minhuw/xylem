@@ -8,6 +8,7 @@ pub mod config;
 pub mod connection;
 pub mod error;
 pub mod request;
+pub mod scheduler;
 pub mod stats;
 pub mod threading;
 pub mod timing;

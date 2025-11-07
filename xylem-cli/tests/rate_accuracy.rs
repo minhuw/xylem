@@ -140,7 +140,8 @@ fn run_rate_experiment(target_rate: f64, duration_secs: u64, conn_count: usize) 
     };
 
     let mut worker =
-        PipelinedWorker::new(TcpTransport::new, protocol, generator, stats, config).unwrap();
+        PipelinedWorker::with_round_robin(TcpTransport::new, protocol, generator, stats, config)
+            .unwrap();
 
     let result = worker.run();
     assert!(result.is_ok(), "Worker failed: {:?}", result.err());
@@ -367,7 +368,8 @@ fn test_rate_vs_throughput_saturation() {
     };
 
     let mut worker =
-        PipelinedWorker::new(TcpTransport::new, protocol, generator, stats, config).unwrap();
+        PipelinedWorker::with_round_robin(TcpTransport::new, protocol, generator, stats, config)
+            .unwrap();
 
     worker.run().unwrap();
     let max_throughput = worker.stats().tx_requests() as f64 / duration.as_secs_f64();
