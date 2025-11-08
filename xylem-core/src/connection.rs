@@ -248,16 +248,25 @@ impl<T: Transport, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionPool<T,
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```no_run
+    /// use xylem_core::connection::ConnectionPool;
+    /// use xylem_core::scheduler::UniformPolicyScheduler;
+    /// use xylem_transport::TcpTransport;
+    /// use std::net::SocketAddr;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let target: SocketAddr = "127.0.0.1:6379".parse()?;
     /// // All connections use Poisson arrivals at 1M req/s
     /// let policy_scheduler = UniformPolicyScheduler::poisson(1_000_000.0)?;
-    /// let pool = ConnectionPool::new(
+    /// let pool: ConnectionPool<TcpTransport, (usize, u64)> = ConnectionPool::new(
     ///     TcpTransport::new,
     ///     target,
     ///     100,  // 100 connections
     ///     10,   // max 10 pending per connection
     ///     Box::new(policy_scheduler)
     /// )?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn new(
         transport_factory: impl Fn() -> T,

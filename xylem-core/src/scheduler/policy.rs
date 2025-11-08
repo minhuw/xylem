@@ -353,10 +353,12 @@ pub trait PolicyScheduler: Send {
 /// Useful when you want identical traffic patterns on all connections.
 ///
 /// # Example
-/// ```ignore
-/// let policy = FixedRatePolicy::new(1000.0);
-/// let scheduler = UniformPolicyScheduler::new(policy);
+/// ```
+/// use xylem_core::scheduler::{UniformPolicyScheduler, FixedRatePolicy};
 /// // All connections will get FixedRate at 1000 req/s
+/// let scheduler = UniformPolicyScheduler::fixed_rate(1000.0);
+/// // Or use the general constructor with a closure:
+/// let scheduler2 = UniformPolicyScheduler::new(|| Box::new(FixedRatePolicy::new(1000.0)));
 /// ```
 pub struct UniformPolicyScheduler {
     /// Policy factory function
@@ -423,10 +425,13 @@ impl PolicyScheduler for UniformPolicyScheduler {
 /// Useful when you want fine-grained control over each connection's traffic pattern.
 ///
 /// # Example
-/// ```ignore
+/// ```
+/// use xylem_core::scheduler::{PerConnectionPolicyScheduler, FixedRatePolicy, PoissonPolicy};
 /// let mut scheduler = PerConnectionPolicyScheduler::new();
-/// scheduler.add_policy(Box::new(FixedRatePolicy::new(1000.0))); // conn 0
-/// scheduler.add_policy(Box::new(PoissonPolicy::new(500.0).unwrap())); // conn 1
+/// // conn 0: FixedRate at 1000 req/s
+/// scheduler.add_policy(|| Box::new(FixedRatePolicy::new(1000.0)));
+/// // conn 1: Poisson at 500 req/s
+/// scheduler.add_policy(|| Box::new(PoissonPolicy::new(500.0).unwrap()));
 /// ```
 pub struct PerConnectionPolicyScheduler {
     /// Policy factory functions, one per connection
@@ -490,7 +495,8 @@ impl PolicyScheduler for PerConnectionPolicyScheduler {
 /// - Rate scaling based on connection ID
 ///
 /// # Example
-/// ```ignore
+/// ```
+/// use xylem_core::scheduler::{FactoryPolicyScheduler, FixedRatePolicy, PoissonPolicy};
 /// // Even connections: FixedRate, Odd connections: Poisson
 /// let scheduler = FactoryPolicyScheduler::new(|conn_id| {
 ///     if conn_id % 2 == 0 {
@@ -522,7 +528,8 @@ impl FactoryPolicyScheduler {
     /// - `factories`: Vector of policy factory functions
     ///
     /// # Example
-    /// ```ignore
+    /// ```
+    /// use xylem_core::scheduler::{FactoryPolicyScheduler, FixedRatePolicy, PoissonPolicy};
     /// let scheduler = FactoryPolicyScheduler::round_robin(vec![
     ///     Box::new(|| Box::new(FixedRatePolicy::new(1000.0))),
     ///     Box::new(|| Box::new(PoissonPolicy::new(500.0).unwrap())),

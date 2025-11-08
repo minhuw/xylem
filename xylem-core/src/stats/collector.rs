@@ -1,5 +1,8 @@
 //! Statistics collection
 
+use super::sampler::{AdaptiveSampler, AdaptiveSamplerConfig};
+use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng};
 use std::time::Duration;
 
 /// Statistics collector (thread-local)
@@ -12,6 +15,8 @@ pub struct StatsCollector {
     tx_requests: u64,
     rx_requests: u64,
     sample_count: u64,
+    rng: SmallRng,
+    adaptive_sampler: Option<AdaptiveSampler>,
 }
 
 impl StatsCollector {
@@ -35,6 +40,8 @@ impl StatsCollector {
             merged.sample_count += collector.sample_count;
         }
 
+        // Note: Adaptive sampler state is not merged (each thread has independent sampler)
+
         merged
     }
 
@@ -49,6 +56,28 @@ impl StatsCollector {
             tx_requests: 0,
             rx_requests: 0,
             sample_count: 0,
+            rng: SmallRng::from_entropy(),
+            adaptive_sampler: None,
+        }
+    }
+
+    /// Create a new statistics collector with adaptive sampling
+    pub fn with_adaptive_sampling(
+        max_samples: usize,
+        adaptive_config: AdaptiveSamplerConfig,
+    ) -> Self {
+        let initial_rate = adaptive_config.initial_rate;
+        Self {
+            samples: Vec::with_capacity(max_samples),
+            max_samples,
+            sampling_rate: initial_rate,
+            tx_bytes: 0,
+            rx_bytes: 0,
+            tx_requests: 0,
+            rx_requests: 0,
+            sample_count: 0,
+            rng: SmallRng::from_entropy(),
+            adaptive_sampler: Some(AdaptiveSampler::new(adaptive_config)),
         }
     }
 
@@ -56,17 +85,28 @@ impl StatsCollector {
     pub fn record_latency(&mut self, latency: Duration) {
         self.tx_requests += 1;
         self.rx_requests += 1;
+        self.sample_count += 1;
 
-        // Simple sampling: always record if we have space, otherwise use sampling rate
-        if self.samples.len() < self.max_samples {
-            self.samples.push(latency);
-            self.sample_count += 1;
-        } else if self.sampling_rate >= 1.0 {
-            // If sampling rate is 1.0, we've already filled up, don't add more
-            self.sample_count += 1;
+        // Check if adaptive sampler wants to adjust rate
+        if let Some(ref mut adaptive_sampler) = self.adaptive_sampler {
+            if let Some(new_rate) = adaptive_sampler.record_sample(&self.samples) {
+                self.sampling_rate = new_rate;
+            }
+        }
+
+        // Probabilistic sampling using RNG
+        // Implement the TODO from line 68
+        let should_sample = if self.sampling_rate >= 1.0 {
+            true
+        } else if self.sampling_rate <= 0.0 {
+            false
         } else {
-            // TODO: Implement probabilistic sampling with RNG
-            self.sample_count += 1;
+            // Random sampling based on sampling_rate
+            self.rng.gen::<f64>() < self.sampling_rate
+        };
+
+        if should_sample && self.samples.len() < self.max_samples {
+            self.samples.push(latency);
         }
     }
 
@@ -118,6 +158,11 @@ impl StatsCollector {
         self.tx_requests = 0;
         self.rx_requests = 0;
         self.sample_count = 0;
+
+        if let Some(ref mut adaptive_sampler) = self.adaptive_sampler {
+            adaptive_sampler.reset();
+            self.sampling_rate = adaptive_sampler.current_rate();
+        }
     }
 
     /// Calculate basic statistics
@@ -143,7 +188,18 @@ impl StatsCollector {
 impl Default for StatsCollector {
     fn default() -> Self {
         // Default: store up to 128K samples at 100% sampling rate
-        Self::new(128 * 1024, 1.0)
+        Self {
+            samples: Vec::with_capacity(128 * 1024),
+            max_samples: 128 * 1024,
+            sampling_rate: 1.0,
+            tx_bytes: 0,
+            rx_bytes: 0,
+            tx_requests: 0,
+            rx_requests: 0,
+            sample_count: 0,
+            rng: SmallRng::from_entropy(),
+            adaptive_sampler: None,
+        }
     }
 }
 

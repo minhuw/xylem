@@ -4,7 +4,6 @@
 //! measurement tool, including transport layer, statistics engine, threading
 //! runtime, and workload generation.
 
-pub mod config;
 pub mod connection;
 pub mod error;
 pub mod request;

@@ -132,7 +132,13 @@ pub fn start_echo_server() -> Result<EchoServerGuard, Box<dyn std::error::Error>
         .stderr(std::process::Stdio::null())
         .status()?;
 
-    let mut process = Command::new("./target/release/xylem-echo-server")
+    // Get the workspace root directory (where Cargo.toml is)
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let workspace_root =
+        std::path::Path::new(manifest_dir).parent().ok_or("No parent directory")?;
+    let server_path = workspace_root.join("target/release/xylem-echo-server");
+
+    let mut process = Command::new(&server_path)
         .arg("--port")
         .arg(port.to_string())
         .stdout(std::process::Stdio::null())

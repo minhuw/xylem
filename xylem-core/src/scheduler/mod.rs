@@ -5,54 +5,19 @@
 //! picks whichever connection's next request is due soonest (like an async runtime picking
 //! the next ready coroutine).
 //!
-//! ## Architecture
-//!
-//! ```text
-//! Per-Connection Model
-//! ├── Policy (per-connection traffic pattern)
-//! │   ├── ClosedLoopPolicy
-//! │   ├── FixedRatePolicy
-//! │   ├── PoissonPolicy
-//! │   └── AdaptivePolicy
-//! ├── PolicyScheduler (assigns policies to connections)
-//! │   ├── UniformPolicyScheduler
-//! │   ├── PerConnectionPolicyScheduler
-//! │   └── FactoryPolicyScheduler
-//! └── TemporalScheduler (min-heap picks next ready connection)
-//! ```
-//!
-//! ## Key Benefits
-//!
-//! - **Truly independent connections**: No global timing state coupling
-//! - **Flexible heterogeneous traffic**: Easy to configure (e.g., 10% at 100K req/s, 90% at 1M req/s)
-//! - **Mix policy types**: Each connection can have different policy (ClosedLoop, FixedRate, Poisson, Adaptive)
-//! - **Pure temporal scheduling**: No spatial concerns like connection selection
-//! - **Efficient**: O(log n) scheduling with min-heap
-//!
 //! ## Example: Uniform Traffic
 //!
-//! ```ignore
-//! use xylem_core::scheduler::{UniformPolicyScheduler, TemporalScheduler};
+//! ```
+//! use xylem_core::scheduler::UniformPolicyScheduler;
 //!
 //! // All connections use Poisson arrivals at 1M req/s
-//! let policy_scheduler = UniformPolicyScheduler::poisson(1_000_000.0)?;
-//! let pool = ConnectionPool::with_policy_scheduler(
-//!     TcpTransport::new,
-//!     target,
-//!     100,  // 100 connections
-//!     10,
-//!     Box::new(policy_scheduler)
-//! )?;
-//!
-//! // Pick next ready connection using temporal scheduler
-//! if let Some(conn) = pool.pick_connection_temporal() {
-//!     conn.send(data, req_id)?;
-//! }
+//! let policy_scheduler = UniformPolicyScheduler::poisson(1_000_000.0).unwrap();
+//! // This scheduler can be used with ConnectionPool to create uniform traffic
 //! ```
 //!
 //! ## Example: Heterogeneous Traffic (10% at 100K, 90% at 1M)
 //!
-//! ```ignore
+//! ```
 //! use xylem_core::scheduler::{FactoryPolicyScheduler, FixedRatePolicy};
 //!
 //! let policy_scheduler = FactoryPolicyScheduler::new(|conn_id| {
@@ -66,21 +31,21 @@
 //!
 //! ## Example: Time-Varying Traffic
 //!
-//! ```ignore
-//! use xylem_core::workload::RampPattern;
+//! ```
+//! use xylem_core::workload::patterns::{RampPattern, LoadPattern};
+//! use std::time::Duration;
 //!
+//! // Create a ramp pattern that goes from 1M to 10M req/s over 60 seconds
 //! let pattern = RampPattern::new(1_000_000.0, 10_000_000.0, Duration::from_secs(60));
 //!
-//! loop {
-//!     let target_rate = pattern.rate_at(start_time.elapsed());
-//!     for conn in pool.connections_mut() {
-//!         conn.policy.set_target_rate(target_rate);
-//!     }
+//! // Get the rate at different time points
+//! let rate_at_start = pattern.rate_at(Duration::from_secs(0));
+//! let rate_at_30s = pattern.rate_at(Duration::from_secs(30));
+//! let rate_at_60s = pattern.rate_at(Duration::from_secs(60));
 //!
-//!     if let Some(conn) = pool.pick_connection_temporal() {
-//!         // Send request...
-//!     }
-//! }
+//! assert_eq!(rate_at_start, 1_000_000.0);
+//! assert!((rate_at_30s - 5_500_000.0).abs() < 100_000.0); // Approximately 5.5M
+//! assert_eq!(rate_at_60s, 10_000_000.0);
 //! ```
 
 pub mod policy;

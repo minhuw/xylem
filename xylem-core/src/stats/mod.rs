@@ -10,6 +10,7 @@ pub mod sampler;
 // Re-export main types
 pub use analysis::aggregate_stats;
 pub use collector::{BasicStats, StatsCollector};
+pub use sampler::{AdaptiveSampler, AdaptiveSamplerConfig};
 
 /// Aggregated statistics
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -67,14 +67,15 @@ impl PartialOrd for SchedulerEntry {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use xylem_core::scheduler::TemporalScheduler;
 /// // Create scheduler
 /// let mut scheduler = TemporalScheduler::new();
 ///
 /// // Add connections (with their ready times computed from their policies)
-/// scheduler.add_connection(0, Some(1000)); // conn 0 ready at t=1000ns
-/// scheduler.add_connection(1, Some(2000)); // conn 1 ready at t=2000ns
-/// scheduler.add_connection(2, None);       // conn 2 ready immediately (closed-loop)
+/// scheduler.update_connection(0, Some(1000)); // conn 0 ready at t=1000ns
+/// scheduler.update_connection(1, Some(2000)); // conn 1 ready at t=2000ns
+/// scheduler.update_connection(2, None);       // conn 2 ready immediately (closed-loop)
 ///
 /// // Pick next ready connection
 /// let current_time = 500;

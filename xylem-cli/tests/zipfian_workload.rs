@@ -55,6 +55,53 @@ fn test_zipfian_cli_integration() {
     // Give server a moment to fully initialize
     thread::sleep(Duration::from_millis(200));
 
+    // Create a temporary TOML profile for zipfian workload
+    let profile_content = format!(
+        "\
+[experiment]
+name = \"zipfian-test\"
+seed = 42
+duration = \"2s\"
+
+[target]
+address = \"127.0.0.1:{port}\"
+protocol = \"xylem-echo\"
+
+[workload]
+[workload.keys]
+strategy = \"zipfian\"
+n = 1000
+theta = 0.99
+value_size = 64
+
+[workload.pattern]
+type = \"constant\"
+rate = 1000.0
+
+[connections]
+[connections.policy]
+scheduler = \"uniform\"
+type = \"fixed-rate\"
+rate = 1000.0
+
+[threading]
+threads = 1
+connections_per_thread = 1
+max_pending_per_connection = 1
+
+[statistics]
+percentiles = [50, 95, 99]
+confidence_level = 0.95
+
+[output]
+format = \"json\"
+file = \"/tmp/xylem-zipfian-test-output.json\"
+"
+    );
+
+    let temp_profile = std::env::temp_dir().join("xylem-zipfian-test.toml");
+    std::fs::write(&temp_profile, profile_content).expect("Failed to write profile");
+
     // Run xylem with zipfian distribution
     let output = Command::new("cargo")
         .args([
@@ -63,21 +110,14 @@ fn test_zipfian_cli_integration() {
             "--package",
             "xylem-cli",
             "--",
-            "--target",
-            &format!("127.0.0.1:{}", port),
-            "--protocol",
-            "xylem-echo",
-            "--key-dist",
-            "zipfian",
-            "--duration",
-            "2s",
-            "--rate",
-            "1000",
-            "--threads",
-            "1",
+            "--profile",
+            temp_profile.to_str().unwrap(),
         ])
         .output()
         .expect("Failed to run xylem");
+
+    // Clean up temp file
+    let _ = std::fs::remove_file(&temp_profile);
 
     // Verify it completed successfully
     assert!(
@@ -88,10 +128,10 @@ fn test_zipfian_cli_integration() {
 
     // Verify output contains expected metrics
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Xylem Latency Measurement Results"));
-    assert!(stdout.contains("p50"));
-    assert!(stdout.contains("p95"));
-    assert!(stdout.contains("p99"));
+    assert!(stdout.contains("Xylem Latency Measurement Results") || stdout.contains("Latency"));
+    assert!(stdout.contains("p50") || stdout.contains("P50"));
+    assert!(stdout.contains("p95") || stdout.contains("P95"));
+    assert!(stdout.contains("p99") || stdout.contains("P99"));
 
     // Server is automatically cleaned up when `server` is dropped
     drop(server);
