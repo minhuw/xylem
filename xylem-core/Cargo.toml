@@ -15,6 +15,7 @@ xylem-transport = { path = "../xylem-transport" }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+schemars = { version = "0.8", optional = true }
 tracing = { workspace = true }
 rand = { workspace = true }
 rand_distr = { workspace = true }
@@ -22,6 +23,9 @@ statrs = { workspace = true }
 core_affinity = { workspace = true }
 humantime-serde = { workspace = true }
 sha2 = "0.10"
+
+[features]
+schema = ["schemars"]
 
 [dev-dependencies]
 xylem-protocols = { path = "../xylem-protocols" }

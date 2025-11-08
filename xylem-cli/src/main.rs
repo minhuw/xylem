@@ -1,4 +1,7 @@
-use clap::Parser;
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{generate, Shell};
+use schemars::schema_for;
+use std::io;
 use std::path::PathBuf;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use xylem_core::stats::StatsCollector;
@@ -6,6 +9,7 @@ use xylem_core::threading::{CpuPinning, ThreadingRuntime, Worker, WorkerConfig};
 use xylem_core::workload::{RateControl, RequestGenerator};
 use xylem_transport::TcpTransport;
 
+mod completions;
 mod config;
 mod output;
 
@@ -18,38 +22,66 @@ use output::ExperimentResults;
 /// This ensures reproducibility and simplifies complex workload specifications.
 ///
 /// Example usage:
-///   xylem -P profiles/redis-get-zipfian.toml
-///   xylem -P profiles/http-spike.toml --target 192.168.1.100:8080
-///   xylem -P profiles/memcached-ramp.toml --duration 120s --seed 12345
+///   xylem run -P profiles/redis-get-zipfian.toml
+///   xylem run -P profiles/http-spike.toml --set target.address=192.168.1.100:8080
+///   xylem run -P profiles/memcached-ramp.toml --set experiment.duration=120s --set experiment.seed=12345
+///   xylem run -P profiles/redis-bench.toml --set traffic_groups.0.sampling_rate=0.5
+///   xylem completions bash > ~/.local/share/bash-completion/completions/xylem
+///
+/// Override any config value using dot notation:
+///   --set target.protocol=redis
+///   --set workload.keys.n=1000000
+///   --set traffic_groups.0.threads=[0,1,2,3]
+///   --set 'traffic_groups.+={name="new-group",threads=[4,5]}'
 ///
 /// See profiles/ directory for example configurations.
 #[derive(Parser)]
 #[command(name = "xylem")]
 #[command(version, about = "Latency measurement tool with config-first design", long_about = None)]
 struct Cli {
-    /// Path to TOML profile configuration file (REQUIRED)
-    #[arg(short = 'P', long, required = true)]
-    profile: PathBuf,
-
-    /// Override target server address (e.g., 192.168.1.100:6379)
-    #[arg(short, long)]
-    target: Option<String>,
-
-    /// Override experiment duration (e.g., 30s, 1m, 1h)
-    #[arg(short, long)]
-    duration: Option<String>,
-
-    /// Override output JSON file path
-    #[arg(short, long)]
-    output: Option<PathBuf>,
-
-    /// Override random seed for reproducibility
-    #[arg(short, long)]
-    seed: Option<u64>,
+    #[command(subcommand)]
+    command: Commands,
 
     /// Log level (trace, debug, info, warn, error)
-    #[arg(short = 'l', long, default_value = "info")]
+    #[arg(short = 'l', long, default_value = "info", global = true)]
     log_level: String,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Run a latency measurement experiment (default command)
+    Run {
+        /// Path to TOML profile configuration file (REQUIRED)
+        #[arg(short = 'P', long, required = true)]
+        profile: PathBuf,
+
+        /// Override any configuration value using dot notation (can be specified multiple times)
+        ///
+        /// Examples:
+        ///   --set target.address=127.0.0.1:6379
+        ///   --set experiment.duration=60s
+        ///   --set experiment.seed=999
+        ///   --set target.protocol=memcached-binary
+        ///   --set workload.keys.n=1000000
+        ///   --set traffic_groups.0.threads=[0,1,2,3]
+        ///   --set output.file=/tmp/results.json
+        #[arg(long = "set", value_name = "KEY=VALUE")]
+        set: Vec<String>,
+    },
+
+    /// Generate shell completions
+    Completions {
+        /// Shell to generate completions for
+        #[arg(value_enum)]
+        shell: Shell,
+    },
+
+    /// Generate JSON Schema for configuration files
+    Schema,
+
+    /// List all valid config paths for --set flag (used by shell completions)
+    #[command(hide = true)]
+    CompletePaths,
 }
 
 // Protocol adapter to bridge xylem_protocols::Protocol with xylem_core Protocol trait
@@ -104,14 +136,55 @@ fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
+    match cli.command {
+        Commands::Completions { shell } => {
+            let bin_name = "xylem";
+            match shell {
+                Shell::Bash => {
+                    println!("{}", completions::generate_bash_completion(bin_name));
+                }
+                Shell::Zsh => {
+                    println!("{}", completions::generate_zsh_completion(bin_name));
+                }
+                _ => {
+                    // For other shells, fall back to clap's default generator
+                    let mut cmd = Cli::command();
+                    generate(shell, &mut cmd, bin_name.to_string(), &mut io::stdout());
+                }
+            }
+            Ok(())
+        }
+        Commands::Schema => {
+            let schema = schema_for!(ProfileConfig);
+            let schema_json = serde_json::to_string_pretty(&schema)?;
+            println!("{}", schema_json);
+            Ok(())
+        }
+        Commands::CompletePaths => {
+            let paths = completions::get_config_paths();
+            for path in paths {
+                println!("{}", path);
+            }
+            Ok(())
+        }
+        Commands::Run { profile, set } => run_experiment(profile, set),
+    }
+}
+
+fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
     tracing::info!("Xylem latency measurement tool (config-first mode)");
-    tracing::info!("Loading profile: {}", cli.profile.display());
+    tracing::info!("Loading profile: {}", profile.display());
 
-    // Load and parse profile configuration
-    let config = ProfileConfig::from_file(&cli.profile)?;
-
-    // Apply CLI overrides
-    let config = config.with_overrides(cli.target, cli.duration, cli.output, cli.seed)?;
+    // Load and parse profile configuration with overrides
+    let config = if set.is_empty() {
+        // No overrides, just load and validate
+        let config = ProfileConfig::from_file(&profile)?;
+        config.validate()?;
+        config
+    } else {
+        // Apply --set overrides
+        ProfileConfig::from_file_with_overrides(&profile, &set)?
+    };
 
     // Display experiment configuration
     tracing::info!("=== Experiment Configuration ===");

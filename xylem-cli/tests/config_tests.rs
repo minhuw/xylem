@@ -1,11 +1,11 @@
 //! Tests for configuration parsing and validation
 
 use std::time::Duration;
-use xylem_cli::config::ProfileConfig;
+use xylem_cli::config::{KeysConfig, ProfileConfig};
 
 #[test]
 fn test_load_redis_zipfian_profile() {
-    let config = ProfileConfig::from_file("profiles/redis-get-zipfian.toml")
+    let config = ProfileConfig::from_file("../profiles/redis-get-zipfian.toml")
         .expect("Failed to load redis-get-zipfian profile");
 
     // Verify experiment config
@@ -27,7 +27,7 @@ fn test_load_redis_zipfian_profile() {
 
 #[test]
 fn test_load_memcached_ramp_profile() {
-    let config = ProfileConfig::from_file("profiles/memcached-ramp.toml")
+    let config = ProfileConfig::from_file("../profiles/memcached-ramp.toml")
         .expect("Failed to load memcached-ramp profile");
 
     // Verify experiment
@@ -46,7 +46,7 @@ fn test_load_memcached_ramp_profile() {
 
 #[test]
 fn test_load_http_spike_profile() {
-    let config = ProfileConfig::from_file("profiles/http-spike.toml")
+    let config = ProfileConfig::from_file("../profiles/http-spike.toml")
         .expect("Failed to load http-spike profile");
 
     // Verify experiment
@@ -65,7 +65,7 @@ fn test_load_http_spike_profile() {
 
 #[test]
 fn test_load_poisson_heterogeneous_profile() {
-    let config = ProfileConfig::from_file("profiles/poisson-heterogeneous.toml")
+    let config = ProfileConfig::from_file("../profiles/poisson-heterogeneous.toml")
         .expect("Failed to load poisson-heterogeneous profile");
 
     // Verify experiment
@@ -80,7 +80,7 @@ fn test_load_poisson_heterogeneous_profile() {
 
 #[test]
 fn test_load_closed_loop_profile() {
-    let config = ProfileConfig::from_file("profiles/closed-loop-max-throughput.toml")
+    let config = ProfileConfig::from_file("../profiles/closed-loop-max-throughput.toml")
         .expect("Failed to load closed-loop-max-throughput profile");
 
     // Verify experiment
@@ -99,7 +99,7 @@ fn test_load_closed_loop_profile() {
 
 #[test]
 fn test_load_latency_agent_profile() {
-    let config = ProfileConfig::from_file("profiles/latency-agent.toml")
+    let config = ProfileConfig::from_file("../profiles/latency-agent.toml")
         .expect("Failed to load latency-agent profile");
 
     // Verify experiment
@@ -131,19 +131,50 @@ fn test_load_latency_agent_profile() {
 }
 
 #[test]
-fn test_config_with_overrides() {
-    let config = ProfileConfig::from_file("profiles/redis-get-zipfian.toml")
-        .expect("Failed to load profile");
+fn test_load_redis_bench_profile() {
+    let config = ProfileConfig::from_file("../profiles/redis-bench.toml")
+        .expect("Failed to load redis-bench profile");
 
-    // Apply overrides
-    let config = config
-        .with_overrides(
-            Some("192.168.1.100:6379".to_string()),
-            Some("60s".to_string()),
-            None,
-            Some(999),
-        )
-        .expect("Failed to apply overrides");
+    // Verify experiment
+    assert_eq!(config.experiment.name, "redis-bench");
+    assert_eq!(config.experiment.seed, Some(42));
+    assert_eq!(config.experiment.duration, Duration::from_secs(30));
+
+    // Verify target
+    assert_eq!(config.target.protocol, "redis");
+
+    // Verify traffic groups - should have 2 groups
+    assert_eq!(config.traffic_groups.len(), 2);
+
+    // Verify latency agent configuration (1 core)
+    let latency_agent = &config.traffic_groups[0];
+    assert_eq!(latency_agent.name, "latency-agent");
+    assert_eq!(latency_agent.threads, vec![0]);
+    assert_eq!(latency_agent.connections_per_thread, 10);
+    assert_eq!(latency_agent.max_pending_per_connection, 1);
+    assert_eq!(latency_agent.sampling_rate, 1.0);
+
+    // Verify throughput agent configuration (3 cores)
+    let throughput_agent = &config.traffic_groups[1];
+    assert_eq!(throughput_agent.name, "throughput-agent");
+    assert_eq!(throughput_agent.threads, vec![1, 2, 3]);
+    assert_eq!(throughput_agent.connections_per_thread, 25);
+    assert_eq!(throughput_agent.max_pending_per_connection, 32);
+    assert_eq!(throughput_agent.sampling_rate, 0.01);
+}
+
+#[test]
+fn test_config_with_overrides() {
+    // Apply overrides using --set style
+    let config = ProfileConfig::from_file_with_overrides(
+        "../profiles/redis-get-zipfian.toml",
+        &[
+            "target.address=192.168.1.100:6379".to_string(),
+            "experiment.duration=60s".to_string(),
+            "experiment.seed=999".to_string(),
+        ],
+    )
+    .expect("Failed to apply overrides");
 
     // Verify overrides were applied
     assert_eq!(config.target.address, Some("192.168.1.100:6379".to_string()));
@@ -201,10 +232,12 @@ file = "results/test.json"
     let config = ProfileConfig::from_file(tmpfile.path()).unwrap();
     assert_eq!(config.target.address, None);
 
-    // Apply CLI override with target
-    let config = config
-        .with_overrides(Some("127.0.0.1:6379".to_string()), None, None, None)
-        .expect("Failed to apply target override");
+    // Apply CLI override with target using --set
+    let config = ProfileConfig::from_file_with_overrides(
+        tmpfile.path(),
+        &["target.address=127.0.0.1:6379".to_string()],
+    )
+    .expect("Failed to apply target override");
 
     // Verify target was set via CLI
     assert_eq!(config.target.address, Some("127.0.0.1:6379".to_string()));
@@ -254,8 +287,8 @@ file = "results/test.json"
     // Load config - should succeed (no validation yet)
     let config = ProfileConfig::from_file(tmpfile.path()).unwrap();
 
-    // Try to apply overrides WITHOUT target - should fail validation
-    let result = config.with_overrides(None, None, None, None);
+    // Validation is now automatic in from_file_with_overrides, so test validation directly
+    let result = config.validate();
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("Target address must be specified"));
 }
@@ -264,7 +297,7 @@ file = "results/test.json"
 fn test_invalid_config_validation() {
     // TODO: Create invalid config files and test validation
     // For now, just verify that valid configs pass validation
-    let config = ProfileConfig::from_file("profiles/redis-get-zipfian.toml")
+    let config = ProfileConfig::from_file("../profiles/redis-get-zipfian.toml")
         .expect("Failed to load profile");
 
     // Should not panic - validation already ran in from_file
@@ -275,7 +308,7 @@ fn test_invalid_config_validation() {
 fn test_key_generation_conversion() {
     use xylem_core::workload::KeyGeneration;
 
-    let config = ProfileConfig::from_file("profiles/redis-get-zipfian.toml")
+    let config = ProfileConfig::from_file("../profiles/redis-get-zipfian.toml")
         .expect("Failed to load profile");
 
     // Test conversion to KeyGeneration with seed
@@ -294,7 +327,7 @@ fn test_key_generation_conversion() {
 
 #[test]
 fn test_value_size_extraction() {
-    let config = ProfileConfig::from_file("profiles/redis-get-zipfian.toml")
+    let config = ProfileConfig::from_file("../profiles/redis-get-zipfian.toml")
         .expect("Failed to load profile");
 
     let value_size = config.workload.keys.value_size();
@@ -310,7 +343,7 @@ fn test_seed_reproducibility_integration() {
     // Test that same seed produces reproducible key generation
     use xylem_core::workload::KeyGeneration;
 
-    let config = ProfileConfig::from_file("profiles/redis-get-zipfian.toml")
+    let config = ProfileConfig::from_file("../profiles/redis-get-zipfian.toml")
         .expect("Failed to load profile");
 
     let master_seed = config.experiment.seed;
@@ -529,7 +562,7 @@ file = "test.json"
     tmpfile.flush().unwrap();
 
     let config = ProfileConfig::from_file(tmpfile.path()).unwrap();
-    let result = config.with_overrides(None, None, None, None);
+    let result = config.validate();
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("Invalid protocol"));
 }
@@ -642,7 +675,165 @@ duration = "10s""#,
     let config = ProfileConfig::from_file(tmpfile.path()).unwrap();
     assert_eq!(config.experiment.seed, Some(999));
 
-    // Verify seed can be overridden via CLI
-    let config = config.with_overrides(None, None, None, Some(12345)).unwrap();
+    // Verify seed can be overridden via CLI using --set
+    let config = ProfileConfig::from_file_with_overrides(
+        tmpfile.path(),
+        &["experiment.seed=12345".to_string()],
+    )
+    .unwrap();
     assert_eq!(config.experiment.seed, Some(12345));
+}
+
+// =============================================================================
+// NEW --SET OVERRIDE TESTS
+// =============================================================================
+
+#[test]
+fn test_set_simple_field() {
+    let config = ProfileConfig::from_file_with_overrides(
+        "../profiles/redis-get-zipfian.toml",
+        &["experiment.seed=42".to_string()],
+    )
+    .unwrap();
+    assert_eq!(config.experiment.seed, Some(42));
+}
+
+#[test]
+fn test_set_nested_field() {
+    let config = ProfileConfig::from_file_with_overrides(
+        "../profiles/redis-get-zipfian.toml",
+        &["workload.keys.n=5000".to_string()],
+    )
+    .unwrap();
+
+    match config.workload.keys {
+        KeysConfig::Zipfian { n, .. } => {
+            assert_eq!(n, 5000);
+        }
+        _ => panic!("Expected Zipfian keys config"),
+    }
+}
+
+#[test]
+fn test_set_array_index() {
+    let config = ProfileConfig::from_file_with_overrides(
+        "../profiles/redis-bench.toml",
+        &["traffic_groups.0.sampling_rate=0.5".to_string()],
+    )
+    .unwrap();
+
+    assert_eq!(config.traffic_groups[0].sampling_rate, 0.5);
+}
+
+#[test]
+fn test_set_array_value() {
+    let config = ProfileConfig::from_file_with_overrides(
+        "../profiles/redis-bench.toml",
+        &["traffic_groups.0.threads=[0,1,2,3]".to_string()],
+    )
+    .unwrap();
+
+    assert_eq!(config.traffic_groups[0].threads, vec![0, 1, 2, 3]);
+}
+
+#[test]
+fn test_set_multiple_overrides() {
+    let config = ProfileConfig::from_file_with_overrides(
+        "../profiles/redis-get-zipfian.toml",
+        &[
+            "target.address=192.168.1.100:6379".to_string(),
+            "experiment.duration=5m".to_string(),
+            "experiment.seed=999".to_string(),
+            "target.protocol=memcached-binary".to_string(),
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(config.target.address, Some("192.168.1.100:6379".to_string()));
+    assert_eq!(config.experiment.duration, Duration::from_secs(300));
+    assert_eq!(config.experiment.seed, Some(999));
+    assert_eq!(config.target.protocol, "memcached-binary");
+}
+
+#[test]
+fn test_set_type_inference_integer() {
+    let config = ProfileConfig::from_file_with_overrides(
+        "../profiles/redis-get-zipfian.toml",
+        &["experiment.seed=12345".to_string()],
+    )
+    .unwrap();
+    assert_eq!(config.experiment.seed, Some(12345));
+}
+
+#[test]
+fn test_set_type_inference_float() {
+    let config = ProfileConfig::from_file_with_overrides(
+        "../profiles/redis-bench.toml",
+        &["traffic_groups.0.sampling_rate=0.75".to_string()],
+    )
+    .unwrap();
+    assert_eq!(config.traffic_groups[0].sampling_rate, 0.75);
+}
+
+#[test]
+fn test_set_type_inference_boolean() {
+    let config = ProfileConfig::from_file_with_overrides(
+        "../profiles/redis-get-zipfian.toml",
+        &["output.real_time=true".to_string()],
+    )
+    .unwrap();
+    assert!(config.output.real_time);
+}
+
+#[test]
+fn test_set_type_inference_string() {
+    let config = ProfileConfig::from_file_with_overrides(
+        "../profiles/redis-get-zipfian.toml",
+        &["target.protocol=http".to_string()],
+    )
+    .unwrap();
+    assert_eq!(config.target.protocol, "http");
+}
+
+#[test]
+fn test_set_invalid_path() {
+    let result = ProfileConfig::from_file_with_overrides(
+        "../profiles/redis-get-zipfian.toml",
+        &["nonexistent.field=value".to_string()],
+    );
+    // Creating a new field will succeed in TOML manipulation,
+    // but should fail during deserialization if it's not a valid field
+    // (or succeed if serde ignores unknown fields)
+    // This test just ensures the operation doesn't panic
+    let _ = result;
+}
+
+#[test]
+fn test_set_invalid_format() {
+    let result = ProfileConfig::from_file_with_overrides(
+        "../profiles/redis-get-zipfian.toml",
+        &["invalid_no_equals".to_string()],
+    );
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("Invalid override format"));
+}
+
+#[test]
+fn test_set_array_out_of_bounds() {
+    let result = ProfileConfig::from_file_with_overrides(
+        "../profiles/redis-bench.toml",
+        &["traffic_groups.999.sampling_rate=0.5".to_string()],
+    );
+    assert!(result.is_err());
+    // Just verify it failed - the exact error message may vary
+}
+
+#[test]
+fn test_set_duration_string() {
+    let config = ProfileConfig::from_file_with_overrides(
+        "../profiles/redis-get-zipfian.toml",
+        &["experiment.duration=2h".to_string()],
+    )
+    .unwrap();
+    assert_eq!(config.experiment.duration, Duration::from_secs(7200));
 }

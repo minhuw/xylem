@@ -1,0 +1,98 @@
+# Redis 4-Core Latency Agent Configuration
+#
+# This profile demonstrates latency agent separation on a 4-core system:
+# - Latency Agent: 1 core (thread 0) for accurate latency measurement
+# - Throughput Agent: 3 cores (threads 1-3) for load generation
+#
+# Total system load: ~50K QPS
+# Latency measurements: From dedicated low-rate agent only
+
+[experiment]
+name = "redis-bench"
+description = "Redis benchmark with latency/throughput agent separation"
+duration = "30s"
+seed = 42
+
+[target]
+address = "127.0.0.1:6379"
+protocol = "redis"
+transport = "tcp"
+
+[workload.keys]
+strategy = "zipfian"
+n = 1000000      # 1M key space
+theta = 0.99     # High skew (realistic cache workload)
+value_size = 64
+
+[workload.pattern]
+type = "constant"
+rate = 50000.0  # Total target: 50K QPS
+
+# ============================================================================
+# LATENCY AGENT
+# ============================================================================
+# - Single core dedicated to latency measurement
+# - Low rate: ~1K QPS
+# - 100% sampling: Capture every single request
+# - max_pending = 1: No pipelining for accurate latency measurement
+#
+# This agent measures latency WITHOUT being affected by queueing delays
+[[traffic_groups]]
+name = "latency-agent"
+threads = [0]
+connections_per_thread = 10      # 10 connections on 1 thread
+max_pending_per_connection = 1   # No pipelining
+sampling_rate = 1.0              # 100% sampling
+
+[traffic_groups.policy]
+type = "poisson"
+rate = 100.0  # 100 req/s per connection × 10 connections = 1K QPS
+
+# ============================================================================
+# THROUGHPUT AGENT
+# ============================================================================
+# - Three cores dedicated to load generation
+# - High rate: ~49K QPS (closed-loop max throughput)
+# - 1% sampling: Reduce memory overhead
+# - max_pending = 32: High pipelining for maximum throughput
+#
+# This agent generates realistic load without distorting latency measurements
+[[traffic_groups]]
+name = "throughput-agent"
+threads = [1, 2, 3]
+connections_per_thread = 25      # 75 total connections (25 per thread)
+max_pending_per_connection = 32  # High pipelining
+sampling_rate = 0.01             # 1% sampling
+
+[traffic_groups.policy]
+type = "closed-loop"  # Send as fast as possible
+
+[output]
+format = "json"
+file = "/tmp/redis-bench-results.json"
+
+# Expected behavior:
+# ==================
+# Latency Agent (thread 0):
+#   - Generates: ~1,000 req/s
+#   - Samples: ~1,000 samples (100%)
+#   - Latency: Accurate p99 measurements without queueing delays
+#   - CPU: Single core, low utilization
+#
+# Throughput Agent (threads 1-3):
+#   - Generates: ~49,000 req/s
+#   - Samples: ~490 samples (1%)
+#   - Purpose: Generate realistic load on Redis
+#   - CPU: 3 cores, high utilization
+#
+# Total System:
+#   - Load: ~50,000 req/s on Redis
+#   - Latency metrics: Dominated by latency agent (better sampling)
+#   - Resource usage: 4 cores total
+#
+# Benefits vs single pool:
+# ========================
+# 1. Accurate service time measurement (no client-side queueing in latency samples)
+# 2. Memory efficient (1% sampling on high-throughput agent)
+# 3. Independent tuning of measurement vs load generation
+# 4. Clear separation of concerns

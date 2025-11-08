@@ -190,6 +190,21 @@ install: build-release
     cp target/release/{{BINARY_NAME}} ~/.cargo/bin/
     @echo "✅ xylem installed! You can run it with: xylem"
 
+# Generate/update JSON Schema for configuration files
+schema:
+    @echo "📋 Generating JSON Schema..."
+    cargo run --bin {{BINARY_NAME}} -- schema > schema/profile.schema.json
+    @echo "✅ Schema written to schema/profile.schema.json"
+
+# Generate shell completion scripts
+completions-bash:
+    @echo "🐚 Generating bash completion..."
+    cargo run --bin {{BINARY_NAME}} -- completions bash
+
+completions-zsh:
+    @echo "🐚 Generating zsh completion..."
+    cargo run --bin {{BINARY_NAME}} -- completions zsh
+
 # Show this help
 help:
     @echo "Xylem Justfile - Available Commands"
@@ -233,4 +248,7 @@ help:
     @echo "📦 Other:"
     @echo "  just clean             - Clean build artifacts"
     @echo "  just install           - Install xylem locally"
+    @echo "  just schema            - Generate JSON Schema for config files"
+    @echo "  just completions-bash  - Generate bash completion script"
+    @echo "  just completions-zsh   - Generate zsh completion script"
     @echo "  just help              - Show this help"

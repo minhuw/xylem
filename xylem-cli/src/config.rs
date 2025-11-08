@@ -5,12 +5,13 @@
 //! for quick overrides.
 
 use anyhow::{bail, Context, Result};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Top-level profile configuration
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct ProfileConfig {
     pub experiment: ExperimentConfig,
     pub target: TargetConfig,
@@ -21,7 +22,7 @@ pub struct ProfileConfig {
 }
 
 /// Experiment metadata
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct ExperimentConfig {
     /// Experiment name
     pub name: String,
@@ -33,11 +34,12 @@ pub struct ExperimentConfig {
     pub seed: Option<u64>,
     /// Experiment duration
     #[serde(with = "humantime_serde")]
+    #[schemars(with = "String")]
     pub duration: Duration,
 }
 
 /// Target server configuration
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct TargetConfig {
     /// Server address (e.g., "127.0.0.1:6379") - can be overridden via CLI
     #[serde(default)]
@@ -54,7 +56,7 @@ fn default_transport() -> String {
 }
 
 /// Workload configuration
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct WorkloadConfig {
     /// Key generation strategy
     pub keys: KeysConfig,
@@ -63,7 +65,7 @@ pub struct WorkloadConfig {
 }
 
 /// Key generation configuration (SPATIAL level)
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(tag = "strategy", rename_all = "lowercase")]
 pub enum KeysConfig {
     Sequential {
@@ -89,7 +91,7 @@ pub enum KeysConfig {
 }
 
 /// Load pattern configuration (MACRO level - time-varying traffic)
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum LoadPatternConfig {
     Constant {
@@ -100,22 +102,27 @@ pub enum LoadPatternConfig {
         start_rate: f64,
         end_rate: f64,
         #[serde(with = "humantime_serde")]
+        #[schemars(with = "String")]
         duration: Duration,
     },
     Spike {
         normal_rate: f64,
         spike_rate: f64,
         #[serde(with = "humantime_serde")]
+        #[schemars(with = "String")]
         spike_start: Duration,
         #[serde(with = "humantime_serde")]
+        #[schemars(with = "String")]
         spike_duration: Duration,
     },
     Sinusoidal {
         base_rate: f64,
         amplitude: f64,
         #[serde(with = "humantime_serde")]
+        #[schemars(with = "String")]
         period: Duration,
         #[serde(with = "humantime_serde", default)]
+        #[schemars(with = "Option<String>")]
         phase_shift: Option<Duration>,
     },
     Step {
@@ -125,20 +132,22 @@ pub enum LoadPatternConfig {
         min_rate: f64,
         max_rate: f64,
         #[serde(with = "humantime_serde")]
+        #[schemars(with = "String")]
         period: Duration,
     },
 }
 
 /// Step configuration for StepPattern
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct StepConfig {
     #[serde(with = "humantime_serde")]
+    #[schemars(with = "String")]
     pub duration: Duration,
     pub rate: f64,
 }
 
 /// Output configuration
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct OutputConfig {
     /// Output format: json, csv
     #[serde(default = "default_format")]
@@ -169,34 +178,33 @@ impl ProfileConfig {
         Ok(config)
     }
 
-    /// Apply CLI overrides to configuration
-    pub fn with_overrides(
-        mut self,
-        target: Option<String>,
-        duration: Option<String>,
-        output: Option<PathBuf>,
-        seed: Option<u64>,
-    ) -> Result<Self> {
-        if let Some(target) = target {
-            self.target.address = Some(target);
+    /// Load profile from TOML file with --set style overrides
+    pub fn from_file_with_overrides<P: AsRef<Path>>(path: P, overrides: &[String]) -> Result<Self> {
+        let path = path.as_ref();
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read config file: {}", path.display()))?;
+
+        // Parse TOML to Value for manipulation
+        let mut value: toml::Value = toml::from_str(&content)
+            .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
+
+        // Apply each override
+        for override_str in overrides {
+            let (key, val) = parse_key_value(override_str)
+                .with_context(|| format!("Invalid override format: {}", override_str))?;
+
+            set_toml_path(&mut value, &key, &val)
+                .with_context(|| format!("Failed to apply override: {}", override_str))?;
         }
 
-        if let Some(duration_str) = duration {
-            let duration = humantime::parse_duration(&duration_str)
-                .with_context(|| format!("Invalid duration format: {}", duration_str))?;
-            self.experiment.duration = duration;
-        }
+        // Deserialize modified TOML to ProfileConfig
+        let config: ProfileConfig = value
+            .try_into()
+            .with_context(|| "Failed to deserialize modified configuration")?;
 
-        if let Some(output) = output {
-            self.output.file = output;
-        }
-
-        if let Some(seed) = seed {
-            self.experiment.seed = Some(seed);
-        }
-
-        self.validate()?;
-        Ok(self)
+        // Validate the final configuration
+        config.validate()?;
+        Ok(config)
     }
 
     /// Validate configuration
@@ -399,6 +407,174 @@ impl ProfileConfig {
         }
         Ok(())
     }
+}
+
+/// Parse a "key=value" string into (key, value) tuple
+fn parse_key_value(override_str: &str) -> Result<(String, String)> {
+    let parts: Vec<&str> = override_str.splitn(2, '=').collect();
+    if parts.len() != 2 {
+        bail!("Invalid override format '{}'. Expected 'key=value'", override_str);
+    }
+    Ok((parts[0].to_string(), parts[1].to_string()))
+}
+
+/// Set a value in TOML using dot-notation path
+fn set_toml_path(root: &mut toml::Value, path: &str, value_str: &str) -> Result<()> {
+    let parts = parse_path(path)?;
+
+    if parts.is_empty() {
+        bail!("Empty path");
+    }
+
+    // Navigate to the parent of the target field
+    let mut current = root;
+    for (i, part) in parts.iter().enumerate() {
+        let is_last = i == parts.len() - 1;
+
+        match part {
+            PathSegment::Key(key) => {
+                if is_last {
+                    // Set the value
+                    let parsed_value = parse_value(value_str)?;
+                    if let toml::Value::Table(table) = current {
+                        table.insert(key.clone(), parsed_value);
+                    } else {
+                        bail!("Cannot set key '{}' on non-table value", key);
+                    }
+                    return Ok(());
+                } else {
+                    // Navigate deeper
+                    let toml::Value::Table(table) = current else {
+                        bail!("Cannot navigate through non-table value at key '{}'", key);
+                    };
+
+                    if !table.contains_key(key) {
+                        // Create intermediate table if it doesn't exist
+                        table.insert(key.clone(), toml::Value::Table(Default::default()));
+                    }
+                    current = table.get_mut(key).unwrap();
+                }
+            }
+            PathSegment::Index(idx) => {
+                if let toml::Value::Array(arr) = current {
+                    if *idx >= arr.len() {
+                        bail!("Array index {} out of bounds (length: {})", idx, arr.len());
+                    }
+                    if is_last {
+                        // Set array element
+                        let parsed_value = parse_value(value_str)?;
+                        arr[*idx] = parsed_value;
+                        return Ok(());
+                    } else {
+                        current = &mut arr[*idx];
+                    }
+                } else {
+                    bail!("Cannot index non-array value");
+                }
+            }
+            PathSegment::Append => {
+                if is_last {
+                    if let toml::Value::Array(arr) = current {
+                        let parsed_value = parse_value(value_str)?;
+                        arr.push(parsed_value);
+                        return Ok(());
+                    } else {
+                        bail!("Cannot append to non-array value");
+                    }
+                } else {
+                    bail!("Append operation '+' can only be at the end of path");
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Parse a path string into segments (handles "key", "0", "+")
+fn parse_path(path: &str) -> Result<Vec<PathSegment>> {
+    let mut segments = Vec::new();
+
+    for part in path.split('.') {
+        if part.is_empty() {
+            continue;
+        }
+
+        if part == "+" {
+            segments.push(PathSegment::Append);
+        } else if let Ok(idx) = part.parse::<usize>() {
+            segments.push(PathSegment::Index(idx));
+        } else {
+            segments.push(PathSegment::Key(part.to_string()));
+        }
+    }
+
+    Ok(segments)
+}
+
+/// Path segment types
+enum PathSegment {
+    Key(String),
+    Index(usize),
+    Append,
+}
+
+/// Parse a string value with type inference
+fn parse_value(value_str: &str) -> Result<toml::Value> {
+    let trimmed = value_str.trim();
+
+    // Boolean
+    if trimmed == "true" {
+        return Ok(toml::Value::Boolean(true));
+    }
+    if trimmed == "false" {
+        return Ok(toml::Value::Boolean(false));
+    }
+
+    // Integer (no decimal point, no scientific notation)
+    if let Ok(int_val) = trimmed.parse::<i64>() {
+        return Ok(toml::Value::Integer(int_val));
+    }
+
+    // Float (has decimal point or scientific notation)
+    if let Ok(float_val) = trimmed.parse::<f64>() {
+        return Ok(toml::Value::Float(float_val));
+    }
+
+    // Array (starts with '[' and ends with ']')
+    if trimmed.starts_with('[') && trimmed.ends_with(']') {
+        // Try to parse as TOML array
+        let array_toml = format!("value = {}", trimmed);
+        if let Ok(toml::Value::Table(mut table)) = toml::from_str::<toml::Value>(&array_toml) {
+            if let Some(value) = table.remove("value") {
+                return Ok(value);
+            }
+        }
+        bail!("Failed to parse array: {}", trimmed);
+    }
+
+    // Inline table (starts with '{' and ends with '}')
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        // Try to parse as TOML inline table
+        let table_toml = format!("value = {}", trimmed);
+        if let Ok(toml::Value::Table(mut table)) = toml::from_str::<toml::Value>(&table_toml) {
+            if let Some(value) = table.remove("value") {
+                return Ok(value);
+            }
+        }
+        bail!("Failed to parse inline table: {}", trimmed);
+    }
+
+    // String (everything else, strip quotes if present)
+    let string_val = if (trimmed.starts_with('"') && trimmed.ends_with('"'))
+        || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+    {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    };
+
+    Ok(toml::Value::String(string_val.to_string()))
 }
 
 // Helper methods to convert config types to runtime types

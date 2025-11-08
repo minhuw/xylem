@@ -15,6 +15,7 @@ use std::time::Duration;
 
 /// Traffic group configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TrafficGroupConfig {
     /// Group name for identification
     pub name: String,
@@ -42,6 +43,7 @@ fn default_sampling_rate() -> f64 {
 
 /// Policy configuration for traffic groups
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum PolicyConfig {
     /// Closed-loop policy (max throughput)
