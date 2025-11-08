@@ -4,10 +4,11 @@
 //! with much more flexibility. Each group can have:
 //! - Its own connection pool
 //! - Independent traffic policy
-//! - Separate sampling rate
+//! - Configurable sampling policy for latency measurement
 //! - Explicit thread affinity
 
 use crate::scheduler::PolicyScheduler;
+use crate::stats::SamplingPolicy;
 use crate::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -28,17 +29,13 @@ pub struct TrafficGroupConfig {
     pub max_pending_per_connection: usize,
     /// Traffic policy configuration
     pub policy: PolicyConfig,
-    /// Sampling rate (0.0 to 1.0)
-    #[serde(default = "default_sampling_rate")]
-    pub sampling_rate: f64,
+    /// Latency sampling policy
+    #[serde(default)]
+    pub sampling_policy: SamplingPolicy,
 }
 
 fn default_max_pending() -> usize {
     10
-}
-
-fn default_sampling_rate() -> f64 {
-    1.0
 }
 
 /// Policy configuration for traffic groups
@@ -125,8 +122,8 @@ pub struct TrafficGroup {
     pub connections_per_thread: usize,
     /// Max pending per connection
     pub max_pending_per_connection: usize,
-    /// Sampling rate
-    pub sampling_rate: f64,
+    /// Sampling policy
+    pub sampling_policy: SamplingPolicy,
 }
 
 impl TrafficGroup {
@@ -138,7 +135,7 @@ impl TrafficGroup {
             threads: config.threads.clone(),
             connections_per_thread: config.connections_per_thread,
             max_pending_per_connection: config.max_pending_per_connection,
-            sampling_rate: config.sampling_rate,
+            sampling_policy: config.sampling_policy.clone(),
         }
     }
 
@@ -224,7 +221,7 @@ mod tests {
             connections_per_thread: 10,
             max_pending_per_connection: 5,
             policy: PolicyConfig::ClosedLoop,
-            sampling_rate: 1.0,
+            sampling_policy: SamplingPolicy::default(),
         };
 
         let group = TrafficGroup::from_config(0, &config);
@@ -243,7 +240,7 @@ mod tests {
                 connections_per_thread: 5,
                 max_pending_per_connection: 1,
                 policy: PolicyConfig::Poisson { rate: 1000.0 },
-                sampling_rate: 1.0,
+                sampling_policy: SamplingPolicy::Unlimited,
             },
             TrafficGroupConfig {
                 name: "throughput".to_string(),
@@ -251,7 +248,7 @@ mod tests {
                 connections_per_thread: 20,
                 max_pending_per_connection: 32,
                 policy: PolicyConfig::ClosedLoop,
-                sampling_rate: 0.01,
+                sampling_policy: SamplingPolicy::Limited { max_samples: 10_000, rate: 0.01 },
             },
         ];
 
@@ -280,7 +277,7 @@ mod tests {
                 connections_per_thread: 5,
                 max_pending_per_connection: 1,
                 policy: PolicyConfig::ClosedLoop,
-                sampling_rate: 1.0,
+                sampling_policy: SamplingPolicy::default(),
             },
             TrafficGroupConfig {
                 name: "g2".to_string(),
@@ -288,7 +285,7 @@ mod tests {
                 connections_per_thread: 10,
                 max_pending_per_connection: 1,
                 policy: PolicyConfig::ClosedLoop,
-                sampling_rate: 1.0,
+                sampling_policy: SamplingPolicy::default(),
             },
         ];
 
@@ -305,7 +302,7 @@ mod tests {
                 connections_per_thread: 5,
                 max_pending_per_connection: 1,
                 policy: PolicyConfig::ClosedLoop,
-                sampling_rate: 1.0,
+                sampling_policy: SamplingPolicy::default(),
             },
             TrafficGroupConfig {
                 name: "g2".to_string(),
@@ -313,7 +310,7 @@ mod tests {
                 connections_per_thread: 10,
                 max_pending_per_connection: 1,
                 policy: PolicyConfig::ClosedLoop,
-                sampling_rate: 1.0,
+                sampling_policy: SamplingPolicy::default(),
             },
         ];
 

@@ -3,7 +3,7 @@
 //! Enables separate statistics tracking for each traffic group, mimicking
 //! Lancet's throughput/latency agent separation.
 
-use super::collector::StatsCollector;
+use super::collector::{SamplingPolicy, StatsCollector};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -24,10 +24,20 @@ impl GroupStatsCollector {
         }
     }
 
-    /// Register a traffic group
-    pub fn register_group(&mut self, group_id: usize, max_samples: usize, sampling_rate: f64) {
-        self.group_collectors
-            .insert(group_id, StatsCollector::new(max_samples, sampling_rate));
+    /// Register a traffic group with a sampling policy
+    pub fn register_group(&mut self, group_id: usize, policy: &SamplingPolicy) {
+        self.group_collectors.insert(group_id, StatsCollector::from_policy(policy));
+    }
+
+    /// Register a traffic group (legacy method - will be deprecated)
+    pub fn register_group_legacy(
+        &mut self,
+        group_id: usize,
+        max_samples: usize,
+        sampling_rate: f64,
+    ) {
+        let policy = SamplingPolicy::Limited { max_samples, rate: sampling_rate };
+        self.register_group(group_id, &policy);
     }
 
     /// Record a latency sample for a specific group
@@ -159,9 +169,9 @@ mod tests {
     fn test_group_collector_basic() {
         let mut collector = GroupStatsCollector::new();
 
-        // Register two groups
-        collector.register_group(0, 1000, 1.0);
-        collector.register_group(1, 1000, 0.5);
+        // Register two groups with different sampling policies
+        collector.register_group_legacy(0, 1000, 1.0);
+        collector.register_group_legacy(1, 1000, 0.5);
 
         // Record samples for group 0
         collector.record_latency(0, Duration::from_millis(10));
@@ -186,7 +196,7 @@ mod tests {
     #[test]
     fn test_group_collector_bytes() {
         let mut collector = GroupStatsCollector::new();
-        collector.register_group(0, 1000, 1.0);
+        collector.register_group_legacy(0, 1000, 1.0);
 
         collector.record_tx_bytes(0, 100);
         collector.record_rx_bytes(0, 50);
@@ -203,9 +213,9 @@ mod tests {
     #[test]
     fn test_group_ids() {
         let mut collector = GroupStatsCollector::new();
-        collector.register_group(2, 1000, 1.0);
-        collector.register_group(0, 1000, 1.0);
-        collector.register_group(1, 1000, 1.0);
+        collector.register_group_legacy(2, 1000, 1.0);
+        collector.register_group_legacy(0, 1000, 1.0);
+        collector.register_group_legacy(1, 1000, 1.0);
 
         let ids = collector.group_ids();
         assert_eq!(ids, vec![0, 1, 2]); // Should be sorted
@@ -214,12 +224,12 @@ mod tests {
     #[test]
     fn test_merge_group_collectors() {
         let mut c1 = GroupStatsCollector::new();
-        c1.register_group(0, 1000, 1.0);
+        c1.register_group_legacy(0, 1000, 1.0);
         c1.record_latency(0, Duration::from_millis(10));
         c1.record_tx_bytes(0, 100);
 
         let mut c2 = GroupStatsCollector::new();
-        c2.register_group(0, 1000, 1.0);
+        c2.register_group_legacy(0, 1000, 1.0);
         c2.record_latency(0, Duration::from_millis(20));
         c2.record_tx_bytes(0, 200);
 
@@ -238,7 +248,7 @@ mod tests {
     #[test]
     fn test_reset() {
         let mut collector = GroupStatsCollector::new();
-        collector.register_group(0, 1000, 1.0);
+        collector.register_group_legacy(0, 1000, 1.0);
         collector.record_latency(0, Duration::from_millis(10));
 
         collector.reset();

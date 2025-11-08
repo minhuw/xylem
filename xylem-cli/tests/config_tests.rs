@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 use xylem_cli::config::{KeysConfig, ProfileConfig};
+use xylem_core::stats::collector::SamplingPolicy;
 
 #[test]
 fn test_load_redis_zipfian_profile() {
@@ -119,7 +120,11 @@ fn test_load_latency_agent_profile() {
     assert_eq!(latency_agent.threads, vec![0, 1]);
     assert_eq!(latency_agent.connections_per_thread, 10);
     assert_eq!(latency_agent.max_pending_per_connection, 1);
-    assert_eq!(latency_agent.sampling_rate, 1.0);
+    // Check sampling policy (should be Unlimited for 100% sampling)
+    match &latency_agent.sampling_policy {
+        SamplingPolicy::Unlimited => {} // Expected
+        _ => panic!("Expected Unlimited sampling policy for latency agent"),
+    }
 
     // Verify throughput agent configuration
     let throughput_agent = &config.traffic_groups[1];
@@ -127,7 +132,13 @@ fn test_load_latency_agent_profile() {
     assert_eq!(throughput_agent.threads, vec![2, 3, 4, 5, 6, 7]);
     assert_eq!(throughput_agent.connections_per_thread, 25);
     assert_eq!(throughput_agent.max_pending_per_connection, 32);
-    assert_eq!(throughput_agent.sampling_rate, 0.01);
+    // Check sampling policy (should be Limited with 1% rate)
+    match &throughput_agent.sampling_policy {
+        SamplingPolicy::Limited { rate, .. } => {
+            assert!((rate - 0.01).abs() < 0.001, "Expected 1% sampling rate");
+        }
+        _ => panic!("Expected Limited sampling policy for throughput agent"),
+    }
 }
 
 #[test]
@@ -152,7 +163,11 @@ fn test_load_redis_bench_profile() {
     assert_eq!(latency_agent.threads, vec![0]);
     assert_eq!(latency_agent.connections_per_thread, 10);
     assert_eq!(latency_agent.max_pending_per_connection, 1);
-    assert_eq!(latency_agent.sampling_rate, 1.0);
+    // Check sampling policy (should be Unlimited for 100% sampling)
+    match &latency_agent.sampling_policy {
+        SamplingPolicy::Unlimited => {} // Expected
+        _ => panic!("Expected Unlimited sampling policy for latency agent"),
+    }
 
     // Verify throughput agent configuration (3 cores)
     let throughput_agent = &config.traffic_groups[1];
@@ -160,7 +175,13 @@ fn test_load_redis_bench_profile() {
     assert_eq!(throughput_agent.threads, vec![1, 2, 3]);
     assert_eq!(throughput_agent.connections_per_thread, 25);
     assert_eq!(throughput_agent.max_pending_per_connection, 32);
-    assert_eq!(throughput_agent.sampling_rate, 0.01);
+    // Check sampling policy (should be Limited with 1% rate)
+    match &throughput_agent.sampling_policy {
+        SamplingPolicy::Limited { rate, .. } => {
+            assert!((rate - 0.01).abs() < 0.001, "Expected 1% sampling rate");
+        }
+        _ => panic!("Expected Limited sampling policy for throughput agent"),
+    }
 }
 
 #[test]
@@ -718,11 +739,15 @@ fn test_set_nested_field() {
 fn test_set_array_index() {
     let config = ProfileConfig::from_file_with_overrides(
         "../profiles/redis-bench.toml",
-        &["traffic_groups.0.sampling_rate=0.5".to_string()],
+        &["traffic_groups.0.sampling_policy.type=unlimited".to_string()],
     )
     .unwrap();
 
-    assert_eq!(config.traffic_groups[0].sampling_rate, 0.5);
+    // Check that sampling policy was changed to Unlimited
+    match &config.traffic_groups[0].sampling_policy {
+        SamplingPolicy::Unlimited => {} // Expected
+        _ => panic!("Expected Unlimited sampling policy after override"),
+    }
 }
 
 #[test]
@@ -769,10 +794,17 @@ fn test_set_type_inference_integer() {
 fn test_set_type_inference_float() {
     let config = ProfileConfig::from_file_with_overrides(
         "../profiles/redis-bench.toml",
-        &["traffic_groups.0.sampling_rate=0.75".to_string()],
+        &["traffic_groups.0.sampling_policy.rate=0.75".to_string()],
     )
     .unwrap();
-    assert_eq!(config.traffic_groups[0].sampling_rate, 0.75);
+
+    // Check that the rate was updated
+    match &config.traffic_groups[0].sampling_policy {
+        SamplingPolicy::Limited { rate, .. } => {
+            assert!((rate - 0.75).abs() < 0.001, "Expected 75% sampling rate");
+        }
+        _ => panic!("Expected Limited sampling policy"),
+    }
 }
 
 #[test]

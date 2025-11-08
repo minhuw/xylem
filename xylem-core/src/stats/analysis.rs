@@ -113,6 +113,198 @@ pub fn aggregate_stats(
     duration: Duration,
     confidence_level: f64,
 ) -> AggregatedStats {
+    // Check if we're using DDSketch mode
+    if let Some(sketch) = collector.ddsketch() {
+        // Use DDSketch for percentile calculations
+        // quantile returns Result<Option<f64>, DDSketchError>
+        let p50 = sketch
+            .quantile(0.50)
+            .ok()
+            .flatten()
+            .map(|q| Duration::from_nanos(q as u64))
+            .unwrap_or(Duration::ZERO);
+        let p95 = sketch
+            .quantile(0.95)
+            .ok()
+            .flatten()
+            .map(|q| Duration::from_nanos(q as u64))
+            .unwrap_or(Duration::ZERO);
+        let p99 = sketch
+            .quantile(0.99)
+            .ok()
+            .flatten()
+            .map(|q| Duration::from_nanos(q as u64))
+            .unwrap_or(Duration::ZERO);
+        let p999 = sketch
+            .quantile(0.999)
+            .ok()
+            .flatten()
+            .map(|q| Duration::from_nanos(q as u64))
+            .unwrap_or(Duration::ZERO);
+        let p9999 = sketch
+            .quantile(0.9999)
+            .ok()
+            .flatten()
+            .map(|q| Duration::from_nanos(q as u64))
+            .unwrap_or(Duration::ZERO);
+        let p99999 = sketch
+            .quantile(0.99999)
+            .ok()
+            .flatten()
+            .map(|q| Duration::from_nanos(q as u64))
+            .unwrap_or(Duration::ZERO);
+
+        // For DDSketch, we don't have exact mean/stddev/CI
+        // We approximate using percentiles
+        let mean = p50; // Approximate mean with median
+        let std_dev = Duration::ZERO; // Not available in sketch mode
+        let ci = Duration::ZERO; // Not available in sketch mode
+
+        // Calculate throughput
+        let duration_secs = duration.as_secs_f64();
+        let total_requests = collector.tx_requests();
+        let throughput_rps = if duration_secs > 0.0 {
+            total_requests as f64 / duration_secs
+        } else {
+            0.0
+        };
+
+        let total_bytes = (collector.tx_bytes() + collector.rx_bytes()) as f64;
+        let throughput_mbps = if duration_secs > 0.0 {
+            (total_bytes * 8.0) / (duration_secs * 1_000_000.0)
+        } else {
+            0.0
+        };
+
+        return AggregatedStats {
+            latency_p50: p50,
+            latency_p95: p95,
+            latency_p99: p99,
+            latency_p999: p999,
+            latency_p9999: p9999,
+            latency_p99999: p99999,
+            mean_latency: mean,
+            std_dev,
+            confidence_interval: ci,
+            throughput_rps,
+            throughput_mbps,
+            total_requests,
+        };
+    }
+
+    // Check if we're using T-Digest mode
+    if let Some(tdigest_mutex) = collector.tdigest() {
+        let tdigest = tdigest_mutex.lock().unwrap();
+
+        // Use T-Digest for percentile calculations
+        let p50 = tdigest.estimate_quantile(0.50);
+        let p95 = tdigest.estimate_quantile(0.95);
+        let p99 = tdigest.estimate_quantile(0.99);
+        let p999 = tdigest.estimate_quantile(0.999);
+        let p9999 = tdigest.estimate_quantile(0.9999);
+        let p99999 = tdigest.estimate_quantile(0.99999);
+
+        let p50_dur = Duration::from_nanos(p50 as u64);
+        let p95_dur = Duration::from_nanos(p95 as u64);
+        let p99_dur = Duration::from_nanos(p99 as u64);
+        let p999_dur = Duration::from_nanos(p999 as u64);
+        let p9999_dur = Duration::from_nanos(p9999 as u64);
+        let p99999_dur = Duration::from_nanos(p99999 as u64);
+
+        // For T-Digest, we don't have exact mean/stddev/CI
+        let mean = p50_dur; // Approximate mean with median
+        let std_dev = Duration::ZERO;
+        let ci = Duration::ZERO;
+
+        // Calculate throughput
+        let duration_secs = duration.as_secs_f64();
+        let total_requests = collector.tx_requests();
+        let throughput_rps = if duration_secs > 0.0 {
+            total_requests as f64 / duration_secs
+        } else {
+            0.0
+        };
+
+        let total_bytes = (collector.tx_bytes() + collector.rx_bytes()) as f64;
+        let throughput_mbps = if duration_secs > 0.0 {
+            (total_bytes * 8.0) / (duration_secs * 1_000_000.0)
+        } else {
+            0.0
+        };
+
+        return AggregatedStats {
+            latency_p50: p50_dur,
+            latency_p95: p95_dur,
+            latency_p99: p99_dur,
+            latency_p999: p999_dur,
+            latency_p9999: p9999_dur,
+            latency_p99999: p99999_dur,
+            mean_latency: mean,
+            std_dev,
+            confidence_interval: ci,
+            throughput_rps,
+            throughput_mbps,
+            total_requests,
+        };
+    }
+
+    // Check if we're using HDR Histogram mode
+    if let Some(hdr_mutex) = collector.hdrhistogram() {
+        let hdr = hdr_mutex.lock().unwrap();
+
+        // Use HDR Histogram for percentile calculations
+        let p50 = hdr.value_at_quantile(0.50);
+        let p95 = hdr.value_at_quantile(0.95);
+        let p99 = hdr.value_at_quantile(0.99);
+        let p999 = hdr.value_at_quantile(0.999);
+        let p9999 = hdr.value_at_quantile(0.9999);
+        let p99999 = hdr.value_at_quantile(0.99999);
+
+        let p50_dur = Duration::from_nanos(p50);
+        let p95_dur = Duration::from_nanos(p95);
+        let p99_dur = Duration::from_nanos(p99);
+        let p999_dur = Duration::from_nanos(p999);
+        let p9999_dur = Duration::from_nanos(p9999);
+        let p99999_dur = Duration::from_nanos(p99999);
+
+        // For HDR Histogram, we can calculate mean
+        let mean = Duration::from_nanos(hdr.mean() as u64);
+        let std_dev = Duration::from_nanos(hdr.stdev() as u64);
+        let ci = Duration::ZERO; // CI not directly available
+
+        // Calculate throughput
+        let duration_secs = duration.as_secs_f64();
+        let total_requests = collector.tx_requests();
+        let throughput_rps = if duration_secs > 0.0 {
+            total_requests as f64 / duration_secs
+        } else {
+            0.0
+        };
+
+        let total_bytes = (collector.tx_bytes() + collector.rx_bytes()) as f64;
+        let throughput_mbps = if duration_secs > 0.0 {
+            (total_bytes * 8.0) / (duration_secs * 1_000_000.0)
+        } else {
+            0.0
+        };
+
+        return AggregatedStats {
+            latency_p50: p50_dur,
+            latency_p95: p95_dur,
+            latency_p99: p99_dur,
+            latency_p999: p999_dur,
+            latency_p9999: p9999_dur,
+            latency_p99999: p99999_dur,
+            mean_latency: mean,
+            std_dev,
+            confidence_interval: ci,
+            throughput_rps,
+            throughput_mbps,
+            total_requests,
+        };
+    }
+
+    // Sample-based mode
     let samples = collector.samples();
 
     if samples.is_empty() {
@@ -121,6 +313,8 @@ pub fn aggregate_stats(
             latency_p95: Duration::ZERO,
             latency_p99: Duration::ZERO,
             latency_p999: Duration::ZERO,
+            latency_p9999: Duration::ZERO,
+            latency_p99999: Duration::ZERO,
             mean_latency: Duration::ZERO,
             std_dev: Duration::ZERO,
             confidence_interval: Duration::ZERO,
@@ -139,6 +333,8 @@ pub fn aggregate_stats(
     let p95 = calculate_percentile(&sorted, 0.95);
     let p99 = calculate_percentile(&sorted, 0.99);
     let p999 = calculate_percentile(&sorted, 0.999);
+    let p9999 = calculate_percentile(&sorted, 0.9999);
+    let p99999 = calculate_percentile(&sorted, 0.99999);
 
     // Calculate mean
     let sum: Duration = sorted.iter().sum();
@@ -171,6 +367,8 @@ pub fn aggregate_stats(
         latency_p95: p95,
         latency_p99: p99,
         latency_p999: p999,
+        latency_p9999: p9999,
+        latency_p99999: p99999,
         mean_latency: mean,
         std_dev,
         confidence_interval: ci,

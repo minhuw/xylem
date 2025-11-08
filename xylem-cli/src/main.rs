@@ -209,12 +209,12 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
     tracing::info!("Traffic groups: {}", config.traffic_groups.len());
     for (i, group) in config.traffic_groups.iter().enumerate() {
         tracing::info!(
-            "  Group {}: '{}' - threads: {:?}, conns/thread: {}, sampling: {}",
+            "  Group {}: '{}' - threads: {:?}, conns/thread: {}, sampling: {:?}",
             i,
             group.name,
             group.threads,
             group.connections_per_thread,
-            group.sampling_rate
+            group.sampling_policy
         );
     }
 

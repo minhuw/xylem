@@ -10,7 +10,7 @@ pub mod sampler;
 
 // Re-export main types
 pub use analysis::aggregate_stats;
-pub use collector::{BasicStats, StatsCollector};
+pub use collector::{BasicStats, SamplingMode, SamplingPolicy, StatsCollector};
 pub use group_collector::GroupStatsCollector;
 pub use sampler::{AdaptiveSampler, AdaptiveSamplerConfig};
 
@@ -21,6 +21,8 @@ pub struct AggregatedStats {
     pub latency_p95: Duration,
     pub latency_p99: Duration,
     pub latency_p999: Duration,
+    pub latency_p9999: Duration,
+    pub latency_p99999: Duration,
     pub mean_latency: Duration,
     pub std_dev: Duration,
     pub confidence_interval: Duration,

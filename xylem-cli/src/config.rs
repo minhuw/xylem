@@ -268,9 +268,6 @@ impl ProfileConfig {
                     group.name
                 );
             }
-            if group.sampling_rate < 0.0 || group.sampling_rate > 1.0 {
-                bail!("Traffic group {} '{}' sampling_rate must be in [0.0, 1.0]", i, group.name);
-            }
         }
 
         // Validate thread assignment
