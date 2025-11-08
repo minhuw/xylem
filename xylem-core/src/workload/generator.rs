@@ -27,7 +27,7 @@ impl Clone for KeyGeneration {
             }
             Self::Random { max, .. } => {
                 // Create new RNG with entropy (cloning doesn't preserve RNG state)
-                Self::Random { max: *max, rng: SmallRng::from_entropy() }
+                Self::Random { max: *max, rng: SmallRng::from_os_rng() }
             }
             Self::RoundRobin { max, current } => Self::RoundRobin { max: *max, current: *current },
             Self::Zipfian(dist) => {
@@ -68,7 +68,7 @@ impl KeyGeneration {
     pub fn random_with_seed(max: u64, seed: Option<u64>) -> Self {
         let rng = match seed {
             Some(s) => SmallRng::seed_from_u64(s),
-            None => SmallRng::from_entropy(),
+            None => SmallRng::from_os_rng(),
         };
         Self::Random { max, rng }
     }
@@ -113,7 +113,7 @@ impl KeyGeneration {
             }
             Self::Random { max, rng } => {
                 // Generate random key in range [0, max)
-                rng.gen_range(0..*max)
+                rng.random_range(0..*max)
             }
             Self::RoundRobin { max, current } => {
                 let key = *current;

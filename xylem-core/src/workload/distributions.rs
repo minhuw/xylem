@@ -83,9 +83,9 @@ impl ZipfianDistribution {
 
         let rng = match seed {
             Some(s) => SmallRng::seed_from_u64(s),
-            None => SmallRng::from_entropy(),
+            None => SmallRng::from_os_rng(),
         };
-        let dist = Zipf::new(n, s)?;
+        let dist = Zipf::new(n as f64, s)?;
 
         Ok(Self { n, s, rng, dist })
     }
@@ -169,7 +169,7 @@ impl ExponentialDistribution {
 
         let rng = match seed {
             Some(s) => SmallRng::seed_from_u64(s),
-            None => SmallRng::from_entropy(),
+            None => SmallRng::from_os_rng(),
         };
         let dist = Exp::new(lambda)?;
 
@@ -249,9 +249,9 @@ impl UniformDistribution {
 
         let rng = match seed {
             Some(s) => SmallRng::seed_from_u64(s),
-            None => SmallRng::from_entropy(),
+            None => SmallRng::from_os_rng(),
         };
-        let dist = Uniform::new(min, max);
+        let dist = Uniform::new(min, max)?;
 
         Ok(Self { min, max, rng, dist })
     }
@@ -322,7 +322,7 @@ impl NormalDistribution {
 
         let rng = match seed {
             Some(s) => SmallRng::seed_from_u64(s),
-            None => SmallRng::from_entropy(),
+            None => SmallRng::from_os_rng(),
         };
         let dist = Normal::new(mean, std_dev)?;
 

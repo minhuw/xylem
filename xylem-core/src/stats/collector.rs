@@ -56,7 +56,7 @@ impl StatsCollector {
             tx_requests: 0,
             rx_requests: 0,
             sample_count: 0,
-            rng: SmallRng::from_entropy(),
+            rng: SmallRng::from_os_rng(),
             adaptive_sampler: None,
         }
     }
@@ -76,7 +76,7 @@ impl StatsCollector {
             tx_requests: 0,
             rx_requests: 0,
             sample_count: 0,
-            rng: SmallRng::from_entropy(),
+            rng: SmallRng::from_os_rng(),
             adaptive_sampler: Some(AdaptiveSampler::new(adaptive_config)),
         }
     }
@@ -102,7 +102,7 @@ impl StatsCollector {
             false
         } else {
             // Random sampling based on sampling_rate
-            self.rng.gen::<f64>() < self.sampling_rate
+            self.rng.random::<f64>() < self.sampling_rate
         };
 
         if should_sample && self.samples.len() < self.max_samples {
@@ -197,7 +197,7 @@ impl Default for StatsCollector {
             tx_requests: 0,
             rx_requests: 0,
             sample_count: 0,
-            rng: SmallRng::from_entropy(),
+            rng: SmallRng::from_os_rng(),
             adaptive_sampler: None,
         }
     }
