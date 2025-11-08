@@ -15,9 +15,8 @@ pub struct ProfileConfig {
     pub experiment: ExperimentConfig,
     pub target: TargetConfig,
     pub workload: WorkloadConfig,
-    pub connections: ConnectionConfig,
-    pub threading: ThreadingConfig,
-    pub statistics: StatisticsConfig,
+    /// Traffic groups configuration
+    pub traffic_groups: Vec<xylem_core::traffic_group::TrafficGroupConfig>,
     pub output: OutputConfig,
 }
 
@@ -138,103 +137,6 @@ pub struct StepConfig {
     pub rate: f64,
 }
 
-/// Connection and policy configuration
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ConnectionConfig {
-    /// Per-connection traffic policy (MICRO level)
-    pub policy: PolicyConfig,
-}
-
-/// Policy scheduler configuration (MICRO level - per-connection timing)
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "scheduler", rename_all = "lowercase")]
-pub enum PolicyConfig {
-    /// All connections use the same policy
-    Uniform {
-        #[serde(flatten)]
-        policy: PolicyType,
-    },
-    /// Explicit per-connection policy assignment
-    #[serde(rename = "per-connection")]
-    PerConnection { assignments: Vec<PolicyType> },
-    /// Custom factory function (percentage-based)
-    Factory { assignments: Vec<PolicyAssignment> },
-}
-
-/// Individual policy type
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-pub enum PolicyType {
-    #[serde(rename = "closed-loop")]
-    ClosedLoop,
-    #[serde(rename = "fixed-rate")]
-    FixedRate {
-        rate: f64,
-    },
-    Poisson {
-        rate: f64,
-    },
-    Adaptive {
-        initial_rate: f64,
-    },
-}
-
-/// Policy assignment with percentage (for factory scheduler)
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct PolicyAssignment {
-    /// Percentage of connections (0-100)
-    pub percentage: u8,
-    #[serde(flatten)]
-    pub policy: PolicyType,
-}
-
-/// Threading configuration
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ThreadingConfig {
-    /// Number of worker threads
-    pub threads: usize,
-    /// Connections per thread
-    pub connections_per_thread: usize,
-    /// Maximum pending requests per connection
-    pub max_pending_per_connection: usize,
-    /// Pin worker threads to CPU cores
-    #[serde(default)]
-    pub pin_cpus: bool,
-    /// Starting CPU core offset for pinning
-    #[serde(default)]
-    pub cpu_start: usize,
-}
-
-/// Statistics configuration
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct StatisticsConfig {
-    /// Sample all requests (false = probabilistic sampling)
-    #[serde(default = "default_true")]
-    pub sample_all: bool,
-    /// Sampling rate (0.0-1.0)
-    #[serde(default = "default_sampling_rate")]
-    pub sampling_rate: f64,
-    /// Percentiles to calculate
-    #[serde(default = "default_percentiles")]
-    pub percentiles: Vec<f64>,
-    /// Confidence interval level (e.g., 0.95 for 95% CI)
-    #[serde(default = "default_confidence")]
-    pub confidence_level: f64,
-}
-
-fn default_true() -> bool {
-    true
-}
-fn default_sampling_rate() -> f64 {
-    1.0
-}
-fn default_percentiles() -> Vec<f64> {
-    vec![50.0, 95.0, 99.0, 99.9]
-}
-fn default_confidence() -> f64 {
-    0.95
-}
-
 /// Output configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OutputConfig {
@@ -339,32 +241,34 @@ impl ProfileConfig {
         self.validate_keys()?;
         self.validate_pattern()?;
 
-        // Connection validation
-        self.validate_policy()?;
-
-        // Threading validation
-        if self.threading.threads == 0 {
-            bail!("threads must be > 0");
-        }
-        if self.threading.connections_per_thread == 0 {
-            bail!("connections_per_thread must be > 0");
-        }
-        if self.threading.max_pending_per_connection == 0 {
-            bail!("max_pending_per_connection must be > 0");
+        // Traffic groups validation
+        if self.traffic_groups.is_empty() {
+            bail!("At least one traffic group must be defined");
         }
 
-        // Statistics validation
-        if self.statistics.sampling_rate < 0.0 || self.statistics.sampling_rate > 1.0 {
-            bail!("sampling_rate must be in range [0.0, 1.0]");
-        }
-        for p in &self.statistics.percentiles {
-            if *p < 0.0 || *p > 100.0 {
-                bail!("Percentile {} must be in range [0.0, 100.0]", p);
+        for (i, group) in self.traffic_groups.iter().enumerate() {
+            if group.threads.is_empty() {
+                bail!("Traffic group {} '{}' must have at least one thread", i, group.name);
+            }
+            if group.connections_per_thread == 0 {
+                bail!("Traffic group {} '{}' connections_per_thread must be > 0", i, group.name);
+            }
+            if group.max_pending_per_connection == 0 {
+                bail!(
+                    "Traffic group {} '{}' max_pending_per_connection must be > 0",
+                    i,
+                    group.name
+                );
+            }
+            if group.sampling_rate < 0.0 || group.sampling_rate > 1.0 {
+                bail!("Traffic group {} '{}' sampling_rate must be in [0.0, 1.0]", i, group.name);
             }
         }
-        if self.statistics.confidence_level < 0.0 || self.statistics.confidence_level > 1.0 {
-            bail!("confidence_level must be in range [0.0, 1.0]");
-        }
+
+        // Validate thread assignment
+        let assignment =
+            xylem_core::traffic_group::ThreadGroupAssignment::from_configs(&self.traffic_groups);
+        assignment.validate()?;
 
         // Output validation
         let valid_formats = ["json", "csv"];
@@ -495,66 +399,6 @@ impl ProfileConfig {
         }
         Ok(())
     }
-
-    fn validate_policy(&self) -> Result<()> {
-        match &self.connections.policy {
-            PolicyConfig::Uniform { policy } => {
-                Self::validate_policy_type(policy)?;
-            }
-            PolicyConfig::PerConnection { assignments } => {
-                if assignments.is_empty() {
-                    bail!("PerConnection policy must have at least one assignment");
-                }
-                for (i, policy) in assignments.iter().enumerate() {
-                    Self::validate_policy_type(policy)
-                        .with_context(|| format!("Policy assignment {}", i))?;
-                }
-            }
-            PolicyConfig::Factory { assignments } => {
-                if assignments.is_empty() {
-                    bail!("Factory policy must have at least one assignment");
-                }
-
-                let total_percentage: u32 = assignments.iter().map(|a| a.percentage as u32).sum();
-                if total_percentage != 100 {
-                    bail!("Factory policy percentages must sum to 100, got {}", total_percentage);
-                }
-
-                for (i, assignment) in assignments.iter().enumerate() {
-                    if assignment.percentage == 0 {
-                        bail!("Factory assignment {} percentage must be > 0", i);
-                    }
-                    Self::validate_policy_type(&assignment.policy)
-                        .with_context(|| format!("Factory assignment {}", i))?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_policy_type(policy: &PolicyType) -> Result<()> {
-        match policy {
-            PolicyType::ClosedLoop => Ok(()),
-            PolicyType::FixedRate { rate } => {
-                if *rate <= 0.0 {
-                    bail!("FixedRate rate must be > 0");
-                }
-                Ok(())
-            }
-            PolicyType::Poisson { rate } => {
-                if *rate <= 0.0 {
-                    bail!("Poisson rate must be > 0");
-                }
-                Ok(())
-            }
-            PolicyType::Adaptive { initial_rate } => {
-                if *initial_rate <= 0.0 {
-                    bail!("Adaptive initial_rate must be > 0");
-                }
-                Ok(())
-            }
-        }
-    }
 }
 
 // Helper methods to convert config types to runtime types
@@ -585,43 +429,6 @@ impl KeysConfig {
             Self::Zipfian { n, theta, .. } => {
                 let seed = master_seed.map(|s| derive_seed(s, components::ZIPFIAN_DIST));
                 KeyGeneration::zipfian_with_seed(*n, *theta, seed)
-            }
-        }
-    }
-}
-
-impl LoadPatternConfig {
-    pub fn to_rate_control(&self) -> xylem_core::workload::RateControl {
-        use xylem_core::workload::RateControl;
-
-        // For now, we only support Constant rate
-        // Full load pattern support requires scheduler integration
-        match self {
-            Self::Constant { rate } => RateControl::Fixed { rate: *rate },
-            Self::Ramp { start_rate, .. } => {
-                // TODO: Implement ramping in scheduler
-                RateControl::Fixed { rate: *start_rate }
-            }
-            Self::Spike { normal_rate, .. } => {
-                // TODO: Implement spike pattern in scheduler
-                RateControl::Fixed { rate: *normal_rate }
-            }
-            Self::Sinusoidal { base_rate, .. } => {
-                // TODO: Implement sinusoidal pattern in scheduler
-                RateControl::Fixed { rate: *base_rate }
-            }
-            Self::Step { steps } => {
-                // TODO: Implement step pattern in scheduler
-                // For now, use first step's rate
-                if let Some(first_step) = steps.first() {
-                    RateControl::Fixed { rate: first_step.rate }
-                } else {
-                    RateControl::ClosedLoop
-                }
-            }
-            Self::Sawtooth { min_rate, .. } => {
-                // TODO: Implement sawtooth pattern in scheduler
-                RateControl::Fixed { rate: *min_rate }
             }
         }
     }

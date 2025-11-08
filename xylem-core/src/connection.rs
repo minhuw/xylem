@@ -44,6 +44,8 @@ pub struct Connection<T: Transport, ReqId: Eq + Hash + Clone> {
     /// when it should send its next request. The scheduler will pick whichever
     /// connection's next request is due soonest.
     policy: Box<dyn Policy>,
+    /// Traffic group ID this connection belongs to
+    group_id: usize,
 }
 
 impl<T: Transport, ReqId: Eq + Hash + Clone + std::fmt::Debug> Connection<T, ReqId> {
@@ -55,12 +57,14 @@ impl<T: Transport, ReqId: Eq + Hash + Clone + std::fmt::Debug> Connection<T, Req
     /// - `target`: Target server address
     /// - `max_pending_requests`: Maximum number of pending requests allowed
     /// - `policy`: Traffic policy that controls when this connection should send
+    /// - `group_id`: Traffic group ID this connection belongs to
     pub fn new(
         mut transport: T,
         idx: usize,
         target: SocketAddr,
         max_pending_requests: usize,
         policy: Box<dyn Policy>,
+        group_id: usize,
     ) -> Result<Self> {
         transport.connect(&target)?;
 
@@ -74,6 +78,7 @@ impl<T: Transport, ReqId: Eq + Hash + Clone + std::fmt::Debug> Connection<T, Req
             buffer_pos: 0,
             closed: false,
             policy,
+            group_id,
         })
     }
 
@@ -225,12 +230,19 @@ impl<T: Transport, ReqId: Eq + Hash + Clone + std::fmt::Debug> Connection<T, Req
     pub fn policy_name(&self) -> &'static str {
         self.policy.name()
     }
+
+    /// Get the traffic group ID
+    pub fn group_id(&self) -> usize {
+        self.group_id
+    }
 }
 
 /// Connection pool managing multiple connections with per-connection policies
 pub struct ConnectionPool<T: Transport, ReqId: Eq + Hash + Clone> {
     /// All connections in the pool
     connections: Vec<Connection<T, ReqId>>,
+    /// Group ID this pool belongs to
+    group_id: usize,
 }
 
 impl<T: Transport, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionPool<T, ReqId> {
@@ -245,6 +257,7 @@ impl<T: Transport, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionPool<T,
     /// - `conn_count`: Number of connections to create
     /// - `max_pending_per_conn`: Maximum pending requests per connection
     /// - `policy_scheduler`: Scheduler that assigns policies to connections
+    /// - `group_id`: Traffic group ID for all connections in this pool
     ///
     /// # Example
     ///
@@ -263,7 +276,8 @@ impl<T: Transport, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionPool<T,
     ///     target,
     ///     100,  // 100 connections
     ///     10,   // max 10 pending per connection
-    ///     Box::new(policy_scheduler)
+    ///     Box::new(policy_scheduler),
+    ///     0    // group_id
     /// )?;
     /// # Ok(())
     /// # }
@@ -274,17 +288,19 @@ impl<T: Transport, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionPool<T,
         conn_count: usize,
         max_pending_per_conn: usize,
         mut policy_scheduler: Box<dyn crate::scheduler::PolicyScheduler>,
+        group_id: usize,
     ) -> Result<Self> {
         let mut connections = Vec::with_capacity(conn_count);
 
         for idx in 0..conn_count {
             let transport = transport_factory();
             let policy = policy_scheduler.assign_policy(idx);
-            let conn = Connection::new(transport, idx, target, max_pending_per_conn, policy)?;
+            let conn =
+                Connection::new(transport, idx, target, max_pending_per_conn, policy, group_id)?;
             connections.push(conn);
         }
 
-        Ok(Self { connections })
+        Ok(Self { connections, group_id })
     }
 
     /// Pick the next ready connection using temporal scheduling
@@ -336,5 +352,10 @@ impl<T: Transport, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionPool<T,
             conn.close()?;
         }
         Ok(())
+    }
+
+    /// Get the group ID for this pool
+    pub fn group_id(&self) -> usize {
+        self.group_id
     }
 }

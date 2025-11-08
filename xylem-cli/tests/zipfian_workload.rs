@@ -78,20 +78,16 @@ value_size = 64
 type = \"constant\"
 rate = 1000.0
 
-[connections]
-[connections.policy]
-scheduler = \"uniform\"
-type = \"fixed-rate\"
-rate = 1000.0
-
-[threading]
-threads = 1
+[[traffic_groups]]
+name = \"main\"
+threads = [0]
 connections_per_thread = 1
 max_pending_per_connection = 1
+sampling_rate = 1.0
 
-[statistics]
-percentiles = [50, 95, 99]
-confidence_level = 0.95
+[traffic_groups.policy]
+type = \"fixed-rate\"
+rate = 1000.0
 
 [output]
 format = \"json\"

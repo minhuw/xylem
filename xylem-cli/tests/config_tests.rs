@@ -18,14 +18,11 @@ fn test_load_redis_zipfian_profile() {
     assert_eq!(config.target.protocol, "redis");
     assert_eq!(config.target.transport, "tcp");
 
-    // Verify threading
-    assert_eq!(config.threading.threads, 4);
-    assert_eq!(config.threading.connections_per_thread, 25);
-    assert!(config.threading.pin_cpus);
-
-    // Verify statistics
-    assert_eq!(config.statistics.percentiles, vec![50.0, 90.0, 95.0, 99.0, 99.9]);
-    assert_eq!(config.statistics.confidence_level, 0.95);
+    // Verify traffic groups
+    assert_eq!(config.traffic_groups.len(), 1);
+    assert_eq!(config.traffic_groups[0].name, "main");
+    assert_eq!(config.traffic_groups[0].threads, vec![0, 1, 2, 3]);
+    assert_eq!(config.traffic_groups[0].connections_per_thread, 25);
 }
 
 #[test]
@@ -41,10 +38,10 @@ fn test_load_memcached_ramp_profile() {
     // Verify target
     assert_eq!(config.target.protocol, "memcached-binary");
 
-    // Verify threading
-    assert_eq!(config.threading.threads, 8);
-
-    // Verify connections
+    // Verify traffic groups
+    assert_eq!(config.traffic_groups.len(), 1);
+    let threads: Vec<usize> = (0..8).collect();
+    assert_eq!(config.traffic_groups[0].threads, threads);
 }
 
 #[test]
@@ -60,14 +57,10 @@ fn test_load_http_spike_profile() {
     // Verify target
     assert_eq!(config.target.protocol, "http");
 
-    // Verify threading
-    assert_eq!(config.threading.threads, 16);
-
-    // Verify connections
-
-    // Verify statistics (more percentiles for spike test)
-    assert_eq!(config.statistics.percentiles.len(), 7);
-    assert_eq!(config.statistics.confidence_level, 0.99);
+    // Verify traffic groups
+    assert_eq!(config.traffic_groups.len(), 1);
+    let threads: Vec<usize> = (0..16).collect();
+    assert_eq!(config.traffic_groups[0].threads, threads);
 }
 
 #[test]
@@ -79,10 +72,10 @@ fn test_load_poisson_heterogeneous_profile() {
     assert_eq!(config.experiment.name, "poisson-heterogeneous");
     assert_eq!(config.experiment.seed, Some(7777));
 
-    // Verify connections
-
-    // Verify threading
-    assert_eq!(config.threading.threads, 8);
+    // Verify traffic groups (this config has 2 groups: slow and fast)
+    assert_eq!(config.traffic_groups.len(), 2);
+    assert_eq!(config.traffic_groups[0].name, "slow-poisson");
+    assert_eq!(config.traffic_groups[1].name, "fast-poisson");
 }
 
 #[test]
@@ -98,10 +91,43 @@ fn test_load_closed_loop_profile() {
     // Verify target
     assert_eq!(config.target.protocol, "memcached-binary");
 
-    // Verify connections (many for max throughput)
+    // Verify traffic groups
+    assert_eq!(config.traffic_groups.len(), 1);
+    let threads: Vec<usize> = (0..16).collect();
+    assert_eq!(config.traffic_groups[0].threads, threads);
+}
 
-    // Verify threading (maximize CPU)
-    assert_eq!(config.threading.threads, 16);
+#[test]
+fn test_load_latency_agent_profile() {
+    let config = ProfileConfig::from_file("profiles/latency-agent.toml")
+        .expect("Failed to load latency-agent profile");
+
+    // Verify experiment
+    assert_eq!(config.experiment.name, "latency-agent-separation");
+    assert_eq!(config.experiment.seed, Some(42));
+    assert_eq!(config.experiment.duration, Duration::from_secs(10));
+
+    // Verify target
+    assert_eq!(config.target.protocol, "redis");
+
+    // Verify traffic groups - should have 2 groups (latency + throughput agents)
+    assert_eq!(config.traffic_groups.len(), 2);
+
+    // Verify latency agent configuration
+    let latency_agent = &config.traffic_groups[0];
+    assert_eq!(latency_agent.name, "latency-agent");
+    assert_eq!(latency_agent.threads, vec![0, 1]);
+    assert_eq!(latency_agent.connections_per_thread, 10);
+    assert_eq!(latency_agent.max_pending_per_connection, 1);
+    assert_eq!(latency_agent.sampling_rate, 1.0);
+
+    // Verify throughput agent configuration
+    let throughput_agent = &config.traffic_groups[1];
+    assert_eq!(throughput_agent.name, "throughput-agent");
+    assert_eq!(throughput_agent.threads, vec![2, 3, 4, 5, 6, 7]);
+    assert_eq!(throughput_agent.connections_per_thread, 25);
+    assert_eq!(throughput_agent.max_pending_per_connection, 32);
+    assert_eq!(throughput_agent.sampling_rate, 0.01);
 }
 
 #[test]
@@ -150,21 +176,15 @@ value_size = 64
 type = "constant"
 rate = 1000.0
 
-[connections]
-[connections.policy]
-scheduler = "uniform"
-type = "closed-loop"
-
-[threading]
-threads = 1
+[[traffic_groups]]
+name = "main"
+threads = [0]
 connections_per_thread = 1
 max_pending_per_connection = 1
-pin_cpus = false
-cpu_start = 0
+sampling_rate = 1.0
 
-[statistics]
-percentiles = [50, 99]
-confidence_level = 0.95
+[traffic_groups.policy]
+type = "closed-loop"
 
 [output]
 format = "json"
@@ -211,21 +231,15 @@ value_size = 64
 type = "constant"
 rate = 1000.0
 
-[connections]
-[connections.policy]
-scheduler = "uniform"
-type = "closed-loop"
-
-[threading]
-threads = 1
+[[traffic_groups]]
+name = "main"
+threads = [0]
 connections_per_thread = 1
 max_pending_per_connection = 1
-pin_cpus = false
-cpu_start = 0
+sampling_rate = 1.0
 
-[statistics]
-percentiles = [50, 99]
-confidence_level = 0.95
+[traffic_groups.policy]
+type = "closed-loop"
 
 [output]
 format = "json"
@@ -345,19 +359,15 @@ value_size = 64
 type = "constant"
 rate = 1000.0
 
-[connections]
-[connections.policy]
-scheduler = "uniform"
-type = "closed-loop"
-
-[threading]
-threads = 1
+[[traffic_groups]]
+name = "main"
+threads = [0]
 connections_per_thread = 1
 max_pending_per_connection = 1
+sampling_rate = 1.0
 
-[statistics]
-percentiles = [50, 99]
-confidence_level = 0.95
+[traffic_groups.policy]
+type = "closed-loop"
 
 [output]
 format = "json"
@@ -450,19 +460,15 @@ value_size = 64
 type = "constant"
 rate = 1000.0
 
-[connections]
-[connections.policy]
-scheduler = "uniform"
-type = "closed-loop"
-
-[threading]
-threads = 1
+[[traffic_groups]]
+name = "main"
+threads = [0]
 connections_per_thread = 1
 max_pending_per_connection = 1
+sampling_rate = 1.0
 
-[statistics]
-percentiles = [50, 99]
-confidence_level = 0.95
+[traffic_groups.policy]
+type = "closed-loop"
 
 [output]
 format = "json"
@@ -502,19 +508,15 @@ value_size = 64
 type = "constant"
 rate = 1000.0
 
-[connections]
-[connections.policy]
-scheduler = "uniform"
-type = "closed-loop"
-
-[threading]
-threads = 1
+[[traffic_groups]]
+name = "main"
+threads = [0]
 connections_per_thread = 1
 max_pending_per_connection = 1
+sampling_rate = 1.0
 
-[statistics]
-percentiles = [50, 99]
-confidence_level = 0.95
+[traffic_groups.policy]
+type = "closed-loop"
 
 [output]
 format = "json"
@@ -553,19 +555,15 @@ value_size = 64
 type = "constant"
 rate = 1000.0
 
-[connections]
-[connections.policy]
-scheduler = "uniform"
-type = "closed-loop"
-
-[threading]
-threads = 1
+[[traffic_groups]]
+name = "main"
+threads = [0]
 connections_per_thread = 1
 max_pending_per_connection = 1
+sampling_rate = 1.0
 
-[statistics]
-percentiles = [50, 99]
-confidence_level = 0.95
+[traffic_groups.policy]
+type = "closed-loop"
 
 [output]
 format = "json"
@@ -603,19 +601,15 @@ value_size = 64
 type = "constant"
 rate = 1000.0
 
-[connections]
-[connections.policy]
-scheduler = "uniform"
-type = "closed-loop"
-
-[threading]
-threads = 1
+[[traffic_groups]]
+name = "main"
+threads = [0]
 connections_per_thread = 1
 max_pending_per_connection = 1
+sampling_rate = 1.0
 
-[statistics]
-percentiles = [50, 99]
-confidence_level = 0.95
+[traffic_groups.policy]
+type = "closed-loop"
 
 [output]
 format = "json"

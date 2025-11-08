@@ -21,33 +21,31 @@ value_size = 128
 
 [workload.pattern]
 type = "constant"
-rate = 50000.0      # Total: ~50K req/s (50 slow * 1 + 950 fast * 100 ≈ 95K theoretical)
+rate = 50000.0      # Total: ~50K req/s
 
-[connections]
-[connections.policy]
-scheduler = "factory"
-# 10% slow connections: 1 req/s mean
-[[connections.policy.assignments]]
-percentage = 10
-type = "poisson"
-rate = 1.0
-
-# 90% fast connections: 100 req/s mean
-[[connections.policy.assignments]]
-percentage = 90
-type = "poisson"
-rate = 100.0
-
-[threading]
-threads = 8
-connections_per_thread = 1
+# Traffic group 1: Slow connections (10% - 1 thread = ~12.5% of 8 threads)
+[[traffic_groups]]
+name = "slow-poisson"
+threads = [0]  # 1 thread for slow connections
+connections_per_thread = 50  # 50 slow connections
 max_pending_per_connection = 1
-pin_cpus = true
-cpu_start = 0
+sampling_rate = 1.0  # 100% sampling
 
-[statistics]
-percentiles = [50, 75, 90, 95, 99, 99.9]
-confidence_level = 0.95
+[traffic_groups.policy]
+type = "poisson"
+rate = 1.0  # 1 req/s mean per connection
+
+# Traffic group 2: Fast connections (90% - 7 threads = ~87.5% of 8 threads)
+[[traffic_groups]]
+name = "fast-poisson"
+threads = [1, 2, 3, 4, 5, 6, 7]  # 7 threads for fast connections
+connections_per_thread = 136  # ~950 total fast connections (7 * 136)
+max_pending_per_connection = 1
+sampling_rate = 1.0  # 100% sampling
+
+[traffic_groups.policy]
+type = "poisson"
+rate = 100.0  # 100 req/s mean per connection
 
 [output]
 format = "human"

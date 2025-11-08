@@ -1,0 +1,100 @@
+# Lancet-style Throughput/Latency Agent Separation using Traffic Groups
+#
+# This demonstrates how xylem's traffic groups can mimic Lancet's agent architecture:
+# - Latency Agent: Low rate (2K QPS), 100% sampling, single outstanding request
+#   Purpose: Accurate latency measurement without queueing effects
+# - Throughput Agent: High rate (98K QPS), 1% sampling, high pipelining
+#   Purpose: Generate realistic load while minimizing memory overhead
+#
+# Total system load: ~100K QPS
+# Latency measurements: From dedicated low-rate agent only
+
+[experiment]
+name = "latency-agent-separation"
+description = "Separate throughput and latency measurement agents"
+duration = "10s"
+seed = 42
+
+[target]
+address = "127.0.0.1:6379"
+protocol = "redis"
+transport = "tcp"
+
+[workload.keys]
+strategy = "zipfian"
+n = 1000000      # 1M key space
+theta = 0.99     # High skew (realistic cache workload)
+value_size = 64
+
+[workload.pattern]
+type = "constant"
+rate = 100000.0  # Total target: 100K QPS
+
+# ============================================================================
+# LATENCY AGENT (like Lancet's latency agent)
+# ============================================================================
+# - Low rate: 2K QPS total (1K QPS per thread)
+# - 100% sampling: Capture every single request
+# - max_pending = 1: No pipelining, accurate latency measurement
+# - Threads: 0-1 (2 threads dedicated to latency measurement)
+#
+# This agent measures latency WITHOUT being affected by queueing delays
+# from high throughput generation.
+[[traffic_groups]]
+name = "latency-agent"
+threads = [0, 1]
+connections_per_thread = 10      # 20 total connections
+max_pending_per_connection = 1   # Closed-loop: one request at a time
+sampling_rate = 1.0              # 100% sampling
+
+[traffic_groups.policy]
+type = "poisson"
+rate = 100.0  # 100 req/s per connection × 20 connections = 2K QPS total
+
+# ============================================================================
+# THROUGHPUT AGENT (like Lancet's throughput agent)
+# ============================================================================
+# - High rate: 98K QPS (closed-loop max throughput)
+# - 1% sampling: Reduce memory overhead while still tracking throughput
+# - max_pending = 32: High pipelining for maximum throughput
+# - Threads: 2-7 (6 threads dedicated to throughput generation)
+#
+# This agent generates realistic load on the system without trying to
+# measure precise latency (which would be distorted by queueing anyway).
+[[traffic_groups]]
+name = "throughput-agent"
+threads = [2, 3, 4, 5, 6, 7]
+connections_per_thread = 25      # 150 total connections
+max_pending_per_connection = 32  # High pipelining for max throughput
+sampling_rate = 0.01             # 1% sampling (low memory overhead)
+
+[traffic_groups.policy]
+type = "closed-loop"  # Send as fast as possible
+
+[output]
+format = "json"
+file = "/tmp/latency-agent-results.json"
+
+# Expected behavior:
+# ==================
+# Latency Agent:
+#   - Generates: ~2,000 req/s
+#   - Samples: ~2,000 samples (100%)
+#   - Latency: Accurate p99 measurements (no queueing delays)
+#
+# Throughput Agent:
+#   - Generates: ~98,000 req/s
+#   - Samples: ~980 samples (1%)
+#   - Purpose: Load generation, not latency measurement
+#
+# Total System:
+#   - Load: ~100,000 req/s on Redis
+#   - Latency metrics: Dominated by latency agent (more samples, more weight)
+#   - Realistic: Throughput agent creates realistic server load
+#
+# Why this is better than single-pool measurement:
+# ================================================
+# 1. Latency agent measures true service time (no queueing)
+# 2. Throughput agent doesn't waste memory on samples
+# 3. Can independently tune each agent's behavior
+# 4. Mimics distributed Lancet setup but on single machine

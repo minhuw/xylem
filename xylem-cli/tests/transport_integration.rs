@@ -85,6 +85,7 @@ fn test_udp_transport_echo() {
         2,  // 2 connections
         10, // 10 max pending per connection
         policy_scheduler,
+        0, // group_id
     );
 
     assert!(pool.is_ok(), "Failed to create UDP connection pool");
@@ -189,7 +190,7 @@ fn test_udp_xylem_echo_protocol() {
     let policy_scheduler = Box::new(UniformPolicyScheduler::closed_loop());
 
     let pool: Result<ConnectionPool<UdpTransport, u64>, _> =
-        ConnectionPool::new(UdpTransport::new, addr, 1, 5, policy_scheduler);
+        ConnectionPool::new(UdpTransport::new, addr, 1, 5, policy_scheduler, 0);
 
     assert!(pool.is_ok(), "Failed to create connection pool");
 

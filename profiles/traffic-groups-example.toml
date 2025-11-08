@@ -1,0 +1,65 @@
+# Traffic Groups Example - Mimicking Lancet's Throughput/Latency Agent Separation
+#
+# This configuration demonstrates the traffic groups feature, which allows
+# multiple connection groups with independent policies, sampling rates, and
+# thread assignments.
+#
+# This example creates:
+# - Latency measurement group: 100% sampling, low rate, precise measurements
+# - Throughput generation group: 1% sampling, high rate, max load
+
+[experiment]
+name = "traffic-groups-redis-demo"
+description = "Demonstrate traffic groups with separate latency and throughput agents"
+duration = "60s"
+seed = 42  # For reproducibility
+
+[target]
+address = "127.0.0.1:6379"
+protocol = "redis"
+transport = "tcp"
+
+[workload.keys]
+strategy = "zipfian"
+n = 1000000
+theta = 0.99
+value_size = 64
+
+[workload.pattern]
+type = "constant"
+rate = 100000.0  # Total target rate across all groups
+
+# TRAFFIC GROUP 1: Latency Measurement (like Lancet's latency agent)
+[[traffic_groups]]
+name = "latency-measurement"
+threads = [0, 1]  # Explicit thread assignment
+connections_per_thread = 5
+max_pending_per_connection = 1  # Single outstanding request for accurate latency
+sampling_rate = 1.0  # 100% sampling - capture every request
+
+[traffic_groups.policy]
+type = "poisson"
+rate = 2000.0  # Low rate: 2K req/s for latency measurement
+
+# TRAFFIC GROUP 2: Throughput Generation (like Lancet's throughput agent)
+[[traffic_groups]]
+name = "throughput-generation"
+threads = [2, 3, 4, 5]  # More threads for high throughput
+connections_per_thread = 25
+max_pending_per_connection = 32  # High pipelining for max throughput
+sampling_rate = 0.01  # 1% sampling - reduce memory overhead
+
+[traffic_groups.policy]
+type = "closed-loop"  # Max throughput mode
+
+[output]
+format = "json"
+file = "results/traffic-groups-demo.json"
+
+# Expected behavior:
+# - Group "latency-measurement": Precise P99 latency measurements at 2K QPS
+# - Group "throughput-generation": High load generation at ~98K QPS
+# - Output will show separate statistics for each group
+# - Total system load: ~100K QPS
+# - Thread 0-1: Latency measurements
+# - Thread 2-5: Throughput generation

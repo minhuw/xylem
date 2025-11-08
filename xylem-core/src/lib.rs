@@ -12,6 +12,7 @@ pub mod seed;
 pub mod stats;
 pub mod threading;
 pub mod timing;
+pub mod traffic_group;
 pub mod workload;
 
 // Re-export transport types from xylem-transport

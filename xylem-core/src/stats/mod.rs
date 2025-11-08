@@ -5,11 +5,13 @@ use std::time::Duration;
 
 pub mod analysis;
 pub mod collector;
+pub mod group_collector;
 pub mod sampler;
 
 // Re-export main types
 pub use analysis::aggregate_stats;
 pub use collector::{BasicStats, StatsCollector};
+pub use group_collector::GroupStatsCollector;
 pub use sampler::{AdaptiveSampler, AdaptiveSamplerConfig};
 
 /// Aggregated statistics

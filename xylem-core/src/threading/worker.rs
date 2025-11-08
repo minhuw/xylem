@@ -87,6 +87,7 @@ impl<T: Transport, P: Protocol> Worker<T, P> {
             config.conn_count,
             config.max_pending_per_conn,
             policy_scheduler,
+            0, // Default group_id for legacy single-pool workers
         )?;
 
         Ok(Self {

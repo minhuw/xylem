@@ -131,8 +131,20 @@ fn main() -> anyhow::Result<()> {
 
     tracing::info!("Target: {} ({})", target_address, config.target.protocol);
     tracing::info!("Transport: {}", config.target.transport);
-    tracing::info!("Threads: {}", config.threading.threads);
-    tracing::info!("Connections per thread: {}", config.threading.connections_per_thread);
+
+    // Display traffic groups information
+    tracing::info!("Traffic groups: {}", config.traffic_groups.len());
+    for (i, group) in config.traffic_groups.iter().enumerate() {
+        tracing::info!(
+            "  Group {}: '{}' - threads: {:?}, conns/thread: {}, sampling: {}",
+            i,
+            group.name,
+            group.threads,
+            group.connections_per_thread,
+            group.sampling_rate
+        );
+    }
+
     tracing::info!("Key strategy: {:?}", config.workload.keys);
     tracing::info!("Load pattern: {:?}", config.workload.pattern);
     tracing::info!("================================");
@@ -141,23 +153,30 @@ fn main() -> anyhow::Result<()> {
     let target_addr: std::net::SocketAddr = target_address.parse()?;
     let duration = config.experiment.duration;
 
-    // Configure CPU pinning
-    let cpu_pinning = if config.threading.pin_cpus {
-        if config.threading.cpu_start > 0 {
-            tracing::info!("CPU pinning enabled with offset {}", config.threading.cpu_start);
-            CpuPinning::Offset(config.threading.cpu_start)
+    // Extract thread assignment from traffic groups
+    let thread_assignment =
+        xylem_core::traffic_group::ThreadGroupAssignment::from_configs(&config.traffic_groups);
+    let thread_ids = thread_assignment.thread_ids();
+    let num_threads = thread_ids.len();
+
+    // Configure CPU pinning based on thread IDs
+    let cpu_pinning = if thread_ids.is_empty() {
+        CpuPinning::None
+    } else {
+        let min_thread_id = *thread_ids.iter().min().unwrap();
+        if min_thread_id > 0 {
+            tracing::info!("CPU pinning enabled with offset {}", min_thread_id);
+            CpuPinning::Offset(min_thread_id)
         } else {
             tracing::info!("CPU pinning enabled (auto mode)");
             CpuPinning::Auto
         }
-    } else {
-        CpuPinning::None
     };
 
     // Validate CPU pinning configuration
-    if config.threading.pin_cpus {
+    if let CpuPinning::Offset(offset) = cpu_pinning {
         if let Some(core_count) = xylem_core::threading::get_core_count() {
-            let max_core_needed = config.threading.cpu_start + config.threading.threads - 1;
+            let max_core_needed = offset + num_threads - 1;
             if max_core_needed >= core_count {
                 tracing::warn!(
                     "CPU pinning may fail: need {} cores but only {} available",
@@ -173,10 +192,6 @@ fn main() -> anyhow::Result<()> {
     // Create key generation strategy with seed support
     let key_gen = config.workload.keys.to_key_generation(config.experiment.seed)?;
 
-    // Create rate control from load pattern
-    // NOTE: For now, we'll use constant rate. Full load pattern support requires scheduler integration.
-    let rate_control = config.workload.pattern.to_rate_control();
-
     // Get value size from keys config
     let value_size = config.workload.keys.value_size();
 
@@ -188,19 +203,49 @@ fn main() -> anyhow::Result<()> {
     // Helper macro to run workers for a specific protocol
     macro_rules! run_protocol {
         ($protocol_expr:expr) => {{
-            let runtime =
-                ThreadingRuntime::with_cpu_pinning(config.threading.threads, cpu_pinning.clone());
+            let runtime = ThreadingRuntime::with_cpu_pinning(num_threads, cpu_pinning.clone());
 
-            // Calculate per-thread rate if rate limiting is enabled
-            let thread_rate_control = match rate_control {
-                RateControl::Fixed { rate } => RateControl::Fixed {
-                    rate: rate / config.threading.threads as f64,
-                },
-                RateControl::ClosedLoop => RateControl::ClosedLoop,
-            };
+            // For now, use a simplified approach: assume one group per thread
+            // This works for most cases and we can enhance later
+            let results = runtime.run_workers(move |thread_idx| {
+                // Find which traffic group this thread belongs to
+                let groups_for_thread =
+                    thread_assignment.get_groups_for_thread(thread_idx).ok_or_else(|| {
+                        anyhow::anyhow!("No groups assigned to thread {}", thread_idx)
+                    })?;
 
-            let results = runtime.run_workers(move |_thread_id| {
+                // For simplicity, if a thread has multiple groups, we'll just use the first one
+                // TODO: Support multiple groups per thread in the future
+                let (group_id, group_meta) = groups_for_thread
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("No group assigned to thread {}", thread_idx))?;
+
+                let group_config = &config.traffic_groups[*group_id];
+
                 let protocol = ProtocolAdapter::new($protocol_expr);
+
+                // Calculate per-thread rate based on group policy
+                let thread_rate_control = match &group_config.policy {
+                    xylem_core::traffic_group::PolicyConfig::ClosedLoop => RateControl::ClosedLoop,
+                    xylem_core::traffic_group::PolicyConfig::FixedRate { rate } => {
+                        RateControl::Fixed { rate: *rate }
+                    }
+                    xylem_core::traffic_group::PolicyConfig::Poisson { rate } => {
+                        // Poisson per connection, so total rate for thread is rate * connections
+                        RateControl::Fixed {
+                            rate: rate * group_meta.connections_per_thread as f64,
+                        }
+                    }
+                    xylem_core::traffic_group::PolicyConfig::Adaptive { .. } => {
+                        // For now, treat adaptive as closed-loop
+                        // TODO: Implement adaptive rate control
+                        tracing::warn!(
+                            "Adaptive policy not yet fully implemented, using closed-loop"
+                        );
+                        RateControl::ClosedLoop
+                    }
+                };
+
                 let generator =
                     RequestGenerator::new(key_gen.clone(), thread_rate_control.clone(), value_size);
                 let stats = StatsCollector::default();
@@ -208,8 +253,8 @@ fn main() -> anyhow::Result<()> {
                     target: target_addr,
                     duration,
                     value_size,
-                    conn_count: config.threading.connections_per_thread,
-                    max_pending_per_conn: config.threading.max_pending_per_connection,
+                    conn_count: group_meta.connections_per_thread,
+                    max_pending_per_conn: group_meta.max_pending_per_connection,
                 };
 
                 let mut worker = Worker::with_closed_loop(
@@ -270,8 +315,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     // Aggregate statistics with percentiles and confidence intervals
-    let aggregated_stats =
-        xylem_core::stats::aggregate_stats(&stats, duration, config.statistics.confidence_level);
+    let aggregated_stats = xylem_core::stats::aggregate_stats(&stats, duration, 0.95);
 
     // Create results
     let results = ExperimentResults::from_aggregated_stats(

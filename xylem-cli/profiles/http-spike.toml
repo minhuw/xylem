@@ -25,22 +25,17 @@ spike_rate = 50000.0      # Spike: 50K req/s (10x)
 spike_start = "30s"       # Spike starts at 30s
 spike_duration = "20s"    # Spike lasts 20s
 
-[connections]
-[connections.policy]
-scheduler = "uniform"
-type = "poisson"
-rate = 10.0  # 10 req/s mean, Poisson distribution
-
-[threading]
-threads = 16
+# Single traffic group with Poisson arrival
+[[traffic_groups]]
+name = "poisson-spike"
+threads = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]  # 16 threads
 connections_per_thread = 1
 max_pending_per_connection = 1
-pin_cpus = true
-cpu_start = 0
+sampling_rate = 1.0  # 100% sampling
 
-[statistics]
-percentiles = [50, 90, 95, 99, 99.9, 99.99, 99.999]
-confidence_level = 0.99
+[traffic_groups.policy]
+type = "poisson"
+rate = 10.0  # 10 req/s per connection (Poisson distribution)
 
 [output]
 format = "human"
