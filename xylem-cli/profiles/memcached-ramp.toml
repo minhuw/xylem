@@ -1,0 +1,46 @@
+# Memcached with ramping load pattern
+# Gradually increases load from 1K to 100K req/s to find breaking point
+
+[experiment]
+name = "memcached-ramp-load"
+description = "Ramping load test to determine maximum sustainable throughput"
+seed = 12345
+duration = "60s"
+
+[target]
+address = "127.0.0.1:11211"
+protocol = "memcached-binary"
+transport = "tcp"
+
+[workload]
+[workload.keys]
+strategy = "random"
+max = 100000        # 100K key space for cache miss testing
+value_size = 1024   # 1KB values
+
+[workload.pattern]
+type = "ramp"
+start_rate = 1000.0    # Start at 1K req/s
+end_rate = 100000.0    # Ramp up to 100K req/s
+duration = "60s"
+
+[connections]
+[connections.policy]
+scheduler = "uniform"
+type = "fixed-rate"
+rate = 500.0  # Per-connection rate (200 * 500 = 100K max)
+
+[threading]
+threads = 8
+connections_per_thread = 1
+max_pending_per_connection = 1
+pin_cpus = true
+cpu_start = 0
+
+[statistics]
+percentiles = [50, 90, 95, 99, 99.9, 99.99]
+confidence_level = 0.95
+
+[output]
+format = "human"
+file = "results/memcached-ramp.json"

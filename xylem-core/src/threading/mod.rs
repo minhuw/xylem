@@ -9,13 +9,11 @@ use std::thread;
 
 pub mod affinity;
 pub mod barrier;
-pub mod pipelined_worker;
 pub mod worker;
 
 // Re-export main types
 pub use affinity::{get_core_count, pin_thread, CpuPinning};
-pub use pipelined_worker::{PipelinedWorker, PipelinedWorkerConfig};
-pub use worker::{Worker, WorkerConfig};
+pub use worker::{Protocol, Worker, WorkerConfig};
 
 /// Multi-threaded runtime for spawning and managing workers
 pub struct ThreadingRuntime {

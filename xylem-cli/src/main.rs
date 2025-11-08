@@ -1,71 +1,55 @@
 use clap::Parser;
-use std::time::Duration;
+use std::path::PathBuf;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use xylem_core::stats::StatsCollector;
 use xylem_core::threading::{CpuPinning, ThreadingRuntime, Worker, WorkerConfig};
-use xylem_core::workload::{KeyGeneration, RateControl, RequestGenerator};
+use xylem_core::workload::{RateControl, RequestGenerator};
 use xylem_transport::TcpTransport;
 
 mod config;
 mod output;
 
+use config::ProfileConfig;
 use output::ExperimentResults;
 
+/// Xylem: Reproducible latency measurement tool
+///
+/// Xylem uses TOML configuration files (profiles) to define experiments.
+/// This ensures reproducibility and simplifies complex workload specifications.
+///
+/// Example usage:
+///   xylem -P profiles/redis-get-zipfian.toml
+///   xylem -P profiles/http-spike.toml --target 192.168.1.100:8080
+///   xylem -P profiles/memcached-ramp.toml --duration 120s --seed 12345
+///
+/// See profiles/ directory for example configurations.
 #[derive(Parser)]
 #[command(name = "xylem")]
-#[command(version, about = "Latency measurement tool", long_about = None)]
+#[command(version, about = "Latency measurement tool with config-first design", long_about = None)]
 struct Cli {
-    /// Target server address (e.g., 192.168.1.100:6379)
+    /// Path to TOML profile configuration file (REQUIRED)
+    #[arg(short = 'P', long, required = true)]
+    profile: PathBuf,
+
+    /// Override target server address (e.g., 192.168.1.100:6379)
     #[arg(short, long)]
-    target: String,
+    target: Option<String>,
 
-    /// Protocol to use (echo, redis, memcached-binary, memcached-ascii, http, synthetic, masstree, xylem-echo)
+    /// Override experiment duration (e.g., 30s, 1m, 1h)
     #[arg(short, long)]
-    protocol: String,
+    duration: Option<String>,
 
-    /// Number of worker threads
-    #[arg(long, default_value = "1")]
-    threads: usize,
-
-    /// Connections per thread (currently only 1 connection per thread supported)
-    #[arg(long, default_value = "1")]
-    connections: usize,
-
-    /// Target request rate (requests per second). If not specified, runs in closed-loop mode
-    #[arg(long)]
-    rate: Option<f64>,
-
-    /// Experiment duration (e.g., 30s, 1m, 1h)
-    #[arg(long, default_value = "10s")]
-    duration: String,
-
-    /// Transport protocol (currently only tcp supported)
-    #[arg(long, default_value = "tcp")]
-    transport: String,
-
-    /// Key distribution (sequential, random, round-robin, zipfian)
-    #[arg(long, default_value = "sequential")]
-    key_dist: String,
-
-    /// Value size in bytes
-    #[arg(long, default_value = "64")]
-    value_size: usize,
-
-    /// Output file for results (JSON format)
+    /// Override output JSON file path
     #[arg(short, long)]
-    output: Option<String>,
+    output: Option<PathBuf>,
+
+    /// Override random seed for reproducibility
+    #[arg(short, long)]
+    seed: Option<u64>,
 
     /// Log level (trace, debug, info, warn, error)
-    #[arg(short, long, default_value = "info")]
+    #[arg(short = 'l', long, default_value = "info")]
     log_level: String,
-
-    /// Pin worker threads to CPU cores (thread N -> core N)
-    #[arg(long)]
-    pin_cpus: bool,
-
-    /// Starting CPU core offset for pinning (used with --pin-cpus)
-    #[arg(long, default_value = "0")]
-    cpu_start: usize,
 }
 
 // Protocol adapter to bridge xylem_protocols::Protocol with xylem_core Protocol trait
@@ -79,7 +63,7 @@ impl<P: xylem_protocols::Protocol> ProtocolAdapter<P> {
     }
 }
 
-impl<P: xylem_protocols::Protocol> xylem_core::threading::worker::Protocol for ProtocolAdapter<P> {
+impl<P: xylem_protocols::Protocol> xylem_core::threading::Protocol for ProtocolAdapter<P> {
     type RequestId = P::RequestId;
 
     fn generate_request(
@@ -120,55 +104,48 @@ fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    tracing::info!("Xylem latency measurement tool");
-    tracing::info!("Target: {}", cli.target);
-    tracing::info!("Protocol: {}", cli.protocol);
-    tracing::info!("Transport: {}", cli.transport);
-    tracing::info!("Threads: {}", cli.threads);
+    tracing::info!("Xylem latency measurement tool (config-first mode)");
+    tracing::info!("Loading profile: {}", cli.profile.display());
 
-    if cli.connections != 1 {
-        tracing::warn!(
-            "Multiple connections per thread not yet implemented, using 1 connection per thread"
-        );
+    // Load and parse profile configuration
+    let config = ProfileConfig::from_file(&cli.profile)?;
+
+    // Apply CLI overrides
+    let config = config.with_overrides(cli.target, cli.duration, cli.output, cli.seed)?;
+
+    // Display experiment configuration
+    tracing::info!("=== Experiment Configuration ===");
+    tracing::info!("Name: {}", config.experiment.name);
+    if let Some(desc) = &config.experiment.description {
+        tracing::info!("Description: {}", desc);
     }
-
-    if let Some(rate) = cli.rate {
-        tracing::info!("Target rate: {} req/s (total across all threads)", rate);
-    } else {
-        tracing::info!("Running in closed-loop mode (max throughput)");
+    if let Some(seed) = config.experiment.seed {
+        tracing::info!("Seed: {} (reproducible mode)", seed);
     }
-    tracing::info!("Duration: {}", cli.duration);
+    tracing::info!("Duration: {:?}", config.experiment.duration);
+    let target_address = config
+        .target
+        .address
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Target address must be specified"))?;
 
-    // Parse duration
-    let duration: Duration = humantime::parse_duration(&cli.duration)?;
+    tracing::info!("Target: {} ({})", target_address, config.target.protocol);
+    tracing::info!("Transport: {}", config.target.transport);
+    tracing::info!("Threads: {}", config.threading.threads);
+    tracing::info!("Connections per thread: {}", config.threading.connections_per_thread);
+    tracing::info!("Key strategy: {:?}", config.workload.keys);
+    tracing::info!("Load pattern: {:?}", config.workload.pattern);
+    tracing::info!("================================");
 
     // Parse target address
-    let target_addr: std::net::SocketAddr = cli.target.parse()?;
-    let target_string = cli.target.clone();
-
-    // Create key generation strategy
-    let key_gen = match cli.key_dist.as_str() {
-        "sequential" => KeyGeneration::sequential(0),
-        "random" => KeyGeneration::random(10000),
-        "round-robin" => KeyGeneration::round_robin(10000),
-        "zipfian" => KeyGeneration::zipfian(10000, 0.99)?,
-        _ => {
-            anyhow::bail!("Unsupported key distribution: {}", cli.key_dist);
-        }
-    };
-
-    // Create rate control
-    let rate_control = if let Some(rate) = cli.rate {
-        RateControl::Fixed { rate }
-    } else {
-        RateControl::ClosedLoop
-    };
+    let target_addr: std::net::SocketAddr = target_address.parse()?;
+    let duration = config.experiment.duration;
 
     // Configure CPU pinning
-    let cpu_pinning = if cli.pin_cpus {
-        if cli.cpu_start > 0 {
-            tracing::info!("CPU pinning enabled with offset {}", cli.cpu_start);
-            CpuPinning::Offset(cli.cpu_start)
+    let cpu_pinning = if config.threading.pin_cpus {
+        if config.threading.cpu_start > 0 {
+            tracing::info!("CPU pinning enabled with offset {}", config.threading.cpu_start);
+            CpuPinning::Offset(config.threading.cpu_start)
         } else {
             tracing::info!("CPU pinning enabled (auto mode)");
             CpuPinning::Auto
@@ -178,9 +155,9 @@ fn main() -> anyhow::Result<()> {
     };
 
     // Validate CPU pinning configuration
-    if cli.pin_cpus {
+    if config.threading.pin_cpus {
         if let Some(core_count) = xylem_core::threading::get_core_count() {
-            let max_core_needed = cli.cpu_start + cli.threads - 1;
+            let max_core_needed = config.threading.cpu_start + config.threading.threads - 1;
             if max_core_needed >= core_count {
                 tracing::warn!(
                     "CPU pinning may fail: need {} cores but only {} available",
@@ -193,25 +170,37 @@ fn main() -> anyhow::Result<()> {
 
     tracing::info!("Starting experiment...");
 
+    // Create key generation strategy with seed support
+    let key_gen = config.workload.keys.to_key_generation(config.experiment.seed)?;
+
+    // Create rate control from load pattern
+    // NOTE: For now, we'll use constant rate. Full load pattern support requires scheduler integration.
+    let rate_control = config.workload.pattern.to_rate_control();
+
+    // Get value size from keys config
+    let value_size = config.workload.keys.value_size();
+
+    // Clone values needed for results output (already have target_address from above)
+    let protocol_name = config.target.protocol.clone();
+    let target_address_string = target_address.to_string();
+    let target_address_for_http = target_address_string.clone();
+
     // Helper macro to run workers for a specific protocol
     macro_rules! run_protocol {
         ($protocol_expr:expr) => {{
-            let runtime = ThreadingRuntime::with_cpu_pinning(cli.threads, cpu_pinning.clone());
+            let runtime =
+                ThreadingRuntime::with_cpu_pinning(config.threading.threads, cpu_pinning.clone());
 
             // Calculate per-thread rate if rate limiting is enabled
             let thread_rate_control = match rate_control {
-                RateControl::Fixed { rate } => {
-                    RateControl::Fixed { rate: rate / cli.threads as f64 }
-                }
+                RateControl::Fixed { rate } => RateControl::Fixed {
+                    rate: rate / config.threading.threads as f64,
+                },
                 RateControl::ClosedLoop => RateControl::ClosedLoop,
             };
 
-            // Clone values that will be moved into closures
-            let value_size = cli.value_size;
-
             let results = runtime.run_workers(move |_thread_id| {
                 let protocol = ProtocolAdapter::new($protocol_expr);
-                let transport = TcpTransport::new();
                 let generator =
                     RequestGenerator::new(key_gen.clone(), thread_rate_control.clone(), value_size);
                 let stats = StatsCollector::default();
@@ -219,8 +208,17 @@ fn main() -> anyhow::Result<()> {
                     target: target_addr,
                     duration,
                     value_size,
+                    conn_count: config.threading.connections_per_thread,
+                    max_pending_per_conn: config.threading.max_pending_per_connection,
                 };
-                let mut worker = Worker::new(transport, protocol, generator, stats, worker_config);
+
+                let mut worker = Worker::with_closed_loop(
+                    TcpTransport::new,
+                    protocol,
+                    generator,
+                    stats,
+                    worker_config,
+                )?;
 
                 worker.run()?;
                 Ok(worker.into_stats())
@@ -232,23 +230,17 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Run experiment based on protocol
-    let stats = match cli.protocol.as_str() {
-        "echo" => {
-            run_protocol!(xylem_protocols::echo::EchoProtocol::new(cli.value_size))
-        }
+    let stats = match protocol_name.as_str() {
         "redis" => {
             run_protocol!(xylem_protocols::redis::RedisProtocol::new(
                 xylem_protocols::redis::RedisOp::Get
             ))
         }
-        "synthetic" => {
-            run_protocol!(xylem_protocols::synthetic::SyntheticProtocol::new(1000))
-        }
         "http" => {
             run_protocol!(xylem_protocols::http::HttpProtocol::new(
-                "GET".to_string(),
+                xylem_protocols::HttpMethod::Get,
                 "/".to_string(),
-                target_string.clone()
+                target_address_for_http.clone()
             ))
         }
         "memcached-binary" => {
@@ -263,7 +255,7 @@ fn main() -> anyhow::Result<()> {
         }
         "masstree" => {
             run_protocol!(xylem_protocols::masstree::MasstreeProtocol::new(
-                xylem_protocols::masstree::MasstreeOp::Get
+                xylem_protocols::MasstreeOp::Get
             ))
         }
         "xylem-echo" => {
@@ -271,19 +263,20 @@ fn main() -> anyhow::Result<()> {
         }
         _ => {
             anyhow::bail!(
-                "Unsupported protocol: {}. Supported: echo, redis, synthetic, http, memcached-binary, memcached-ascii, masstree, xylem-echo",
-                cli.protocol
+                "Unsupported protocol: {}. Supported: redis, http, memcached-binary, memcached-ascii, masstree, xylem-echo",
+                protocol_name
             );
         }
     };
 
     // Aggregate statistics with percentiles and confidence intervals
-    let aggregated_stats = xylem_core::stats::aggregate_stats(&stats, duration, 0.95);
+    let aggregated_stats =
+        xylem_core::stats::aggregate_stats(&stats, duration, config.statistics.confidence_level);
 
     // Create results
     let results = ExperimentResults::from_aggregated_stats(
-        cli.protocol.clone(),
-        cli.target.clone(),
+        protocol_name,
+        target_address_string,
         duration,
         aggregated_stats,
     );
@@ -291,9 +284,15 @@ fn main() -> anyhow::Result<()> {
     // Output results
     results.print_human();
 
-    // Write JSON if requested
-    if let Some(output_path) = cli.output {
-        results.write_json(&output_path)?;
+    // Write output file if configured
+    if config.output.format == "json" {
+        let path_str = config
+            .output
+            .file
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("Invalid output file path"))?;
+        results.write_json(path_str)?;
+        tracing::info!("Results written to: {}", config.output.file.display());
     }
 
     Ok(())

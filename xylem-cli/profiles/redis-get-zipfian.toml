@@ -1,0 +1,44 @@
+# Redis GET with Zipfian key distribution
+# Simulates realistic workload with hot keys (99% skew)
+
+[experiment]
+name = "redis-get-zipfian"
+description = "Standard Redis GET workload with Zipfian distribution for cache hit rate analysis"
+seed = 42  # Reproducible results
+duration = "30s"
+
+[target]
+address = "127.0.0.1:6379"
+protocol = "redis"
+transport = "tcp"
+
+[workload]
+[workload.keys]
+strategy = "zipfian"
+n = 10000           # 10K key space
+theta = 0.99        # High skew (99% of requests to ~1% of keys)
+value_size = 64     # 64 bytes per value
+
+[workload.pattern]
+type = "constant"
+rate = 50000.0      # 50K req/s
+
+[connections]
+[connections.policy]
+scheduler = "uniform"
+type = "closed-loop"  # Max throughput mode
+
+[threading]
+threads = 4
+connections_per_thread = 25  # 100 total connections (4 * 25)
+max_pending_per_connection = 1  # Closed-loop = 1 pending request max
+pin_cpus = true
+cpu_start = 0
+
+[statistics]
+percentiles = [50, 90, 95, 99, 99.9]
+confidence_level = 0.95
+
+[output]
+format = "json"
+file = "results/redis-zipfian.json"

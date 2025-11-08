@@ -1,0 +1,47 @@
+# HTTP load test with traffic spike
+# Simulates normal load with sudden 10x spike to test system resilience
+
+[experiment]
+name = "http-spike-test"
+description = "HTTP load test with 10x traffic spike to measure tail latencies under stress"
+seed = 99999
+duration = "120s"
+
+[target]
+address = "127.0.0.1:8080"
+protocol = "http"
+transport = "tcp"
+
+[workload]
+[workload.keys]
+strategy = "round-robin"
+max = 1000          # Cycle through 1000 different URLs
+value_size = 256    # Request body size (POST)
+
+[workload.pattern]
+type = "spike"
+normal_rate = 5000.0      # Normal: 5K req/s
+spike_rate = 50000.0      # Spike: 50K req/s (10x)
+spike_start = "30s"       # Spike starts at 30s
+spike_duration = "20s"    # Spike lasts 20s
+
+[connections]
+[connections.policy]
+scheduler = "uniform"
+type = "poisson"
+rate = 10.0  # 10 req/s mean, Poisson distribution
+
+[threading]
+threads = 16
+connections_per_thread = 1
+max_pending_per_connection = 1
+pin_cpus = true
+cpu_start = 0
+
+[statistics]
+percentiles = [50, 90, 95, 99, 99.9, 99.99, 99.999]
+confidence_level = 0.99
+
+[output]
+format = "human"
+file = "results/http-spike.json"

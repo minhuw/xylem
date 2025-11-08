@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use std::thread::sleep;
 use std::time::Duration;
 use xylem_core::stats::StatsCollector;
-use xylem_core::threading::{PipelinedWorker, PipelinedWorkerConfig};
+use xylem_core::threading::{Worker, WorkerConfig};
 use xylem_core::workload::{KeyGeneration, RateControl, RequestGenerator};
 use xylem_transport::TcpTransport;
 
@@ -133,7 +133,7 @@ fn test_redis_pipelined_single_connection() {
     let generator =
         RequestGenerator::new(KeyGeneration::sequential(0), RateControl::ClosedLoop, 64);
     let stats = StatsCollector::default();
-    let config = PipelinedWorkerConfig {
+    let config = WorkerConfig {
         target: target_addr,
         duration,
         value_size: 64,
@@ -142,8 +142,7 @@ fn test_redis_pipelined_single_connection() {
     };
 
     let mut worker =
-        PipelinedWorker::with_closed_loop(TcpTransport::new, protocol, generator, stats, config)
-            .unwrap();
+        Worker::with_closed_loop(TcpTransport::new, protocol, generator, stats, config).unwrap();
 
     println!("Starting pipelined test (1 conn, 16 max pending)...");
     let result = worker.run();
@@ -183,7 +182,7 @@ fn test_redis_pipelined_multiple_connections() {
     let generator =
         RequestGenerator::new(KeyGeneration::sequential(0), RateControl::ClosedLoop, 64);
     let stats = StatsCollector::default();
-    let config = PipelinedWorkerConfig {
+    let config = WorkerConfig {
         target: target_addr,
         duration,
         value_size: 64,
@@ -192,8 +191,7 @@ fn test_redis_pipelined_multiple_connections() {
     };
 
     let mut worker =
-        PipelinedWorker::with_closed_loop(TcpTransport::new, protocol, generator, stats, config)
-            .unwrap();
+        Worker::with_closed_loop(TcpTransport::new, protocol, generator, stats, config).unwrap();
 
     println!("Starting pipelined test (4 conns, 16 max pending each)...");
     let result = worker.run();
@@ -237,7 +235,7 @@ fn test_redis_pipelined_rate_limited() {
         64,
     );
     let stats = StatsCollector::default();
-    let config = PipelinedWorkerConfig {
+    let config = WorkerConfig {
         target: target_addr,
         duration,
         value_size: 64,
@@ -246,8 +244,7 @@ fn test_redis_pipelined_rate_limited() {
     };
 
     let mut worker =
-        PipelinedWorker::with_closed_loop(TcpTransport::new, protocol, generator, stats, config)
-            .unwrap();
+        Worker::with_closed_loop(TcpTransport::new, protocol, generator, stats, config).unwrap();
 
     println!("Starting rate-limited test (target: {target_rate} req/s)...");
     let result = worker.run();

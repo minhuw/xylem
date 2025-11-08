@@ -1,0 +1,44 @@
+# Closed-loop maximum throughput test
+# Measures maximum achievable throughput without rate limiting
+# Useful for baseline performance measurement and capacity planning
+
+[experiment]
+name = "closed-loop-max-throughput"
+description = "Maximum throughput test using closed-loop execution (no rate limiting)"
+seed = 1234567890
+duration = "30s"
+
+[target]
+address = "127.0.0.1:11211"
+protocol = "memcached-binary"
+transport = "tcp"
+
+[workload]
+[workload.keys]
+strategy = "random"
+max = 1000000       # 1M key space to test cache behavior
+value_size = 64     # Small values for max throughput
+
+[workload.pattern]
+type = "constant"
+rate = 1000000.0    # Aspirational (closed-loop will achieve actual max)
+
+[connections]
+[connections.policy]
+scheduler = "uniform"
+type = "closed-loop"  # Send next request immediately after response
+
+[threading]
+threads = 16        # Maximize CPU utilization
+connections_per_thread = 1
+max_pending_per_connection = 1
+pin_cpus = true
+cpu_start = 0
+
+[statistics]
+percentiles = [50, 90, 95, 99, 99.9, 99.99]
+confidence_level = 0.95
+
+[output]
+format = "human"
+file = "results/closed-loop-max.json"

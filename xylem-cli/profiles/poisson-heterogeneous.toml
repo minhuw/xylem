@@ -1,0 +1,54 @@
+# Heterogeneous Poisson traffic with mixed slow/fast connections
+# 10% slow Poisson (1 req/s), 90% fast Poisson (100 req/s)
+# Tests scheduler's ability to handle diverse connection behaviors
+
+[experiment]
+name = "poisson-heterogeneous"
+description = "Mixed traffic pattern: 10% slow connections (1 req/s) + 90% fast (100 req/s) using Poisson arrival"
+seed = 7777
+duration = "60s"
+
+[target]
+address = "127.0.0.1:6379"
+protocol = "redis"
+transport = "tcp"
+
+[workload]
+[workload.keys]
+strategy = "sequential"
+start = 0
+value_size = 128
+
+[workload.pattern]
+type = "constant"
+rate = 50000.0      # Total: ~50K req/s (50 slow * 1 + 950 fast * 100 ≈ 95K theoretical)
+
+[connections]
+[connections.policy]
+scheduler = "factory"
+# 10% slow connections: 1 req/s mean
+[[connections.policy.assignments]]
+percentage = 10
+type = "poisson"
+rate = 1.0
+
+# 90% fast connections: 100 req/s mean
+[[connections.policy.assignments]]
+percentage = 90
+type = "poisson"
+rate = 100.0
+
+[threading]
+threads = 8
+connections_per_thread = 1
+max_pending_per_connection = 1
+pin_cpus = true
+cpu_start = 0
+
+[statistics]
+percentiles = [50, 75, 90, 95, 99, 99.9]
+confidence_level = 0.95
+
+[output]
+format = "human"
+file = "results/poisson-heterogeneous.json"

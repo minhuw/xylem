@@ -176,7 +176,6 @@ fn test_redis_single_thread() {
     let protocol = ProtocolAdapter::new(protocol);
 
     // Create worker components
-    let transport = TcpTransport::new();
     let generator =
         RequestGenerator::new(KeyGeneration::sequential(0), RateControl::ClosedLoop, 64);
     let stats = StatsCollector::default();
@@ -184,9 +183,13 @@ fn test_redis_single_thread() {
         target: target_addr,
         duration,
         value_size: 64,
+        conn_count: 1,
+        max_pending_per_conn: 1,
     };
 
-    let mut worker = Worker::new(transport, protocol, generator, stats, worker_config);
+    let mut worker =
+        Worker::with_closed_loop(TcpTransport::new, protocol, generator, stats, worker_config)
+            .expect("Failed to create worker");
 
     // Run the worker
     println!("Starting single-threaded Redis test...");
@@ -268,7 +271,6 @@ fn test_redis_multi_thread() {
         let protocol =
             xylem_protocols::redis::RedisProtocol::new(xylem_protocols::redis::RedisOp::Get);
         let protocol = ProtocolAdapter::new(protocol);
-        let transport = TcpTransport::new();
         let generator = RequestGenerator::new(
             KeyGeneration::sequential(thread_id as u64 * 10000),
             RateControl::ClosedLoop,
@@ -279,8 +281,12 @@ fn test_redis_multi_thread() {
             target: target_addr,
             duration,
             value_size: 64,
+            conn_count: 1,
+            max_pending_per_conn: 1,
         };
-        let mut worker = Worker::new(transport, protocol, generator, stats, worker_config);
+        let mut worker =
+            Worker::with_closed_loop(TcpTransport::new, protocol, generator, stats, worker_config)
+                .expect("Failed to create worker");
 
         {
             worker.run()?;
@@ -360,7 +366,6 @@ fn test_redis_rate_limited() {
 
     let protocol = xylem_protocols::redis::RedisProtocol::new(xylem_protocols::redis::RedisOp::Get);
     let protocol = ProtocolAdapter::new(protocol);
-    let transport = TcpTransport::new();
     let generator = RequestGenerator::new(
         KeyGeneration::sequential(0),
         RateControl::Fixed { rate: target_rate },
@@ -371,9 +376,13 @@ fn test_redis_rate_limited() {
         target: target_addr,
         duration,
         value_size: 64,
+        conn_count: 1,
+        max_pending_per_conn: 1,
     };
 
-    let mut worker = Worker::new(transport, protocol, generator, stats, worker_config);
+    let mut worker =
+        Worker::with_closed_loop(TcpTransport::new, protocol, generator, stats, worker_config)
+            .expect("Failed to create worker");
 
     println!("Starting rate-limited test (target: {target_rate} req/s)...");
     let result = worker.run();

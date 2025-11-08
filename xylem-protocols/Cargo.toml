@@ -16,3 +16,5 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 bytes = { workspace = true }
 httparse = { workspace = true }
+rmp = "0.8.14"
+rmp-serde.workspace = true

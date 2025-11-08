@@ -74,12 +74,13 @@ fn test_round_robin_scheduler_with_multiple_connections() {
         target: target_addr,
         duration,
         value_size: 64,
+        conn_count: 4,
+        max_pending_per_conn: 8,
     };
 
-    // Create transport factory that creates transports with RoundRobin scheduler
-    let transport = TcpTransport::new();
-
-    let mut worker = Worker::new(transport, protocol, generator, stats, worker_config);
+    let mut worker =
+        Worker::with_closed_loop(TcpTransport::new, protocol, generator, stats, worker_config)
+            .expect("Failed to create worker");
 
     println!("Testing RoundRobin scheduler behavior with multiple connections...");
     let result = worker.run();
@@ -129,11 +130,13 @@ fn test_round_robin_scheduler_with_sequential_workload() {
         target: target_addr,
         duration,
         value_size: 128,
+        conn_count: 4,
+        max_pending_per_conn: 8,
     };
 
-    let transport = TcpTransport::new();
-
-    let mut worker = Worker::new(transport, protocol, generator, stats, worker_config);
+    let mut worker =
+        Worker::with_closed_loop(TcpTransport::new, protocol, generator, stats, worker_config)
+            .expect("Failed to create worker");
 
     println!("Testing RoundRobin scheduler with sequential workload...");
     let result = worker.run();

@@ -7,6 +7,10 @@ description = "CLI interface for Xylem latency measurement tool"
 license = "MIT"
 repository = "https://github.com/minhuw/xylem"
 
+[lib]
+name = "xylem_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "xylem"
 path = "src/main.rs"
@@ -26,6 +30,8 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 humantime = { workspace = true }
+humantime-serde.workspace = true
+toml.workspace = true
 
 [dev-dependencies]
 tempfile = "3.8"

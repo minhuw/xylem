@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use std::thread::sleep;
 use std::time::Duration;
 use xylem_core::stats::StatsCollector;
-use xylem_core::threading::{PipelinedWorker, PipelinedWorkerConfig};
+use xylem_core::threading::{Worker, WorkerConfig};
 use xylem_core::workload::{KeyGeneration, RateControl, RequestGenerator};
 use xylem_transport::TcpTransport;
 
@@ -131,7 +131,7 @@ fn run_rate_experiment(target_rate: f64, duration_secs: u64, conn_count: usize) 
         64,
     );
     let stats = StatsCollector::default();
-    let config = PipelinedWorkerConfig {
+    let config = WorkerConfig {
         target: target_addr,
         duration,
         value_size: 64,
@@ -140,8 +140,7 @@ fn run_rate_experiment(target_rate: f64, duration_secs: u64, conn_count: usize) 
     };
 
     let mut worker =
-        PipelinedWorker::with_closed_loop(TcpTransport::new, protocol, generator, stats, config)
-            .unwrap();
+        Worker::with_closed_loop(TcpTransport::new, protocol, generator, stats, config).unwrap();
 
     let result = worker.run();
     assert!(result.is_ok(), "Worker failed: {:?}", result.err());
@@ -359,7 +358,7 @@ fn test_rate_vs_throughput_saturation() {
     let generator =
         RequestGenerator::new(KeyGeneration::sequential(0), RateControl::ClosedLoop, 64);
     let stats = StatsCollector::default();
-    let config = PipelinedWorkerConfig {
+    let config = WorkerConfig {
         target: target_addr,
         duration,
         value_size: 64,
@@ -368,8 +367,7 @@ fn test_rate_vs_throughput_saturation() {
     };
 
     let mut worker =
-        PipelinedWorker::with_closed_loop(TcpTransport::new, protocol, generator, stats, config)
-            .unwrap();
+        Worker::with_closed_loop(TcpTransport::new, protocol, generator, stats, config).unwrap();
 
     worker.run().unwrap();
     let max_throughput = worker.stats().tx_requests() as f64 / duration.as_secs_f64();

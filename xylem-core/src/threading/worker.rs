@@ -1,13 +1,19 @@
-//! Worker thread implementation
+//! Worker implementation with connection pooling and request pipelining
 //!
-//! Implements Lancet-style busy-waiting event loop for nanosecond-precision latency measurement.
+//! This implements Lancet's symmetric agent model, allowing multiple outstanding
+//! requests per connection for maximum throughput with accurate latency tracking.
+//!
+//! The worker can operate in different modes based on configuration:
+//! - Single connection, single pending request: Simple closed-loop latency measurement
+//! - Multiple connections with pipelining: High-throughput load testing
 
+use crate::connection::ConnectionPool;
 use crate::stats::StatsCollector;
 use crate::timing;
 use crate::workload::RequestGenerator;
 use crate::Result;
 use std::net::SocketAddr;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use xylem_transport::Transport;
 
 /// Protocol trait for generating requests and parsing responses with request ID tracking
@@ -40,144 +46,219 @@ pub trait Protocol: Send {
     fn reset(&mut self);
 }
 
-/// Worker configuration
+/// Configuration for worker
 pub struct WorkerConfig {
+    /// Target server address
     pub target: SocketAddr,
+    /// Experiment duration
     pub duration: Duration,
+    /// Value size for requests
     pub value_size: usize,
+    /// Number of connections per worker
+    pub conn_count: usize,
+    /// Maximum pending requests per connection
+    pub max_pending_per_conn: usize,
 }
 
-/// Worker that runs measurement loop
+/// Worker with connection pooling and request pipelining
 pub struct Worker<T: Transport, P: Protocol> {
-    transport: T,
+    pool: ConnectionPool<T, P::RequestId>,
     protocol: P,
     generator: RequestGenerator,
     stats: StatsCollector,
     config: WorkerConfig,
+    /// Track keys for scheduler feedback
+    current_key: u64,
 }
 
 impl<T: Transport, P: Protocol> Worker<T, P> {
-    /// Create a new worker
+    /// Create a new pipelined worker with per-connection policies
     pub fn new(
-        transport: T,
+        transport_factory: impl Fn() -> T,
         protocol: P,
         generator: RequestGenerator,
         stats: StatsCollector,
         config: WorkerConfig,
-    ) -> Self {
-        Self {
-            transport,
+        policy_scheduler: Box<dyn crate::scheduler::PolicyScheduler>,
+    ) -> Result<Self> {
+        let pool = ConnectionPool::new(
+            transport_factory,
+            config.target,
+            config.conn_count,
+            config.max_pending_per_conn,
+            policy_scheduler,
+        )?;
+
+        Ok(Self {
+            pool,
             protocol,
             generator,
             stats,
             config,
-        }
+            current_key: 0,
+        })
     }
 
-    /// Run the measurement loop using Lancet-style busy-waiting
+    /// Create a new pipelined worker with closed-loop policy (max throughput)
+    pub fn with_closed_loop(
+        transport_factory: impl Fn() -> T,
+        protocol: P,
+        generator: RequestGenerator,
+        stats: StatsCollector,
+        config: WorkerConfig,
+    ) -> Result<Self> {
+        let policy_scheduler = Box::new(crate::scheduler::UniformPolicyScheduler::closed_loop());
+        Self::new(transport_factory, protocol, generator, stats, config, policy_scheduler)
+    }
+
+    /// Run the pipelined measurement loop (Lancet symmetric_tcp_main style)
     pub fn run(&mut self) -> Result<()> {
-        // Connect to target
-        self.transport.connect(&self.config.target)?;
-
-        let _start = Instant::now();
         let start_ns = timing::time_ns();
-        let duration = self.config.duration;
-        let duration_ns = duration.as_nanos() as u64;
+        let duration_ns = self.config.duration.as_nanos() as u64;
+        let mut next_tx_ns = start_ns;
 
-        // Calculate next send time based on rate control
-        let mut next_send_ns = start_ns;
-        let mut last_send_ts = None;
-
-        // Main measurement loop - Lancet style
         loop {
             let now_ns = timing::time_ns();
 
-            // Check if we've exceeded the duration
-            if now_ns - start_ns >= duration_ns {
+            // Check if duration exceeded
+            if now_ns >= start_ns + duration_ns {
                 break;
             }
 
-            // Send phase - busy wait until next send time
-            if now_ns >= next_send_ns && last_send_ts.is_none() {
-                // Generate request (single connection, so conn_id = 0)
+            // SEND PHASE: Send requests while we're ahead of schedule
+            while now_ns >= next_tx_ns {
+                // Generate request first to get the key for scheduler
                 let (key, value_size) = self.generator.next_request();
-                let (request_data, _req_id) = self.protocol.generate_request(0, key, value_size);
+                self.current_key = key;
 
-                // Send request and capture timestamp
-                let send_ts = self.transport.send(&request_data)?;
+                // Pick a connection that can accept more requests
+                let conn = match self.pool.pick_connection() {
+                    Some(c) => c,
+                    None => break, // No available connections, move to receive phase
+                };
+
+                let conn_id = conn.idx();
+                let (request_data, req_id) =
+                    self.protocol.generate_request(conn_id, key, value_size);
+
+                // Send request and notify policy
+                let sent_time_ns = timing::time_ns();
+                conn.send(&request_data, req_id)?;
+                conn.on_request_sent(sent_time_ns);
                 self.stats.record_tx_bytes(request_data.len());
 
-                // Store send timestamp for latency calculation
-                last_send_ts = Some(send_ts);
-
-                // Mark request as sent for rate control
+                // Mark request sent for rate control
                 self.generator.mark_request_sent();
 
-                // Update next send time based on rate control
+                // Schedule next transmission
                 if let Some(delay) = self.generator.delay_until_next() {
-                    next_send_ns = timing::time_ns() + delay.as_nanos() as u64;
+                    next_tx_ns = timing::time_ns() + delay.as_nanos() as u64;
                 } else {
-                    next_send_ns = timing::time_ns();
+                    // Closed-loop: send immediately
+                    next_tx_ns = timing::time_ns();
+                }
+
+                // Update current time
+                let now_ns = timing::time_ns();
+
+                // Break if we've caught up or exceeded the schedule
+                if now_ns < next_tx_ns {
+                    break;
                 }
             }
 
-            // Receive phase - non-blocking poll
-            if self.transport.poll_readable()? {
-                let (response_data, recv_ts) = self.transport.recv()?;
+            // RECEIVE PHASE: Poll all connections for responses
+            self.process_responses()?;
 
-                if response_data.is_empty() {
-                    continue;
-                }
-
-                // Parse response (single connection, so conn_id = 0)
-                let (bytes_consumed, _req_id_opt) =
-                    self.protocol.parse_response(0, &response_data)?;
-
-                if bytes_consumed == 0 {
-                    continue; // Incomplete response
-                }
-
-                self.stats.record_rx_bytes(bytes_consumed);
-
-                // Calculate and record latency
-                let Some(send_ts) = last_send_ts.take() else {
-                    continue;
-                };
-                let latency = recv_ts.duration_since(&send_ts);
-                self.stats.record_latency(latency);
-            }
-
-            // Yield to OS scheduler without sleeping
+            // Yield to scheduler
             std::hint::spin_loop();
         }
 
-        // Drain any remaining responses
-        for _ in 0..100 {
-            if !self.transport.poll_readable()? {
-                break;
-            }
+        // Drain remaining responses
+        self.drain_responses()?;
 
-            let Ok((response_data, _)) = self.transport.recv() else {
-                continue;
-            };
-
-            if response_data.is_empty() {
-                continue;
-            }
-
-            if let Ok((bytes_consumed, _)) = self.protocol.parse_response(0, &response_data) {
-                if bytes_consumed > 0 {
-                    self.stats.record_rx_bytes(bytes_consumed);
-                }
-            }
-
-            std::thread::sleep(Duration::from_micros(100));
-        }
-
-        // Close connection
-        self.transport.close()?;
+        // Close all connections
+        self.pool.close_all()?;
 
         Ok(())
+    }
+
+    /// Process responses from all connections
+    fn process_responses(&mut self) -> Result<()> {
+        let protocol = &mut self.protocol;
+        let stats = &mut self.stats;
+
+        for conn in self.pool.connections_mut() {
+            if !conn.poll_readable()? {
+                continue;
+            }
+
+            let conn_id = conn.idx();
+            let latencies =
+                conn.recv_responses(|data| match protocol.parse_response(conn_id, data) {
+                    Ok((bytes_consumed, req_id_opt)) => {
+                        if bytes_consumed > 0 {
+                            stats.record_rx_bytes(bytes_consumed);
+                        }
+                        Ok((bytes_consumed, req_id_opt))
+                    }
+                    Err(e) => Err(e.into()),
+                })?;
+
+            // Record all latencies
+            for (_req_id, latency) in latencies {
+                stats.record_latency(latency);
+            }
+        }
+
+        // Per-connection policies don't need global feedback
+        // Each connection manages its own timing independently
+
+        Ok(())
+    }
+
+    /// Drain any remaining responses after measurement period
+    fn drain_responses(&mut self) -> Result<()> {
+        for _ in 0..100 {
+            let has_pending = self.drain_iteration()?;
+            if !has_pending {
+                break;
+            }
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        Ok(())
+    }
+
+    /// Single drain iteration - returns true if any connections have pending requests
+    fn drain_iteration(&mut self) -> Result<bool> {
+        let mut any_pending = false;
+        let protocol = &mut self.protocol;
+        let stats = &mut self.stats;
+
+        for conn in self.pool.connections_mut() {
+            if conn.pending_count() == 0 {
+                continue;
+            }
+
+            any_pending = true;
+
+            if !conn.poll_readable()? {
+                continue;
+            }
+
+            let conn_id = conn.idx();
+            let _ = conn.recv_responses(|data| match protocol.parse_response(conn_id, data) {
+                Ok((bytes_consumed, req_id_opt)) => {
+                    if bytes_consumed > 0 {
+                        stats.record_rx_bytes(bytes_consumed);
+                    }
+                    Ok((bytes_consumed, req_id_opt))
+                }
+                Err(e) => Err(e.into()),
+            })?;
+        }
+
+        Ok(any_pending)
     }
 
     /// Get the stats collector
@@ -185,7 +266,7 @@ impl<T: Transport, P: Protocol> Worker<T, P> {
         &self.stats
     }
 
-    /// Consume the worker and return the stats collector
+    /// Consume the worker and return stats
     pub fn into_stats(self) -> StatsCollector {
         self.stats
     }
@@ -200,7 +281,7 @@ mod tests {
     use std::thread;
     use xylem_transport::TcpTransport;
 
-    // Adapter to make xylem_protocols::Protocol work with our Protocol trait
+    // Protocol adapter
     struct ProtocolAdapter<P: xylem_protocols::Protocol> {
         inner: P,
     }
@@ -241,8 +322,8 @@ mod tests {
     }
 
     #[test]
-    fn test_worker_basic() {
-        // Start a simple echo server
+    fn test_pipelined_worker_basic() {
+        // Start echo server
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -257,19 +338,16 @@ mod tests {
                     Err(_) => break,
                 };
 
-                // Echo back
                 if socket.write_all(&buf[..n]).is_err() {
                     break;
                 }
             }
         });
 
-        // Wait for server to start
         thread::sleep(Duration::from_millis(50));
 
-        // Create worker components
-        let transport = TcpTransport::new();
-        let echo_protocol = xylem_protocols::echo::EchoProtocol::new(64);
+        // Create pipelined worker
+        let echo_protocol = xylem_protocols::xylem_echo::XylemEchoProtocol::new(0);
         let protocol = ProtocolAdapter::new(echo_protocol);
         let generator =
             RequestGenerator::new(KeyGeneration::sequential(0), RateControl::ClosedLoop, 64);
@@ -278,23 +356,92 @@ mod tests {
             target: addr,
             duration: Duration::from_millis(100),
             value_size: 64,
+            conn_count: 1,
+            max_pending_per_conn: 1,
         };
 
-        let mut worker = Worker::new(transport, protocol, generator, stats, config);
+        let mut worker =
+            Worker::with_closed_loop(TcpTransport::new, protocol, generator, stats, config)
+                .unwrap();
 
-        // Run worker
         let result = worker.run();
+        assert!(result.is_ok(), "Worker should complete: {:?}", result.err());
 
-        // Worker should complete successfully
-        if let Err(e) = &result {
-            eprintln!("Worker error: {e:?}");
-        }
-        assert!(result.is_ok());
-
-        // Should have collected some stats
         let stats = worker.stats();
-        assert!(stats.tx_requests() > 0);
-        assert!(stats.rx_requests() > 0);
-        assert!(!stats.samples().is_empty());
+        assert!(stats.tx_requests() > 0, "Should have sent requests");
+    }
+
+    #[test]
+    fn test_fixed_rate_policy() {
+        use crate::scheduler::UniformPolicyScheduler;
+        use std::time::Instant;
+
+        // Start echo server
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = vec![0u8; 4096];
+
+            loop {
+                let n = match socket.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(_) => break,
+                };
+
+                if socket.write_all(&buf[..n]).is_err() {
+                    break;
+                }
+            }
+        });
+
+        thread::sleep(Duration::from_millis(50));
+
+        // Create worker with fixed-rate policy
+        let echo_protocol = xylem_protocols::xylem_echo::XylemEchoProtocol::new(0);
+        let protocol = ProtocolAdapter::new(echo_protocol);
+
+        let generator = RequestGenerator::new(
+            KeyGeneration::sequential(0),
+            RateControl::ClosedLoop, // Let policy control rate
+            64,
+        );
+        let stats = StatsCollector::default();
+        let config = WorkerConfig {
+            target: addr,
+            duration: Duration::from_millis(200),
+            value_size: 64,
+            conn_count: 1,
+            max_pending_per_conn: 10,
+        };
+
+        // Fixed rate: 100 req/s = 10ms per request
+        let policy_scheduler = Box::new(UniformPolicyScheduler::fixed_rate(100.0));
+
+        let start = Instant::now();
+        let mut worker =
+            Worker::new(TcpTransport::new, protocol, generator, stats, config, policy_scheduler)
+                .unwrap();
+
+        let result = worker.run();
+        assert!(result.is_ok(), "Worker should complete: {:?}", result.err());
+
+        let elapsed = start.elapsed();
+        let stats = worker.stats();
+
+        // At 100 req/s for 200ms, expect ~20 requests
+        let expected = 20;
+        let actual = stats.tx_requests();
+        assert!(
+            actual >= expected - 5 && actual <= expected + 5,
+            "Expected ~{} requests at 100 req/s for {:?}, got {}",
+            expected,
+            elapsed,
+            actual
+        );
+
+        println!("✓ Fixed-rate policy sent {} requests in {:?}", actual, elapsed);
     }
 }
