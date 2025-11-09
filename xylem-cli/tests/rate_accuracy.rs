@@ -7,10 +7,11 @@ use std::process::{Child, Command};
 use std::sync::Mutex;
 use std::thread::sleep;
 use std::time::Duration;
-use xylem_core::stats::StatsCollector;
 use xylem_core::threading::{Worker, WorkerConfig};
 use xylem_core::workload::{KeyGeneration, RateControl, RequestGenerator};
 use xylem_transport::TcpTransport;
+
+mod common;
 
 // Global Redis server state
 static REDIS_SERVER: Mutex<Option<Child>> = Mutex::new(None);
@@ -130,7 +131,7 @@ fn run_rate_experiment(target_rate: f64, duration_secs: u64, conn_count: usize) 
         RateControl::Fixed { rate: target_rate },
         64,
     );
-    let stats = StatsCollector::default();
+    let stats = common::create_test_stats();
     let config = WorkerConfig {
         target: target_addr,
         duration,
@@ -145,7 +146,7 @@ fn run_rate_experiment(target_rate: f64, duration_secs: u64, conn_count: usize) 
     let result = worker.run();
     assert!(result.is_ok(), "Worker failed: {:?}", result.err());
 
-    let stats = worker.stats();
+    let stats = worker.stats().global();
     let actual_rate = stats.tx_requests() as f64 / duration.as_secs_f64();
     let error_percent = ((actual_rate - target_rate) / target_rate * 100.0).abs();
 
@@ -357,7 +358,7 @@ fn test_rate_vs_throughput_saturation() {
     let protocol = ProtocolAdapter::new(protocol);
     let generator =
         RequestGenerator::new(KeyGeneration::sequential(0), RateControl::ClosedLoop, 64);
-    let stats = StatsCollector::default();
+    let stats = common::create_test_stats();
     let config = WorkerConfig {
         target: target_addr,
         duration,
@@ -370,7 +371,7 @@ fn test_rate_vs_throughput_saturation() {
         Worker::with_closed_loop(TcpTransport::new, protocol, generator, stats, config).unwrap();
 
     worker.run().unwrap();
-    let max_throughput = worker.stats().tx_requests() as f64 / duration.as_secs_f64();
+    let max_throughput = worker.stats().global().tx_requests() as f64 / duration.as_secs_f64();
 
     println!("Maximum throughput (closed-loop): {max_throughput:.0} req/s\n");
 

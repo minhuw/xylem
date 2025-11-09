@@ -6,10 +6,12 @@ use std::process::{Child, Command};
 use std::sync::Mutex;
 use std::thread::sleep;
 use std::time::Duration;
-use xylem_core::stats::StatsCollector;
+use xylem_core::stats::GroupStatsCollector;
 use xylem_core::threading::{ThreadingRuntime, Worker, WorkerConfig};
 use xylem_core::workload::{KeyGeneration, RateControl, RequestGenerator};
 use xylem_transport::TcpTransport;
+
+mod common;
 
 // Global state to track Memcached server process
 static MEMCACHED_SERVER: Mutex<Option<Child>> = Mutex::new(None);
@@ -122,7 +124,7 @@ fn test_memcached_binary_single_thread() {
     let target_addr = "127.0.0.1:11211".parse().unwrap();
 
     let results = runtime
-        .run_workers(move |_thread_id| {
+        .run_workers_generic(move |_thread_id| {
             let protocol = ProtocolAdapter::new(
                 xylem_protocols::memcached::binary::MemcachedBinaryProtocol::new(
                     xylem_protocols::memcached::binary::MemcachedOp::Get,
@@ -131,7 +133,7 @@ fn test_memcached_binary_single_thread() {
             let _transport = TcpTransport::new();
             let generator =
                 RequestGenerator::new(KeyGeneration::sequential(0), RateControl::ClosedLoop, 64);
-            let stats = StatsCollector::default();
+            let stats = common::create_test_stats();
             let config = WorkerConfig {
                 target: target_addr,
                 duration: Duration::from_secs(1),
@@ -142,22 +144,22 @@ fn test_memcached_binary_single_thread() {
 
             let mut worker =
                 Worker::with_closed_loop(TcpTransport::new, protocol, generator, stats, config)?;
-            worker.run().unwrap();
+            worker.run()?;
             Ok(worker.into_stats())
         })
         .expect("Worker failed");
 
-    let stats = StatsCollector::merge(results);
-    let basic_stats = stats.calculate_basic_stats();
+    let stats = GroupStatsCollector::merge(results);
+    let basic_stats = stats.global().calculate_basic_stats();
 
     println!("\n=== Memcached Binary Protocol Test Results ===");
-    println!("Requests: {}", stats.tx_requests());
+    println!("Requests: {}", stats.global().tx_requests());
     println!("Mean latency: {:.2} μs", basic_stats.mean.as_micros());
     println!("Min latency: {:.2} μs", basic_stats.min.as_micros());
     println!("Max latency: {:.2} μs", basic_stats.max.as_micros());
 
     // Assertions
-    assert!(stats.tx_requests() > 100, "Should process at least 100 requests");
+    assert!(stats.global().tx_requests() > 100, "Should process at least 100 requests");
     assert!(basic_stats.mean.as_micros() > 0, "Mean latency should be positive");
     assert!(basic_stats.mean.as_millis() < 10, "Mean latency should be < 10ms");
 }
@@ -172,7 +174,7 @@ fn test_memcached_ascii_single_thread() {
     let target_addr = "127.0.0.1:11211".parse().unwrap();
 
     let results = runtime
-        .run_workers(move |_thread_id| {
+        .run_workers_generic(move |_thread_id| {
             let protocol = ProtocolAdapter::new(
                 xylem_protocols::memcached::ascii::MemcachedAsciiProtocol::new(
                     xylem_protocols::memcached::ascii::MemcachedOp::Get,
@@ -181,7 +183,7 @@ fn test_memcached_ascii_single_thread() {
             let _transport = TcpTransport::new();
             let generator =
                 RequestGenerator::new(KeyGeneration::sequential(0), RateControl::ClosedLoop, 64);
-            let stats = StatsCollector::default();
+            let stats = common::create_test_stats();
             let config = WorkerConfig {
                 target: target_addr,
                 duration: Duration::from_secs(1),
@@ -192,22 +194,22 @@ fn test_memcached_ascii_single_thread() {
 
             let mut worker =
                 Worker::with_closed_loop(TcpTransport::new, protocol, generator, stats, config)?;
-            worker.run().unwrap();
+            worker.run()?;
             Ok(worker.into_stats())
         })
         .expect("Worker failed");
 
-    let stats = StatsCollector::merge(results);
-    let basic_stats = stats.calculate_basic_stats();
+    let stats = GroupStatsCollector::merge(results);
+    let basic_stats = stats.global().calculate_basic_stats();
 
     println!("\n=== Memcached ASCII Protocol Test Results ===");
-    println!("Requests: {}", stats.tx_requests());
+    println!("Requests: {}", stats.global().tx_requests());
     println!("Mean latency: {:.2} μs", basic_stats.mean.as_micros());
     println!("Min latency: {:.2} μs", basic_stats.min.as_micros());
     println!("Max latency: {:.2} μs", basic_stats.max.as_micros());
 
     // Assertions
-    assert!(stats.tx_requests() > 100, "Should process at least 100 requests");
+    assert!(stats.global().tx_requests() > 100, "Should process at least 100 requests");
     assert!(basic_stats.mean.as_micros() > 0, "Mean latency should be positive");
     assert!(basic_stats.mean.as_millis() < 10, "Mean latency should be < 10ms");
 }
@@ -222,7 +224,7 @@ fn test_memcached_binary_multi_thread() {
     let target_addr = "127.0.0.1:11211".parse().unwrap();
 
     let results = runtime
-        .run_workers(move |_thread_id| {
+        .run_workers_generic(move |_thread_id| {
             let protocol = ProtocolAdapter::new(
                 xylem_protocols::memcached::binary::MemcachedBinaryProtocol::new(
                     xylem_protocols::memcached::binary::MemcachedOp::Get,
@@ -231,7 +233,7 @@ fn test_memcached_binary_multi_thread() {
             let _transport = TcpTransport::new();
             let generator =
                 RequestGenerator::new(KeyGeneration::random(10000), RateControl::ClosedLoop, 64);
-            let stats = StatsCollector::default();
+            let stats = common::create_test_stats();
             let config = WorkerConfig {
                 target: target_addr,
                 duration: Duration::from_secs(2),
@@ -242,24 +244,24 @@ fn test_memcached_binary_multi_thread() {
 
             let mut worker =
                 Worker::with_closed_loop(TcpTransport::new, protocol, generator, stats, config)?;
-            worker.run().unwrap();
+            worker.run()?;
             Ok(worker.into_stats())
         })
         .expect("Worker failed");
 
-    let stats = StatsCollector::merge(results);
-    let basic_stats = stats.calculate_basic_stats();
-    let throughput_rps = stats.tx_requests() as f64 / 2.0; // 2 second duration
+    let stats = GroupStatsCollector::merge(results);
+    let basic_stats = stats.global().calculate_basic_stats();
+    let throughput_rps = stats.global().tx_requests() as f64 / 2.0; // 2 second duration
 
     println!("\n=== Memcached Binary Multi-Thread Test Results ===");
     println!("Threads: 4");
-    println!("Requests: {}", stats.tx_requests());
+    println!("Requests: {}", stats.global().tx_requests());
     println!("Throughput: {throughput_rps:.2} req/s");
     println!("Mean latency: {:.2} μs", basic_stats.mean.as_micros());
 
     // Assertions
     assert!(
-        stats.tx_requests() > 1000,
+        stats.global().tx_requests() > 1000,
         "Should process at least 1000 requests with 4 threads"
     );
     assert!(throughput_rps > 100.0, "Should achieve > 100 req/s");
@@ -276,7 +278,7 @@ fn test_memcached_ascii_rate_limited() {
     let target_rate = 1000.0; // 1000 req/s
 
     let results = runtime
-        .run_workers(move |_thread_id| {
+        .run_workers_generic(move |_thread_id| {
             let protocol = ProtocolAdapter::new(
                 xylem_protocols::memcached::ascii::MemcachedAsciiProtocol::new(
                     xylem_protocols::memcached::ascii::MemcachedOp::Get,
@@ -288,7 +290,7 @@ fn test_memcached_ascii_rate_limited() {
                 RateControl::Fixed { rate: target_rate },
                 64,
             );
-            let stats = StatsCollector::default();
+            let stats = common::create_test_stats();
             let config = WorkerConfig {
                 target: target_addr,
                 duration: Duration::from_secs(2),
@@ -299,19 +301,19 @@ fn test_memcached_ascii_rate_limited() {
 
             let mut worker =
                 Worker::with_closed_loop(TcpTransport::new, protocol, generator, stats, config)?;
-            worker.run().unwrap();
+            worker.run()?;
             Ok(worker.into_stats())
         })
         .expect("Worker failed");
 
-    let stats = StatsCollector::merge(results);
-    let basic_stats = stats.calculate_basic_stats();
-    let actual_rate = stats.tx_requests() as f64 / 2.0; // 2 second duration
+    let stats = GroupStatsCollector::merge(results);
+    let basic_stats = stats.global().calculate_basic_stats();
+    let actual_rate = stats.global().tx_requests() as f64 / 2.0; // 2 second duration
 
     println!("\n=== Memcached ASCII Rate-Limited Test Results ===");
     println!("Target rate: {target_rate:.2} req/s");
     println!("Actual rate: {actual_rate:.2} req/s");
-    println!("Requests: {}", stats.tx_requests());
+    println!("Requests: {}", stats.global().tx_requests());
     println!("Mean latency: {:.2} μs", basic_stats.mean.as_micros());
 
     // Allow 10% deviation from target rate

@@ -6,7 +6,6 @@
 mod common;
 
 use std::time::Duration;
-use xylem_core::stats::StatsCollector;
 use xylem_core::threading::worker::{Protocol, Worker, WorkerConfig};
 use xylem_core::workload::{KeyGeneration, RateControl, RequestGenerator};
 use xylem_protocols::redis::RedisOp;
@@ -67,7 +66,7 @@ fn test_round_robin_scheduler_with_multiple_connections() {
     let protocol = ProtocolAdapter::new(protocol);
     let generator =
         RequestGenerator::new(KeyGeneration::sequential(0), RateControl::ClosedLoop, 64);
-    let stats = StatsCollector::default();
+    let stats = common::create_test_stats();
 
     // Use worker config with multiple connections
     let worker_config = WorkerConfig {
@@ -89,18 +88,18 @@ fn test_round_robin_scheduler_with_multiple_connections() {
 
     // Check stats
     let stats = worker.into_stats();
-    let total_requests = stats.tx_requests();
+    let total_requests = stats.global().tx_requests();
 
     println!("RoundRobin Scheduler Results:");
     println!("  Total requests: {}", total_requests);
-    println!("  Successful responses: {}", stats.rx_requests());
+    println!("  Successful responses: {}", stats.global().rx_requests());
     println!(
         "  Error rate: {:.2}%",
-        (total_requests - stats.rx_requests()) as f64 / total_requests as f64 * 100.0
+        (total_requests - stats.global().rx_requests()) as f64 / total_requests as f64 * 100.0
     );
 
     assert!(total_requests > 100, "Should have sent many requests");
-    assert!(stats.rx_requests() > 100, "Should have received many responses");
+    assert!(stats.global().rx_requests() > 100, "Should have received many responses");
 
     let throughput = total_requests as f64 / duration.as_secs_f64();
     println!("  Throughput: {:.2} req/s", throughput);
@@ -124,7 +123,7 @@ fn test_round_robin_scheduler_with_sequential_workload() {
     // Use sequential key generation to test distribution
     let generator =
         RequestGenerator::new(KeyGeneration::sequential(0), RateControl::ClosedLoop, 128);
-    let stats = StatsCollector::default();
+    let stats = common::create_test_stats();
 
     let worker_config = WorkerConfig {
         target: target_addr,
@@ -146,19 +145,23 @@ fn test_round_robin_scheduler_with_sequential_workload() {
     let stats = worker.into_stats();
 
     println!("Sequential Workload Test Results:");
-    println!("  Total requests: {}", stats.tx_requests());
-    println!("  Total bytes sent: {}", stats.tx_bytes());
-    println!("  Total bytes received: {}", stats.rx_bytes());
+    println!("  Total requests: {}", stats.global().tx_requests());
+    println!("  Total bytes sent: {}", stats.global().tx_bytes());
+    println!("  Total bytes received: {}", stats.global().rx_bytes());
 
-    assert!(stats.tx_requests() > 50, "Should have sent requests with sequential keys");
-    assert!(stats.rx_requests() > 50, "Should have received responses");
+    assert!(
+        stats.global().tx_requests() > 50,
+        "Should have sent requests with sequential keys"
+    );
+    assert!(stats.global().rx_requests() > 50, "Should have received responses");
 
     // Verify error rate is low
-    let error_rate =
-        (stats.tx_requests() - stats.rx_requests()) as f64 / stats.tx_requests() as f64 * 100.0;
+    let error_rate = (stats.global().tx_requests() - stats.global().rx_requests()) as f64
+        / stats.global().tx_requests() as f64
+        * 100.0;
     println!("  Error rate: {:.2}%", error_rate);
     assert!(error_rate < 5.0, "Error rate should be low");
 
-    let throughput = stats.tx_requests() as f64 / duration.as_secs_f64();
+    let throughput = stats.global().tx_requests() as f64 / duration.as_secs_f64();
     println!("  Throughput: {:.2} req/s", throughput);
 }

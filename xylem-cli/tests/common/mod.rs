@@ -9,6 +9,7 @@ use std::process::{Child, Command};
 use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
+use xylem_core::stats::GroupStatsCollector;
 
 static REDIS_PORT: Mutex<Option<u16>> = Mutex::new(None);
 
@@ -213,4 +214,15 @@ pub fn start_udp_echo_server() -> (thread::JoinHandle<()>, u16) {
     });
 
     (handle, port)
+}
+
+/// Create a GroupStatsCollector for testing with a single group (group_id=0)
+///
+/// This is a helper for tests that were written for single-group Workers
+/// and need to be migrated to GroupStatsCollector.
+pub fn create_test_stats() -> GroupStatsCollector {
+    let mut stats = GroupStatsCollector::new();
+    // Register group 0 with unlimited sampling
+    stats.register_group_legacy(0, 1_000_000, 1.0);
+    stats
 }

@@ -35,13 +35,14 @@ impl ThreadingRuntime {
         Self { num_threads, cpu_pinning }
     }
 
-    /// Run multiple workers in parallel and aggregate results
+    /// Run multiple workers in parallel and aggregate results (generic over stats type)
     ///
     /// Uses native OS threads with a barrier for synchronization.
     /// All threads start execution simultaneously after the barrier.
-    pub fn run_workers<F>(&self, worker_factory: F) -> Result<Vec<StatsCollector>>
+    pub fn run_workers_generic<F, T>(&self, worker_factory: F) -> Result<Vec<T>>
     where
-        F: Fn(usize) -> Result<StatsCollector> + Send + Sync + Clone + 'static,
+        F: Fn(usize) -> Result<T> + Send + Sync + Clone + 'static,
+        T: Send + 'static,
     {
         // Create synchronization barrier for all threads
         let barrier = Arc::new(Barrier::new(self.num_threads));
@@ -79,6 +80,17 @@ impl ThreadingRuntime {
         }
 
         Ok(results)
+    }
+
+    /// Run multiple workers in parallel and aggregate results
+    ///
+    /// Uses native OS threads with a barrier for synchronization.
+    /// All threads start execution simultaneously after the barrier.
+    pub fn run_workers<F>(&self, worker_factory: F) -> Result<Vec<StatsCollector>>
+    where
+        F: Fn(usize) -> Result<StatsCollector> + Send + Sync + Clone + 'static,
+    {
+        self.run_workers_generic(worker_factory)
     }
 
     /// Get number of threads

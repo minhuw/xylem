@@ -238,15 +238,16 @@ impl<T: Transport, ReqId: Eq + Hash + Clone + std::fmt::Debug> Connection<T, Req
 }
 
 /// Connection pool managing multiple connections with per-connection policies
+///
+/// Supports connections from multiple traffic groups within a single pool.
+/// Each connection tracks its own group_id independently.
 pub struct ConnectionPool<T: Transport, ReqId: Eq + Hash + Clone> {
-    /// All connections in the pool
+    /// All connections in the pool (may belong to different groups)
     connections: Vec<Connection<T, ReqId>>,
-    /// Group ID this pool belongs to
-    group_id: usize,
 }
 
 impl<T: Transport, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionPool<T, ReqId> {
-    /// Create a new connection pool with per-connection policies
+    /// Create a new connection pool with per-connection policies for a single group
     ///
     /// Each connection gets its own independent traffic policy from the PolicyScheduler.
     /// The temporal scheduler picks whichever connection's next request is due soonest.
@@ -300,7 +301,76 @@ impl<T: Transport, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionPool<T,
             connections.push(conn);
         }
 
-        Ok(Self { connections, group_id })
+        Ok(Self { connections })
+    }
+
+    /// Create a new connection pool with connections from multiple traffic groups
+    ///
+    /// This allows multiple traffic groups to share the same worker thread, with connections
+    /// from different groups coexisting in the same pool. Each connection independently tracks
+    /// its group_id and policy.
+    ///
+    /// # Parameters
+    /// - `transport_factory`: Function to create a new transport instance
+    /// - `target`: Target server address
+    /// - `groups`: Vector of (group_id, conn_count, max_pending, policy_scheduler) tuples
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use xylem_core::connection::ConnectionPool;
+    /// use xylem_core::scheduler::UniformPolicyScheduler;
+    /// use xylem_transport::TcpTransport;
+    /// use std::net::SocketAddr;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let target: SocketAddr = "127.0.0.1:6379".parse()?;
+    ///
+    /// // Group 0: Latency measurements (low rate, high sampling)
+    /// let latency_scheduler: Box<dyn xylem_core::scheduler::PolicyScheduler> =
+    ///     Box::new(UniformPolicyScheduler::poisson(100.0)?);
+    ///
+    /// // Group 1: Throughput measurements (closed-loop, low sampling)
+    /// let throughput_scheduler: Box<dyn xylem_core::scheduler::PolicyScheduler> =
+    ///     Box::new(UniformPolicyScheduler::closed_loop());
+    ///
+    /// let groups: Vec<(usize, usize, usize, Box<dyn xylem_core::scheduler::PolicyScheduler>)> = vec![
+    ///     (0, 10, 1, latency_scheduler),    // group_id=0, 10 conns, max_pending=1
+    ///     (1, 50, 10, throughput_scheduler), // group_id=1, 50 conns, max_pending=10
+    /// ];
+    ///
+    /// let pool: ConnectionPool<TcpTransport, (usize, u64)> =
+    ///     ConnectionPool::new_multi_group(TcpTransport::new, target, groups)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn new_multi_group(
+        transport_factory: impl Fn() -> T,
+        target: SocketAddr,
+        groups: Vec<(usize, usize, usize, Box<dyn crate::scheduler::PolicyScheduler>)>,
+    ) -> Result<Self> {
+        let total_conns: usize = groups.iter().map(|(_, count, _, _)| count).sum();
+        let mut connections = Vec::with_capacity(total_conns);
+        let mut conn_idx = 0;
+
+        for (group_id, conn_count, max_pending_per_conn, mut policy_scheduler) in groups {
+            for _ in 0..conn_count {
+                let transport = transport_factory();
+                let policy = policy_scheduler.assign_policy(conn_idx);
+                let conn = Connection::new(
+                    transport,
+                    conn_idx,
+                    target,
+                    max_pending_per_conn,
+                    policy,
+                    group_id,
+                )?;
+                connections.push(conn);
+                conn_idx += 1;
+            }
+        }
+
+        Ok(Self { connections })
     }
 
     /// Pick the next ready connection using temporal scheduling
@@ -352,10 +422,5 @@ impl<T: Transport, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionPool<T,
             conn.close()?;
         }
         Ok(())
-    }
-
-    /// Get the group ID for this pool
-    pub fn group_id(&self) -> usize {
-        self.group_id
     }
 }

@@ -7,8 +7,7 @@
 //! ## Available Transports
 //!
 //! - **TCP**: Non-blocking TCP sockets with mio
-//! - **UDP**: (TODO) Non-blocking UDP sockets
-//! - **TLS**: (TODO) TLS over TCP using rustls
+//! - **UDP**: Non-blocking UDP sockets
 //!
 //! ## Example
 //!

@@ -8,7 +8,7 @@
 //! - Multiple connections with pipelining: High-throughput load testing
 
 use crate::connection::ConnectionPool;
-use crate::stats::StatsCollector;
+use crate::stats::GroupStatsCollector;
 use crate::timing;
 use crate::workload::RequestGenerator;
 use crate::Result;
@@ -65,7 +65,7 @@ pub struct Worker<T: Transport, P: Protocol> {
     pool: ConnectionPool<T, P::RequestId>,
     protocol: P,
     generator: RequestGenerator,
-    stats: StatsCollector,
+    stats: GroupStatsCollector,
     config: WorkerConfig,
     /// Track keys for scheduler feedback
     current_key: u64,
@@ -77,7 +77,7 @@ impl<T: Transport, P: Protocol> Worker<T, P> {
         transport_factory: impl Fn() -> T,
         protocol: P,
         generator: RequestGenerator,
-        stats: StatsCollector,
+        stats: GroupStatsCollector,
         config: WorkerConfig,
         policy_scheduler: Box<dyn crate::scheduler::PolicyScheduler>,
     ) -> Result<Self> {
@@ -105,11 +105,32 @@ impl<T: Transport, P: Protocol> Worker<T, P> {
         transport_factory: impl Fn() -> T,
         protocol: P,
         generator: RequestGenerator,
-        stats: StatsCollector,
+        stats: GroupStatsCollector,
         config: WorkerConfig,
     ) -> Result<Self> {
         let policy_scheduler = Box::new(crate::scheduler::UniformPolicyScheduler::closed_loop());
         Self::new(transport_factory, protocol, generator, stats, config, policy_scheduler)
+    }
+
+    /// Create a new pipelined worker with multiple traffic groups
+    pub fn new_multi_group(
+        transport_factory: impl Fn() -> T,
+        protocol: P,
+        generator: RequestGenerator,
+        stats: GroupStatsCollector,
+        config: WorkerConfig,
+        groups: Vec<(usize, usize, usize, Box<dyn crate::scheduler::PolicyScheduler>)>,
+    ) -> Result<Self> {
+        let pool = ConnectionPool::new_multi_group(transport_factory, config.target, groups)?;
+
+        Ok(Self {
+            pool,
+            protocol,
+            generator,
+            stats,
+            config,
+            current_key: 0,
+        })
     }
 
     /// Run the pipelined measurement loop (Lancet symmetric_tcp_main style)
@@ -144,9 +165,10 @@ impl<T: Transport, P: Protocol> Worker<T, P> {
 
                 // Send request and notify policy
                 let sent_time_ns = timing::time_ns();
+                let group_id = conn.group_id();
                 conn.send(&request_data, req_id)?;
                 conn.on_request_sent(sent_time_ns);
-                self.stats.record_tx_bytes(request_data.len());
+                self.stats.record_tx_bytes(group_id, request_data.len());
 
                 // Mark request sent for rate control
                 self.generator.mark_request_sent();
@@ -195,20 +217,21 @@ impl<T: Transport, P: Protocol> Worker<T, P> {
             }
 
             let conn_id = conn.idx();
+            let group_id = conn.group_id();
             let latencies =
                 conn.recv_responses(|data| match protocol.parse_response(conn_id, data) {
                     Ok((bytes_consumed, req_id_opt)) => {
                         if bytes_consumed > 0 {
-                            stats.record_rx_bytes(bytes_consumed);
+                            stats.record_rx_bytes(group_id, bytes_consumed);
                         }
                         Ok((bytes_consumed, req_id_opt))
                     }
                     Err(e) => Err(e.into()),
                 })?;
 
-            // Record all latencies
+            // Record all latencies with group_id
             for (_req_id, latency) in latencies {
-                stats.record_latency(latency);
+                stats.record_latency(group_id, latency);
             }
         }
 
@@ -248,10 +271,11 @@ impl<T: Transport, P: Protocol> Worker<T, P> {
             }
 
             let conn_id = conn.idx();
+            let group_id = conn.group_id();
             let _ = conn.recv_responses(|data| match protocol.parse_response(conn_id, data) {
                 Ok((bytes_consumed, req_id_opt)) => {
                     if bytes_consumed > 0 {
-                        stats.record_rx_bytes(bytes_consumed);
+                        stats.record_rx_bytes(group_id, bytes_consumed);
                     }
                     Ok((bytes_consumed, req_id_opt))
                 }
@@ -263,12 +287,12 @@ impl<T: Transport, P: Protocol> Worker<T, P> {
     }
 
     /// Get the stats collector
-    pub fn stats(&self) -> &StatsCollector {
+    pub fn stats(&self) -> &GroupStatsCollector {
         &self.stats
     }
 
     /// Consume the worker and return stats
-    pub fn into_stats(self) -> StatsCollector {
+    pub fn into_stats(self) -> GroupStatsCollector {
         self.stats
     }
 }
@@ -352,7 +376,8 @@ mod tests {
         let protocol = ProtocolAdapter::new(echo_protocol);
         let generator =
             RequestGenerator::new(KeyGeneration::sequential(0), RateControl::ClosedLoop, 64);
-        let stats = StatsCollector::default();
+        let mut stats = GroupStatsCollector::default();
+        stats.register_group_legacy(0, 100000, 1.0);
         let config = WorkerConfig {
             target: addr,
             duration: Duration::from_millis(100),
@@ -369,7 +394,7 @@ mod tests {
         assert!(result.is_ok(), "Worker should complete: {:?}", result.err());
 
         let stats = worker.stats();
-        assert!(stats.tx_requests() > 0, "Should have sent requests");
+        assert!(stats.global().tx_requests() > 0, "Should have sent requests");
     }
 
     #[test]
@@ -409,7 +434,8 @@ mod tests {
             RateControl::ClosedLoop, // Let policy control rate
             64,
         );
-        let stats = StatsCollector::default();
+        let mut stats = GroupStatsCollector::default();
+        stats.register_group_legacy(0, 100000, 1.0);
         let config = WorkerConfig {
             target: addr,
             duration: Duration::from_millis(200),
@@ -434,7 +460,7 @@ mod tests {
 
         // At 100 req/s for 200ms, expect ~20 requests
         let expected = 20;
-        let actual = stats.tx_requests();
+        let actual = stats.global().tx_requests();
         assert!(
             actual >= expected - 5 && actual <= expected + 5,
             "Expected ~{} requests at 100 req/s for {:?}, got {}",

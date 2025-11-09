@@ -4,7 +4,6 @@ use schemars::schema_for;
 use std::io;
 use std::path::PathBuf;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use xylem_core::stats::StatsCollector;
 use xylem_core::threading::{CpuPinning, ThreadingRuntime, Worker, WorkerConfig};
 use xylem_core::workload::{RateControl, RequestGenerator};
 use xylem_transport::TcpTransport;
@@ -286,64 +285,78 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
         ($protocol_expr:expr) => {{
             let runtime = ThreadingRuntime::with_cpu_pinning(num_threads, cpu_pinning.clone());
 
-            // For now, use a simplified approach: assume one group per thread
-            // This works for most cases and we can enhance later
-            let results = runtime.run_workers(move |thread_idx| {
-                // Find which traffic group this thread belongs to
+            // Support multiple traffic groups per thread
+            let results = runtime.run_workers_generic(move |thread_idx| {
+                // Find which traffic groups this thread belongs to
                 let groups_for_thread =
                     thread_assignment.get_groups_for_thread(thread_idx).ok_or_else(|| {
                         anyhow::anyhow!("No groups assigned to thread {}", thread_idx)
                     })?;
 
-                // For simplicity, if a thread has multiple groups, we'll just use the first one
-                // TODO: Support multiple groups per thread in the future
-                let (group_id, group_meta) = groups_for_thread
-                    .first()
-                    .ok_or_else(|| anyhow::anyhow!("No group assigned to thread {}", thread_idx))?;
-
-                let group_config = &config.traffic_groups[*group_id];
-
                 let protocol = ProtocolAdapter::new($protocol_expr);
 
-                // Calculate per-thread rate based on group policy
-                let thread_rate_control = match &group_config.policy {
-                    xylem_core::traffic_group::PolicyConfig::ClosedLoop => RateControl::ClosedLoop,
-                    xylem_core::traffic_group::PolicyConfig::FixedRate { rate } => {
-                        RateControl::Fixed { rate: *rate }
-                    }
-                    xylem_core::traffic_group::PolicyConfig::Poisson { rate } => {
-                        // Poisson per connection, so total rate for thread is rate * connections
-                        RateControl::Fixed {
-                            rate: rate * group_meta.connections_per_thread as f64,
-                        }
-                    }
-                    xylem_core::traffic_group::PolicyConfig::Adaptive { .. } => {
-                        // For now, treat adaptive as closed-loop
-                        // TODO: Implement adaptive rate control
-                        tracing::warn!(
-                            "Adaptive policy not yet fully implemented, using closed-loop"
-                        );
-                        RateControl::ClosedLoop
-                    }
-                };
+                // Create a shared request generator for this thread
+                // All groups share the same key generation but may have different traffic policies
+                let generator = RequestGenerator::new(key_gen.clone(), RateControl::ClosedLoop, value_size);
 
-                let generator =
-                    RequestGenerator::new(key_gen.clone(), thread_rate_control.clone(), value_size);
-                let stats = StatsCollector::default();
+                // Initialize group stats collector and register all groups
+                let mut stats = xylem_core::stats::GroupStatsCollector::new();
+
+                // Build group configurations for multi-group worker
+                let mut groups_config = Vec::new();
+
+                for (group_id, group_meta) in groups_for_thread.iter() {
+                    let group_config = &config.traffic_groups[*group_id];
+
+                    // Register group in stats collector
+                    stats.register_group(*group_id, &group_config.sampling_policy);
+
+                    // Create policy scheduler for this group
+                    let policy_scheduler: Box<dyn xylem_core::scheduler::PolicyScheduler> = match &group_config.policy {
+                        xylem_core::traffic_group::PolicyConfig::ClosedLoop => {
+                            Box::new(xylem_core::scheduler::UniformPolicyScheduler::closed_loop())
+                        }
+                        xylem_core::traffic_group::PolicyConfig::FixedRate { rate } => {
+                            Box::new(xylem_core::scheduler::UniformPolicyScheduler::fixed_rate(*rate))
+                        }
+                        xylem_core::traffic_group::PolicyConfig::Poisson { rate } => {
+                            Box::new(xylem_core::scheduler::UniformPolicyScheduler::poisson(*rate)?)
+                        }
+                        xylem_core::traffic_group::PolicyConfig::Adaptive { .. } => {
+                            tracing::warn!(
+                                "Adaptive policy not yet fully implemented, using closed-loop"
+                            );
+                            Box::new(xylem_core::scheduler::UniformPolicyScheduler::closed_loop())
+                        }
+                    };
+
+                    // Add to groups config: (group_id, conn_count, max_pending, policy_scheduler)
+                    groups_config.push((
+                        *group_id,
+                        group_meta.connections_per_thread,
+                        group_meta.max_pending_per_connection,
+                        policy_scheduler,
+                    ));
+                }
+
+                // Calculate total connections for worker config
+                let total_conn_count: usize = groups_config.iter().map(|(_, count, _, _)| count).sum();
+
                 let worker_config = WorkerConfig {
                     target: target_addr,
                     duration,
                     value_size,
-                    conn_count: group_meta.connections_per_thread,
-                    max_pending_per_conn: group_meta.max_pending_per_connection,
+                    conn_count: total_conn_count,
+                    max_pending_per_conn: 1, // This will be overridden per-group
                 };
 
-                let mut worker = Worker::with_closed_loop(
+                let mut worker = Worker::new_multi_group(
                     TcpTransport::new,
                     protocol,
                     generator,
                     stats,
                     worker_config,
+                    groups_config,
                 )?;
 
                 worker.run()?;
@@ -351,7 +364,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
             })?;
 
             tracing::info!("Experiment completed successfully");
-            StatsCollector::merge(results)
+            xylem_core::stats::GroupStatsCollector::merge(results)
         }};
     }
 
@@ -396,7 +409,8 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
     };
 
     // Aggregate statistics with percentiles and confidence intervals
-    let aggregated_stats = xylem_core::stats::aggregate_stats(&stats, duration, 0.95);
+    // Use global stats which aggregates all traffic groups
+    let aggregated_stats = xylem_core::stats::aggregate_stats(stats.global(), duration, 0.95);
 
     // Create results
     let results = ExperimentResults::from_aggregated_stats(

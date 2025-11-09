@@ -90,7 +90,7 @@ impl GroupStatsCollector {
     }
 
     /// Merge multiple group collectors (from different threads)
-    pub fn merge(collectors: Vec<GroupStatsCollector>) -> Self {
+    pub fn merge(mut collectors: Vec<GroupStatsCollector>) -> Self {
         let mut merged = GroupStatsCollector::new();
 
         // Collect all group IDs
@@ -103,9 +103,9 @@ impl GroupStatsCollector {
         for &group_id in &all_group_ids {
             let mut group_collectors_to_merge = Vec::new();
 
-            for collector in &collectors {
-                if let Some(group_collector) = collector.get_group(group_id) {
-                    group_collectors_to_merge.push(group_collector.clone());
+            for collector in &mut collectors {
+                if let Some(group_collector) = collector.group_collectors.remove(&group_id) {
+                    group_collectors_to_merge.push(group_collector);
                 }
             }
 
@@ -116,8 +116,9 @@ impl GroupStatsCollector {
             }
         }
 
-        // Merge global collectors
-        let global_collectors: Vec<_> = collectors.iter().map(|c| c.global().clone()).collect();
+        // Merge global collectors - move them out instead of cloning
+        let global_collectors: Vec<_> =
+            collectors.into_iter().map(|c| c.global_collector).collect();
         merged.global_collector = StatsCollector::merge(global_collectors);
 
         merged

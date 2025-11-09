@@ -25,10 +25,12 @@ use std::process::{Child, Command};
 use std::sync::Mutex;
 use std::thread::sleep;
 use std::time::Duration;
-use xylem_core::stats::StatsCollector;
+use xylem_core::stats::GroupStatsCollector;
 use xylem_core::threading::{ThreadingRuntime, Worker, WorkerConfig};
 use xylem_core::workload::{KeyGeneration, RateControl, RequestGenerator};
 use xylem_transport::TcpTransport;
+
+mod common;
 
 // Global state to track nginx server process
 static NGINX_SERVER: Mutex<Option<Child>> = Mutex::new(None);
@@ -220,7 +222,7 @@ fn test_http_get_single_thread() {
     let protocol = ProtocolAdapter::new(protocol);
     let generator =
         RequestGenerator::new(KeyGeneration::sequential(0), RateControl::ClosedLoop, 64);
-    let stats = StatsCollector::default();
+    let stats = common::create_test_stats();
     let worker_config = WorkerConfig {
         target: target_addr,
         duration,
@@ -239,19 +241,22 @@ fn test_http_get_single_thread() {
     assert!(result.is_ok(), "Worker should complete successfully: {:?}", result.err());
 
     let stats = worker.into_stats();
-    let basic_stats = stats.calculate_basic_stats();
+    let basic_stats = stats.global().calculate_basic_stats();
 
     println!("Results:");
-    println!("  Total requests: {}", stats.tx_requests());
-    println!("  Throughput: {:.2} req/s", stats.tx_requests() as f64 / duration.as_secs_f64());
+    println!("  Total requests: {}", stats.global().tx_requests());
+    println!(
+        "  Throughput: {:.2} req/s",
+        stats.global().tx_requests() as f64 / duration.as_secs_f64()
+    );
     println!("  Min latency: {:.2} μs", basic_stats.min.as_micros());
     println!("  Mean latency: {:.2} μs", basic_stats.mean.as_micros());
     println!("  Max latency: {:.2} μs", basic_stats.max.as_micros());
 
     // Verify we got some requests through
-    assert!(stats.tx_requests() > 0, "Should have sent some requests");
-    assert!(stats.rx_requests() > 0, "Should have received some responses");
-    assert!(!stats.samples().is_empty(), "Should have collected latency samples");
+    assert!(stats.global().tx_requests() > 0, "Should have sent some requests");
+    assert!(stats.global().rx_requests() > 0, "Should have received some responses");
+    assert!(!stats.global().samples().is_empty(), "Should have collected latency samples");
 
     // Sanity check on latency (should be < 10ms for local nginx)
     assert!(
@@ -279,7 +284,7 @@ fn test_http_post_single_thread() {
     let protocol = ProtocolAdapter::new(protocol);
     let generator =
         RequestGenerator::new(KeyGeneration::sequential(0), RateControl::ClosedLoop, 128);
-    let stats = StatsCollector::default();
+    let stats = common::create_test_stats();
     let worker_config = WorkerConfig {
         target: target_addr,
         duration,
@@ -298,15 +303,18 @@ fn test_http_post_single_thread() {
     assert!(result.is_ok(), "Worker should complete successfully");
 
     let stats = worker.into_stats();
-    let basic_stats = stats.calculate_basic_stats();
+    let basic_stats = stats.global().calculate_basic_stats();
 
     println!("Results:");
-    println!("  Total requests: {}", stats.tx_requests());
-    println!("  Throughput: {:.2} req/s", stats.tx_requests() as f64 / duration.as_secs_f64());
+    println!("  Total requests: {}", stats.global().tx_requests());
+    println!(
+        "  Throughput: {:.2} req/s",
+        stats.global().tx_requests() as f64 / duration.as_secs_f64()
+    );
     println!("  Mean latency: {:.2} μs", basic_stats.mean.as_micros());
 
-    assert!(stats.tx_requests() > 0, "Should have sent POST requests");
-    assert!(stats.rx_requests() > 0, "Should have received responses");
+    assert!(stats.global().tx_requests() > 0, "Should have sent POST requests");
+    assert!(stats.global().rx_requests() > 0, "Should have received responses");
 }
 
 #[test]
@@ -324,7 +332,7 @@ fn test_http_multi_thread() {
 
     println!("Starting {num_threads}-threaded HTTP test...");
 
-    let results = runtime.run_workers(move |thread_id| {
+    let results = runtime.run_workers_generic(move |thread_id| {
         let protocol = xylem_protocols::http::HttpProtocol::new(
             xylem_protocols::HttpMethod::Get,
             "/".to_string(),
@@ -336,7 +344,7 @@ fn test_http_multi_thread() {
             RateControl::ClosedLoop,
             64,
         );
-        let stats = StatsCollector::default();
+        let stats = common::create_test_stats();
         let worker_config = WorkerConfig {
             target: target_addr,
             duration,
@@ -348,10 +356,8 @@ fn test_http_multi_thread() {
             Worker::with_closed_loop(TcpTransport::new, protocol, generator, stats, worker_config)
                 .expect("Failed to create worker");
 
-        {
-            worker.run()?;
-            Ok(worker.into_stats())
-        }
+        worker.run()?;
+        Ok(worker.into_stats())
     });
 
     assert!(
@@ -364,26 +370,26 @@ fn test_http_multi_thread() {
     assert_eq!(results.len(), num_threads);
 
     // Merge stats from all threads
-    let merged_stats = StatsCollector::merge(results);
-    let basic_stats = merged_stats.calculate_basic_stats();
+    let merged_stats = GroupStatsCollector::merge(results);
+    let basic_stats = merged_stats.global().calculate_basic_stats();
 
     println!("Results ({num_threads} threads):");
-    println!("  Total requests: {}", merged_stats.tx_requests());
+    println!("  Total requests: {}", merged_stats.global().tx_requests());
     println!(
         "  Throughput: {:.2} req/s",
-        merged_stats.tx_requests() as f64 / duration.as_secs_f64()
+        merged_stats.global().tx_requests() as f64 / duration.as_secs_f64()
     );
     println!("  Min latency: {:.2} μs", basic_stats.min.as_micros());
     println!("  Mean latency: {:.2} μs", basic_stats.mean.as_micros());
     println!("  Max latency: {:.2} μs", basic_stats.max.as_micros());
 
     // Verify we got some requests through
-    assert!(merged_stats.tx_requests() > 0, "Should have sent some requests");
-    assert!(merged_stats.rx_requests() > 0, "Should have received some responses");
+    assert!(merged_stats.global().tx_requests() > 0, "Should have sent some requests");
+    assert!(merged_stats.global().rx_requests() > 0, "Should have received some responses");
 
     // With 4 threads, we should get reasonable throughput
     assert!(
-        merged_stats.tx_requests() > 100,
+        merged_stats.global().tx_requests() > 100,
         "Should have reasonable throughput with {num_threads} threads"
     );
 }
@@ -410,7 +416,7 @@ fn test_http_rate_limited() {
         RateControl::Fixed { rate: target_rate },
         64,
     );
-    let stats = StatsCollector::default();
+    let stats = common::create_test_stats();
     let worker_config = WorkerConfig {
         target: target_addr,
         duration,
@@ -429,12 +435,12 @@ fn test_http_rate_limited() {
     assert!(result.is_ok(), "Worker should complete successfully");
 
     let stats = worker.into_stats();
-    let actual_rate = stats.tx_requests() as f64 / duration.as_secs_f64();
+    let actual_rate = stats.global().tx_requests() as f64 / duration.as_secs_f64();
 
     println!("Results:");
     println!("  Target rate: {target_rate:.2} req/s");
     println!("  Actual rate: {actual_rate:.2} req/s");
-    println!("  Total requests: {}", stats.tx_requests());
+    println!("  Total requests: {}", stats.global().tx_requests());
 
     // Verify we're close to target rate (within 40% tolerance)
     let rate_ratio = actual_rate / target_rate;
@@ -462,7 +468,7 @@ fn test_http_put_request() {
     let protocol = ProtocolAdapter::new(protocol);
     let generator =
         RequestGenerator::new(KeyGeneration::sequential(0), RateControl::ClosedLoop, 256);
-    let stats = StatsCollector::default();
+    let stats = common::create_test_stats();
     let worker_config = WorkerConfig {
         target: target_addr,
         duration,
@@ -483,11 +489,11 @@ fn test_http_put_request() {
     let stats = worker.into_stats();
 
     println!("Results:");
-    println!("  Total requests: {}", stats.tx_requests());
-    println!("  Total bytes sent: {}", stats.tx_bytes());
+    println!("  Total requests: {}", stats.global().tx_requests());
+    println!("  Total bytes sent: {}", stats.global().tx_bytes());
 
-    assert!(stats.tx_requests() > 0, "Should have sent PUT requests");
-    assert!(stats.rx_requests() > 0, "Should have received responses");
+    assert!(stats.global().tx_requests() > 0, "Should have sent PUT requests");
+    assert!(stats.global().rx_requests() > 0, "Should have received responses");
 }
 
 #[test]
@@ -508,7 +514,7 @@ fn test_http_pipelined() {
     let protocol = ProtocolAdapter::new(protocol);
     let generator =
         RequestGenerator::new(KeyGeneration::sequential(0), RateControl::ClosedLoop, 64);
-    let stats = StatsCollector::default();
+    let stats = common::create_test_stats();
     let worker_config = WorkerConfig {
         target: target_addr,
         duration,
@@ -526,7 +532,7 @@ fn test_http_pipelined() {
 
     assert!(result.is_ok(), "Worker should complete: {:?}", result.err());
 
-    let stats = worker.stats();
+    let stats = worker.stats().global();
     let basic_stats = stats.calculate_basic_stats();
 
     println!("Results:");

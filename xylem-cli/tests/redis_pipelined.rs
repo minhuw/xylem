@@ -6,10 +6,11 @@ use std::process::{Child, Command};
 use std::sync::Mutex;
 use std::thread::sleep;
 use std::time::Duration;
-use xylem_core::stats::StatsCollector;
 use xylem_core::threading::{Worker, WorkerConfig};
 use xylem_core::workload::{KeyGeneration, RateControl, RequestGenerator};
 use xylem_transport::TcpTransport;
+
+mod common;
 
 // Global state to track Redis server process
 static REDIS_SERVER: Mutex<Option<Child>> = Mutex::new(None);
@@ -132,7 +133,7 @@ fn test_redis_pipelined_single_connection() {
     let protocol = ProtocolAdapter::new(protocol);
     let generator =
         RequestGenerator::new(KeyGeneration::sequential(0), RateControl::ClosedLoop, 64);
-    let stats = StatsCollector::default();
+    let stats = common::create_test_stats();
     let config = WorkerConfig {
         target: target_addr,
         duration,
@@ -149,7 +150,7 @@ fn test_redis_pipelined_single_connection() {
 
     assert!(result.is_ok(), "Worker should complete: {:?}", result.err());
 
-    let stats = worker.stats();
+    let stats = worker.stats().global();
     let basic_stats = stats.calculate_basic_stats();
 
     println!("Results:");
@@ -181,7 +182,7 @@ fn test_redis_pipelined_multiple_connections() {
     let protocol = ProtocolAdapter::new(protocol);
     let generator =
         RequestGenerator::new(KeyGeneration::sequential(0), RateControl::ClosedLoop, 64);
-    let stats = StatsCollector::default();
+    let stats = common::create_test_stats();
     let config = WorkerConfig {
         target: target_addr,
         duration,
@@ -198,7 +199,7 @@ fn test_redis_pipelined_multiple_connections() {
 
     assert!(result.is_ok(), "Worker should complete: {:?}", result.err());
 
-    let stats = worker.stats();
+    let stats = worker.stats().global();
     let basic_stats = stats.calculate_basic_stats();
 
     println!("Results:");
@@ -234,7 +235,7 @@ fn test_redis_pipelined_rate_limited() {
         RateControl::Fixed { rate: target_rate },
         64,
     );
-    let stats = StatsCollector::default();
+    let stats = common::create_test_stats();
     let config = WorkerConfig {
         target: target_addr,
         duration,
@@ -251,7 +252,7 @@ fn test_redis_pipelined_rate_limited() {
 
     assert!(result.is_ok(), "Worker should complete: {:?}", result.err());
 
-    let stats = worker.stats();
+    let stats = worker.stats().global();
     let actual_rate = stats.tx_requests() as f64 / duration.as_secs_f64();
 
     println!("Results:");
