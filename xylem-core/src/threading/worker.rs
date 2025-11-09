@@ -7,11 +7,12 @@
 //! - Single connection, single pending request: Simple closed-loop latency measurement
 //! - Multiple connections with pipelining: High-throughput load testing
 
-use crate::connection::ConnectionPool;
+use crate::connection::{ConnectionPool, TrafficGroupConfig};
 use crate::stats::GroupStatsCollector;
 use crate::timing;
 use crate::workload::RequestGenerator;
 use crate::Result;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 use xylem_transport::Transport;
@@ -63,7 +64,8 @@ pub struct WorkerConfig {
 /// Worker with connection pooling and request pipelining
 pub struct Worker<T: Transport, P: Protocol> {
     pool: ConnectionPool<T, P::RequestId>,
-    protocol: P,
+    /// Map of traffic group ID to protocol instance
+    protocols: HashMap<usize, P>,
     generator: RequestGenerator,
     stats: GroupStatsCollector,
     config: WorkerConfig,
@@ -90,9 +92,12 @@ impl<T: Transport, P: Protocol> Worker<T, P> {
             0, // Default group_id for legacy single-pool workers
         )?;
 
+        let mut protocols = HashMap::new();
+        protocols.insert(0, protocol); // Single protocol uses group_id 0
+
         Ok(Self {
             pool,
-            protocol,
+            protocols,
             generator,
             stats,
             config,
@@ -115,7 +120,7 @@ impl<T: Transport, P: Protocol> Worker<T, P> {
     /// Create a new pipelined worker with multiple traffic groups
     pub fn new_multi_group(
         transport_factory: impl Fn() -> T,
-        protocol: P,
+        protocols: HashMap<usize, P>,
         generator: RequestGenerator,
         stats: GroupStatsCollector,
         config: WorkerConfig,
@@ -125,7 +130,31 @@ impl<T: Transport, P: Protocol> Worker<T, P> {
 
         Ok(Self {
             pool,
-            protocol,
+            protocols,
+            generator,
+            stats,
+            config,
+            current_key: 0,
+        })
+    }
+
+    /// Create a new pipelined worker with multiple traffic groups, each with its own target
+    ///
+    /// # Parameters
+    /// - `groups`: Vec of (group_id, target, conn_count, max_pending_per_conn, policy_scheduler)
+    pub fn new_multi_group_with_targets(
+        transport_factory: impl Fn() -> T,
+        protocols: HashMap<usize, P>,
+        generator: RequestGenerator,
+        stats: GroupStatsCollector,
+        config: WorkerConfig,
+        groups: Vec<TrafficGroupConfig>,
+    ) -> Result<Self> {
+        let pool = ConnectionPool::new_multi_group_with_targets(transport_factory, groups)?;
+
+        Ok(Self {
+            pool,
+            protocols,
             generator,
             stats,
             config,
@@ -160,8 +189,12 @@ impl<T: Transport, P: Protocol> Worker<T, P> {
                 };
 
                 let conn_id = conn.idx();
-                let (request_data, req_id) =
-                    self.protocol.generate_request(conn_id, key, value_size);
+                let group_id = conn.group_id();
+
+                // Look up protocol for this connection's traffic group
+                let protocol =
+                    self.protocols.get_mut(&group_id).expect("Protocol not found for group_id");
+                let (request_data, req_id) = protocol.generate_request(conn_id, key, value_size);
 
                 // Send request and notify policy
                 let sent_time_ns = timing::time_ns();
@@ -208,7 +241,6 @@ impl<T: Transport, P: Protocol> Worker<T, P> {
 
     /// Process responses from all connections
     fn process_responses(&mut self) -> Result<()> {
-        let protocol = &mut self.protocol;
         let stats = &mut self.stats;
 
         for conn in self.pool.connections_mut() {
@@ -218,6 +250,11 @@ impl<T: Transport, P: Protocol> Worker<T, P> {
 
             let conn_id = conn.idx();
             let group_id = conn.group_id();
+
+            // Look up protocol for this connection's traffic group
+            let protocol =
+                self.protocols.get_mut(&group_id).expect("Protocol not found for group_id");
+
             let latencies =
                 conn.recv_responses(|data| match protocol.parse_response(conn_id, data) {
                     Ok((bytes_consumed, req_id_opt)) => {
@@ -256,7 +293,6 @@ impl<T: Transport, P: Protocol> Worker<T, P> {
     /// Single drain iteration - returns true if any connections have pending requests
     fn drain_iteration(&mut self) -> Result<bool> {
         let mut any_pending = false;
-        let protocol = &mut self.protocol;
         let stats = &mut self.stats;
 
         for conn in self.pool.connections_mut() {
@@ -272,6 +308,11 @@ impl<T: Transport, P: Protocol> Worker<T, P> {
 
             let conn_id = conn.idx();
             let group_id = conn.group_id();
+
+            // Look up protocol for this connection's traffic group
+            let protocol =
+                self.protocols.get_mut(&group_id).expect("Protocol not found for group_id");
+
             let _ = conn.recv_responses(|data| match protocol.parse_response(conn_id, data) {
                 Ok((bytes_consumed, req_id_opt)) => {
                     if bytes_consumed > 0 {

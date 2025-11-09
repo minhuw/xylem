@@ -80,6 +80,7 @@ rate = 1000.0
 
 [[traffic_groups]]
 name = \"main\"
+protocol = \"xylem-echo\"
 threads = [0]
 connections_per_thread = 1
 max_pending_per_connection = 1

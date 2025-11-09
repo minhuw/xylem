@@ -13,6 +13,10 @@ use xylem_transport::{Timestamp, Transport};
 /// Maximum receive buffer size per connection
 const MAX_PAYLOAD: usize = 16384;
 
+/// Traffic group configuration: (group_id, target, conn_count, max_pending_per_conn, policy_scheduler)
+pub type TrafficGroupConfig =
+    (usize, SocketAddr, usize, usize, Box<dyn crate::scheduler::PolicyScheduler>);
+
 /// Pending request tracking
 #[derive(Debug)]
 struct PendingRequest {
@@ -349,11 +353,31 @@ impl<T: Transport, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionPool<T,
         target: SocketAddr,
         groups: Vec<(usize, usize, usize, Box<dyn crate::scheduler::PolicyScheduler>)>,
     ) -> Result<Self> {
-        let total_conns: usize = groups.iter().map(|(_, count, _, _)| count).sum();
+        // Convert to new format with per-group targets (all using same target for backward compat)
+        let groups_with_targets: Vec<_> = groups
+            .into_iter()
+            .map(|(group_id, conn_count, max_pending, scheduler)| {
+                (group_id, target, conn_count, max_pending, scheduler)
+            })
+            .collect();
+
+        Self::new_multi_group_with_targets(transport_factory, groups_with_targets)
+    }
+
+    /// Create a new connection pool with multiple traffic groups, each with its own target
+    ///
+    /// # Parameters
+    /// - `transport_factory`: Function to create a new transport instance
+    /// - `groups`: Vec of (group_id, target, conn_count, max_pending_per_conn, policy_scheduler)
+    pub fn new_multi_group_with_targets(
+        transport_factory: impl Fn() -> T,
+        groups: Vec<TrafficGroupConfig>,
+    ) -> Result<Self> {
+        let total_conns: usize = groups.iter().map(|(_, _, count, _, _)| count).sum();
         let mut connections = Vec::with_capacity(total_conns);
         let mut conn_idx = 0;
 
-        for (group_id, conn_count, max_pending_per_conn, mut policy_scheduler) in groups {
+        for (group_id, target, conn_count, max_pending_per_conn, mut policy_scheduler) in groups {
             for _ in 0..conn_count {
                 let transport = transport_factory();
                 let policy = policy_scheduler.assign_policy(conn_idx);

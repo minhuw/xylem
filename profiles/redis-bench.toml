@@ -39,6 +39,7 @@ rate = 50000.0  # Total target: 50K QPS
 # This agent measures latency WITHOUT being affected by queueing delays
 [[traffic_groups]]
 name = "latency-agent"
+protocol = "redis"
 threads = [0]
 connections_per_thread = 10      # 10 connections on 1 thread
 max_pending_per_connection = 1   # No pipelining
@@ -59,6 +60,7 @@ rate = 100.0  # 100 req/s per connection × 10 connections = 1K QPS
 # This agent generates realistic load without distorting latency measurements
 [[traffic_groups]]
 name = "throughput-agent"
+protocol = "redis"
 threads = [1, 2, 3]
 connections_per_thread = 25      # 75 total connections (25 per thread)
 max_pending_per_connection = 32  # High pipelining

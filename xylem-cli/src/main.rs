@@ -1,3 +1,4 @@
+use anyhow::Context;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
 use schemars::schema_for;
@@ -209,7 +210,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Target address must be specified"))?;
 
-    tracing::info!("Target: {} ({})", target_address, config.target.protocol);
+    tracing::info!("Target: {} (protocol: per-group)", target_address);
     tracing::info!("Transport: {}", config.target.transport);
 
     // Display traffic groups information
@@ -276,137 +277,137 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
     let value_size = config.workload.keys.value_size();
 
     // Clone values needed for results output (already have target_address from above)
-    let protocol_name = config.target.protocol.clone();
     let target_address_string = target_address.to_string();
     let target_address_for_http = target_address_string.clone();
 
-    // Helper macro to run workers for a specific protocol
-    macro_rules! run_protocol {
-        ($protocol_expr:expr) => {{
-            let runtime = ThreadingRuntime::with_cpu_pinning(num_threads, cpu_pinning.clone());
+    // Determine the main protocol name for output (use first group's protocol)
+    let output_protocol = config.traffic_groups[0]
+        .protocol
+        .as_ref()
+        .or(config.target.protocol.as_ref())
+        .unwrap_or(&"unknown".to_string())
+        .clone();
 
-            // Support multiple traffic groups per thread
-            let results = runtime.run_workers_generic(move |thread_idx| {
-                // Find which traffic groups this thread belongs to
-                let groups_for_thread =
-                    thread_assignment.get_groups_for_thread(thread_idx).ok_or_else(|| {
-                        anyhow::anyhow!("No groups assigned to thread {}", thread_idx)
-                    })?;
+    let runtime = ThreadingRuntime::with_cpu_pinning(num_threads, cpu_pinning.clone());
 
-                let protocol = ProtocolAdapter::new($protocol_expr);
+    // Support multiple traffic groups per thread with per-group protocols
+    let results = runtime.run_workers_generic(move |thread_idx| {
+        // Find which traffic groups this thread belongs to
+        let groups_for_thread = thread_assignment
+            .get_groups_for_thread(thread_idx)
+            .ok_or_else(|| anyhow::anyhow!("No groups assigned to thread {}", thread_idx))?;
 
-                // Create a shared request generator for this thread
-                // All groups share the same key generation but may have different traffic policies
-                let generator = RequestGenerator::new(key_gen.clone(), RateControl::ClosedLoop, value_size);
+        // Build protocol map: one protocol per group_id
+        let mut protocols = std::collections::HashMap::new();
 
-                // Initialize group stats collector and register all groups
-                let mut stats = xylem_core::stats::GroupStatsCollector::new();
+        for (group_id, _group_meta) in groups_for_thread.iter() {
+            let group_config = &config.traffic_groups[*group_id];
 
-                // Build group configurations for multi-group worker
-                let mut groups_config = Vec::new();
+            // Get protocol name: prefer group's protocol, fall back to target.protocol
+            let protocol_name = group_config
+                .protocol
+                .as_ref()
+                .or(config.target.protocol.as_ref())
+                .expect("Protocol must be specified (validated in config)");
 
-                for (group_id, group_meta) in groups_for_thread.iter() {
-                    let group_config = &config.traffic_groups[*group_id];
+            // Create protocol using multi_protocol factory
+            let protocol = match protocol_name.as_str() {
+                "http" => xylem_cli::multi_protocol::create_protocol(
+                    "http",
+                    Some(("/", &target_address_for_http)),
+                )?,
+                other => xylem_cli::multi_protocol::create_protocol(other, None)?,
+            };
 
-                    // Register group in stats collector
-                    stats.register_group(*group_id, &group_config.sampling_policy);
+            // Wrap in ProtocolAdapter
+            let protocol_adapted = ProtocolAdapter::new(protocol);
+            protocols.insert(*group_id, protocol_adapted);
+        }
 
-                    // Create policy scheduler for this group
-                    let policy_scheduler: Box<dyn xylem_core::scheduler::PolicyScheduler> = match &group_config.policy {
-                        xylem_core::traffic_group::PolicyConfig::ClosedLoop => {
-                            Box::new(xylem_core::scheduler::UniformPolicyScheduler::closed_loop())
-                        }
-                        xylem_core::traffic_group::PolicyConfig::FixedRate { rate } => {
-                            Box::new(xylem_core::scheduler::UniformPolicyScheduler::fixed_rate(*rate))
-                        }
-                        xylem_core::traffic_group::PolicyConfig::Poisson { rate } => {
-                            Box::new(xylem_core::scheduler::UniformPolicyScheduler::poisson(*rate)?)
-                        }
-                        xylem_core::traffic_group::PolicyConfig::Adaptive { .. } => {
-                            tracing::warn!(
-                                "Adaptive policy not yet fully implemented, using closed-loop"
-                            );
-                            Box::new(xylem_core::scheduler::UniformPolicyScheduler::closed_loop())
-                        }
-                    };
+        // Create a shared request generator for this thread
+        // All groups share the same key generation but may have different traffic policies
+        let generator = RequestGenerator::new(key_gen.clone(), RateControl::ClosedLoop, value_size);
 
-                    // Add to groups config: (group_id, conn_count, max_pending, policy_scheduler)
-                    groups_config.push((
-                        *group_id,
-                        group_meta.connections_per_thread,
-                        group_meta.max_pending_per_connection,
-                        policy_scheduler,
-                    ));
-                }
+        // Initialize group stats collector and register all groups
+        let mut stats = xylem_core::stats::GroupStatsCollector::new();
 
-                // Calculate total connections for worker config
-                let total_conn_count: usize = groups_config.iter().map(|(_, count, _, _)| count).sum();
+        // Build group configurations for multi-group worker
+        let mut groups_config = Vec::new();
 
-                let worker_config = WorkerConfig {
-                    target: target_addr,
-                    duration,
-                    value_size,
-                    conn_count: total_conn_count,
-                    max_pending_per_conn: 1, // This will be overridden per-group
+        for (group_id, group_meta) in groups_for_thread.iter() {
+            let group_config = &config.traffic_groups[*group_id];
+
+            // Register group in stats collector
+            stats.register_group(*group_id, &group_config.sampling_policy);
+
+            // Create policy scheduler for this group
+            let policy_scheduler: Box<dyn xylem_core::scheduler::PolicyScheduler> =
+                match &group_config.policy {
+                    xylem_core::traffic_group::PolicyConfig::ClosedLoop => {
+                        Box::new(xylem_core::scheduler::UniformPolicyScheduler::closed_loop())
+                    }
+                    xylem_core::traffic_group::PolicyConfig::FixedRate { rate } => {
+                        Box::new(xylem_core::scheduler::UniformPolicyScheduler::fixed_rate(*rate))
+                    }
+                    xylem_core::traffic_group::PolicyConfig::Poisson { rate } => {
+                        Box::new(xylem_core::scheduler::UniformPolicyScheduler::poisson(*rate)?)
+                    }
+                    xylem_core::traffic_group::PolicyConfig::Adaptive { .. } => {
+                        tracing::warn!(
+                            "Adaptive policy not yet fully implemented, using closed-loop"
+                        );
+                        Box::new(xylem_core::scheduler::UniformPolicyScheduler::closed_loop())
+                    }
                 };
 
-                let mut worker = Worker::new_multi_group(
-                    TcpTransport::new,
-                    protocol,
-                    generator,
-                    stats,
-                    worker_config,
-                    groups_config,
-                )?;
+            // Determine target for this group (group-specific or fallback to global)
+            let group_target = if let Some(ref target_str) = group_config.target {
+                target_str.parse().with_context(|| {
+                    format!(
+                        "Failed to parse target address '{}' for group {}",
+                        target_str, group_config.name
+                    )
+                })?
+            } else {
+                target_addr
+            };
 
-                worker.run()?;
-                Ok(worker.into_stats())
-            })?;
+            // Add to groups config: (group_id, target, conn_count, max_pending, policy_scheduler)
+            groups_config.push((
+                *group_id,
+                group_target,
+                group_meta.connections_per_thread,
+                group_meta.max_pending_per_connection,
+                policy_scheduler,
+            ));
+        }
 
-            tracing::info!("Experiment completed successfully");
-            xylem_core::stats::GroupStatsCollector::merge(results)
-        }};
-    }
+        // Calculate total connections for worker config
+        let total_conn_count: usize = groups_config.iter().map(|(_, _, count, _, _)| count).sum();
 
-    // Run experiment based on protocol
-    let stats = match protocol_name.as_str() {
-        "redis" => {
-            run_protocol!(xylem_protocols::redis::RedisProtocol::new(
-                xylem_protocols::redis::RedisOp::Get
-            ))
-        }
-        "http" => {
-            run_protocol!(xylem_protocols::http::HttpProtocol::new(
-                xylem_protocols::HttpMethod::Get,
-                "/".to_string(),
-                target_address_for_http.clone()
-            ))
-        }
-        "memcached-binary" => {
-            run_protocol!(xylem_protocols::memcached::MemcachedBinaryProtocol::new(
-                xylem_protocols::memcached::MemcachedOp::Get
-            ))
-        }
-        "memcached-ascii" => {
-            run_protocol!(xylem_protocols::memcached::MemcachedAsciiProtocol::new(
-                xylem_protocols::memcached::ascii::MemcachedOp::Get
-            ))
-        }
-        "masstree" => {
-            run_protocol!(xylem_protocols::masstree::MasstreeProtocol::new(
-                xylem_protocols::MasstreeOp::Get
-            ))
-        }
-        "xylem-echo" => {
-            run_protocol!(xylem_protocols::xylem_echo::XylemEchoProtocol::new(0))
-        }
-        _ => {
-            anyhow::bail!(
-                "Unsupported protocol: {}. Supported: redis, http, memcached-binary, memcached-ascii, masstree, xylem-echo",
-                protocol_name
-            );
-        }
-    };
+        let worker_config = WorkerConfig {
+            target: target_addr,
+            duration,
+            value_size,
+            conn_count: total_conn_count,
+            max_pending_per_conn: 1, // This will be overridden per-group
+        };
+
+        let mut worker = Worker::new_multi_group_with_targets(
+            TcpTransport::new,
+            protocols,
+            generator,
+            stats,
+            worker_config,
+            groups_config,
+        )?;
+
+        worker.run()?;
+        Ok(worker.into_stats())
+    })?;
+
+    tracing::info!("Experiment completed successfully");
+    let stats = xylem_core::stats::GroupStatsCollector::merge(results);
 
     // Aggregate statistics with percentiles and confidence intervals
     // Use global stats which aggregates all traffic groups
@@ -414,7 +415,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
 
     // Create results
     let results = ExperimentResults::from_aggregated_stats(
-        protocol_name,
+        output_protocol,
         target_address_string,
         duration,
         aggregated_stats,

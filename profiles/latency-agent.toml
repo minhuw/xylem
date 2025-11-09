@@ -41,6 +41,7 @@ rate = 100000.0  # Total target: 100K QPS
 # This agent measures latency WITHOUT being affected by queueing delays
 # from high throughput generation.
 [[traffic_groups]]
+protocol = "redis"
 name = "latency-agent"
 threads = [0, 1]
 connections_per_thread = 10      # 20 total connections
@@ -62,6 +63,7 @@ rate = 100.0  # 100 req/s per connection × 20 connections = 2K QPS total
 # This agent generates realistic load on the system without trying to
 # measure precise latency (which would be distorted by queueing anyway).
 [[traffic_groups]]
+protocol = "redis"
 name = "throughput-agent"
 threads = [2, 3, 4, 5, 6, 7]
 connections_per_thread = 25      # 150 total connections

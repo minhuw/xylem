@@ -1,0 +1,59 @@
+# Multi-Protocol Example
+# Demonstrates running Redis and Memcached workloads simultaneously on the same threads
+
+[experiment]
+name = "multi-protocol-demo"
+description = "Redis and Memcached running on the same worker threads"
+seed = 42
+duration = "30s"
+
+[target]
+address = "127.0.0.1:6379"  # Default address (can be overridden per group if needed)
+# No global protocol - each group specifies its own
+transport = "tcp"
+
+[workload]
+[workload.keys]
+strategy = "zipfian"
+n = 100000        # 100K key space
+theta = 0.99      # High skew
+value_size = 64
+
+[workload.pattern]
+type = "constant"
+rate = 20000.0  # 20K req/s total
+
+# Redis workload on threads 0-1
+[[traffic_groups]]
+name = "redis-load"
+protocol = "redis"
+threads = [0, 1]
+connections_per_thread = 10
+max_pending_per_connection = 8
+sampling_rate = 0.1  # 10% sampling
+
+[traffic_groups.policy]
+type = "closed-loop"
+
+# Memcached workload on the same threads 0-1
+[[traffic_groups]]
+name = "memcached-load"
+protocol = "memcached-binary"
+threads = [0, 1]  # Same threads as Redis!
+connections_per_thread = 10
+max_pending_per_connection = 8
+sampling_rate = 0.1  # 10% sampling
+
+[traffic_groups.policy]
+type = "closed-loop"
+
+[output]
+format = "json"
+file = "/tmp/multi-protocol-results.json"
+
+# Expected behavior:
+# ==================
+# - Threads 0 and 1 each handle BOTH Redis and Memcached connections
+# - Each thread has 20 connections total (10 Redis + 10 Memcached)
+# - Stats are separated by traffic group
+# - Different protocols can be benchmarked under identical conditions

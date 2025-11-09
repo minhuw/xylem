@@ -44,8 +44,10 @@ pub struct TargetConfig {
     /// Server address (e.g., "127.0.0.1:6379") - can be overridden via CLI
     #[serde(default)]
     pub address: Option<String>,
-    /// Protocol: echo, redis, memcached-binary, memcached-ascii, http, synthetic, masstree, xylem-echo
-    pub protocol: String,
+    /// Default protocol for traffic groups that don't specify their own
+    /// Valid: redis, memcached-binary, memcached-ascii, http
+    #[serde(default)]
+    pub protocol: Option<String>,
     /// Transport: tcp, udp, tls
     #[serde(default = "default_transport")]
     pub transport: String,
@@ -226,14 +228,47 @@ impl ProfileConfig {
             bail!("Target address must be specified (either in config or via --target CLI flag)");
         }
 
-        let valid_protocols =
-            ["redis", "memcached-binary", "memcached-ascii", "http", "masstree", "xylem-echo"];
-        if !valid_protocols.contains(&self.target.protocol.as_str()) {
-            bail!(
-                "Invalid protocol '{}'. Valid options: {}",
-                self.target.protocol,
-                valid_protocols.join(", ")
-            );
+        let valid_protocols = [
+            "redis",
+            "memcached-binary",
+            "memcached-ascii",
+            "http",
+            "xylem-echo", // Test protocol
+        ];
+
+        // Validate target.protocol if specified
+        if let Some(protocol) = &self.target.protocol {
+            if !valid_protocols.contains(&protocol.as_str()) {
+                bail!(
+                    "Invalid target protocol '{}'. Valid options: {}",
+                    protocol,
+                    valid_protocols.join(", ")
+                );
+            }
+        }
+
+        // Validate that each traffic group has a protocol (either its own or from target)
+        for (i, group) in self.traffic_groups.iter().enumerate() {
+            let group_protocol = group.protocol.as_ref().or(self.target.protocol.as_ref());
+
+            if group_protocol.is_none() {
+                bail!(
+                    "Traffic group {} '{}' has no protocol specified. Either set target.protocol or traffic_groups[{}].protocol",
+                    i, group.name, i
+                );
+            }
+
+            if let Some(protocol) = group_protocol {
+                if !valid_protocols.contains(&protocol.as_str()) {
+                    bail!(
+                        "Invalid protocol '{}' for traffic group {} '{}'. Valid options: {}",
+                        protocol,
+                        i,
+                        group.name,
+                        valid_protocols.join(", ")
+                    );
+                }
+            }
         }
 
         let valid_transports = ["tcp", "udp", "tls"];

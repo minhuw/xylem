@@ -23,6 +23,9 @@ pub struct TrafficGroupConfig {
     /// Protocol for this group (optional, falls back to target.protocol if not specified)
     #[serde(default)]
     pub protocol: Option<String>,
+    /// Target address for this group (optional, falls back to global target if not specified)
+    #[serde(default)]
+    pub target: Option<String>,
     /// Thread IDs this group runs on
     pub threads: Vec<usize>,
     /// Number of connections per thread
@@ -121,6 +124,8 @@ pub struct TrafficGroup {
     pub name: String,
     /// Protocol for this group (None = use default)
     pub protocol: Option<String>,
+    /// Target address for this group (None = use default)
+    pub target: Option<String>,
     /// Threads this group runs on
     pub threads: Vec<usize>,
     /// Connections per thread
@@ -138,6 +143,7 @@ impl TrafficGroup {
             id,
             name: config.name.clone(),
             protocol: config.protocol.clone(),
+            target: config.target.clone(),
             threads: config.threads.clone(),
             connections_per_thread: config.connections_per_thread,
             max_pending_per_connection: config.max_pending_per_connection,
@@ -224,6 +230,7 @@ mod tests {
         let config = TrafficGroupConfig {
             name: "test-group".to_string(),
             protocol: None,
+            target: None,
             threads: vec![0, 1, 2],
             connections_per_thread: 10,
             max_pending_per_connection: 5,
@@ -244,6 +251,7 @@ mod tests {
             TrafficGroupConfig {
                 name: "latency".to_string(),
                 protocol: None,
+                target: None,
                 threads: vec![0, 1],
                 connections_per_thread: 5,
                 max_pending_per_connection: 1,
@@ -253,6 +261,7 @@ mod tests {
             TrafficGroupConfig {
                 name: "throughput".to_string(),
                 protocol: None,
+                target: None,
                 threads: vec![2, 3, 4],
                 connections_per_thread: 20,
                 max_pending_per_connection: 32,
@@ -283,6 +292,7 @@ mod tests {
             TrafficGroupConfig {
                 name: "g1".to_string(),
                 protocol: None,
+                target: None,
                 threads: vec![0, 1],
                 connections_per_thread: 5,
                 max_pending_per_connection: 1,
@@ -292,6 +302,7 @@ mod tests {
             TrafficGroupConfig {
                 name: "g2".to_string(),
                 protocol: None,
+                target: None,
                 threads: vec![2],
                 connections_per_thread: 10,
                 max_pending_per_connection: 1,
@@ -310,6 +321,7 @@ mod tests {
             TrafficGroupConfig {
                 name: "g1".to_string(),
                 protocol: None,
+                target: None,
                 threads: vec![0, 1],
                 connections_per_thread: 5,
                 max_pending_per_connection: 1,
@@ -319,6 +331,7 @@ mod tests {
             TrafficGroupConfig {
                 name: "g2".to_string(),
                 protocol: None,
+                target: None,
                 threads: vec![3], // Gap! Missing thread 2
                 connections_per_thread: 10,
                 max_pending_per_connection: 1,

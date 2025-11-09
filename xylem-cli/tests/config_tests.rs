@@ -16,7 +16,7 @@ fn test_load_redis_zipfian_profile() {
 
     // Verify target config
     assert_eq!(config.target.address, Some("127.0.0.1:6379".to_string()));
-    assert_eq!(config.target.protocol, "redis");
+    assert_eq!(config.target.protocol, Some("redis".to_string()));
     assert_eq!(config.target.transport, "tcp");
 
     // Verify traffic groups
@@ -37,7 +37,7 @@ fn test_load_memcached_ramp_profile() {
     assert_eq!(config.experiment.duration, Duration::from_secs(60));
 
     // Verify target
-    assert_eq!(config.target.protocol, "memcached-binary");
+    assert_eq!(config.target.protocol, Some("memcached-binary".to_string()));
 
     // Verify traffic groups
     assert_eq!(config.traffic_groups.len(), 1);
@@ -56,7 +56,7 @@ fn test_load_http_spike_profile() {
     assert_eq!(config.experiment.duration, Duration::from_secs(120));
 
     // Verify target
-    assert_eq!(config.target.protocol, "http");
+    assert_eq!(config.target.protocol, Some("http".to_string()));
 
     // Verify traffic groups
     assert_eq!(config.traffic_groups.len(), 1);
@@ -90,7 +90,7 @@ fn test_load_closed_loop_profile() {
     assert_eq!(config.experiment.duration, Duration::from_secs(30));
 
     // Verify target
-    assert_eq!(config.target.protocol, "memcached-binary");
+    assert_eq!(config.target.protocol, Some("memcached-binary".to_string()));
 
     // Verify traffic groups
     assert_eq!(config.traffic_groups.len(), 1);
@@ -109,7 +109,7 @@ fn test_load_latency_agent_profile() {
     assert_eq!(config.experiment.duration, Duration::from_secs(10));
 
     // Verify target
-    assert_eq!(config.target.protocol, "redis");
+    assert_eq!(config.target.protocol, Some("redis".to_string()));
 
     // Verify traffic groups - should have 2 groups (latency + throughput agents)
     assert_eq!(config.traffic_groups.len(), 2);
@@ -152,7 +152,7 @@ fn test_load_redis_bench_profile() {
     assert_eq!(config.experiment.duration, Duration::from_secs(30));
 
     // Verify target
-    assert_eq!(config.target.protocol, "redis");
+    assert_eq!(config.target.protocol, Some("redis".to_string()));
 
     // Verify traffic groups - should have 2 groups
     assert_eq!(config.traffic_groups.len(), 2);
@@ -204,7 +204,7 @@ fn test_config_with_overrides() {
 
     // Verify non-overridden values remain unchanged
     assert_eq!(config.experiment.name, "redis-get-zipfian");
-    assert_eq!(config.target.protocol, "redis");
+    assert_eq!(config.target.protocol, Some("redis".to_string()));
 }
 
 #[test]
@@ -537,7 +537,7 @@ file = "test.json"
 
         let config = ProfileConfig::from_file(tmpfile.path())
             .unwrap_or_else(|_| panic!("Failed to parse config for protocol: {}", protocol));
-        assert_eq!(config.target.protocol, protocol);
+        assert_eq!(config.target.protocol.as_deref(), Some(protocol));
     }
 }
 
@@ -585,7 +585,12 @@ file = "test.json"
     let config = ProfileConfig::from_file(tmpfile.path()).unwrap();
     let result = config.validate();
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("Invalid protocol"));
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("Invalid") && err_msg.contains("protocol"),
+        "Error message should contain 'Invalid' and 'protocol', got: {}",
+        err_msg
+    );
 }
 
 #[test]
@@ -777,7 +782,7 @@ fn test_set_multiple_overrides() {
     assert_eq!(config.target.address, Some("192.168.1.100:6379".to_string()));
     assert_eq!(config.experiment.duration, Duration::from_secs(300));
     assert_eq!(config.experiment.seed, Some(999));
-    assert_eq!(config.target.protocol, "memcached-binary");
+    assert_eq!(config.target.protocol, Some("memcached-binary".to_string()));
 }
 
 #[test]
@@ -796,7 +801,7 @@ fn test_set_type_inference_float() {
         "../profiles/redis-bench.toml",
         &["traffic_groups.0.sampling_policy.rate=0.75".to_string()],
     )
-    .unwrap();
+    .expect("Failed to load redis-bench.toml with overrides");
 
     // Check that the rate was updated
     match &config.traffic_groups[0].sampling_policy {
@@ -824,7 +829,7 @@ fn test_set_type_inference_string() {
         &["target.protocol=http".to_string()],
     )
     .unwrap();
-    assert_eq!(config.target.protocol, "http");
+    assert_eq!(config.target.protocol, Some("http".to_string()));
 }
 
 #[test]

@@ -26,6 +26,7 @@ rate = 50000.0      # 50K req/s
 # Single traffic group (equivalent to legacy mode)
 [[traffic_groups]]
 name = "main"
+protocol = "redis"
 threads = [0, 1, 2, 3]  # 4 threads
 connections_per_thread = 25  # 100 total connections (4 * 25)
 max_pending_per_connection = 1  # Closed-loop = 1 pending request max
