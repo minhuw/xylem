@@ -18,6 +18,21 @@ test:
     @echo "This will take around 30-60 seconds..."
     RUST_LOG=error cargo test --workspace -- --ignored --test-threads=1
 
+# Run all examples to validate they work
+examples:
+    @echo "📚 Running all examples..."
+    @echo ""
+    @echo "🚀 Starting Redis server for examples..."
+    @just redis-start
+    @echo ""
+    @echo "=== Running redis_basic example ==="
+    @cargo run --example redis_basic --release
+    @echo ""
+    @echo "🧹 Cleaning up: Stopping Redis server..."
+    @just redis-stop
+    @echo ""
+    @echo "✅ All examples completed successfully!"
+
 # Run fast unit tests only (no integration tests)
 test-unit:
     @echo "🚀 Running unit tests..."
@@ -218,6 +233,7 @@ help:
     @echo "  just test-memcached    - Memcached tests only"
     @echo "  just test-scheduler    - Scheduler integration tests"
     @echo "  just test-pipelined    - Pipelined worker tests"
+    @echo "  just examples          - Run all examples"
     @echo ""
     @echo "🔨 Building:"
     @echo "  just build             - Debug build"

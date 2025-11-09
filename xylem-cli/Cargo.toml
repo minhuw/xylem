@@ -15,6 +15,14 @@ path = "src/lib.rs"
 name = "xylem"
 path = "src/main.rs"
 
+[[example]]
+name = "redis_basic"
+path = "examples/redis_basic.rs"
+
+[[example]]
+name = "sketch_precision_comparison"
+path = "examples/sketch_precision_comparison.rs"
+
 [lints]
 workspace = true
 

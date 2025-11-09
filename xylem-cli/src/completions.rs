@@ -161,14 +161,26 @@ pub fn get_config_paths() -> Vec<String> {
     let schema = schema_for!(ProfileConfig);
     let mut paths = BTreeSet::new();
 
+    // Extract $defs for reference resolution
+    let defs = if let Value::Object(obj) = schema.as_value() {
+        obj.get("$defs").and_then(|v| v.as_object()).cloned()
+    } else {
+        None
+    };
+
     // schema_for! now returns a Schema directly (which wraps serde_json::Value)
-    extract_paths_from_schema_value(&schema, "", &mut paths);
+    extract_paths_from_schema_value(&schema, "", &mut paths, &defs);
 
     paths.into_iter().collect()
 }
 
 /// Recursively extract all valid paths from a JSON schema value
-fn extract_paths_from_schema_value(schema: &Schema, prefix: &str, paths: &mut BTreeSet<String>) {
+fn extract_paths_from_schema_value(
+    schema: &Schema,
+    prefix: &str,
+    paths: &mut BTreeSet<String>,
+    defs: &Option<serde_json::Map<String, Value>>,
+) {
     // Schema is now a wrapper around serde_json::Value
     // We need to work with it as JSON
     let Value::Object(schema_obj) = schema.as_value() else {
@@ -178,6 +190,30 @@ fn extract_paths_from_schema_value(schema: &Schema, prefix: &str, paths: &mut BT
     // Add the current path if it's not empty
     if !prefix.is_empty() {
         paths.insert(prefix.to_string());
+    }
+
+    // Handle $ref references first - resolve and recurse
+    if let Some(Value::String(reference)) = schema_obj.get("$ref") {
+        // Early return if no defs available
+        let Some(defs_map) = defs else {
+            return;
+        };
+
+        // $ref format is typically "#/$defs/TypeName"
+        let Some(type_name) = reference.strip_prefix("#/$defs/") else {
+            return;
+        };
+
+        let Some(ref_schema_value) = defs_map.get(type_name) else {
+            return;
+        };
+
+        let Ok(ref_schema) = serde_json::from_value::<Schema>(ref_schema_value.clone()) else {
+            return;
+        };
+
+        extract_paths_from_schema_value(&ref_schema, prefix, paths, defs);
+        return;
     }
 
     // Handle object properties
@@ -194,7 +230,7 @@ fn extract_paths_from_schema_value(schema: &Schema, prefix: &str, paths: &mut BT
 
             // Recurse into the property if it's a valid schema
             if let Ok(prop_schema) = serde_json::from_value::<Schema>(prop_schema_value.clone()) {
-                extract_paths_from_schema_value(&prop_schema, &new_prefix, paths);
+                extract_paths_from_schema_value(&prop_schema, &new_prefix, paths, defs);
             }
         }
     }
@@ -205,22 +241,15 @@ fn extract_paths_from_schema_value(schema: &Schema, prefix: &str, paths: &mut BT
         paths.insert(array_prefix.clone());
 
         if let Ok(item_schema) = serde_json::from_value::<Schema>(Value::Object(items.clone())) {
-            extract_paths_from_schema_value(&item_schema, &array_prefix, paths);
+            extract_paths_from_schema_value(&item_schema, &array_prefix, paths, defs);
         }
-    }
-
-    // Handle $ref references
-    if let Some(Value::String(_reference)) = schema_obj.get("$ref") {
-        // For now, we'll just note that references exist but won't follow them
-        // since schemars 1.x handles references differently
-        // The schema should already be resolved by schema_for!
     }
 
     // Handle oneOf (for enums with different variants)
     if let Some(Value::Array(one_of)) = schema_obj.get("oneOf") {
         for variant_value in one_of {
             if let Ok(variant_schema) = serde_json::from_value::<Schema>(variant_value.clone()) {
-                extract_paths_from_schema_value(&variant_schema, prefix, paths);
+                extract_paths_from_schema_value(&variant_schema, prefix, paths, defs);
             }
         }
     }
@@ -229,7 +258,7 @@ fn extract_paths_from_schema_value(schema: &Schema, prefix: &str, paths: &mut BT
     if let Some(Value::Array(all_of)) = schema_obj.get("allOf") {
         for schema_value in all_of {
             if let Ok(composed_schema) = serde_json::from_value::<Schema>(schema_value.clone()) {
-                extract_paths_from_schema_value(&composed_schema, prefix, paths);
+                extract_paths_from_schema_value(&composed_schema, prefix, paths, defs);
             }
         }
     }
@@ -259,12 +288,6 @@ mod tests {
         // Should contain array indexing for traffic_groups
         assert!(paths.contains(&"traffic_groups".to_string()));
         assert!(paths.contains(&"traffic_groups.0".to_string()));
-
-        // Print all paths for manual inspection
-        println!("\nExtracted {} config paths:", paths.len());
-        for (i, path) in paths.iter().enumerate() {
-            println!("  {:2}. {}", i + 1, path);
-        }
 
         // Ensure we have a reasonable number of paths (should be > 30)
         assert!(paths.len() > 30, "Expected > 30 paths, got {}", paths.len());
