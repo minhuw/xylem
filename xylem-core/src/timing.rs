@@ -87,6 +87,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(tarpaulin))]
     fn test_busy_wait_precision() {
         let start = time_ns();
         busy_wait_ns(100_000); // 100 microseconds
@@ -98,6 +99,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(tarpaulin))]
     fn test_busy_wait_until() {
         let start = time_ns();
         let target = start + 50_000; // 50 microseconds

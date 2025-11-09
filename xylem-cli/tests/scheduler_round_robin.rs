@@ -55,6 +55,7 @@ impl<P: xylem_protocols::Protocol> Protocol for ProtocolAdapter<P> {
 
 /// Test that RoundRobin scheduler distributes requests across multiple connections
 #[test]
+#[cfg(not(tarpaulin))]
 fn test_round_robin_scheduler_with_multiple_connections() {
     let redis = common::start_redis().expect("Failed to start Redis");
     let port = redis.port();

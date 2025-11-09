@@ -95,3 +95,28 @@ jobs:
       - name: Run cargo deny
         run: nix develop --command cargo deny check
         continue-on-error: true
+
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Setup Magic Nix Cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Install tarpaulin
+        run: nix develop --command cargo install cargo-tarpaulin
+
+      - name: Generate coverage
+        run: nix develop --command cargo tarpaulin --verbose --all-features --workspace --timeout 300 --out xml
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./cobertura.xml
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}

@@ -67,6 +67,9 @@ rustls-pemfile = "2.2"
 [workspace.lints.clippy]
 uninlined_format_args = "allow"
 
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin)'] }
+
 [profile.release]
 opt-level = 3
 lto = true
