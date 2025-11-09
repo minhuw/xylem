@@ -36,7 +36,9 @@ name = "latency-measurement"
 threads = [0, 1]  # Explicit thread assignment
 connections_per_thread = 5
 max_pending_per_connection = 1  # Single outstanding request for accurate latency
-sampling_rate = 1.0  # 100% sampling - capture every request
+
+[traffic_groups.sampling_policy]
+type = "unlimited"  # 100% sampling - capture every request
 
 [traffic_groups.policy]
 type = "poisson"
@@ -49,7 +51,10 @@ name = "throughput-generation"
 threads = [2, 3, 4, 5]  # More threads for high throughput
 connections_per_thread = 25
 max_pending_per_connection = 32  # High pipelining for max throughput
-sampling_rate = 0.01  # 1% sampling - reduce memory overhead
+
+[traffic_groups.sampling_policy]
+type = "limited"
+rate = 0.01  # 1% sampling - reduce memory overhead
 
 [traffic_groups.policy]
 type = "closed-loop"  # Max throughput mode

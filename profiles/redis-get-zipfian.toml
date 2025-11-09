@@ -30,7 +30,9 @@ protocol = "redis"
 threads = [0, 1, 2, 3]  # 4 threads
 connections_per_thread = 25  # 100 total connections (4 * 25)
 max_pending_per_connection = 1  # Closed-loop = 1 pending request max
-sampling_rate = 1.0  # 100% sampling
+
+[traffic_groups.sampling_policy]
+type = "unlimited"  # 100% sampling
 
 [traffic_groups.policy]
 type = "closed-loop"  # Max throughput mode

@@ -30,7 +30,9 @@ name = "slow-poisson"
 threads = [0]  # 1 thread for slow connections
 connections_per_thread = 50  # 50 slow connections
 max_pending_per_connection = 1
-sampling_rate = 1.0  # 100% sampling
+
+[traffic_groups.sampling_policy]
+type = "unlimited"  # 100% sampling
 
 [traffic_groups.policy]
 type = "poisson"
@@ -43,7 +45,9 @@ name = "fast-poisson"
 threads = [1, 2, 3, 4, 5, 6, 7]  # 7 threads for fast connections
 connections_per_thread = 136  # ~950 total fast connections (7 * 136)
 max_pending_per_connection = 1
-sampling_rate = 1.0  # 100% sampling
+
+[traffic_groups.sampling_policy]
+type = "unlimited"  # 100% sampling
 
 [traffic_groups.policy]
 type = "poisson"

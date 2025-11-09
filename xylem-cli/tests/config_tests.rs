@@ -799,12 +799,12 @@ fn test_set_type_inference_integer() {
 fn test_set_type_inference_float() {
     let config = ProfileConfig::from_file_with_overrides(
         "../profiles/redis-bench.toml",
-        &["traffic_groups.0.sampling_policy.rate=0.75".to_string()],
+        &["traffic_groups.1.sampling_policy.rate=0.75".to_string()],
     )
     .expect("Failed to load redis-bench.toml with overrides");
 
-    // Check that the rate was updated
-    match &config.traffic_groups[0].sampling_policy {
+    // Check that the rate was updated (using index 1 which is throughput-agent with limited policy)
+    match &config.traffic_groups[1].sampling_policy {
         SamplingPolicy::Limited { rate, .. } => {
             assert!((rate - 0.75).abs() < 0.001, "Expected 75% sampling rate");
         }

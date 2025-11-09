@@ -30,7 +30,10 @@ protocol = "redis"
 threads = [0, 1]
 connections_per_thread = 10
 max_pending_per_connection = 8
-sampling_rate = 0.1  # 10% sampling
+
+[traffic_groups.sampling_policy]
+type = "limited"
+rate = 0.1  # 10% sampling
 
 [traffic_groups.policy]
 type = "closed-loop"
@@ -42,7 +45,10 @@ protocol = "memcached-binary"
 threads = [0, 1]  # Same threads as Redis!
 connections_per_thread = 10
 max_pending_per_connection = 8
-sampling_rate = 0.1  # 10% sampling
+
+[traffic_groups.sampling_policy]
+type = "limited"
+rate = 0.1  # 10% sampling
 
 [traffic_groups.policy]
 type = "closed-loop"

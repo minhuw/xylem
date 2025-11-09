@@ -43,7 +43,9 @@ protocol = "redis"
 threads = [0]
 connections_per_thread = 10      # 10 connections on 1 thread
 max_pending_per_connection = 1   # No pipelining
-sampling_rate = 1.0              # 100% sampling
+
+[traffic_groups.sampling_policy]
+type = "unlimited"               # 100% sampling
 
 [traffic_groups.policy]
 type = "poisson"
@@ -64,7 +66,10 @@ protocol = "redis"
 threads = [1, 2, 3]
 connections_per_thread = 25      # 75 total connections (25 per thread)
 max_pending_per_connection = 32  # High pipelining
-sampling_rate = 0.01             # 1% sampling
+
+[traffic_groups.sampling_policy]
+type = "limited"
+rate = 0.01                      # 1% sampling
 
 [traffic_groups.policy]
 type = "closed-loop"  # Send as fast as possible

@@ -46,7 +46,9 @@ name = "latency-agent"
 threads = [0, 1]
 connections_per_thread = 10      # 20 total connections
 max_pending_per_connection = 1   # Closed-loop: one request at a time
-sampling_rate = 1.0              # 100% sampling
+
+[traffic_groups.sampling_policy]
+type = "unlimited"               # 100% sampling
 
 [traffic_groups.policy]
 type = "poisson"
@@ -68,7 +70,10 @@ name = "throughput-agent"
 threads = [2, 3, 4, 5, 6, 7]
 connections_per_thread = 25      # 150 total connections
 max_pending_per_connection = 32  # High pipelining for max throughput
-sampling_rate = 0.01             # 1% sampling (low memory overhead)
+
+[traffic_groups.sampling_policy]
+type = "limited"
+rate = 0.01                      # 1% sampling (low memory overhead)
 
 [traffic_groups.policy]
 type = "closed-loop"  # Send as fast as possible

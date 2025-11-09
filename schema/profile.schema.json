@@ -1,52 +1,48 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ProfileConfig",
   "description": "Top-level profile configuration",
   "type": "object",
-  "required": [
-    "experiment",
-    "output",
-    "target",
-    "traffic_groups",
-    "workload"
-  ],
   "properties": {
     "experiment": {
-      "$ref": "#/definitions/ExperimentConfig"
+      "$ref": "#/$defs/ExperimentConfig"
     },
     "output": {
-      "$ref": "#/definitions/OutputConfig"
+      "$ref": "#/$defs/OutputConfig"
     },
     "target": {
-      "$ref": "#/definitions/TargetConfig"
+      "$ref": "#/$defs/TargetConfig"
     },
     "traffic_groups": {
       "description": "Traffic groups configuration",
       "type": "array",
       "items": {
-        "$ref": "#/definitions/TrafficGroupConfig"
+        "$ref": "#/$defs/TrafficGroupConfig"
       }
     },
     "workload": {
-      "$ref": "#/definitions/WorkloadConfig"
+      "$ref": "#/$defs/WorkloadConfig"
     }
   },
-  "definitions": {
+  "required": [
+    "experiment",
+    "target",
+    "workload",
+    "traffic_groups",
+    "output"
+  ],
+  "$defs": {
     "ExperimentConfig": {
       "description": "Experiment metadata",
       "type": "object",
-      "required": [
-        "duration",
-        "name"
-      ],
       "properties": {
         "description": {
           "description": "Optional description",
-          "default": null,
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "default": null
         },
         "duration": {
           "description": "Experiment duration",
@@ -58,117 +54,107 @@
         },
         "seed": {
           "description": "Random seed for reproducibility (None = use entropy)",
-          "default": null,
           "type": [
             "integer",
             "null"
           ],
           "format": "uint64",
-          "minimum": 0.0
+          "default": null,
+          "minimum": 0
         }
-      }
+      },
+      "required": [
+        "name",
+        "duration"
+      ]
     },
     "KeysConfig": {
       "description": "Key generation configuration (SPATIAL level)",
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "start",
-            "strategy",
-            "value_size"
-          ],
           "properties": {
             "start": {
               "type": "integer",
               "format": "uint64",
-              "minimum": 0.0
+              "minimum": 0
             },
             "strategy": {
               "type": "string",
-              "enum": [
-                "sequential"
-              ]
+              "const": "sequential"
             },
             "value_size": {
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             }
-          }
+          },
+          "required": [
+            "strategy",
+            "start",
+            "value_size"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "max",
-            "strategy",
-            "value_size"
-          ],
           "properties": {
             "max": {
               "type": "integer",
               "format": "uint64",
-              "minimum": 0.0
+              "minimum": 0
             },
             "strategy": {
               "type": "string",
-              "enum": [
-                "random"
-              ]
+              "const": "random"
             },
             "value_size": {
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             }
-          }
+          },
+          "required": [
+            "strategy",
+            "max",
+            "value_size"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "max",
-            "strategy",
-            "value_size"
-          ],
           "properties": {
             "max": {
               "type": "integer",
               "format": "uint64",
-              "minimum": 0.0
+              "minimum": 0
             },
             "strategy": {
               "type": "string",
-              "enum": [
-                "round-robin"
-              ]
+              "const": "round-robin"
             },
             "value_size": {
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             }
-          }
+          },
+          "required": [
+            "strategy",
+            "max",
+            "value_size"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "n",
-            "strategy",
-            "theta",
-            "value_size"
-          ],
           "properties": {
             "n": {
               "description": "Number of keys in range [0, n-1]",
               "type": "integer",
               "format": "uint64",
-              "minimum": 0.0
+              "minimum": 0
             },
             "strategy": {
               "type": "string",
-              "enum": [
-                "zipfian"
-              ]
+              "const": "zipfian"
             },
             "theta": {
               "description": "Exponent (theta) controlling skewness",
@@ -178,9 +164,15 @@
             "value_size": {
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             }
-          }
+          },
+          "required": [
+            "strategy",
+            "n",
+            "theta",
+            "value_size"
+          ]
         }
       ]
     },
@@ -189,10 +181,6 @@
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "rate",
-            "type"
-          ],
           "properties": {
             "rate": {
               "description": "Requests per second",
@@ -201,20 +189,16 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "constant"
-              ]
+              "const": "constant"
             }
-          }
+          },
+          "required": [
+            "type",
+            "rate"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "duration",
-            "end_rate",
-            "start_rate",
-            "type"
-          ],
           "properties": {
             "duration": {
               "type": "string"
@@ -229,21 +213,18 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "ramp"
-              ]
+              "const": "ramp"
             }
-          }
+          },
+          "required": [
+            "type",
+            "start_rate",
+            "end_rate",
+            "duration"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "normal_rate",
-            "spike_duration",
-            "spike_rate",
-            "spike_start",
-            "type"
-          ],
           "properties": {
             "normal_rate": {
               "type": "number",
@@ -261,20 +242,19 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "spike"
-              ]
+              "const": "spike"
             }
-          }
+          },
+          "required": [
+            "type",
+            "normal_rate",
+            "spike_rate",
+            "spike_start",
+            "spike_duration"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "amplitude",
-            "base_rate",
-            "period",
-            "type"
-          ],
           "properties": {
             "amplitude": {
               "type": "number",
@@ -288,49 +268,45 @@
               "type": "string"
             },
             "phase_shift": {
-              "default": null,
               "type": [
                 "string",
                 "null"
-              ]
+              ],
+              "default": null
             },
             "type": {
               "type": "string",
-              "enum": [
-                "sinusoidal"
-              ]
+              "const": "sinusoidal"
             }
-          }
+          },
+          "required": [
+            "type",
+            "base_rate",
+            "amplitude",
+            "period"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "steps",
-            "type"
-          ],
           "properties": {
             "steps": {
               "type": "array",
               "items": {
-                "$ref": "#/definitions/StepConfig"
+                "$ref": "#/$defs/StepConfig"
               }
             },
             "type": {
               "type": "string",
-              "enum": [
-                "step"
-              ]
+              "const": "step"
             }
-          }
+          },
+          "required": [
+            "type",
+            "steps"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "max_rate",
-            "min_rate",
-            "period",
-            "type"
-          ],
           "properties": {
             "max_rate": {
               "type": "number",
@@ -345,20 +321,21 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "sawtooth"
-              ]
+              "const": "sawtooth"
             }
-          }
+          },
+          "required": [
+            "type",
+            "min_rate",
+            "max_rate",
+            "period"
+          ]
         }
       ]
     },
     "OutputConfig": {
       "description": "Output configuration",
       "type": "object",
-      "required": [
-        "file"
-      ],
       "properties": {
         "file": {
           "description": "Output file path",
@@ -366,15 +343,18 @@
         },
         "format": {
           "description": "Output format: json, csv",
-          "default": "json",
-          "type": "string"
+          "type": "string",
+          "default": "json"
         },
         "real_time": {
           "description": "Print real-time updates",
-          "default": false,
-          "type": "boolean"
+          "type": "boolean",
+          "default": false
         }
-      }
+      },
+      "required": [
+        "file"
+      ]
     },
     "PolicyConfig": {
       "description": "Policy configuration for traffic groups",
@@ -382,25 +362,19 @@
         {
           "description": "Closed-loop policy (max throughput)",
           "type": "object",
-          "required": [
-            "type"
-          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": [
-                "closed-loop"
-              ]
+              "const": "closed-loop"
             }
-          }
+          },
+          "required": [
+            "type"
+          ]
         },
         {
           "description": "Fixed-rate policy",
           "type": "object",
-          "required": [
-            "rate",
-            "type"
-          ],
           "properties": {
             "rate": {
               "description": "Rate in requests per second",
@@ -409,19 +383,17 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "fixed-rate"
-              ]
+              "const": "fixed-rate"
             }
-          }
+          },
+          "required": [
+            "type",
+            "rate"
+          ]
         },
         {
           "description": "Poisson policy",
           "type": "object",
-          "required": [
-            "rate",
-            "type"
-          ],
           "properties": {
             "rate": {
               "description": "Average rate in requests per second",
@@ -430,20 +402,17 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "poisson"
-              ]
+              "const": "poisson"
             }
-          }
+          },
+          "required": [
+            "type",
+            "rate"
+          ]
         },
         {
           "description": "Adaptive policy",
           "type": "object",
-          "required": [
-            "initial_rate",
-            "target_latency_us",
-            "type"
-          ],
           "properties": {
             "initial_rate": {
               "description": "Initial rate in requests per second",
@@ -452,39 +421,201 @@
             },
             "max_rate": {
               "description": "Maximum rate (cap)",
-              "default": 10000000.0,
               "type": "number",
-              "format": "double"
+              "format": "double",
+              "default": 10000000.0
             },
             "min_rate": {
               "description": "Minimum rate (fallback)",
-              "default": 100.0,
               "type": "number",
-              "format": "double"
+              "format": "double",
+              "default": 100.0
             },
             "target_latency_us": {
               "description": "Target latency in microseconds",
               "type": "integer",
               "format": "uint64",
-              "minimum": 0.0
+              "minimum": 0
             },
             "type": {
               "type": "string",
-              "enum": [
-                "adaptive"
-              ]
+              "const": "adaptive"
             }
-          }
+          },
+          "required": [
+            "type",
+            "initial_rate",
+            "target_latency_us"
+          ]
+        }
+      ]
+    },
+    "SamplingPolicy": {
+      "description": "Sampling policy configuration for latency measurement",
+      "oneOf": [
+        {
+          "description": "Limited sampling with fixed rate and max samples",
+          "type": "object",
+          "properties": {
+            "max_samples": {
+              "description": "Maximum number of samples to store",
+              "type": "integer",
+              "format": "uint",
+              "default": 131072,
+              "minimum": 0
+            },
+            "rate": {
+              "description": "Sampling rate (0.0 to 1.0)",
+              "type": "number",
+              "format": "double",
+              "default": 1.0
+            },
+            "type": {
+              "type": "string",
+              "const": "limited"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "description": "Zero sampling: record every latency (unlimited storage)\nWARNING: Can consume large amounts of memory for high-throughput workloads",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "unlimited"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "description": "Adaptive sampling: dynamically adjust rate to maintain target CI width",
+          "type": "object",
+          "properties": {
+            "initial_rate": {
+              "description": "Initial sampling rate",
+              "type": "number",
+              "format": "double",
+              "default": 1.0
+            },
+            "max_rate": {
+              "description": "Maximum sampling rate",
+              "type": "number",
+              "format": "double",
+              "default": 1.0
+            },
+            "max_samples": {
+              "description": "Maximum number of samples to store",
+              "type": "integer",
+              "format": "uint",
+              "default": 131072,
+              "minimum": 0
+            },
+            "min_rate": {
+              "description": "Minimum sampling rate",
+              "type": "number",
+              "format": "double",
+              "default": 0.001
+            },
+            "target_ci_width_us": {
+              "description": "Target confidence interval width (in microseconds)",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "type": {
+              "type": "string",
+              "const": "adaptive"
+            }
+          },
+          "required": [
+            "type",
+            "target_ci_width_us"
+          ]
+        },
+        {
+          "description": "DDSketch: Distributed quantile sketch with relative-error guarantees\nMemory-efficient and fully mergeable across traffic groups",
+          "type": "object",
+          "properties": {
+            "alpha": {
+              "description": "Relative accuracy parameter (e.g., 0.01 = 1% error)",
+              "type": "number",
+              "format": "double",
+              "default": 0.01
+            },
+            "max_bins": {
+              "description": "Maximum number of bins (in steps of 128)",
+              "type": "integer",
+              "format": "uint32",
+              "default": 1024,
+              "minimum": 0
+            },
+            "type": {
+              "type": "string",
+              "const": "dd-sketch"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "description": "T-Digest: Adaptive clustering sketch optimized for extreme tail percentiles\nBetter accuracy than DDSketch for p999+, fully mergeable",
+          "type": "object",
+          "properties": {
+            "compression": {
+              "description": "Compression parameter (higher = more accurate, more memory)\nTypical values: 100-1000",
+              "type": "integer",
+              "format": "uint",
+              "default": 1000,
+              "minimum": 0
+            },
+            "type": {
+              "type": "string",
+              "const": "t-digest"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "description": "HDR Histogram: High dynamic range histogram for maximum accuracy\nHigher memory usage but excellent for all percentiles",
+          "type": "object",
+          "properties": {
+            "max_value_us": {
+              "description": "Maximum expected value (in microseconds)",
+              "type": "integer",
+              "format": "uint64",
+              "default": 3600000000,
+              "minimum": 0
+            },
+            "sigfigs": {
+              "description": "Number of significant digits (1-5)\nHigher = more accurate but more memory",
+              "type": "integer",
+              "format": "uint8",
+              "default": 3,
+              "maximum": 255,
+              "minimum": 0
+            },
+            "type": {
+              "type": "string",
+              "const": "hdr-histogram"
+            }
+          },
+          "required": [
+            "type"
+          ]
         }
       ]
     },
     "StepConfig": {
       "description": "Step configuration for StepPattern",
       "type": "object",
-      "required": [
-        "duration",
-        "rate"
-      ],
       "properties": {
         "duration": {
           "type": "string"
@@ -493,56 +624,55 @@
           "type": "number",
           "format": "double"
         }
-      }
+      },
+      "required": [
+        "duration",
+        "rate"
+      ]
     },
     "TargetConfig": {
       "description": "Target server configuration",
       "type": "object",
-      "required": [
-        "protocol"
-      ],
       "properties": {
         "address": {
           "description": "Server address (e.g., \"127.0.0.1:6379\") - can be overridden via CLI",
-          "default": null,
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "default": null
         },
         "protocol": {
-          "description": "Protocol: echo, redis, memcached-binary, memcached-ascii, http, synthetic, masstree, xylem-echo",
-          "type": "string"
+          "description": "Default protocol for traffic groups that don't specify their own\nValid: redis, memcached-binary, memcached-ascii, http",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
         },
         "transport": {
           "description": "Transport: tcp, udp, tls",
-          "default": "tcp",
-          "type": "string"
+          "type": "string",
+          "default": "tcp"
         }
       }
     },
     "TrafficGroupConfig": {
       "description": "Traffic group configuration",
       "type": "object",
-      "required": [
-        "connections_per_thread",
-        "name",
-        "policy",
-        "threads"
-      ],
       "properties": {
         "connections_per_thread": {
           "description": "Number of connections per thread",
           "type": "integer",
           "format": "uint",
-          "minimum": 0.0
+          "minimum": 0
         },
         "max_pending_per_connection": {
           "description": "Maximum pending requests per connection",
-          "default": 10,
           "type": "integer",
           "format": "uint",
-          "minimum": 0.0
+          "default": 10,
+          "minimum": 0
         },
         "name": {
           "description": "Group name for identification",
@@ -550,17 +680,32 @@
         },
         "policy": {
           "description": "Traffic policy configuration",
-          "allOf": [
-            {
-              "$ref": "#/definitions/PolicyConfig"
-            }
-          ]
+          "$ref": "#/$defs/PolicyConfig"
         },
-        "sampling_rate": {
-          "description": "Sampling rate (0.0 to 1.0)",
-          "default": 1.0,
-          "type": "number",
-          "format": "double"
+        "protocol": {
+          "description": "Protocol for this group (optional, falls back to target.protocol if not specified)",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "sampling_policy": {
+          "description": "Latency sampling policy",
+          "$ref": "#/$defs/SamplingPolicy",
+          "default": {
+            "max_samples": 131072,
+            "rate": 1.0,
+            "type": "limited"
+          }
+        },
+        "target": {
+          "description": "Target address for this group (optional, falls back to global target if not specified)",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
         },
         "threads": {
           "description": "Thread IDs this group runs on",
@@ -568,36 +713,34 @@
           "items": {
             "type": "integer",
             "format": "uint",
-            "minimum": 0.0
+            "minimum": 0
           }
         }
-      }
+      },
+      "required": [
+        "name",
+        "threads",
+        "connections_per_thread",
+        "policy"
+      ]
     },
     "WorkloadConfig": {
       "description": "Workload configuration",
       "type": "object",
-      "required": [
-        "keys",
-        "pattern"
-      ],
       "properties": {
         "keys": {
           "description": "Key generation strategy",
-          "allOf": [
-            {
-              "$ref": "#/definitions/KeysConfig"
-            }
-          ]
+          "$ref": "#/$defs/KeysConfig"
         },
         "pattern": {
           "description": "Load pattern (MACRO level - time-varying traffic)",
-          "allOf": [
-            {
-              "$ref": "#/definitions/LoadPatternConfig"
-            }
-          ]
+          "$ref": "#/$defs/LoadPatternConfig"
         }
-      }
+      },
+      "required": [
+        "keys",
+        "pattern"
+      ]
     }
   }
 }
