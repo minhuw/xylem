@@ -237,13 +237,13 @@ mod tests {
         let merged = GroupStatsCollector::merge(vec![c1, c2]);
 
         let group0 = merged.get_group(0).unwrap();
-        // Merge creates new collectors from samples, so byte counts won't be preserved
-        // Only latency samples are copied
-        assert_eq!(group0.tx_requests(), 0); // Known limitation of merge
-                                             // assert_eq!(group0.tx_bytes(), 300); // Byte counts not preserved in merge
+        // Merge aggregates counters from all collectors
+        assert_eq!(group0.tx_requests(), 2); // 1 from c1 + 1 from c2
+        assert_eq!(group0.tx_bytes(), 300); // 100 from c1 + 200 from c2
 
         let global = merged.global();
-        assert_eq!(global.tx_requests(), 0); // Known limitation
+        assert_eq!(global.tx_requests(), 2); // Aggregated from both collectors
+        assert_eq!(global.tx_bytes(), 300); // Aggregated from both collectors
     }
 
     #[test]

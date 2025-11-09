@@ -10,13 +10,9 @@ DEFAULT_MEMCACHED_PORT := "11211"
 _default:
     @just --list
 
-# Run all integration tests (Redis, Memcached, etc.)
-# This is the main test command - runs comprehensive integration tests
-# RUST_LOG=error suppresses verbose dependency logs
-test:
-    @echo "🔌 Running integration tests (requires Redis/Memcached)..."
-    @echo "This will take around 30-60 seconds..."
-    RUST_LOG=error cargo test --workspace -- --ignored --test-threads=1
+# Run all tests
+test: test-unit test-integration
+    @echo "✅ All tests passed!"
 
 # Run all examples to validate they work
 examples:
@@ -38,9 +34,12 @@ test-unit:
     @echo "🚀 Running unit tests..."
     cargo test --workspace
 
-# Run all tests (unit + integration)
-test-all: test-unit test
-    @echo "✅ All tests passed!"
+# Run integration tests only (requires Redis/Memcached)
+# RUST_LOG=error suppresses verbose dependency logs
+test-integration:
+    @echo "🔌 Running integration tests (requires Redis/Memcached)..."
+    @echo "This will take around 30-60 seconds..."
+    RUST_LOG=error cargo test --workspace -- --ignored --test-threads=1
 
 # Run only Redis integration tests
 test-redis:
@@ -226,9 +225,9 @@ help:
     @echo "===================================="
     @echo ""
     @echo "📊 Testing:"
-    @echo "  just test              - Run ALL integration tests (Redis/Memcached)"
-    @echo "  just test-unit         - Fast unit tests only (no integration)"
-    @echo "  just test-all          - All tests (unit + integration)"
+    @echo "  just test              - Run ALL tests (unit + integration)"
+    @echo "  just test-unit         - Unit tests only (fast, no Redis/Memcached)"
+    @echo "  just test-integration  - Integration tests only (requires Redis/Memcached)"
     @echo "  just test-redis        - Redis tests only"
     @echo "  just test-memcached    - Memcached tests only"
     @echo "  just test-scheduler    - Scheduler integration tests"
