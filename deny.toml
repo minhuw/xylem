@@ -1,0 +1,35 @@
+# Configuration for cargo-deny
+# See: https://embarkstudios.github.io/cargo-deny/
+
+[advisories]
+version = 2
+ignore = [
+    # paste crate is unmaintained but widely used and stable
+    # We'll monitor for alternatives like 'pastey' if needed
+    "RUSTSEC-2024-0436",
+]
+
+[licenses]
+version = 2
+# Allow common open-source licenses
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "0BSD",
+    "OpenSSL",
+    "Unicode-3.0",
+]
+
+# Confidence threshold for license detection
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
