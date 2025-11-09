@@ -13,3 +13,4 @@ ignore:
   - "tests/**"
   - "benches/**"
   - "examples/**"
+  - "xylem-echo-server/**"
