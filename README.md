@@ -7,6 +7,37 @@
 
 **Xylem** is a high-performance and modular traffic generator and measurement tool for RPC workloads built with different combinations of application **protocol** (e.g., redis, masstree, HTTP) and **transport** protocol (e.g., TCP, UDP, UNIX Domain Socket).
 
+## Documentation
+
+Comprehensive documentation is available in the `book/` directory. To build and view the documentation locally:
+
+```bash
+# Install mdBook
+cargo install mdbook
+
+# Build and serve the documentation
+cd book
+mdbook serve --open
+```
+
+The documentation includes:
+- Getting Started guide
+- User guide with CLI reference
+- Architecture overview
+- Protocol and transport documentation
+- Examples and tutorials
+- API reference
+
+## Quick Start
+
+```bash
+# Build from source
+cargo build --release
+
+# Run a simple Redis benchmark
+./target/release/xylem --protocol redis --transport tcp --host localhost --port 6379 --duration 10s --rate 1000
+```
+
 ## License
 
 MIT License - see [LICENSE](LICENSE) file for details.
