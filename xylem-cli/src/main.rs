@@ -22,10 +22,10 @@ use output::ExperimentResults;
 /// This ensures reproducibility and simplifies complex workload specifications.
 ///
 /// Example usage:
-///   xylem run -P profiles/redis-get-zipfian.toml
-///   xylem run -P profiles/http-spike.toml --set target.address=192.168.1.100:8080
-///   xylem run -P profiles/memcached-ramp.toml --set experiment.duration=120s --set experiment.seed=12345
-///   xylem run -P profiles/redis-bench.toml --set traffic_groups.0.sampling_rate=0.5
+///   xylem -P profiles/redis-get-zipfian.toml
+///   xylem -P profiles/http-spike.toml --set target.address=192.168.1.100:8080
+///   xylem -P profiles/memcached-ramp.toml --set experiment.duration=120s --set experiment.seed=12345
+///   xylem -P profiles/redis-bench.toml --set traffic_groups.0.sampling_rate=0.5
 ///   xylem completions bash > ~/.local/share/bash-completion/completions/xylem
 ///
 /// Override any config value using dot notation:
@@ -40,7 +40,24 @@ use output::ExperimentResults;
 #[command(version, about = "Latency measurement tool with config-first design", long_about = None)]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
+
+    /// Path to TOML profile configuration file
+    #[arg(short = 'P', long)]
+    profile: Option<PathBuf>,
+
+    /// Override any configuration value using dot notation (can be specified multiple times)
+    ///
+    /// Examples:
+    ///   --set target.address=127.0.0.1:6379
+    ///   --set experiment.duration=60s
+    ///   --set experiment.seed=999
+    ///   --set target.protocol=memcached-binary
+    ///   --set workload.keys.n=1000000
+    ///   --set traffic_groups.0.threads=[0,1,2,3]
+    ///   --set output.file=/tmp/results.json
+    #[arg(long = "set", value_name = "KEY=VALUE")]
+    set: Vec<String>,
 
     /// Log level (trace, debug, info, warn, error)
     #[arg(short = 'l', long, default_value = "info", global = true)]
@@ -49,26 +66,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run a latency measurement experiment (default command)
-    Run {
-        /// Path to TOML profile configuration file (REQUIRED)
-        #[arg(short = 'P', long, required = true)]
-        profile: PathBuf,
-
-        /// Override any configuration value using dot notation (can be specified multiple times)
-        ///
-        /// Examples:
-        ///   --set target.address=127.0.0.1:6379
-        ///   --set experiment.duration=60s
-        ///   --set experiment.seed=999
-        ///   --set target.protocol=memcached-binary
-        ///   --set workload.keys.n=1000000
-        ///   --set traffic_groups.0.threads=[0,1,2,3]
-        ///   --set output.file=/tmp/results.json
-        #[arg(long = "set", value_name = "KEY=VALUE")]
-        set: Vec<String>,
-    },
-
     /// Generate shell completions
     Completions {
         /// Shell to generate completions for
@@ -137,7 +134,7 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     match cli.command {
-        Commands::Completions { shell } => {
+        Some(Commands::Completions { shell }) => {
             let bin_name = "xylem";
             match shell {
                 Shell::Bash => {
@@ -154,20 +151,31 @@ fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Commands::Schema => {
+        Some(Commands::Schema) => {
             let schema = schema_for!(ProfileConfig);
             let schema_json = serde_json::to_string_pretty(&schema)?;
             println!("{}", schema_json);
             Ok(())
         }
-        Commands::CompletePaths => {
+        Some(Commands::CompletePaths) => {
             let paths = completions::get_config_paths();
             for path in paths {
                 println!("{}", path);
             }
             Ok(())
         }
-        Commands::Run { profile, set } => run_experiment(profile, set),
+        None => {
+            // No subcommand provided - check if profile flag is set
+            if let Some(profile) = cli.profile {
+                // Run the experiment
+                run_experiment(profile, cli.set)
+            } else {
+                // No profile provided - show help
+                let mut cmd = Cli::command();
+                cmd.print_help()?;
+                std::process::exit(1);
+            }
+        }
     }
 }
 

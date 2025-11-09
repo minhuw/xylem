@@ -68,10 +68,24 @@ _{bin_name}() {{
         return 0
     fi
 
-    # Complete subcommands
-    if [[ $cword -eq 1 ]]; then
-        COMPREPLY=( $(compgen -W "run completions schema help" -- "$cur") )
-        return 0
+    # Check if we already have a subcommand
+    local has_subcommand=0
+    for ((i=1; i<cword; i++)); do
+        case "${{words[i]}}" in
+            completions|schema|help)
+                has_subcommand=1
+                break
+                ;;
+        esac
+    done
+
+    # Complete subcommands only if no flags and no subcommand yet
+    if [[ $has_subcommand -eq 0 && "$cur" != -* ]]; then
+        # If we're at position 1 or haven't seen a profile flag yet, suggest subcommands
+        if [[ $cword -eq 1 ]]; then
+            COMPREPLY=( $(compgen -W "completions schema help" -- "$cur") )
+            return 0
+        fi
     fi
 
     # Complete shell names for 'completions' subcommand
@@ -108,6 +122,8 @@ _{bin_name}() {{
     local line state
 
     _arguments -C \
+        '(-P --profile)'{{'{{'}}-P,--profile{{'}}'}}'[Profile path]:file:_files -g "*.toml"' \
+        '*--set[Override config]:key=value:_{bin_name}_complete_set_keys' \
         '(-l --log-level)'{{'{{'}}-l,--log-level{{'}}'}}'[Log level]:level:(trace debug info warn error)' \
         '1: :->command' \
         '*:: :->args'
@@ -116,7 +132,6 @@ _{bin_name}() {{
         command)
             local -a subcommands
             subcommands=(
-                'run:Run a latency measurement experiment'
                 'completions:Generate shell completions'
                 'schema:Generate JSON Schema'
                 'help:Print help'
@@ -125,11 +140,6 @@ _{bin_name}() {{
             ;;
         args)
             case $line[1] in
-                run)
-                    _arguments \
-                        '(-P --profile)'{{'{{'}}-P,--profile{{'}}'}}'[Profile path]:file:_files -g "*.toml"' \
-                        '*--set[Override config]:key=value:_{bin_name}_complete_set_keys'
-                    ;;
                 completions)
                     _arguments '1:shell:(bash zsh fish)'
                     ;;

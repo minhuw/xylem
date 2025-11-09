@@ -84,7 +84,6 @@ fn run_experiment(config_path: &Path) -> ExperimentResults {
             "--package",
             "xylem-cli",
             "--",
-            "run",
             "-P",
             config_path.to_str().unwrap(),
         ])
