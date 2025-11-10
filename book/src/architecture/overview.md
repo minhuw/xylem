@@ -31,33 +31,19 @@ Xylem is designed with a modular, layered architecture that separates concerns a
 
 ## Design Principles
 
-Xylem's architecture is built on several core design principles that guide its implementation and ensure it meets the needs of high-performance latency measurement. The system is designed with modularity at its heart, where each component has a single, well-defined responsibility. The CLI layer handles user interaction and TOML configuration parsing, presenting a clean interface to users. The core engine orchestrates workload generation, manages threading, and collects statistics, serving as the central coordinator. Protocol implementations focus solely on encoding and decoding application-level messages, while the transport layer handles all network communication details.
+Xylem's architecture follows several core design principles. The system employs a modular design where each component has a well-defined responsibility: the CLI layer handles user interaction and TOML configuration parsing, the core engine orchestrates workload generation and statistics collection, protocol implementations handle message encoding/decoding, and the transport layer manages network communication.
 
-This modular design enables composability, allowing protocols and transports to be freely mixed and matched. Users can run Redis over TCP for standard deployments, switch to UDP for lower latency when appropriate, or use Unix domain sockets for maximum performance in local testing. HTTP can run over TCP or Unix sockets depending on the deployment scenario, and Memcached can be tested over any transport the system supports. This flexibility allows Xylem to adapt to diverse testing requirements without code changes.
+The architecture enables composability through clean interfaces. Protocols and transports can be combined freely - Redis can run over TCP, UDP, or Unix domain sockets; HTTP over TCP or Unix sockets; and Memcached over any supported transport. This flexibility allows Xylem to adapt to different testing scenarios without code modifications.
 
-Performance is a fundamental consideration throughout the system. The implementation avoids unnecessary data copies wherever possible, using an event-driven architecture built on the `mio` library for efficient I/O multiplexing. Statistics collection uses lock-free data structures to minimize contention in multi-threaded scenarios, and memory allocation patterns are carefully designed to reduce overhead during high-throughput operations.
+Performance considerations are integrated throughout the design. The implementation minimizes data copies, uses an event-driven architecture with `mio` for I/O multiplexing, employs lock-free data structures for statistics collection, and optimizes memory allocation patterns for high-throughput operations.
 
-Finally, the system is built for extensibility through clean trait-based interfaces. Adding new protocols or transports involves implementing well-defined traits with clear contracts. The plugin architecture allows custom implementations to integrate seamlessly with the existing codebase, making it straightforward to extend Xylem for new use cases without modifying the core engine.
-
-### 3. Performance
-
-- **Zero-copy** where possible
-- **Event-driven** architecture using `mio`
-- **Lock-free** data structures for statistics
-- **Efficient** memory allocation patterns
-
-### 4. Extensibility
-
-- Clean trait-based interfaces
-- Easy to add new protocols
-- Easy to add new transports
-- Plugin architecture (planned)
+Extensibility is achieved through trait-based interfaces. New protocols implement the `Protocol` trait, and new transports implement the `Transport` trait. These well-defined contracts allow custom implementations to integrate with the existing codebase without modifying core components.
 
 ## Key Components
 
-### [Core Engine](./core.md)
+### Core Engine
 
-The heart of Xylem, responsible for workload generation, connection management, statistics collection, and event loop orchestration.
+The core engine handles workload generation, connection management, statistics collection, and event loop orchestration.
 
 ### [Protocol Layer](./protocols.md)
 
@@ -69,39 +55,13 @@ Handles network communication including connection establishment, data transmiss
 
 ## Data Flow
 
-The system processes requests through a well-defined pipeline. Users provide workload configuration through TOML profile files, which the core engine reads during initialization to set up the appropriate protocols and transports. During execution, the event loop continuously generates requests according to the configured pattern and collects responses as they arrive. Statistics are gathered throughout the run, tracking latency, throughput, and error rates. When the benchmark completes, final results are formatted according to the output configuration and displayed to the user.
+The system processes requests through a defined pipeline. Users provide workload configuration via TOML profile files. The core engine reads the configuration during initialization to instantiate the appropriate protocols and transports. During execution, the event loop generates requests according to the configured pattern and collects responses as they arrive. Statistics are gathered throughout the run, tracking latency, throughput, and error rates. Upon completion, results are formatted according to the output configuration and presented to the user.
 
 ## Threading Model
 
-Xylem uses a single-threaded event loop design:
-- **Main thread** - Event loop and I/O multiplexing
-- **Optional workers** - For CPU-intensive tasks (planned)
+Xylem uses a multi-threaded design where each thread runs an independent event loop. Threads are pinned to specific CPU cores for optimal performance, and each maintains its own set of connections and statistics. This design eliminates lock contention and provides predictable, scalable performance.
 
-Benefits:
-- No locking overhead
-- Predictable performance
-- Easier to debug
+## See Also
 
-## Performance Characteristics
-
-### Latency
-
-- **Request latency** - Typically < 1μs overhead
-- **Measurement overhead** - Minimal impact on results
-
-### Throughput
-
-- **Single connection** - Up to 100K+ req/s
-- **Multiple connections** - Limited by network and target
-
-### Memory
-
-- **Fixed overhead** - ~10MB base
-- **Per-connection** - ~4KB
-- **Statistics** - Depends on sketch algorithm
-
-## Next Steps
-
-- Learn about [Core Components](./core.md)
-- Understand [Protocol Layer](./protocols.md)
-- Explore [Transport Layer](./transports.md)
+- [Protocol Layer](./protocols.md)
+- [Transport Layer](./transports.md)

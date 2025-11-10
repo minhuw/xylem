@@ -1,10 +1,10 @@
 # Protocol Layer
 
-The protocol layer (`xylem-protocols`) implements application-level protocols for different types of RPC workloads.
+The protocol layer (`xylem-protocols`) implements application-level protocols for RPC workload generation and measurement.
 
 ## Protocol Trait
 
-All protocols implement a common `Protocol` trait that defines the interface for request generation and response parsing:
+All protocol implementations conform to the `Protocol` trait interface:
 
 ```rust
 pub trait Protocol: Send {
@@ -33,25 +33,25 @@ pub trait Protocol: Send {
 }
 ```
 
-This trait provides a uniform interface for all protocol implementations, allowing the core engine to work with any protocol without knowing its specific details.
+The trait provides a uniform interface for protocol implementations, enabling the core engine to interact with any protocol through a consistent API.
 
 ## Protocol Design
 
-Protocols in Xylem are designed to be stateless where possible, with minimal memory overhead per request. Each protocol implementation handles the details of encoding requests in the appropriate wire format and parsing responses back into a form the core engine can process. The request ID mechanism allows the system to correlate responses with their corresponding requests, which is essential for accurate latency measurement in pipelined or out-of-order scenarios.
+Protocol implementations are designed to minimize state and memory overhead. Each implementation encodes requests in the appropriate wire format and parses responses into a form suitable for latency measurement. The `RequestId` mechanism enables request-response correlation, which is required for accurate latency measurement in scenarios involving pipelining or out-of-order responses.
 
 ## Supported Protocols
 
-Xylem includes implementations for several common RPC protocols:
+The following protocol implementations are available:
 
-- **Redis** - Implements the RESP (Redis Serialization Protocol) for key-value operations
-- **HTTP** - Implements HTTP/1.1 for web service testing
-- **Memcached** - Implements both binary and text Memcached protocols
+- **Redis** - RESP (Redis Serialization Protocol) for key-value operations
+- **HTTP** - HTTP/1.1 for web service testing
+- **Memcached** - Binary and text protocol variants for cache testing
 
-Each protocol implementation is documented in detail in the User Guide's [Protocols](../guide/protocols.md) section.
+Detailed documentation for each protocol is available in the [Protocols](../guide/protocols.md) section of the User Guide.
 
 ## Request-Response Correlation
 
-The protocol layer maintains the necessary state to correlate responses with their originating requests. This is particularly important for protocols that support pipelining or when multiple requests may be in flight simultaneously. The `RequestId` type allows each protocol to define its own correlation mechanism appropriate to its semantics.
+The protocol layer maintains state necessary for correlating responses with their originating requests. This is required for protocols supporting pipelining or scenarios where multiple requests are in flight concurrently. Each protocol defines an appropriate `RequestId` type for its correlation semantics.
 
 ## See Also
 
