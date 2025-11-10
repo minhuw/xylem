@@ -1,0 +1,37 @@
+/* Import General Sans font from CDN */
+@import url('https://api.fontshare.com/v2/css?f[]=general-sans@200,300,400,500,600,700&display=swap');
+
+/* Import Google Sans Mono from Google Fonts */
+@import url('https://fonts.googleapis.com/css2?family=Google+Sans+Mono:wght@400;500;600;700&display=swap');
+
+/* Import Inter for emphasized text */
+@import url('https://fonts.googleapis.com/css2?family=Inter:ital,wght@0,400;0,500;0,600;0,700;1,400;1,500;1,600;1,700&display=swap');
+
+/* Apply General Sans as the main font */
+:root {
+    --body-font: 'General Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+    --mono-font: 'Google Sans Mono', 'Fira Code', 'Source Code Pro', Consolas, Monaco, monospace;
+    --emphasis-font: 'Roboto', 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+}
+
+body {
+    font-family: var(--body-font);
+}
+
+.sidebar, .sidebar-scrollbox {
+    font-family: var(--body-font);
+}
+
+h1, h2, h3, h4, h5, h6 {
+    font-family: var(--emphasis-font);
+}
+
+/* Keep monospace for code */
+code, pre, .hljs {
+    font-family: var(--mono-font);
+}
+
+/* Use Inter for emphasized text */
+em, i, strong, b {
+    font-family: var(--emphasis-font);
+}
