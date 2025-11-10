@@ -1,51 +1,20 @@
 # Protocol Configuration
 
-Configure protocol in the `[target]` section of your profile.
+Configure the protocol in the `[target]` section of your TOML profile.
 
-## Protocol Selection
-
-Specify the protocol using the `protocol` field:
+## Specifying Protocol
 
 ```toml
 [target]
-protocol = "redis"
+protocol = "redis"  # or "http", "memcached-binary", "memcached-ascii"
 address = "localhost:6379"
 ```
 
 ## Supported Protocols
 
-### Redis Protocol
+- **redis** - Redis Serialization Protocol (RESP)
+- **http** - HTTP/1.1
+- **memcached-binary** - Memcached binary protocol
+- **memcached-ascii** - Memcached text protocol
 
-```toml
-[target]
-protocol = "redis"
-address = "localhost:6379"
-```
-
-The Redis protocol implementation supports standard Redis commands like GET, SET, etc. The specific operation pattern is defined in the workload configuration.
-
-### HTTP Protocol
-
-```toml
-[target]
-protocol = "http"
-address = "localhost:8080"
-```
-
-For HTTP workloads, you can configure the request path and method through workload-specific options.
-
-### Memcached Protocol
-
-```toml
-[target]
-protocol = "memcached-binary"
-address = "localhost:11211"
-```
-
-or
-
-```toml
-[target]
-protocol = "memcached-ascii"
-address = "localhost:11211"
-```
+See the [Architecture - Protocol Layer](../../architecture/protocols.md) for implementation details.
