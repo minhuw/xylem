@@ -1,224 +1,60 @@
 # Protocol Layer
 
-The protocol layer (`xylem-protocols`) implements application-level protocols.
+The protocol layer (`xylem-protocols`) implements application-level protocols for different types of RPC workloads.
 
 ## Protocol Trait
 
-All protocols implement the `Protocol` trait:
+All protocols implement a common `Protocol` trait that defines the interface for request generation and response parsing:
 
 ```rust
 pub trait Protocol: Send {
-    /// Encode the next request
-    fn encode_request(&mut self) -> Result<Vec<u8>>;
+    type RequestId: Eq + Hash + Clone + Copy + Debug;
     
-    /// Decode response data
-    fn decode_response(&mut self, data: &[u8]) -> Result<usize>;
+    /// Generate a request with an ID
+    fn generate_request(
+        &mut self,
+        conn_id: usize,
+        key: u64,
+        value_size: usize,
+    ) -> (Vec<u8>, Self::RequestId);
     
-    /// Check if response is complete
-    fn is_complete(&self) -> bool;
+    /// Parse a response and return the request ID
+    fn parse_response(
+        &mut self,
+        conn_id: usize,
+        data: &[u8],
+    ) -> Result<(usize, Option<Self::RequestId>)>;
     
-    /// Reset state for next request
+    /// Protocol name
+    fn name(&self) -> &'static str;
+    
+    /// Reset protocol state
     fn reset(&mut self);
-    
-    /// Get protocol-specific metrics
-    fn metrics(&self) -> ProtocolMetrics;
 }
 ```
 
-## Protocol Implementations
+This trait provides a uniform interface for all protocol implementations, allowing the core engine to work with any protocol without knowing its specific details.
 
-### Redis Protocol
+## Protocol Design
 
-Implements RESP (Redis Serialization Protocol):
+Protocols in Xylem are designed to be stateless where possible, with minimal memory overhead per request. Each protocol implementation handles the details of encoding requests in the appropriate wire format and parsing responses back into a form the core engine can process. The request ID mechanism allows the system to correlate responses with their corresponding requests, which is essential for accurate latency measurement in pipelined or out-of-order scenarios.
 
-```rust
-pub struct RedisProtocol {
-    operation: RedisOperation,
-    key_generator: KeyGenerator,
-    state: ProtocolState,
-}
-```
+## Supported Protocols
 
-**Features:**
-- RESP2 and RESP3 support
-- Pipelining
-- Key pattern generation
-- All common commands
+Xylem includes implementations for several common RPC protocols:
 
-### HTTP Protocol
+- **Redis** - Implements the RESP (Redis Serialization Protocol) for key-value operations
+- **HTTP** - Implements HTTP/1.1 for web service testing
+- **Memcached** - Implements both binary and text Memcached protocols
 
-Implements HTTP/1.1:
+Each protocol implementation is documented in detail in the User Guide's [Protocols](../guide/protocols.md) section.
 
-```rust
-pub struct HttpProtocol {
-    method: Method,
-    path: String,
-    headers: HeaderMap,
-    body: Option<Vec<u8>>,
-}
-```
+## Request-Response Correlation
 
-**Features:**
-- All HTTP methods
-- Custom headers
-- Request body support
-- Keep-alive connections
-
-### Memcached Protocol
-
-Implements binary and text protocols:
-
-```rust
-pub struct MemcachedProtocol {
-    operation: MemcachedOp,
-    key_generator: KeyGenerator,
-    binary: bool,
-}
-```
-
-**Features:**
-- Binary and text protocol
-- All common operations
-- Expiration support
-- CAS operations
-
-## State Management
-
-Protocols maintain state for request-response correlation:
-
-```rust
-pub enum ProtocolState {
-    Idle,
-    WaitingResponse { request_id: u64 },
-    Complete,
-    Error(String),
-}
-```
-
-## Request Encoding
-
-Efficient request encoding with minimal allocations:
-
-```rust
-impl RedisProtocol {
-    fn encode_request(&mut self) -> Result<Vec<u8>> {
-        let mut buf = Vec::with_capacity(64);
-        match self.operation {
-            RedisOperation::Get(ref key) => {
-                write!(buf, "*2\r\n$3\r\nGET\r\n")?;
-                write!(buf, "${}\r\n{}\r\n", key.len(), key)?;
-            }
-            // ... other operations
-        }
-        Ok(buf)
-    }
-}
-```
-
-## Response Parsing
-
-Incremental parsing for streaming data:
-
-```rust
-impl RedisProtocol {
-    fn decode_response(&mut self, data: &[u8]) -> Result<usize> {
-        match self.state {
-            ProtocolState::WaitingResponse { .. } => {
-                // Parse RESP format
-                let (consumed, response) = parse_resp(data)?;
-                self.state = ProtocolState::Complete;
-                Ok(consumed)
-            }
-            _ => Err(anyhow!("Invalid state")),
-        }
-    }
-}
-```
-
-## Key Generation
-
-Dynamic key generation for realistic workloads:
-
-```rust
-pub enum KeyPattern {
-    Sequential { prefix: String, counter: u64 },
-    Random { prefix: String },
-    Zipfian { prefix: String, n: usize, s: f64 },
-}
-```
-
-**Patterns:**
-- **Sequential** - `key:1`, `key:2`, `key:3`, ...
-- **Random** - Random keys from key space
-- **Zipfian** - Skewed distribution (popular keys accessed more)
-
-## Protocol Factory
-
-Dynamic protocol creation:
-
-```rust
-pub fn create_protocol(config: &ProtocolConfig) -> Result<Box<dyn Protocol>> {
-    match config.protocol.as_str() {
-        "redis" => Ok(Box::new(RedisProtocol::new(config)?)),
-        "http" => Ok(Box::new(HttpProtocol::new(config)?)),
-        "memcached" => Ok(Box::new(MemcachedProtocol::new(config)?)),
-        _ => Err(anyhow!("Unknown protocol: {}", config.protocol)),
-    }
-}
-```
-
-## Adding a New Protocol
-
-To add a new protocol:
-
-1. **Implement the Protocol trait**:
-```rust
-pub struct MyProtocol {
-    // Protocol state
-}
-
-impl Protocol for MyProtocol {
-    // Implement required methods
-}
-```
-
-2. **Add to protocol factory**:
-```rust
-"myprotocol" => Ok(Box::new(MyProtocol::new(config)?)),
-```
-
-3. **Add configuration support**:
-```rust
-#[derive(Deserialize)]
-pub struct MyProtocolConfig {
-    // Protocol-specific config
-}
-```
-
-## Testing
-
-Comprehensive protocol tests:
-
-```rust
-#[test]
-fn test_redis_get_encode() {
-    let mut proto = RedisProtocol::new_get("key1");
-    let req = proto.encode_request().unwrap();
-    assert_eq!(req, b"*2\r\n$3\r\nGET\r\n$4\r\nkey1\r\n");
-}
-
-#[test]
-fn test_redis_response_decode() {
-    let mut proto = RedisProtocol::new_get("key1");
-    let _ = proto.encode_request();
-    let consumed = proto.decode_response(b"$5\r\nvalue\r\n").unwrap();
-    assert_eq!(consumed, 13);
-    assert!(proto.is_complete());
-}
-```
+The protocol layer maintains the necessary state to correlate responses with their originating requests. This is particularly important for protocols that support pipelining or when multiple requests may be in flight simultaneously. The `RequestId` type allows each protocol to define its own correlation mechanism appropriate to its semantics.
 
 ## See Also
 
+- [Protocol implementations in User Guide](../guide/protocols.md)
 - [Architecture Overview](./overview.md)
-- [Custom Protocols](../guide/protocols/custom.md)
-- [Extending Xylem](../advanced/extending.md)
+- [Transport Layer](./transports.md)

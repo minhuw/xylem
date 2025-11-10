@@ -1,10 +1,10 @@
 # Transport Layer
 
-The transport layer (`xylem-transport`) handles network communication.
+The transport layer (`xylem-transport`) handles all network communication for Xylem.
 
 ## Transport Trait
 
-All transports implement the `Transport` trait:
+All transports implement a common `Transport` trait that defines the interface for network operations:
 
 ```rust
 pub trait Transport: Send {
@@ -25,253 +25,32 @@ pub trait Transport: Send {
 }
 ```
 
-## Transport Implementations
+This uniform interface allows the core engine to work with any transport mechanism without knowing the underlying implementation details. Whether communicating over TCP, UDP, or Unix domain sockets, the core engine uses the same set of operations.
 
-### TCP Transport
+## Transport Design
 
-Standard TCP implementation using `std::net::TcpStream`:
+Transports are designed to be lightweight wrappers around operating system primitives, adding minimal overhead to network operations. Each transport handles the specifics of its communication mechanism while presenting a consistent interface to higher layers. The implementations focus on efficiency and correctness, with careful attention to error handling and resource management.
 
-```rust
-pub struct TcpTransport {
-    stream: Option<TcpStream>,
-    addr: SocketAddr,
-    options: TcpOptions,
-}
+## Supported Transports
 
-pub struct TcpOptions {
-    pub nodelay: bool,
-    pub keepalive: bool,
-    pub send_buffer: Option<usize>,
-    pub recv_buffer: Option<usize>,
-}
-```
+Xylem includes implementations for several transport mechanisms:
 
-**Features:**
-- Non-blocking I/O
-- TCP_NODELAY support
-- Configurable buffers
-- Keep-alive support
+- **TCP** - Reliable, connection-oriented byte streams using standard TCP sockets
+- **UDP** - Connectionless datagram communication for lower latency scenarios  
+- **Unix Domain Sockets** - Local inter-process communication with minimal overhead
 
-### UDP Transport
-
-Connectionless UDP implementation:
-
-```rust
-pub struct UdpTransport {
-    socket: UdpSocket,
-    addr: SocketAddr,
-    max_packet_size: usize,
-}
-```
-
-**Features:**
-- Stateless operation
-- Configurable packet size
-- No connection establishment
-
-### Unix Socket Transport
-
-Unix domain socket implementation:
-
-```rust
-pub struct UnixTransport {
-    stream: Option<UnixStream>,
-    path: PathBuf,
-}
-```
-
-**Features:**
-- Lowest latency
-- File system permissions
-- No network overhead
-
-### TLS Transport
-
-Encrypted TCP using `rustls`:
-
-```rust
-pub struct TlsTransport {
-    stream: Option<TlsStream<TcpStream>>,
-    config: Arc<ClientConfig>,
-    addr: SocketAddr,
-    domain: ServerName,
-}
-```
-
-**Features:**
-- TLS 1.2 and 1.3
-- Server verification
-- Client certificates (mTLS)
-- Custom CA certificates
+Each transport implementation is documented in detail in the User Guide's [Transports](../guide/transports.md) section.
 
 ## Non-Blocking I/O
 
-All transports support non-blocking operation for integration with the event loop:
-
-```rust
-impl TcpTransport {
-    pub fn set_nonblocking(&mut self, nonblocking: bool) -> Result<()> {
-        if let Some(stream) = &self.stream {
-            stream.set_nonblocking(nonblocking)?;
-        }
-        Ok(())
-    }
-}
-```
+All transports support non-blocking operation, which is essential for integration with Xylem's event-driven architecture. The core engine uses `mio` for efficient I/O multiplexing, allowing a single thread to manage many concurrent connections. Transports register their file descriptors with the event loop and handle readiness notifications appropriately.
 
 ## Connection Management
 
-### Connection Establishment
-
-```rust
-pub fn connect(&mut self) -> Result<()> {
-    match TcpStream::connect_timeout(&self.addr, Duration::from_secs(5)) {
-        Ok(stream) => {
-            // Configure socket options
-            if self.options.nodelay {
-                stream.set_nodelay(true)?;
-            }
-            self.stream = Some(stream);
-            Ok(())
-        }
-        Err(e) => Err(anyhow!("Connection failed: {}", e)),
-    }
-}
-```
-
-### Connection Pooling
-
-Reuse connections for better performance:
-
-```rust
-pub struct ConnectionPool {
-    connections: Vec<Box<dyn Transport>>,
-    available: VecDeque<usize>,
-}
-
-impl ConnectionPool {
-    pub fn acquire(&mut self) -> Option<&mut dyn Transport> {
-        self.available.pop_front()
-            .map(|idx| &mut *self.connections[idx])
-    }
-    
-    pub fn release(&mut self, idx: usize) {
-        self.available.push_back(idx);
-    }
-}
-```
-
-## Error Handling
-
-Transport-specific errors:
-
-```rust
-#[derive(Error, Debug)]
-pub enum TransportError {
-    #[error("Connection failed: {0}")]
-    ConnectionFailed(String),
-    
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
-    
-    #[error("TLS error: {0}")]
-    Tls(String),
-    
-    #[error("Timeout")]
-    Timeout,
-}
-```
-
-## Event Loop Integration
-
-Transports register with the event loop using `mio`:
-
-```rust
-use mio::{Poll, Token, Interest};
-
-pub fn register(&mut self, poll: &Poll, token: Token) -> Result<()> {
-    if let Some(stream) = &mut self.stream {
-        poll.registry().register(
-            &mut SourceFd(&stream.as_raw_fd()),
-            token,
-            Interest::READABLE | Interest::WRITABLE,
-        )?;
-    }
-    Ok(())
-}
-```
-
-## Performance Optimizations
-
-### Zero-Copy
-
-Minimize data copying:
-```rust
-pub fn send_vectored(&mut self, bufs: &[IoSlice]) -> Result<usize> {
-    self.stream.as_ref()
-        .unwrap()
-        .write_vectored(bufs)
-        .map_err(Into::into)
-}
-```
-
-### Buffer Tuning
-
-Optimize socket buffers:
-```rust
-pub fn set_buffer_sizes(&mut self, send: usize, recv: usize) -> Result<()> {
-    let stream = self.stream.as_ref().unwrap();
-    let socket = socket2::Socket::from(stream.as_raw_fd());
-    socket.set_send_buffer_size(send)?;
-    socket.set_recv_buffer_size(recv)?;
-    Ok(())
-}
-```
-
-## TLS Configuration
-
-### Server Verification
-
-```rust
-let mut root_store = RootCertStore::empty();
-root_store.add_parsable_certificates(
-    &rustls_native_certs::load_native_certs()?
-);
-
-let config = ClientConfig::builder()
-    .with_root_certificates(root_store)
-    .with_no_client_auth();
-```
-
-### Client Certificates
-
-```rust
-let client_cert = load_cert("client.pem")?;
-let client_key = load_key("client-key.pem")?;
-
-let config = ClientConfig::builder()
-    .with_root_certificates(root_store)
-    .with_client_auth_cert(client_cert, client_key)?;
-```
-
-## Testing
-
-Transport tests ensure correct behavior:
-
-```rust
-#[test]
-fn test_tcp_connect() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    
-    let mut transport = TcpTransport::new(addr, TcpOptions::default());
-    assert!(transport.connect().is_ok());
-    assert!(transport.is_connected());
-}
-```
+The transport layer provides primitives for connection management, but the core engine handles higher-level concerns like connection pooling and reconnection strategies. This separation allows the core to implement sophisticated connection management policies while keeping transport implementations simple and focused.
 
 ## See Also
 
+- [Transport implementations in User Guide](../guide/transports.md)
 - [Architecture Overview](./overview.md)
-- [Transport Configuration](../guide/configuration/transport.md)
-- [Performance Tuning](../advanced/performance.md)
+- [Protocol Layer](./protocols.md)

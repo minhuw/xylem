@@ -1,85 +1,51 @@
 # Protocol Configuration
 
-Configure protocol-specific options for Redis, HTTP, Memcached, and custom protocols.
+Configure protocol in the `[target]` section of your profile.
 
-## Redis Protocol
+## Protocol Selection
 
-```json
-{
-  "protocol": "redis",
-  "protocol_config": {
-    "operation": "get",
-    "key_pattern": "user:*",
-    "value_size": 100,
-    "pipeline": 10
-  }
-}
+Specify the protocol using the `protocol` field:
+
+```toml
+[target]
+protocol = "redis"
+address = "localhost:6379"
 ```
 
-**Options:**
-- `operation` - Redis operation (get, set, incr, etc.)
-- `key_pattern` - Key pattern with wildcards
-- `value_size` - Size of values for SET operations
-- `pipeline` - Number of pipelined requests
+## Supported Protocols
 
-## HTTP Protocol
+### Redis Protocol
 
-```json
-{
-  "protocol": "http",
-  "protocol_config": {
-    "method": "GET",
-    "path": "/api/users",
-    "headers": {
-      "User-Agent": "Xylem",
-      "Accept": "application/json"
-    },
-    "body": null
-  }
-}
+```toml
+[target]
+protocol = "redis"
+address = "localhost:6379"
 ```
 
-**Options:**
-- `method` - HTTP method (GET, POST, PUT, DELETE)
-- `path` - Request path
-- `headers` - Custom HTTP headers
-- `body` - Request body (for POST/PUT)
+The Redis protocol implementation supports standard Redis commands like GET, SET, etc. The specific operation pattern is defined in the workload configuration.
 
-## Memcached Protocol
+### HTTP Protocol
 
-```json
-{
-  "protocol": "memcached",
-  "protocol_config": {
-    "operation": "get",
-    "key_pattern": "cache:*",
-    "value_size": 1024
-  }
-}
+```toml
+[target]
+protocol = "http"
+address = "localhost:8080"
 ```
 
-**Options:**
-- `operation` - Memcached operation (get, set, delete, etc.)
-- `key_pattern` - Key pattern
-- `value_size` - Size of values for SET operations
+For HTTP workloads, you can configure the request path and method through workload-specific options.
 
-## Custom Protocol
+### Memcached Protocol
 
-For custom protocol implementations:
-
-```json
-{
-  "protocol": "custom",
-  "protocol_config": {
-    "plugin": "/path/to/protocol.so",
-    "options": {
-      "custom_option": "value"
-    }
-  }
-}
+```toml
+[target]
+protocol = "memcached-binary"
+address = "localhost:11211"
 ```
 
-## See Also
+or
 
-- [Workload Configuration](./workload.md)
-- [Protocols Guide](../protocols.md)
+```toml
+[target]
+protocol = "memcached-ascii"
+address = "localhost:11211"
+```

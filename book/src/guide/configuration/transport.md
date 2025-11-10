@@ -1,102 +1,45 @@
 # Transport Configuration
 
-Configure transport layer options including TCP, UDP, Unix sockets, and TLS.
+Transport is configured in the `[target]` section through the `address` field.
 
-## Transport Types
+## Address Format
+
+The transport type is inferred from the address format:
 
 ### TCP
 
-Basic TCP transport configuration:
+Use hostname:port format:
 
-```json
-{
-  "transport": {
-    "type": "tcp",
-    "host": "localhost",
-    "port": 6379,
-    "nodelay": true,
-    "keepalive": true
-  }
-}
+```toml
+[target]
+protocol = "redis"
+address = "localhost:6379"
 ```
 
-**Options:**
-- `host` - Target host address
-- `port` - Target port number
-- `nodelay` - Enable TCP_NODELAY (disable Nagle's algorithm)
-- `keepalive` - Enable TCP keepalive
+or
 
-### UDP
-
-UDP transport configuration:
-
-```json
-{
-  "transport": {
-    "type": "udp",
-    "host": "localhost",
-    "port": 8080
-  }
-}
+```toml
+[target]
+protocol = "redis"
+address = "192.168.1.100:6379"
 ```
 
 ### Unix Domain Socket
 
-Unix socket transport:
+Use a filesystem path:
 
-```json
-{
-  "transport": {
-    "type": "unix",
-    "path": "/var/run/service.sock"
-  }
-}
+```toml
+[target]
+protocol = "redis"
+address = "/var/run/redis/redis.sock"
 ```
 
-### TLS
+### UDP
 
-TLS over TCP configuration:
+UDP transport is specified using the same hostname:port format. The protocol implementation determines whether to use TCP or UDP.
 
-```json
-{
-  "transport": {
-    "type": "tls",
-    "host": "localhost",
-    "port": 6380,
-    "verify": true,
-    "ca_cert": "/path/to/ca.pem",
-    "client_cert": "/path/to/client.pem",
-    "client_key": "/path/to/client-key.pem"
-  }
-}
-```
+## Connection Options
 
-**Options:**
-- `verify` - Verify server certificate
-- `ca_cert` - Path to CA certificate
-- `client_cert` - Path to client certificate (for mutual TLS)
-- `client_key` - Path to client private key
+Transport-specific options can be configured through environment variables or extended configuration:
 
-## Connection Pool Options
-
-Configure connection pooling behavior:
-
-```json
-{
-  "transport": {
-    "type": "tcp",
-    "host": "localhost",
-    "port": 6379,
-    "pool": {
-      "max_connections": 100,
-      "min_connections": 10,
-      "connection_timeout": "5s"
-    }
-  }
-}
-```
-
-## See Also
-
-- [Workload Configuration](./workload.md)
-- [Transports Guide](../transports.md)
+- TCP_NODELAY - Typically enabled by default for low latency

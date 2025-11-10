@@ -1,99 +1,70 @@
 # Workload Configuration
 
-Define workload patterns, duration, rate, and other runtime parameters.
+Define workload patterns, key distributions, and runtime parameters in the `[workload]` section of your profile.
 
 ## Basic Structure
 
-```json
-{
-  "workload": {
-    "duration": "60s",
-    "rate": 5000,
-    "connections": 10,
-    "warmup": "5s"
-  }
-}
+```toml
+[workload]
+keys = { type = "zipfian", n = 10000, s = 0.99 }
+value_size = 100
 ```
 
-## Options
+## Key Distribution
 
-### `duration`
+### `keys.type`
 
-**Type:** String (duration)  
+**Type:** String  
 **Required:** Yes
 
-How long to run the benchmark. Accepts human-readable durations.
+The key distribution pattern to use.
 
-**Examples:**
-- `"10s"` - 10 seconds
-- `"5m"` - 5 minutes
-- `"1h"` - 1 hour
+**Options:**
+- `"zipfian"` - Zipfian distribution (realistic cache workload with hot keys)
+- `"uniform"` - Uniform random distribution
+- `"sequential"` - Sequential key access
 
-### `rate`
+### Zipfian Distribution
 
-**Type:** Integer  
-**Required:** Yes
-
-Target request rate in requests per second.
-
-### `connections`
-
-**Type:** Integer  
-**Default:** 1
-
-Number of concurrent connections to maintain.
-
-### `warmup`
-
-**Type:** String (duration)  
-**Default:** `"0s"`
-
-Warmup period before collecting statistics. Useful for letting the system reach steady state.
-
-## Advanced Patterns
-
-### Closed-Loop Workload
-
-```json
-{
-  "workload": {
-    "type": "closed-loop",
-    "duration": "60s",
-    "connections": 50,
-    "think_time": "10ms"
-  }
-}
+```toml
+[workload]
+keys = { type = "zipfian", n = 100000, s = 0.99 }
 ```
 
-### Open-Loop Workload
+**Parameters:**
+- `n` - Number of keys in the key space
+- `s` - Skew parameter (higher values = more skewed, typical: 0.99)
 
-```json
-{
-  "workload": {
-    "type": "open-loop",
-    "duration": "60s",
-    "rate": 10000
-  }
-}
+### Uniform Distribution
+
+```toml
+[workload]
+keys = { type = "uniform", n = 100000 }
 ```
 
-### Distribution Patterns
+### Sequential Distribution
 
-Specify request distribution patterns:
+```toml
+[workload]
+keys = { type = "sequential", start = 0, n = 100000 }
+```
 
-```json
-{
-  "workload": {
-    "duration": "60s",
-    "rate_distribution": {
-      "type": "poisson",
-      "mean": 5000
-    }
-  }
-}
+## Value Size
+
+### `value_size`
+
+**Type:** Integer  
+**Required:** For protocols that need it (e.g., SET operations)
+
+Size of values in bytes.
+
+```toml
+[workload]
+value_size = 1024  # 1KB values
 ```
 
 ## See Also
 
 - [Transport Configuration](./transport.md)
 - [Protocol Configuration](./protocol.md)
+- [Traffic Groups](../cli-reference.md#traffic-groups)

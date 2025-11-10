@@ -1,80 +1,83 @@
 # Configuration
 
-Xylem supports configuration via JSON files for complex workload definitions.
+Xylem uses TOML configuration files (called "profiles") for defining experiments.
 
 ## Configuration File Structure
 
-A configuration file is a JSON document with the following top-level fields:
+A profile is a TOML document with the following top-level sections:
 
-```json
-{
-  "protocol": "redis",
-  "transport": { ... },
-  "workload": { ... },
-  "output": { ... }
-}
+```toml
+[experiment]
+duration = "60s"
+seed = 123
+
+[target]
+protocol = "redis"
+address = "127.0.0.1:6379"
+
+[workload]
+# Workload parameters
+
+[[traffic_groups]]
+name = "main"
+threads = [0, 1, 2, 3]
+# Rate control parameters
 ```
 
 ## Sections
 
 The configuration is divided into several sections:
 
-- **[Workload Configuration](./configuration/workload.md)** - Define workload patterns, duration, and rates
-- **[Transport Configuration](./configuration/transport.md)** - Configure transport layer options
+- **[Workload Configuration](./configuration/workload.md)** - Define workload patterns, duration, and key distributions
+- **[Transport Configuration](./configuration/transport.md)** - Configure network transport options
 - **[Protocol Configuration](./configuration/protocol.md)** - Protocol-specific settings
 
 ## Basic Example
 
-```json
-{
-  "protocol": "redis",
-  "transport": {
-    "type": "tcp",
-    "host": "localhost",
-    "port": 6379
-  },
-  "workload": {
-    "duration": "60s",
-    "rate": 5000,
-    "connections": 10
-  },
-  "output": {
-    "format": "json",
-    "file": "results.json"
-  }
-}
+```toml
+[experiment]
+duration = "60s"
+seed = 42
+
+[target]
+protocol = "redis"
+address = "localhost:6379"
+
+[workload]
+keys = { type = "zipfian", n = 10000, s = 0.99 }
+value_size = 100
+
+[[traffic_groups]]
+name = "group-1"
+threads = [0, 1, 2, 3]
+rate_control = { type = "closed_loop", concurrency = 50 }
+
+[output]
+format = "json"
+file = "results.json"
 ```
 
-## Schema Validation
+## Configuration Overrides
 
-Xylem provides a JSON schema for configuration validation. The schema file is available in the repository at `schema/config.json`.
-
-You can use tools like [ajv](https://ajv.js.org/) to validate your configuration:
+You can override any configuration value using the `--set` flag with dot notation:
 
 ```bash
-ajv validate -s schema/config.json -d your-config.json
-```
+# Override target address
+xylem -P profile.toml --set target.address=192.168.1.100:6379
 
-## Configuration Precedence
+# Override experiment duration
+xylem -P profile.toml --set experiment.duration=120s
 
-When both CLI arguments and configuration file are provided:
-
-1. CLI arguments take precedence over configuration file
-2. Configuration file provides defaults for unspecified CLI options
-
-Example:
-
-```bash
-# rate from CLI (2000) overrides config file
-xylem --config config.json --rate 2000
+# Override multiple parameters
+xylem -P profile.toml --set experiment.duration=60s --set experiment.seed=999
 ```
 
 ## Loading Configuration
 
-Use the `--config` flag to load a configuration file:
+Use the `-P` or `--profile` flag to load a profile file:
 
 ```bash
-xylem --config workload.json
+xylem -P profiles/redis-get-zipfian.toml
 ```
 
 ## See Also
@@ -82,4 +85,4 @@ xylem --config workload.json
 - [Workload Configuration](./configuration/workload.md)
 - [Transport Configuration](./configuration/transport.md)
 - [Protocol Configuration](./configuration/protocol.md)
-- [JSON Schema Reference](../reference/schema.md)
+- [Configuration Schema](../reference/schema.md)
