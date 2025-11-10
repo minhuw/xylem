@@ -15,7 +15,7 @@ Xylem is designed with a modular, layered architecture that separates concerns a
 │       (xylem-core)                      │
 │  - Workload Management                  │
 │  - Statistics Collection                │
-│  - Event Loop                           │
+│  - Threading & Event Loop               │
 └─────────────────────────────────────────┘
          │                  │
          ▼                  ▼
@@ -24,8 +24,8 @@ Xylem is designed with a modular, layered architecture that separates concerns a
 │ (xylem-protocols)│  │(xylem-transport) │
 │  - Redis        │  │   - TCP          │
 │  - HTTP         │  │   - UDP          │
-│  - Memcached    │  │   - Unix         │
-│  - Custom       │  │   - TLS          │
+│  - Memcached    │  │   - Unix Socket  │
+│  - Masstree     │  │                  │
 └─────────────────┘  └──────────────────┘
 ```
 
@@ -34,8 +34,8 @@ Xylem is designed with a modular, layered architecture that separates concerns a
 ### 1. Modularity
 
 Each component has a single, well-defined responsibility:
-- **CLI** - User interface and configuration parsing
-- **Core** - Workload orchestration and statistics
+- **CLI** - User interface and TOML configuration parsing
+- **Core** - Workload orchestration, threading, and statistics
 - **Protocols** - Application-level protocol implementation
 - **Transports** - Network communication layer
 
@@ -43,9 +43,10 @@ Each component has a single, well-defined responsibility:
 
 Protocols and transports can be mixed and matched:
 - Redis over TCP
-- Redis over TLS
+- Redis over UDP
 - HTTP over TCP
 - HTTP over Unix sockets
+- Memcached over TCP
 
 ### 3. Performance
 

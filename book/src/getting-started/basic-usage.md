@@ -2,54 +2,73 @@
 
 This chapter covers the fundamental concepts and usage patterns of Xylem.
 
-## Command-Line Interface
+## Configuration-First Design
 
-Xylem provides a comprehensive command-line interface for running benchmarks.
+Xylem uses TOML configuration files (called "profiles") to define experiments. This approach ensures reproducibility and simplifies complex workload specifications.
 
 ### Basic Syntax
 
 ```bash
-xylem [OPTIONS] --protocol <PROTOCOL> --transport <TRANSPORT>
+xylem -P <profile.toml>
 ```
 
-### Common Options
+### Example Profiles
 
-- `--protocol <PROTOCOL>`: Specify the application protocol (redis, http, memcached)
-- `--transport <TRANSPORT>`: Specify the transport layer (tcp, udp, unix, tls)
-- `--host <HOST>`: Target host address
-- `--port <PORT>`: Target port number
-- `--duration <DURATION>`: How long to run the benchmark (e.g., 10s, 5m)
-- `--rate <RATE>`: Request rate (requests per second)
-- `--config <FILE>`: Path to JSON configuration file
-
-## Configuration Files
-
-For complex workloads, use JSON configuration files:
-
-```json
-{
-  "protocol": "redis",
-  "transport": {
-    "type": "tcp",
-    "host": "localhost",
-    "port": 6379
-  },
-  "workload": {
-    "duration": "60s",
-    "rate": 10000,
-    "connections": 10
-  },
-  "output": {
-    "format": "json",
-    "file": "results.json"
-  }
-}
-```
-
-Run with:
+Xylem includes example profiles in the `profiles/` directory:
 
 ```bash
-xylem --config workload.json
+# Run a Redis GET benchmark with Zipfian distribution
+xylem -P profiles/redis-get-zipfian.toml
+
+# Run an HTTP load test
+xylem -P profiles/http-spike.toml
+
+# Run a Memcached benchmark
+xylem -P profiles/memcached-ramp.toml
+```
+
+## Configuration Overrides
+
+You can override any configuration value using the `--set` flag with dot notation:
+
+```bash
+# Override target address
+xylem -P profiles/redis.toml --set target.address=192.168.1.100:6379
+
+# Override experiment duration and seed
+xylem -P profiles/bench.toml --set experiment.duration=120s --set experiment.seed=12345
+
+# Override workload parameters
+xylem -P profiles/redis.toml --set workload.keys.n=1000000
+
+# Override thread assignment
+xylem -P profiles/multi.toml --set traffic_groups.0.threads=[0,1,2,3]
+```
+
+## Profile File Structure
+
+A typical profile file includes:
+
+```toml
+# Experiment configuration
+[experiment]
+duration = "60s"
+seed = 123
+
+# Target service configuration
+[target]
+protocol = "redis"
+address = "127.0.0.1:6379"
+
+# Workload configuration
+[workload]
+# ... workload parameters
+
+# Traffic groups (thread assignment and rate control)
+[[traffic_groups]]
+name = "group-1"
+threads = [0, 1, 2, 3]
+# ... rate control parameters
 ```
 
 ## Understanding Output
@@ -80,36 +99,36 @@ Xylem provides detailed statistics after each run:
 
 ### Fixed-Rate Benchmarking
 
-Generate a constant load:
+Generate a constant load by configuring rate control in the profile:
 
-```bash
-xylem --protocol redis --rate 5000 --duration 60s
+```toml
+[experiment]
+duration = "60s"
+
+[[traffic_groups]]
+name = "main"
+threads = [0, 1, 2, 3]
+rate_control = { type = "closed_loop", concurrency = 100 }
 ```
 
-### Burst Testing
+### Multi-Protocol Testing
 
-Test system behavior under sudden load spikes (configure via JSON):
+Run multiple protocols simultaneously by defining multiple traffic groups in your profile.
 
-```json
-{
-  "workload": {
-    "pattern": "burst",
-    "burst_size": 1000,
-    "interval": "5s"
-  }
-}
-```
+## Logging
 
-### Multi-Connection Testing
-
-Test with multiple concurrent connections:
+Control logging verbosity:
 
 ```bash
-xylem --protocol redis --connections 50 --rate 10000
+# Debug level logging
+xylem -P profiles/redis.toml --log-level debug
+
+# Using RUST_LOG environment variable
+RUST_LOG=debug xylem -P profiles/redis.toml
 ```
 
 ## Next Steps
 
 - Explore [CLI Reference](../guide/cli-reference.md) for all available options
-- Learn about [Configuration](../guide/configuration.md) in detail
+- Learn about [Configuration](../guide/configuration.md) file format
 - See [Examples](../examples/redis.md) for real-world scenarios

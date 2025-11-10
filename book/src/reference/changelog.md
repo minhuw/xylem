@@ -6,11 +6,11 @@ Release history and notable changes for Xylem.
 
 ### Added
 - mdBook documentation structure
-- Comprehensive user guide
+- User guide covering CLI, configuration, protocols, and transports
 - Architecture documentation
-- Examples and tutorials
+- Examples for Redis, HTTP, and multi-protocol workloads
 
-## [0.1.0] - 2024-XX-XX
+## [0.1.0] - Unreleased
 
 ### Added
 - Initial release of Xylem

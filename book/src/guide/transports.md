@@ -7,24 +7,17 @@ Xylem supports multiple transport layers for network communication.
 - **[TCP](./transports/tcp.md)** - Reliable byte stream transport
 - **[UDP](./transports/udp.md)** - Unreliable datagram transport
 - **[Unix Domain Sockets](./transports/unix.md)** - Local inter-process communication
-- **[TLS](./transports/tls.md)** - Encrypted TCP transport
 
 ## Transport Selection
 
-Specify the transport using the `--transport` flag or in configuration:
+Specify the transport in your TOML profile configuration:
 
-```bash
-xylem --transport tcp
-```
-
-Or in JSON:
-
-```json
-{
-  "transport": {
-    "type": "tcp"
-  }
-}
+```toml
+[target]
+protocol = "redis"
+address = "localhost:6379"  # TCP
+# or
+address = "/var/run/redis.sock"  # Unix socket
 ```
 
 ## Transport Features
@@ -43,13 +36,6 @@ Transport-specific options for optimizing performance:
 - Send/receive buffer sizes
 - Keep-alive settings
 
-### Security
-
-TLS transport provides:
-- Server certificate verification
-- Mutual TLS (client certificates)
-- Custom CA certificates
-
 ## Choosing a Transport
 
 ### TCP
@@ -66,11 +52,6 @@ TLS transport provides:
 - **Use for:** Local services, highest performance
 - **Pros:** Lowest latency, no network overhead
 - **Cons:** Only works for local processes
-
-### TLS
-- **Use for:** Encrypted communication, production deployments
-- **Pros:** Security, authentication
-- **Cons:** Higher CPU usage and latency
 
 ## See Also
 

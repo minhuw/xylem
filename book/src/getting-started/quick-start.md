@@ -2,9 +2,25 @@
 
 This guide will help you run your first benchmark with Xylem in just a few minutes.
 
-## Running a Simple Redis Benchmark
+## Prerequisites
 
-Let's start with a simple Redis benchmark using the default configuration.
+- Rust 1.70 or later
+- A target service to benchmark (e.g., Redis, HTTP server, Memcached)
+
+## Build Xylem
+
+```bash
+# Clone the repository
+git clone https://github.com/minhuw/xylem.git
+cd xylem
+
+# Build in release mode
+cargo build --release
+
+# The binary will be at target/release/xylem
+```
+
+## Running a Simple Redis Benchmark
 
 ### 1. Start a Redis Server
 
@@ -18,52 +34,71 @@ By default, Redis listens on `localhost:6379`.
 
 ### 2. Run the Benchmark
 
-Run Xylem with a simple workload:
+Use one of the included example profiles:
 
 ```bash
-xylem --protocol redis --transport tcp --host localhost --port 6379 --duration 10s --rate 1000
+./target/release/xylem -P profiles/redis-get-zipfian.toml
 ```
 
-This command will:
-- Use the Redis protocol
-- Connect via TCP
-- Target `localhost:6379`
-- Run for 10 seconds
-- Send requests at 1000 requests per second
+This profile runs a Redis GET benchmark with a Zipfian key distribution.
 
 ### 3. Understanding the Output
 
 Xylem will display statistics about the benchmark, including:
-- Latency percentiles (p50, p95, p99, etc.)
+- Latency percentiles (p50, p95, p99, p99.9, etc.)
 - Throughput (requests per second)
 - Error rates
-- Connection statistics
+- Per-thread statistics
 
-## Configuration File Example
+## Customizing the Benchmark
 
-For more complex workloads, you can use a JSON configuration file:
-
-```json
-{
-  "protocol": "redis",
-  "transport": {
-    "type": "tcp",
-    "host": "localhost",
-    "port": 6379
-  },
-  "workload": {
-    "duration": "30s",
-    "rate": 5000,
-    "operation": "get",
-    "key_pattern": "user:*"
-  }
-}
-```
-
-Save this as `config.json` and run:
+You can override configuration values using the `--set` flag:
 
 ```bash
-xylem --config config.json
+# Change target address
+./target/release/xylem -P profiles/redis-get-zipfian.toml \
+  --set target.address=192.168.1.100:6379
+
+# Change experiment duration
+./target/release/xylem -P profiles/redis-get-zipfian.toml \
+  --set experiment.duration=120s
+
+# Change multiple parameters
+./target/release/xylem -P profiles/redis-get-zipfian.toml \
+  --set experiment.duration=60s \
+  --set experiment.seed=42 \
+  --set workload.keys.n=1000000
+```
+
+## Creating a Custom Profile
+
+Create your own TOML profile file:
+
+```toml
+# my-benchmark.toml
+
+[experiment]
+duration = "30s"
+seed = 123
+
+[target]
+protocol = "redis"
+address = "localhost:6379"
+
+[workload]
+# Workload configuration
+keys = { type = "zipfian", n = 10000, s = 0.99 }
+value_size = 100
+
+[[traffic_groups]]
+name = "main"
+threads = [0, 1, 2, 3]
+rate_control = { type = "closed_loop", concurrency = 50 }
+```
+
+Run with:
+```bash
+./target/release/xylem -P my-benchmark.toml
 ```
 
 ## Next Steps
@@ -71,3 +106,4 @@ xylem --config config.json
 - Learn more about [Basic Usage](./basic-usage.md)
 - Explore [Configuration options](../guide/configuration.md)
 - See more [Examples](../examples/redis.md)
+- Check out example profiles in the `profiles/` directory

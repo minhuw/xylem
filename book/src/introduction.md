@@ -2,16 +2,16 @@
 
 Welcome to the **Xylem** documentation!
 
-Xylem is a high-performance and modular traffic generator and measurement tool designed for RPC workloads. It provides a flexible framework for benchmarking and load testing distributed systems with different combinations of application protocols (e.g., Redis, HTTP, Memcached) and transport protocols (e.g., TCP, UDP, Unix Domain Socket, TLS).
+Xylem is a high-performance and modular traffic generator and measurement tool designed for RPC workloads. It provides a flexible framework for benchmarking and load testing distributed systems with different combinations of application protocols (e.g., Redis, HTTP, Memcached) and transport protocols (e.g., TCP, UDP, Unix Domain Socket).
 
 ## Key Features
 
-- **Multi-Protocol Support**: Built-in support for Redis, HTTP, Memcached, and extensible for custom protocols
-- **Flexible Transport Layer**: Support for TCP, UDP, Unix Domain Sockets, and TLS
+- **Multi-Protocol Support**: Built-in support for Redis, HTTP, Memcached, and Masstree protocols
+- **Flexible Transport Layer**: Support for TCP, UDP, and Unix Domain Sockets
 - **High Performance**: Efficient event-driven architecture for generating high loads
-- **Rich Metrics**: Detailed latency measurements and statistics using various sketch algorithms
-- **Configurable Workloads**: JSON-based configuration for complex workload patterns
-- **Modular Design**: Clean separation between protocol, transport, and core logic
+- **Reproducible**: Configuration-first design using TOML profiles ensures reproducibility
+- **Detailed Metrics**: Latency measurements and statistics using various sketch algorithms
+- **Multi-Threaded**: Support for thread affinity and multi-threaded workload generation
 
 ## Use Cases
 
@@ -34,6 +34,6 @@ Xylem is actively developed and maintained. The project is licensed under MIT OR
 
 ## Next Steps
 
-- Learn how to [install Xylem](./getting-started/installation.md)
 - Follow the [Quick Start guide](./getting-started/quick-start.md)
+- Learn about [Basic Usage](./getting-started/basic-usage.md)
 - Explore the [Architecture](./architecture/overview.md) to understand Xylem's design

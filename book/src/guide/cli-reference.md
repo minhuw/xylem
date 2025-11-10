@@ -2,6 +2,14 @@
 
 Complete reference for Xylem command-line interface.
 
+Xylem uses a config-first design with TOML profile files. This ensures reproducibility and simplifies complex workload specifications.
+
+## Basic Usage
+
+```bash
+xylem -P profiles/redis-get-zipfian.toml
+```
+
 ## Global Options
 
 ### `--version`
@@ -20,123 +28,117 @@ Display help information.
 xylem --help
 ```
 
-### `--config <FILE>`
+### `-P, --profile <FILE>`
 
-Path to JSON configuration file.
-
-```bash
-xylem --config workload.json
-```
-
-## Protocol Options
-
-### `--protocol <PROTOCOL>`
-
-Specify the application protocol to use.
-
-**Supported values:**
-- `redis` - Redis protocol
-- `http` - HTTP protocol
-- `memcached` - Memcached protocol
+Path to TOML profile configuration file.
 
 ```bash
-xylem --protocol redis
+xylem -P profiles/redis-bench.toml
 ```
 
-## Transport Options
+### `--set <KEY=VALUE>`
 
-### `--transport <TRANSPORT>`
-
-Specify the transport layer.
-
-**Supported values:**
-- `tcp` - TCP transport
-- `udp` - UDP transport
-- `unix` - Unix domain socket
-- `tls` - TLS over TCP
+Override any configuration value using dot notation. Can be specified multiple times.
 
 ```bash
-xylem --transport tcp
+xylem -P profiles/redis.toml --set target.address=192.168.1.100:6379
+xylem -P profiles/http.toml --set experiment.duration=120s --set experiment.seed=12345
 ```
-
-### `--host <HOST>`
-
-Target host address.
-
-```bash
-xylem --host localhost
-```
-
-### `--port <PORT>`
-
-Target port number.
-
-```bash
-xylem --port 6379
-```
-
-## Workload Options
-
-### `--duration <DURATION>`
-
-How long to run the benchmark. Accepts human-readable durations.
 
 **Examples:**
-- `10s` - 10 seconds
-- `5m` - 5 minutes
-- `1h` - 1 hour
+- `--set target.address=127.0.0.1:6379`
+- `--set experiment.duration=60s`
+- `--set experiment.seed=999`
+- `--set target.protocol=memcached-binary`
+- `--set workload.keys.n=1000000`
+- `--set traffic_groups.0.threads=[0,1,2,3]`
+- `--set output.file=/tmp/results.json`
+
+### `-l, --log-level <LEVEL>`
+
+Set log level (trace, debug, info, warn, error).
+
+**Default:** info
 
 ```bash
-xylem --duration 60s
+xylem -P profiles/redis.toml --log-level debug
 ```
 
-### `--rate <RATE>`
+## Subcommands
 
-Target request rate (requests per second).
+### `completions <SHELL>`
+
+Generate shell completion scripts.
+
+**Supported shells:**
+- bash
+- zsh
+- fish
+- powershell
+- elvish
+
+**Examples:**
 
 ```bash
-xylem --rate 1000
+# Bash
+xylem completions bash > ~/.local/share/bash-completion/completions/xylem
+
+# Zsh
+xylem completions zsh > ~/.zsh/completions/_xylem
+
+# Fish
+xylem completions fish > ~/.config/fish/completions/xylem.fish
 ```
 
-### `--connections <N>`
+### `schema`
 
-Number of concurrent connections.
+Generate JSON Schema for configuration files.
 
 ```bash
-xylem --connections 10
+xylem schema > config-schema.json
 ```
 
-## Output Options
+## Configuration Overrides
 
-### `--output <FORMAT>`
-
-Output format for results.
-
-**Supported formats:**
-- `text` - Human-readable text (default)
-- `json` - JSON format
-- `csv` - CSV format
+The `--set` flag uses dot notation to override any configuration value:
 
 ```bash
-xylem --output json
+# Override target address
+xylem -P profiles/redis.toml --set target.address=localhost:6379
+
+# Override experiment parameters
+xylem -P profiles/bench.toml --set experiment.duration=300s --set experiment.seed=42
+
+# Override workload settings
+xylem -P profiles/redis.toml --set workload.keys.n=1000000
+
+# Override traffic group settings
+xylem -P profiles/multi.toml --set traffic_groups.0.threads=[0,1,2,3]
+
+# Add new traffic group
+xylem -P profiles/base.toml --set 'traffic_groups.+={name="new-group",threads=[4,5]}'
 ```
 
-### `--output-file <FILE>`
+## Profile Files
 
-Write results to a file.
+Xylem requires a TOML profile file that defines the experiment configuration. See the `profiles/` directory for example configurations.
 
-```bash
-xylem --output-file results.json
-```
+Example profile structure:
+```toml
+[experiment]
+duration = "60s"
+seed = 123
 
-## Shell Completion
+[target]
+protocol = "redis"
+address = "127.0.0.1:6379"
 
-Generate shell completion scripts:
+[workload]
+# Workload configuration...
 
-```bash
-xylem --completions bash > xylem.bash
-xylem --completions zsh > _xylem
-xylem --completions fish > xylem.fish
+[[traffic_groups]]
+name = "group-1"
+threads = [0, 1, 2, 3]
 ```
 
 ## Environment Variables
@@ -146,10 +148,11 @@ Xylem respects the following environment variables:
 - `RUST_LOG` - Set logging level (e.g., `debug`, `info`, `warn`, `error`)
 
 ```bash
-RUST_LOG=debug xylem --protocol redis
+RUST_LOG=debug xylem -P profiles/redis.toml
 ```
 
 ## See Also
 
-- [Configuration](./configuration.md) - Detailed configuration options
+- [Configuration](./configuration.md) - Detailed configuration file format
 - [Examples](../examples/redis.md) - Common usage examples
+- [JSON Schema](../reference/schema.md) - Configuration schema reference
