@@ -1,6 +1,6 @@
 # Output Formats
 
-Xylem supports multiple output formats for results and metrics.
+Xylem supports multiple output formats for results and metrics, configured in your TOML profile.
 
 ## Supported Formats
 
@@ -8,8 +8,9 @@ Xylem supports multiple output formats for results and metrics.
 
 Default format with human-readable statistics:
 
-```bash
-xylem --protocol redis --output text
+```toml
+[output]
+format = "text"
 ```
 
 Example output:
@@ -35,11 +36,13 @@ Throughput: 9997.5 req/s
 
 Machine-readable JSON output:
 
-```bash
-xylem --protocol redis --output json
+```toml
+[output]
+format = "json"
+file = "results.json"
 ```
 
-Example:
+Example JSON output:
 ```json
 {
   "duration_secs": 60.0,
@@ -61,11 +64,13 @@ Example:
 
 Comma-separated values for analysis:
 
-```bash
-xylem --protocol redis --output csv
+```toml
+[output]
+format = "csv"
+file = "results.csv"
 ```
 
-Example:
+Example CSV output:
 ```csv
 metric,value
 duration_secs,60.0
@@ -78,64 +83,30 @@ p99_latency_ms,5.67
 throughput_rps,9997.5
 ```
 
-## Writing to File
-
-Save output to a file:
-
-```bash
-xylem --protocol redis --output json --output-file results.json
-```
-
 ## Configuration
 
-Specify output format in configuration:
+Specify output format in your profile:
 
-```json
-{
-  "output": {
-    "format": "json",
-    "file": "benchmark-results.json",
-    "pretty": true
-  }
-}
+```toml
+[output]
+format = "json"
+file = "benchmark-results.json"
 ```
 
 ### Options
 
 - `format` - Output format (text, json, csv)
 - `file` - Output file path (stdout if not specified)
-- `pretty` - Pretty-print JSON (JSON only)
 
-## Real-Time Streaming
+## Command Line Override
 
-For long-running benchmarks, stream results:
+You can override output settings using `--set`:
 
-```json
-{
-  "output": {
-    "format": "json",
-    "stream": true,
-    "interval": "1s"
-  }
-}
-```
-
-This outputs statistics every second during the run.
-
-## Custom Templates
-
-For advanced formatting, use custom templates:
-
-```json
-{
-  "output": {
-    "format": "custom",
-    "template": "/path/to/template.hbs"
-  }
-}
+```bash
+xylem -P profile.toml --set output.format=json --set output.file=results.json
 ```
 
 ## See Also
 
-- [Metrics and Statistics](../advanced/metrics.md)
 - [Configuration](./configuration.md)
+- [CLI Reference](./cli-reference.md)
