@@ -131,8 +131,11 @@ fn test_memcached_binary_single_thread() {
                 ),
             );
             let _transport = TcpTransport::new();
-            let generator =
-                RequestGenerator::new(KeyGeneration::sequential(0), RateControl::ClosedLoop, 64);
+            let generator = RequestGenerator::new(
+                KeyGeneration::sequential(0),
+                RateControl::ClosedLoop,
+                Box::new(xylem_core::workload::FixedSize::new(64)),
+            );
             let stats = common::create_test_stats();
             let config = WorkerConfig {
                 target: target_addr,
@@ -181,8 +184,11 @@ fn test_memcached_ascii_single_thread() {
                 ),
             );
             let _transport = TcpTransport::new();
-            let generator =
-                RequestGenerator::new(KeyGeneration::sequential(0), RateControl::ClosedLoop, 64);
+            let generator = RequestGenerator::new(
+                KeyGeneration::sequential(0),
+                RateControl::ClosedLoop,
+                Box::new(xylem_core::workload::FixedSize::new(64)),
+            );
             let stats = common::create_test_stats();
             let config = WorkerConfig {
                 target: target_addr,
@@ -231,8 +237,11 @@ fn test_memcached_binary_multi_thread() {
                 ),
             );
             let _transport = TcpTransport::new();
-            let generator =
-                RequestGenerator::new(KeyGeneration::random(10000), RateControl::ClosedLoop, 64);
+            let generator = RequestGenerator::new(
+                KeyGeneration::random(10000),
+                RateControl::ClosedLoop,
+                Box::new(xylem_core::workload::FixedSize::new(64)),
+            );
             let stats = common::create_test_stats();
             let config = WorkerConfig {
                 target: target_addr,
@@ -288,7 +297,7 @@ fn test_memcached_ascii_rate_limited() {
             let generator = RequestGenerator::new(
                 KeyGeneration::sequential(0),
                 RateControl::Fixed { rate: target_rate },
-                64,
+                Box::new(xylem_core::workload::FixedSize::new(64)),
             );
             let stats = common::create_test_stats();
             let config = WorkerConfig {

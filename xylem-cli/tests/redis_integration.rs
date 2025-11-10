@@ -174,12 +174,17 @@ fn test_redis_single_thread() {
     let duration = Duration::from_secs(2);
 
     // Create Redis protocol with GET operations
-    let protocol = xylem_protocols::redis::RedisProtocol::new(xylem_protocols::redis::RedisOp::Get);
+    let protocol = xylem_protocols::redis::RedisProtocol::new(Box::new(
+        xylem_protocols::FixedCommandSelector::new(xylem_protocols::redis::RedisOp::Get),
+    ));
     let protocol = ProtocolAdapter::new(protocol);
 
     // Create worker components
-    let generator =
-        RequestGenerator::new(KeyGeneration::sequential(0), RateControl::ClosedLoop, 64);
+    let generator = RequestGenerator::new(
+        KeyGeneration::sequential(0),
+        RateControl::ClosedLoop,
+        Box::new(xylem_core::workload::FixedSize::new(64)),
+    );
     let stats = common::create_test_stats();
     let worker_config = WorkerConfig {
         target: target_addr,
@@ -273,13 +278,14 @@ fn test_redis_multi_thread() {
     println!("Starting {num_threads}-threaded Redis test...");
 
     let results = runtime.run_workers_generic(move |thread_id| {
-        let protocol =
-            xylem_protocols::redis::RedisProtocol::new(xylem_protocols::redis::RedisOp::Get);
+        let protocol = xylem_protocols::redis::RedisProtocol::new(Box::new(
+            xylem_protocols::FixedCommandSelector::new(xylem_protocols::redis::RedisOp::Get),
+        ));
         let protocol = ProtocolAdapter::new(protocol);
         let generator = RequestGenerator::new(
             KeyGeneration::sequential(thread_id as u64 * 10000),
             RateControl::ClosedLoop,
-            64,
+            Box::new(xylem_core::workload::FixedSize::new(64)),
         );
         let stats = common::create_test_stats();
         let worker_config = WorkerConfig {
@@ -368,12 +374,14 @@ fn test_redis_rate_limited() {
     let duration = Duration::from_secs(2);
     let target_rate = 500.0; // 500 req/s (adjusted for closed-loop latency)
 
-    let protocol = xylem_protocols::redis::RedisProtocol::new(xylem_protocols::redis::RedisOp::Get);
+    let protocol = xylem_protocols::redis::RedisProtocol::new(Box::new(
+        xylem_protocols::FixedCommandSelector::new(xylem_protocols::redis::RedisOp::Get),
+    ));
     let protocol = ProtocolAdapter::new(protocol);
     let generator = RequestGenerator::new(
         KeyGeneration::sequential(0),
         RateControl::Fixed { rate: target_rate },
-        64,
+        Box::new(xylem_core::workload::FixedSize::new(64)),
     );
     let stats = common::create_test_stats();
     let worker_config = WorkerConfig {

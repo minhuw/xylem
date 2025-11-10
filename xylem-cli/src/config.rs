@@ -64,6 +64,12 @@ pub struct WorkloadConfig {
     pub keys: KeysConfig,
     /// Load pattern (MACRO level - time-varying traffic)
     pub pattern: LoadPatternConfig,
+    /// Value size configuration (optional, defaults to fixed size from keys config)
+    #[serde(default)]
+    pub value_size: Option<ValueSizeConfig>,
+    /// Operations/command configuration (optional, defaults to GET for redis)
+    #[serde(default)]
+    pub operations: Option<OperationsConfig>,
 }
 
 /// Key generation configuration (SPATIAL level)
@@ -88,6 +94,15 @@ pub enum KeysConfig {
         n: u64,
         /// Exponent (theta) controlling skewness
         theta: f64,
+        value_size: usize,
+    },
+    Gaussian {
+        /// Mean as percentage of keyspace (0.0 to 1.0)
+        mean_pct: f64,
+        /// Standard deviation as percentage of keyspace (0.0 to 1.0)
+        std_dev_pct: f64,
+        /// Maximum key value (keyspace size)
+        max: u64,
         value_size: usize,
     },
 }
@@ -146,6 +161,84 @@ pub struct StepConfig {
     #[schemars(with = "String")]
     pub duration: Duration,
     pub rate: f64,
+}
+
+/// Value size configuration
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "strategy", rename_all = "lowercase")]
+pub enum ValueSizeConfig {
+    /// Fixed size for all requests
+    Fixed { size: usize },
+    /// Uniform random size in range [min, max]
+    Uniform { min: usize, max: usize },
+    /// Normal (Gaussian) distribution
+    Normal {
+        mean: f64,
+        std_dev: f64,
+        min: usize,
+        max: usize,
+    },
+    /// Per-command size configuration
+    #[serde(rename = "per_command")]
+    PerCommand {
+        /// Size strategies for specific commands
+        commands: std::collections::HashMap<String, CommandValueSizeConfig>,
+        /// Default strategy for unspecified commands
+        default: Box<ValueSizeConfig>,
+    },
+}
+
+/// Value size configuration for a specific command
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "distribution", rename_all = "lowercase")]
+pub enum CommandValueSizeConfig {
+    Fixed {
+        size: usize,
+    },
+    Uniform {
+        min: usize,
+        max: usize,
+    },
+    Normal {
+        mean: f64,
+        std_dev: f64,
+        min: usize,
+        max: usize,
+    },
+}
+
+/// Operations configuration (command selection)
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "strategy", rename_all = "lowercase")]
+pub enum OperationsConfig {
+    /// Fixed operation (backward compatible)
+    Fixed { operation: String },
+    /// Weighted random selection
+    Weighted { commands: Vec<CommandWeightConfig> },
+}
+
+/// Command weight configuration
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct CommandWeightConfig {
+    /// Command name: "get", "set", "incr", "mget", "wait", or "custom"
+    pub name: String,
+    /// Weight (probability) for this command
+    pub weight: f64,
+    /// Additional parameters for specific commands
+    #[serde(flatten)]
+    pub params: Option<CommandParams>,
+}
+
+/// Additional parameters for specific command types
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(untagged)]
+pub enum CommandParams {
+    /// MGET parameters
+    MGet { count: usize },
+    /// WAIT parameters
+    Wait { num_replicas: usize, timeout_ms: u64 },
+    /// Custom command template
+    Custom { template: String },
 }
 
 /// Output configuration
@@ -352,6 +445,20 @@ impl ProfileConfig {
                 }
                 if *theta < 0.0 {
                     bail!("Zipfian theta must be >= 0.0");
+                }
+                if *value_size == 0 {
+                    bail!("value_size must be > 0");
+                }
+            }
+            KeysConfig::Gaussian { mean_pct, std_dev_pct, max, value_size } => {
+                if *max == 0 {
+                    bail!("Gaussian max must be > 0");
+                }
+                if !(0.0..=1.0).contains(mean_pct) {
+                    bail!("Gaussian mean_pct must be in range [0.0, 1.0]");
+                }
+                if !(0.0..=1.0).contains(std_dev_pct) {
+                    bail!("Gaussian std_dev_pct must be in range [0.0, 1.0]");
                 }
                 if *value_size == 0 {
                     bail!("value_size must be > 0");
@@ -617,6 +724,7 @@ impl KeysConfig {
             Self::Random { value_size, .. } => *value_size,
             Self::RoundRobin { value_size, .. } => *value_size,
             Self::Zipfian { value_size, .. } => *value_size,
+            Self::Gaussian { value_size, .. } => *value_size,
         }
     }
 
@@ -638,6 +746,131 @@ impl KeysConfig {
                 let seed = master_seed.map(|s| derive_seed(s, components::ZIPFIAN_DIST));
                 KeyGeneration::zipfian_with_seed(*n, *theta, seed)
             }
+            Self::Gaussian { mean_pct, std_dev_pct, max, .. } => {
+                let seed = master_seed.map(|s| derive_seed(s, components::GAUSSIAN_DIST));
+                KeyGeneration::gaussian_with_seed(*mean_pct, *std_dev_pct, *max, seed)
+            }
+        }
+    }
+}
+
+impl ValueSizeConfig {
+    /// Convert to a ValueSizeGenerator
+    pub fn to_generator(
+        &self,
+        master_seed: Option<u64>,
+    ) -> anyhow::Result<Box<dyn xylem_core::workload::ValueSizeGenerator>> {
+        use xylem_core::seed::derive_seed;
+        use xylem_core::workload::{FixedSize, NormalSize, PerCommandSize, UniformSize};
+
+        match self {
+            Self::Fixed { size } => Ok(Box::new(FixedSize::new(*size))),
+            Self::Uniform { min, max } => {
+                let seed = master_seed.map(|s| derive_seed(s, "uniform_value_size"));
+                Ok(Box::new(UniformSize::with_seed(*min, *max, seed)?))
+            }
+            Self::Normal { mean, std_dev, min, max } => {
+                let seed = master_seed.map(|s| derive_seed(s, "normal_value_size"));
+                Ok(Box::new(NormalSize::with_seed(*mean, *std_dev, *min, *max, seed)?))
+            }
+            Self::PerCommand { commands, default } => {
+                let mut command_generators = std::collections::HashMap::new();
+                for (cmd, cfg) in commands {
+                    let gen = cfg.to_generator(master_seed)?;
+                    command_generators.insert(cmd.clone(), gen);
+                }
+                let default_gen = default.to_generator(master_seed)?;
+                Ok(Box::new(PerCommandSize::new(command_generators, default_gen)))
+            }
+        }
+    }
+}
+
+impl CommandValueSizeConfig {
+    /// Convert to a ValueSizeGenerator
+    pub fn to_generator(
+        &self,
+        master_seed: Option<u64>,
+    ) -> anyhow::Result<Box<dyn xylem_core::workload::ValueSizeGenerator>> {
+        use xylem_core::seed::derive_seed;
+        use xylem_core::workload::{FixedSize, NormalSize, UniformSize};
+
+        match self {
+            Self::Fixed { size } => Ok(Box::new(FixedSize::new(*size))),
+            Self::Uniform { min, max } => {
+                let seed = master_seed.map(|s| derive_seed(s, "uniform_cmd_size"));
+                Ok(Box::new(UniformSize::with_seed(*min, *max, seed)?))
+            }
+            Self::Normal { mean, std_dev, min, max } => {
+                let seed = master_seed.map(|s| derive_seed(s, "normal_cmd_size"));
+                Ok(Box::new(NormalSize::with_seed(*mean, *std_dev, *min, *max, seed)?))
+            }
+        }
+    }
+}
+
+impl OperationsConfig {
+    /// Convert to a Redis CommandSelector
+    pub fn to_redis_selector(
+        &self,
+        master_seed: Option<u64>,
+    ) -> anyhow::Result<Box<dyn xylem_protocols::CommandSelector<xylem_protocols::RedisOp>>> {
+        use xylem_core::seed::derive_seed;
+        use xylem_protocols::{FixedCommandSelector, WeightedCommandSelector};
+
+        match self {
+            Self::Fixed { operation } => {
+                let op = Self::parse_redis_op(operation, None)?;
+                Ok(Box::new(FixedCommandSelector::new(op)))
+            }
+            Self::Weighted { commands } => {
+                let mut weighted_ops = Vec::new();
+                for cmd_cfg in commands {
+                    let op = Self::parse_redis_op(&cmd_cfg.name, cmd_cfg.params.as_ref())?;
+                    weighted_ops.push((op, cmd_cfg.weight));
+                }
+                let seed = master_seed.map(|s| derive_seed(s, "command_selector"));
+                Ok(Box::new(WeightedCommandSelector::with_seed(weighted_ops, seed)?))
+            }
+        }
+    }
+
+    fn parse_redis_op(
+        name: &str,
+        params: Option<&CommandParams>,
+    ) -> anyhow::Result<xylem_protocols::RedisOp> {
+        use xylem_protocols::{CommandTemplate, RedisOp};
+
+        match name.to_lowercase().as_str() {
+            "get" => Ok(RedisOp::Get),
+            "set" => Ok(RedisOp::Set),
+            "incr" => Ok(RedisOp::Incr),
+            "mget" => {
+                if let Some(CommandParams::MGet { count }) = params {
+                    Ok(RedisOp::MGet { count: *count })
+                } else {
+                    anyhow::bail!("MGET requires 'count' parameter")
+                }
+            }
+            "wait" => {
+                if let Some(CommandParams::Wait { num_replicas, timeout_ms }) = params {
+                    Ok(RedisOp::Wait {
+                        num_replicas: *num_replicas,
+                        timeout_ms: *timeout_ms,
+                    })
+                } else {
+                    anyhow::bail!("WAIT requires 'num_replicas' and 'timeout_ms' parameters")
+                }
+            }
+            "custom" => {
+                if let Some(CommandParams::Custom { template }) = params {
+                    let cmd_template = CommandTemplate::parse(template)?;
+                    Ok(RedisOp::Custom(cmd_template))
+                } else {
+                    anyhow::bail!("Custom command requires 'template' parameter")
+                }
+            }
+            _ => anyhow::bail!("Unknown Redis operation: {}", name),
         }
     }
 }

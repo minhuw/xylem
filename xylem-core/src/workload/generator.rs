@@ -1,6 +1,7 @@
 //! Request generation
 
-use super::distributions::{Distribution, ZipfianDistribution};
+use super::distributions::{Distribution, NormalDistribution, ZipfianDistribution};
+use super::value_size::ValueSizeGenerator;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use std::time::{Duration, Instant};
@@ -16,6 +17,17 @@ pub enum KeyGeneration {
     RoundRobin { max: u64, current: u64 },
     /// Zipfian distribution (hot-key pattern)
     Zipfian(ZipfianDistribution),
+    /// Gaussian (Normal) distribution (bell curve pattern)
+    Gaussian {
+        /// Mean as percentage of keyspace (0.0 to 1.0)
+        mean_pct: f64,
+        /// Standard deviation as percentage of keyspace (0.0 to 1.0)
+        std_dev_pct: f64,
+        /// Maximum key value (keyspace size)
+        max: u64,
+        /// Underlying normal distribution
+        dist: NormalDistribution,
+    },
 }
 
 // Manual Clone implementation
@@ -36,6 +48,19 @@ impl Clone for KeyGeneration {
                     ZipfianDistribution::new(dist.n(), dist.exponent())
                         .expect("Invalid Zipf parameters"),
                 )
+            }
+            Self::Gaussian { mean_pct, std_dev_pct, max, .. } => {
+                // Recreate distribution with same parameters
+                let mean = (*max as f64) * mean_pct;
+                let std_dev = (*max as f64) * std_dev_pct;
+                let dist =
+                    NormalDistribution::new(mean, std_dev).expect("Invalid Gaussian parameters");
+                Self::Gaussian {
+                    mean_pct: *mean_pct,
+                    std_dev_pct: *std_dev_pct,
+                    max: *max,
+                    dist,
+                }
             }
         }
     }
@@ -103,6 +128,53 @@ impl KeyGeneration {
         Ok(Self::Zipfian(dist))
     }
 
+    /// Create a Gaussian (Normal) key generator with entropy-based seed
+    ///
+    /// # Parameters
+    /// - `mean_pct`: Mean as percentage of keyspace (0.0 to 1.0)
+    /// - `std_dev_pct`: Standard deviation as percentage of keyspace (0.0 to 1.0)
+    /// - `max`: Maximum key value (keyspace size)
+    ///
+    /// # Returns
+    /// Returns an error if max == 0, mean_pct or std_dev_pct are out of bounds
+    pub fn gaussian(mean_pct: f64, std_dev_pct: f64, max: u64) -> anyhow::Result<Self> {
+        Self::gaussian_with_seed(mean_pct, std_dev_pct, max, None)
+    }
+
+    /// Create a Gaussian (Normal) key generator with explicit seed
+    ///
+    /// # Parameters
+    /// - `mean_pct`: Mean as percentage of keyspace (0.0 to 1.0)
+    /// - `std_dev_pct`: Standard deviation as percentage of keyspace (0.0 to 1.0)
+    /// - `max`: Maximum key value (keyspace size)
+    /// - `seed`: Optional seed for reproducibility (None = use entropy)
+    ///
+    /// # Returns
+    /// Returns an error if max == 0, mean_pct or std_dev_pct are out of bounds
+    pub fn gaussian_with_seed(
+        mean_pct: f64,
+        std_dev_pct: f64,
+        max: u64,
+        seed: Option<u64>,
+    ) -> anyhow::Result<Self> {
+        if max == 0 {
+            anyhow::bail!("Gaussian max must be > 0");
+        }
+        if !(0.0..=1.0).contains(&mean_pct) {
+            anyhow::bail!("Gaussian mean_pct must be in range [0.0, 1.0]");
+        }
+        if !(0.0..=1.0).contains(&std_dev_pct) {
+            anyhow::bail!("Gaussian std_dev_pct must be in range [0.0, 1.0]");
+        }
+
+        // Convert percentages to absolute values
+        let mean = (max as f64) * mean_pct;
+        let std_dev = (max as f64) * std_dev_pct;
+
+        let dist = NormalDistribution::with_seed(mean, std_dev, seed)?;
+        Ok(Self::Gaussian { mean_pct, std_dev_pct, max, dist })
+    }
+
     /// Generate the next key
     pub fn next_key(&mut self) -> u64 {
         match self {
@@ -121,6 +193,12 @@ impl KeyGeneration {
                 key
             }
             Self::Zipfian(dist) => dist.sample_key(),
+            Self::Gaussian { max, dist, .. } => {
+                // Sample from normal distribution and clamp to [0, max)
+                let sample = dist.sample();
+                let clamped = sample.max(0.0).min(*max as f64 - 1.0);
+                clamped as u64
+            }
         }
     }
 
@@ -137,6 +215,9 @@ impl KeyGeneration {
                 *current = 0;
             }
             Self::Zipfian(dist) => {
+                dist.reset();
+            }
+            Self::Gaussian { dist, .. } => {
                 dist.reset();
             }
         }
@@ -156,18 +237,22 @@ pub enum RateControl {
 pub struct RequestGenerator {
     key_gen: KeyGeneration,
     rate_control: RateControl,
-    value_size: usize,
+    value_size_gen: Box<dyn ValueSizeGenerator>,
     last_request_time: Option<Instant>,
     request_count: u64,
 }
 
 impl RequestGenerator {
-    /// Create a new request generator
-    pub fn new(key_gen: KeyGeneration, rate_control: RateControl, value_size: usize) -> Self {
+    /// Create a new request generator with a value size generator
+    pub fn new(
+        key_gen: KeyGeneration,
+        rate_control: RateControl,
+        value_size_gen: Box<dyn ValueSizeGenerator>,
+    ) -> Self {
         Self {
             key_gen,
             rate_control,
-            value_size,
+            value_size_gen,
             last_request_time: None,
             request_count: 0,
         }
@@ -176,8 +261,17 @@ impl RequestGenerator {
     /// Generate the next request parameters (key, value_size)
     pub fn next_request(&mut self) -> (u64, usize) {
         let key = self.key_gen.next_key();
+        let value_size = self.value_size_gen.next_size();
         self.request_count += 1;
-        (key, self.value_size)
+        (key, value_size)
+    }
+
+    /// Generate the next request with command-specific size
+    pub fn next_request_for_command(&mut self, command: &str) -> (u64, usize) {
+        let key = self.key_gen.next_key();
+        let value_size = self.value_size_gen.next_size_for_command(command);
+        self.request_count += 1;
+        (key, value_size)
     }
 
     /// Calculate delay until next request should be sent
@@ -215,6 +309,7 @@ impl RequestGenerator {
     /// Reset the generator
     pub fn reset(&mut self) {
         self.key_gen.reset();
+        self.value_size_gen.reset();
         self.last_request_time = None;
         self.request_count = 0;
     }
@@ -223,6 +318,7 @@ impl RequestGenerator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workload::FixedSize;
 
     #[test]
     fn test_sequential_keys() {
@@ -272,7 +368,8 @@ mod tests {
     #[test]
     fn test_request_generator_closed_loop() {
         let keygen = KeyGeneration::sequential(0);
-        let mut gen = RequestGenerator::new(keygen, RateControl::ClosedLoop, 64);
+        let mut gen =
+            RequestGenerator::new(keygen, RateControl::ClosedLoop, Box::new(FixedSize::new(64)));
 
         let (key1, size1) = gen.next_request();
         assert_eq!(key1, 0);
@@ -290,7 +387,11 @@ mod tests {
     fn test_request_generator_fixed_rate() {
         let keygen = KeyGeneration::sequential(0);
         let rate = 1000.0; // 1000 req/s = 1ms per request
-        let mut gen = RequestGenerator::new(keygen, RateControl::Fixed { rate }, 64);
+        let mut gen = RequestGenerator::new(
+            keygen,
+            RateControl::Fixed { rate },
+            Box::new(FixedSize::new(64)),
+        );
 
         let (key, size) = gen.next_request();
         assert_eq!(key, 0);
@@ -306,7 +407,8 @@ mod tests {
     #[test]
     fn test_request_count() {
         let keygen = KeyGeneration::sequential(0);
-        let mut gen = RequestGenerator::new(keygen, RateControl::ClosedLoop, 64);
+        let mut gen =
+            RequestGenerator::new(keygen, RateControl::ClosedLoop, Box::new(FixedSize::new(64)));
 
         assert_eq!(gen.request_count(), 0);
 
@@ -320,7 +422,8 @@ mod tests {
     #[test]
     fn test_reset() {
         let keygen = KeyGeneration::sequential(10);
-        let mut gen = RequestGenerator::new(keygen, RateControl::ClosedLoop, 64);
+        let mut gen =
+            RequestGenerator::new(keygen, RateControl::ClosedLoop, Box::new(FixedSize::new(64)));
 
         gen.next_request();
         gen.next_request();
@@ -425,7 +528,8 @@ mod tests {
     #[test]
     fn test_zipfian_with_request_generator() {
         let keygen = KeyGeneration::zipfian(1000, 0.99).expect("Failed to create Zipfian");
-        let mut gen = RequestGenerator::new(keygen, RateControl::ClosedLoop, 64);
+        let mut gen =
+            RequestGenerator::new(keygen, RateControl::ClosedLoop, Box::new(FixedSize::new(64)));
 
         // Generate requests and verify keys are valid
         for _ in 0..100 {

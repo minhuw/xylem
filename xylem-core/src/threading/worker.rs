@@ -341,7 +341,7 @@ impl<T: Transport, P: Protocol> Worker<T, P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workload::{KeyGeneration, RateControl};
+    use crate::workload::{FixedSize, KeyGeneration, RateControl};
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
@@ -415,8 +415,11 @@ mod tests {
         // Create pipelined worker
         let echo_protocol = xylem_protocols::xylem_echo::XylemEchoProtocol::new(0);
         let protocol = ProtocolAdapter::new(echo_protocol);
-        let generator =
-            RequestGenerator::new(KeyGeneration::sequential(0), RateControl::ClosedLoop, 64);
+        let generator = RequestGenerator::new(
+            KeyGeneration::sequential(0),
+            RateControl::ClosedLoop,
+            Box::new(FixedSize::new(64)),
+        );
         let mut stats = GroupStatsCollector::default();
         stats.register_group_legacy(0, 100000, 1.0);
         let config = WorkerConfig {
@@ -473,7 +476,7 @@ mod tests {
         let generator = RequestGenerator::new(
             KeyGeneration::sequential(0),
             RateControl::ClosedLoop, // Let policy control rate
-            64,
+            Box::new(FixedSize::new(64)),
         );
         let mut stats = GroupStatsCollector::default();
         stats.register_group_legacy(0, 100000, 1.0);

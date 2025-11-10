@@ -124,12 +124,14 @@ fn run_rate_experiment(target_rate: f64, duration_secs: u64, conn_count: usize) 
     let target_addr = "127.0.0.1:6379".parse().unwrap();
     let duration = Duration::from_secs(duration_secs);
 
-    let protocol = xylem_protocols::redis::RedisProtocol::new(xylem_protocols::redis::RedisOp::Get);
+    let protocol = xylem_protocols::redis::RedisProtocol::new(Box::new(
+        xylem_protocols::FixedCommandSelector::new(xylem_protocols::redis::RedisOp::Get),
+    ));
     let protocol = ProtocolAdapter::new(protocol);
     let generator = RequestGenerator::new(
         KeyGeneration::sequential(0),
         RateControl::Fixed { rate: target_rate },
-        64,
+        Box::new(xylem_core::workload::FixedSize::new(64)),
     );
     let stats = common::create_test_stats();
     let config = WorkerConfig {
@@ -354,10 +356,15 @@ fn test_rate_vs_throughput_saturation() {
     let target_addr = "127.0.0.1:6379".parse().unwrap();
     let duration = Duration::from_secs(3);
 
-    let protocol = xylem_protocols::redis::RedisProtocol::new(xylem_protocols::redis::RedisOp::Get);
+    let protocol = xylem_protocols::redis::RedisProtocol::new(Box::new(
+        xylem_protocols::FixedCommandSelector::new(xylem_protocols::redis::RedisOp::Get),
+    ));
     let protocol = ProtocolAdapter::new(protocol);
-    let generator =
-        RequestGenerator::new(KeyGeneration::sequential(0), RateControl::ClosedLoop, 64);
+    let generator = RequestGenerator::new(
+        KeyGeneration::sequential(0),
+        RateControl::ClosedLoop,
+        Box::new(xylem_core::workload::FixedSize::new(64)),
+    );
     let stats = common::create_test_stats();
     let config = WorkerConfig {
         target: target_addr,

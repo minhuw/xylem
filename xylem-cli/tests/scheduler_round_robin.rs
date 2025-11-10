@@ -63,10 +63,15 @@ fn test_round_robin_scheduler_with_multiple_connections() {
     let target_addr = format!("127.0.0.1:{}", port).parse().unwrap();
     let duration = Duration::from_secs(2);
 
-    let protocol = xylem_protocols::redis::RedisProtocol::new(RedisOp::Get);
+    let protocol = xylem_protocols::redis::RedisProtocol::new(Box::new(
+        xylem_protocols::FixedCommandSelector::new(RedisOp::Get),
+    ));
     let protocol = ProtocolAdapter::new(protocol);
-    let generator =
-        RequestGenerator::new(KeyGeneration::sequential(0), RateControl::ClosedLoop, 64);
+    let generator = RequestGenerator::new(
+        KeyGeneration::sequential(0),
+        RateControl::ClosedLoop,
+        Box::new(xylem_core::workload::FixedSize::new(64)),
+    );
     let stats = common::create_test_stats();
 
     // Use worker config with multiple connections
@@ -118,12 +123,17 @@ fn test_round_robin_scheduler_with_sequential_workload() {
     let target_addr = format!("127.0.0.1:{}", port).parse().unwrap();
     let duration = Duration::from_secs(1);
 
-    let protocol = xylem_protocols::redis::RedisProtocol::new(RedisOp::Set);
+    let protocol = xylem_protocols::redis::RedisProtocol::new(Box::new(
+        xylem_protocols::FixedCommandSelector::new(RedisOp::Set),
+    ));
     let protocol = ProtocolAdapter::new(protocol);
 
     // Use sequential key generation to test distribution
-    let generator =
-        RequestGenerator::new(KeyGeneration::sequential(0), RateControl::ClosedLoop, 128);
+    let generator = RequestGenerator::new(
+        KeyGeneration::sequential(0),
+        RateControl::ClosedLoop,
+        Box::new(xylem_core::workload::FixedSize::new(128)),
+    );
     let stats = common::create_test_stats();
 
     let worker_config = WorkerConfig {

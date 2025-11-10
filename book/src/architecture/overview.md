@@ -7,9 +7,10 @@ Xylem is designed with a modular, layered architecture that separates concerns a
 ```
 ┌─────────────────────────────────────────┐
 │           CLI Interface                 │
-│         (xylem-cli)                     │
+│            (xylem-cli)                  │
 └─────────────────────────────────────────┘
-                  │
+                     │
+                     ▼
 ┌─────────────────────────────────────────┐
 │         Core Engine                     │
 │       (xylem-core)                      │
@@ -17,11 +18,11 @@ Xylem is designed with a modular, layered architecture that separates concerns a
 │  - Statistics Collection                │
 │  - Threading & Event Loop               │
 └─────────────────────────────────────────┘
-         │                  │
-         ▼                  ▼
+         │                    │
+         ▼                    ▼
 ┌─────────────────┐  ┌──────────────────┐
-│   Protocols     │  │   Transports     │
-│ (xylem-protocols)│  │(xylem-transport) │
+│  Protocols - X  │  │  Transports - Y  │
+│(xylem-protocols)│  │ (xylem-transport)│
 │  - Redis        │  │   - TCP          │
 │  - HTTP         │  │   - UDP          │
 │  - Memcached    │  │   - Unix Socket  │

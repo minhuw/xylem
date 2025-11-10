@@ -104,12 +104,17 @@ fn main() -> anyhow::Result<()> {
     println!("  • Mode: Closed-loop (max throughput)\n");
 
     // Create Redis protocol with GET operations
-    let protocol = xylem_protocols::redis::RedisProtocol::new(xylem_protocols::redis::RedisOp::Get);
+    let selector =
+        Box::new(xylem_protocols::FixedCommandSelector::new(xylem_protocols::redis::RedisOp::Get));
+    let protocol = xylem_protocols::redis::RedisProtocol::new(selector);
     let protocol = ProtocolAdapter::new(protocol);
 
     // Create request generator with sequential key generation and closed-loop pacing
-    let generator =
-        RequestGenerator::new(KeyGeneration::sequential(0), RateControl::ClosedLoop, value_size);
+    let generator = RequestGenerator::new(
+        KeyGeneration::sequential(0),
+        RateControl::ClosedLoop,
+        Box::new(xylem_core::workload::FixedSize::new(value_size)),
+    );
 
     // Create stats collector with unlimited sampling (collect all latencies)
     let mut stats = GroupStatsCollector::new();

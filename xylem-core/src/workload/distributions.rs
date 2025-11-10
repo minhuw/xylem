@@ -282,6 +282,7 @@ impl Distribution for UniformDistribution {
 /// Used for:
 /// - Value sizes around a mean with variation
 /// - Modeling natural phenomena with central tendency
+#[derive(Debug)]
 pub struct NormalDistribution {
     /// Mean (μ)
     mean: f64,

@@ -76,6 +76,7 @@ pub mod components {
     pub const EXPONENTIAL_DIST: &str = "exponential_distribution";
     pub const UNIFORM_DIST: &str = "uniform_distribution";
     pub const NORMAL_DIST: &str = "normal_distribution";
+    pub const GAUSSIAN_DIST: &str = "gaussian_distribution";
     pub const RANDOM_KEYS: &str = "random_key_generation";
     pub const POISSON_POLICY: &str = "poisson_policy";
 }

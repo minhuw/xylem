@@ -273,8 +273,8 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
     // Create key generation strategy with seed support
     let key_gen = config.workload.keys.to_key_generation(config.experiment.seed)?;
 
-    // Get value size from keys config
-    let value_size = config.workload.keys.value_size();
+    // Clone config for use in worker closure
+    let config_for_worker = config.clone();
 
     // Clone values needed for results output (already have target_address from above)
     let target_address_string = target_address.to_string();
@@ -297,26 +297,51 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
             .get_groups_for_thread(thread_idx)
             .ok_or_else(|| anyhow::anyhow!("No groups assigned to thread {}", thread_idx))?;
 
+        // Create value size generator from config
+        let value_size_gen: Box<dyn xylem_core::workload::ValueSizeGenerator> =
+            if let Some(ref value_size_config) = config_for_worker.workload.value_size {
+                value_size_config.to_generator(config_for_worker.experiment.seed)?
+            } else {
+                Box::new(xylem_core::workload::FixedSize::new(
+                    config_for_worker.workload.keys.value_size(),
+                ))
+            };
+
         // Build protocol map: one protocol per group_id
         let mut protocols = std::collections::HashMap::new();
 
         for (group_id, _group_meta) in groups_for_thread.iter() {
-            let group_config = &config.traffic_groups[*group_id];
+            let group_config = &config_for_worker.traffic_groups[*group_id];
 
             // Get protocol name: prefer group's protocol, fall back to target.protocol
             let protocol_name = group_config
                 .protocol
                 .as_ref()
-                .or(config.target.protocol.as_ref())
+                .or(config_for_worker.target.protocol.as_ref())
                 .expect("Protocol must be specified (validated in config)");
 
             // Create protocol using multi_protocol factory
             let protocol = match protocol_name.as_str() {
-                "http" => xylem_cli::multi_protocol::create_protocol(
-                    "http",
-                    Some(("/", &target_address_for_http)),
-                )?,
-                other => xylem_cli::multi_protocol::create_protocol(other, None)?,
+                "http" => {
+                    xylem_cli::multi_protocol::create_http_protocol("/", &target_address_for_http)?
+                }
+                "redis" => {
+                    // Create a new selector for this group
+                    let group_redis_selector =
+                        if let Some(ref ops_config) = config_for_worker.workload.operations {
+                            ops_config.to_redis_selector(config_for_worker.experiment.seed)?
+                        } else {
+                            // Default to GET if no operations config specified
+                            Box::new(xylem_protocols::FixedCommandSelector::new(
+                                xylem_protocols::RedisOp::Get,
+                            ))
+                        };
+                    xylem_cli::multi_protocol::create_redis_protocol(group_redis_selector)
+                }
+                "memcached-binary" => xylem_cli::multi_protocol::create_memcached_binary_protocol(),
+                "memcached-ascii" => xylem_cli::multi_protocol::create_memcached_ascii_protocol(),
+                "xylem-echo" => xylem_cli::multi_protocol::create_xylem_echo_protocol(),
+                other => return Err(anyhow::anyhow!("Unknown protocol: {}", other).into()),
             };
 
             // Wrap in ProtocolAdapter
@@ -326,7 +351,8 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
 
         // Create a shared request generator for this thread
         // All groups share the same key generation but may have different traffic policies
-        let generator = RequestGenerator::new(key_gen.clone(), RateControl::ClosedLoop, value_size);
+        let generator =
+            RequestGenerator::new(key_gen.clone(), RateControl::ClosedLoop, value_size_gen);
 
         // Initialize group stats collector and register all groups
         let mut stats = xylem_core::stats::GroupStatsCollector::new();
@@ -335,7 +361,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
         let mut groups_config = Vec::new();
 
         for (group_id, group_meta) in groups_for_thread.iter() {
-            let group_config = &config.traffic_groups[*group_id];
+            let group_config = &config_for_worker.traffic_groups[*group_id];
 
             // Register group in stats collector
             stats.register_group(*group_id, &group_config.sampling_policy);
@@ -388,7 +414,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
         let worker_config = WorkerConfig {
             target: target_addr,
             duration,
-            value_size,
+            value_size: config_for_worker.workload.keys.value_size(), // Not used, RequestGenerator handles this
             conn_count: total_conn_count,
             max_pending_per_conn: 1, // This will be overridden per-group
         };

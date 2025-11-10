@@ -220,8 +220,11 @@ fn test_http_get_single_thread() {
         "localhost".to_string(),
     );
     let protocol = ProtocolAdapter::new(protocol);
-    let generator =
-        RequestGenerator::new(KeyGeneration::sequential(0), RateControl::ClosedLoop, 64);
+    let generator = RequestGenerator::new(
+        KeyGeneration::sequential(0),
+        RateControl::ClosedLoop,
+        Box::new(xylem_core::workload::FixedSize::new(64)),
+    );
     let stats = common::create_test_stats();
     let worker_config = WorkerConfig {
         target: target_addr,
@@ -282,8 +285,11 @@ fn test_http_post_single_thread() {
         "localhost".to_string(),
     );
     let protocol = ProtocolAdapter::new(protocol);
-    let generator =
-        RequestGenerator::new(KeyGeneration::sequential(0), RateControl::ClosedLoop, 128);
+    let generator = RequestGenerator::new(
+        KeyGeneration::sequential(0),
+        RateControl::ClosedLoop,
+        Box::new(xylem_core::workload::FixedSize::new(128)),
+    );
     let stats = common::create_test_stats();
     let worker_config = WorkerConfig {
         target: target_addr,
@@ -342,7 +348,7 @@ fn test_http_multi_thread() {
         let generator = RequestGenerator::new(
             KeyGeneration::sequential(thread_id as u64 * 10000),
             RateControl::ClosedLoop,
-            64,
+            Box::new(xylem_core::workload::FixedSize::new(64)),
         );
         let stats = common::create_test_stats();
         let worker_config = WorkerConfig {
@@ -414,7 +420,7 @@ fn test_http_rate_limited() {
     let generator = RequestGenerator::new(
         KeyGeneration::sequential(0),
         RateControl::Fixed { rate: target_rate },
-        64,
+        Box::new(xylem_core::workload::FixedSize::new(64)),
     );
     let stats = common::create_test_stats();
     let worker_config = WorkerConfig {
@@ -466,8 +472,11 @@ fn test_http_put_request() {
         "localhost".to_string(),
     );
     let protocol = ProtocolAdapter::new(protocol);
-    let generator =
-        RequestGenerator::new(KeyGeneration::sequential(0), RateControl::ClosedLoop, 256);
+    let generator = RequestGenerator::new(
+        KeyGeneration::sequential(0),
+        RateControl::ClosedLoop,
+        Box::new(xylem_core::workload::FixedSize::new(256)),
+    );
     let stats = common::create_test_stats();
     let worker_config = WorkerConfig {
         target: target_addr,
@@ -512,8 +521,11 @@ fn test_http_pipelined() {
         "localhost".to_string(),
     );
     let protocol = ProtocolAdapter::new(protocol);
-    let generator =
-        RequestGenerator::new(KeyGeneration::sequential(0), RateControl::ClosedLoop, 64);
+    let generator = RequestGenerator::new(
+        KeyGeneration::sequential(0),
+        RateControl::ClosedLoop,
+        Box::new(xylem_core::workload::FixedSize::new(64)),
+    );
     let stats = common::create_test_stats();
     let worker_config = WorkerConfig {
         target: target_addr,

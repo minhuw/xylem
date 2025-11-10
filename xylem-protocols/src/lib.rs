@@ -58,3 +58,6 @@ pub mod xylem_echo;
 // Re-export commonly used types
 pub use http::HttpMethod;
 pub use masstree::MasstreeOp;
+pub use redis::command_selector::{CommandSelector, FixedCommandSelector, WeightedCommandSelector};
+pub use redis::command_template::CommandTemplate;
+pub use redis::RedisOp;

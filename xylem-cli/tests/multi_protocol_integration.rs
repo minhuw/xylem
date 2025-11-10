@@ -229,18 +229,25 @@ fn run_multi_protocol_test() -> Result<(), Box<dyn std::error::Error>> {
         let mut protocols = HashMap::new();
 
         // Group 0: Redis on port 6379
-        let redis_protocol = multi_protocol::create_protocol("redis", None)?;
+        let redis_selector =
+            Box::new(xylem_protocols::FixedCommandSelector::new(xylem_protocols::RedisOp::Get));
+        let redis_protocol = multi_protocol::create_protocol("redis", None, Some(redis_selector))?;
         protocols.insert(0, ProtocolAdapter::new(redis_protocol));
 
         // Group 1: Memcached on port 11211
-        let memcached_protocol = multi_protocol::create_protocol("memcached-binary", None)?;
+        let memcached_protocol = multi_protocol::create_protocol("memcached-binary", None, None)?;
         protocols.insert(1, ProtocolAdapter::new(memcached_protocol));
 
         // Group 2: HTTP on port 8080
-        let http_protocol = multi_protocol::create_protocol("http", Some(("/", "127.0.0.1:8080")))?;
+        let http_protocol =
+            multi_protocol::create_protocol("http", Some(("/", "127.0.0.1:8080")), None)?;
         protocols.insert(2, ProtocolAdapter::new(http_protocol));
 
-        let generator = RequestGenerator::new(key_gen.clone(), RateControl::ClosedLoop, value_size);
+        let generator = RequestGenerator::new(
+            key_gen.clone(),
+            RateControl::ClosedLoop,
+            Box::new(xylem_core::workload::FixedSize::new(value_size)),
+        );
 
         let mut stats = GroupStatsCollector::new();
         stats.register_group(0, &SamplingPolicy::Unlimited);
@@ -371,14 +378,24 @@ fn run_redis_memcached_test() -> Result<(), Box<dyn std::error::Error>> {
         let mut protocols = HashMap::new();
 
         // Group 0: Redis (simulating one protocol)
-        let redis_protocol1 = multi_protocol::create_protocol("redis", None)?;
+        let redis_selector1 =
+            Box::new(xylem_protocols::FixedCommandSelector::new(xylem_protocols::RedisOp::Get));
+        let redis_protocol1 =
+            multi_protocol::create_protocol("redis", None, Some(redis_selector1))?;
         protocols.insert(0, ProtocolAdapter::new(redis_protocol1));
 
         // Group 1: Redis (simulating another protocol - validates multi-protocol dispatch)
-        let redis_protocol2 = multi_protocol::create_protocol("redis", None)?;
+        let redis_selector2 =
+            Box::new(xylem_protocols::FixedCommandSelector::new(xylem_protocols::RedisOp::Get));
+        let redis_protocol2 =
+            multi_protocol::create_protocol("redis", None, Some(redis_selector2))?;
         protocols.insert(1, ProtocolAdapter::new(redis_protocol2));
 
-        let generator = RequestGenerator::new(key_gen.clone(), RateControl::ClosedLoop, value_size);
+        let generator = RequestGenerator::new(
+            key_gen.clone(),
+            RateControl::ClosedLoop,
+            Box::new(xylem_core::workload::FixedSize::new(value_size)),
+        );
 
         let mut stats = GroupStatsCollector::new();
         stats.register_group(0, &SamplingPolicy::Unlimited);
