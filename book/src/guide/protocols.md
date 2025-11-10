@@ -30,4 +30,3 @@ All protocols in Xylem implement a common interface that provides:
 ## See Also
 
 - [Configuration](./configuration.md)
-- [Examples](../examples/redis.md)

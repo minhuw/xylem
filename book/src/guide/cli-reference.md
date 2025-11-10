@@ -154,5 +154,4 @@ RUST_LOG=debug xylem -P profiles/redis.toml
 ## See Also
 
 - [Configuration](./configuration.md) - Detailed configuration file format
-- [Examples](../examples/redis.md) - Common usage examples
-- [JSON Schema](../reference/schema.md) - Configuration schema reference
+- [Configuration Schema](../reference/schema.md) - Configuration schema reference

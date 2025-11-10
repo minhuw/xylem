@@ -17,6 +17,8 @@
   - [Redis Protocol](./guide/protocols/redis.md)
   - [HTTP Protocol](./guide/protocols/http.md)
   - [Memcached Protocol](./guide/protocols/memcached.md)
+  - [Masstree Protocol](./guide/protocols/masstree.md)
+  - [Xylem Echo Protocol](./guide/protocols/xylem-echo.md)
 - [Transports](./guide/transports.md)
   - [TCP](./guide/transports/tcp.md)
   - [UDP](./guide/transports/udp.md)

@@ -26,6 +26,7 @@ Xylem is designed with a modular, layered architecture that separates concerns a
 │  - HTTP         │  │   - UDP          │
 │  - Memcached    │  │   - Unix Socket  │
 │  - Masstree     │  │                  │
+│  - xylem-echo   │  │                  │
 └─────────────────┘  └──────────────────┘
 ```
 

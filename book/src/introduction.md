@@ -6,7 +6,7 @@ Xylem is a high-performance and modular traffic generator and measurement tool d
 
 ## Key Features
 
-- **Multi-Protocol Support**: Built-in support for Redis, HTTP, Memcached, and Masstree protocols
+- **Multi-Protocol Support**: Built-in support for Redis, HTTP, Memcached, Masstree, and xylem-echo protocols
 - **Flexible Transport Layer**: Support for TCP, UDP, and Unix Domain Sockets
 - **High Performance**: Efficient event-driven architecture for generating high loads
 - **Reproducible**: Configuration-first design using TOML profiles ensures reproducibility
@@ -35,5 +35,5 @@ Xylem is actively developed and maintained. The project is licensed under MIT OR
 ## Next Steps
 
 - Follow the [Quick Start guide](./getting-started/quick-start.md)
-- Learn about [Basic Usage](./getting-started/basic-usage.md)
+- Learn about [CLI Reference](./guide/cli-reference.md)
 - Explore the [Architecture](./architecture/overview.md) to understand Xylem's design

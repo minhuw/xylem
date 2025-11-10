@@ -1,324 +1,226 @@
-# JSON Schema
+# Configuration Schema
 
-Xylem configuration JSON schema reference.
+Xylem uses TOML configuration files to define experiments. This reference documents the complete schema for experiment profiles.
 
-## Schema Location
+## Overview
 
-The JSON schema is available in the repository:
-```
-schema/config.json
-```
+A complete Xylem configuration file contains the following sections:
 
-## Using the Schema
-
-### Validation
-
-Validate configuration files using tools like `ajv`:
-
-```bash
-npm install -g ajv-cli
-ajv validate -s schema/config.json -d my-config.json
+```toml
+[experiment]      # Experiment metadata and duration
+[target]          # Target service address, protocol, and transport
+[workload]        # Workload generation parameters
+[[traffic_groups]] # One or more traffic generation groups
+[output]          # Output format and destination
 ```
 
-### IDE Integration
+## Experiment Section
 
-Many IDEs support JSON Schema for auto-completion and validation.
+The `[experiment]` section defines metadata and experiment-wide settings.
 
-#### VS Code
-
-Add to your config file:
-
-```json
-{
-  "$schema": "file:///path/to/xylem/schema/config.json",
-  "protocol": "redis",
-  ...
-}
+```toml
+[experiment]
+name = "redis-bench"
+description = "Redis benchmark with latency/throughput agent separation"
+duration = "30s"
+seed = 42
 ```
 
-#### IntelliJ IDEA
+### Fields
 
-Settings → Languages & Frameworks → Schemas and DTDs → JSON Schema Mappings
+- `name` (string, required): Name of the experiment
+- `description` (string, optional): Description of the experiment
+- `duration` (string, required): Duration in format "Ns", "Nm", "Nh" (seconds, minutes, hours)
+- `seed` (integer, optional): Random seed for reproducibility
 
-## Schema Overview
+## Target Section
 
-### Top-Level Structure
+The `[target]` section specifies the target service to benchmark.
 
-```json
-{
-  "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "Xylem Configuration",
-  "type": "object",
-  "required": ["protocol", "transport", "workload"],
-  "properties": {
-    "protocol": { "type": "string" },
-    "transport": { "type": "object" },
-    "workload": { "type": "object" },
-    "protocol_config": { "type": "object" },
-    "output": { "type": "object" }
-  }
-}
+```toml
+[target]
+address = "127.0.0.1:6379"
+protocol = "redis"
+transport = "tcp"
 ```
 
-## Protocol Schema
+### Fields
 
-```json
-{
-  "protocol": {
-    "type": "string",
-    "enum": ["redis", "http", "memcached"],
-    "description": "Application protocol to use"
-  }
-}
+- `address` (string, required): Target address. Format depends on transport:
+  - TCP/UDP: `"host:port"` or `"ip:port"`
+  - Unix socket: `"/path/to/socket"`
+- `protocol` (string, required): Application protocol. Supported values:
+  - `"redis"`
+  - `"http"`
+  - `"memcached-binary"`
+  - `"memcached-ascii"`
+  - `"masstree"`
+  - `"xylem-echo"` (testing only)
+- `transport` (string, required): Transport layer. Supported values:
+  - `"tcp"`
+  - `"udp"`
+  - `"unix"`
+
+## Workload Section
+
+The `[workload]` section defines the workload pattern and key distribution.
+
+```toml
+[workload]
+
+[workload.keys]
+strategy = "zipfian"
+n = 1000000
+theta = 0.99
+value_size = 64
+
+[workload.pattern]
+type = "constant"
+rate = 50000.0
 ```
 
-## Transport Schema
+### Fields
 
-### TCP Transport
+**`[workload.keys]`** - Key distribution parameters:
+- `strategy` (string, required): Distribution strategy
+  - `"uniform"`: Uniform distribution
+  - `"zipfian"`: Zipfian distribution (power law)
+- `n` (integer, required): Key space size (total number of keys)
+- `theta` (float, required for zipfian): Skew parameter (0.0 to 1.0)
+  - 0.99 = high skew (typical for caches)
+  - 0.5 = moderate skew
+- `value_size` (integer, required): Size of values in bytes
 
-```json
-{
-  "transport": {
-    "type": "object",
-    "required": ["type", "host", "port"],
-    "properties": {
-      "type": { "const": "tcp" },
-      "host": { "type": "string" },
-      "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
-      "nodelay": { "type": "boolean", "default": true },
-      "keepalive": { "type": "boolean", "default": false }
-    }
-  }
-}
+**`[workload.pattern]`** - Traffic pattern:
+- `type` (string, required): Pattern type
+  - `"constant"`: Constant rate
+  - (other types may be supported)
+- `rate` (float, required): Target request rate in requests/second
+
+## Traffic Groups
+
+Traffic groups define how workload is distributed across threads and connections. You can define multiple `[[traffic_groups]]` sections.
+
+```toml
+[[traffic_groups]]
+name = "latency-agent"
+protocol = "redis"
+threads = [0]
+connections_per_thread = 10
+max_pending_per_connection = 1
+
+[traffic_groups.sampling_policy]
+type = "unlimited"
+
+[traffic_groups.policy]
+type = "poisson"
+rate = 100.0
 ```
 
-### TLS Transport
+### Fields
 
-```json
-{
-  "transport": {
-    "type": "object",
-    "required": ["type", "host", "port"],
-    "properties": {
-      "type": { "const": "tls" },
-      "host": { "type": "string" },
-      "port": { "type": "integer" },
-      "verify": { "type": "boolean", "default": true },
-      "ca_cert": { "type": "string" },
-      "client_cert": { "type": "string" },
-      "client_key": { "type": "string" }
-    }
-  }
-}
+- `name` (string, required): Name for this traffic group
+- `protocol` (string, optional): Override protocol for this group (defaults to `[target]` protocol)
+- `threads` (array of integers, required): Thread IDs to use for this group
+- `connections_per_thread` (integer, required): Number of connections per thread
+- `max_pending_per_connection` (integer, required): Maximum pending requests per connection
+  - `1` = no pipelining (accurate latency measurement)
+  - Higher values = pipelining enabled
+
+### Sampling Policy
+
+**`[traffic_groups.sampling_policy]`**:
+- `type` (string, required):
+  - `"unlimited"`: Sample every request (100% sampling)
+  - `"limited"`: Sample a fraction of requests
+- `rate` (float, required for limited): Sampling rate (0.0 to 1.0)
+  - `0.01` = 1% sampling
+  - `0.1` = 10% sampling
+
+### Traffic Policy
+
+**`[traffic_groups.policy]`**:
+- `type` (string, required):
+  - `"poisson"`: Poisson arrival process (open-loop)
+  - `"closed-loop"`: Closed-loop (send as fast as possible)
+- `rate` (float, required for poisson): Request rate per connection in requests/second
+
+## Output Section
+
+The `[output]` section configures where and how results are written.
+
+```toml
+[output]
+format = "json"
+file = "/tmp/results.json"
 ```
 
-## Workload Schema
+### Fields
 
-```json
-{
-  "workload": {
-    "type": "object",
-    "required": ["duration", "rate"],
-    "properties": {
-      "duration": {
-        "type": "string",
-        "pattern": "^[0-9]+(ns|us|ms|s|m|h)$",
-        "description": "Benchmark duration (e.g., '60s', '5m')"
-      },
-      "rate": {
-        "type": "integer",
-        "minimum": 1,
-        "description": "Target request rate (req/s)"
-      },
-      "connections": {
-        "type": "integer",
-        "minimum": 1,
-        "default": 1
-      },
-      "warmup": {
-        "type": "string",
-        "pattern": "^[0-9]+(ns|us|ms|s|m|h)$",
-        "default": "0s"
-      }
-    }
-  }
-}
-```
+- `format` (string, required): Output format
+  - `"json"`: JSON format
+  - (other formats may be supported)
+- `file` (string, required): Output file path
 
-## Protocol Config Schema
+## Complete Example
 
-### Redis
+```toml
+[experiment]
+name = "redis-bench"
+description = "Redis benchmark"
+duration = "30s"
+seed = 42
 
-```json
-{
-  "protocol_config": {
-    "type": "object",
-    "properties": {
-      "operation": {
-        "type": "string",
-        "enum": ["get", "set", "incr", "decr"],
-        "default": "get"
-      },
-      "key_pattern": {
-        "type": "string",
-        "default": "key:*"
-      },
-      "value_size": {
-        "type": "integer",
-        "minimum": 0,
-        "default": 100
-      },
-      "pipeline": {
-        "type": "integer",
-        "minimum": 1,
-        "default": 1
-      }
-    }
-  }
-}
-```
+[target]
+address = "127.0.0.1:6379"
+protocol = "redis"
+transport = "tcp"
 
-### HTTP
+[workload.keys]
+strategy = "zipfian"
+n = 1000000
+theta = 0.99
+value_size = 64
 
-```json
-{
-  "protocol_config": {
-    "type": "object",
-    "properties": {
-      "method": {
-        "type": "string",
-        "enum": ["GET", "POST", "PUT", "DELETE", "HEAD", "PATCH"],
-        "default": "GET"
-      },
-      "path": {
-        "type": "string",
-        "default": "/"
-      },
-      "headers": {
-        "type": "object",
-        "additionalProperties": { "type": "string" }
-      },
-      "body": {
-        "type": "string"
-      }
-    }
-  }
-}
-```
+[workload.pattern]
+type = "constant"
+rate = 50000.0
 
-## Output Schema
+[[traffic_groups]]
+name = "latency-agent"
+protocol = "redis"
+threads = [0]
+connections_per_thread = 10
+max_pending_per_connection = 1
 
-```json
-{
-  "output": {
-    "type": "object",
-    "properties": {
-      "format": {
-        "type": "string",
-        "enum": ["text", "json", "csv"],
-        "default": "text"
-      },
-      "file": {
-        "type": "string"
-      },
-      "pretty": {
-        "type": "boolean",
-        "default": false
-      }
-    }
-  }
-}
-```
+[traffic_groups.sampling_policy]
+type = "unlimited"
 
-## Statistics Schema
+[traffic_groups.policy]
+type = "poisson"
+rate = 100.0
 
-```json
-{
-  "statistics": {
-    "type": "object",
-    "properties": {
-      "sketch": {
-        "type": "string",
-        "enum": ["ddsketch", "tdigest", "hdr"],
-        "default": "ddsketch"
-      },
-      "percentiles": {
-        "type": "array",
-        "items": {
-          "type": "number",
-          "minimum": 0,
-          "maximum": 100
-        }
-      }
-    }
-  }
-}
-```
+[[traffic_groups]]
+name = "throughput-agent"
+protocol = "redis"
+threads = [1, 2, 3]
+connections_per_thread = 25
+max_pending_per_connection = 32
 
-## Example Configurations
+[traffic_groups.sampling_policy]
+type = "limited"
+rate = 0.01
 
-### Minimal Configuration
+[traffic_groups.policy]
+type = "closed-loop"
 
-```json
-{
-  "protocol": "redis",
-  "transport": {
-    "type": "tcp",
-    "host": "localhost",
-    "port": 6379
-  },
-  "workload": {
-    "duration": "60s",
-    "rate": 1000
-  }
-}
-```
-
-### Full Configuration
-
-```json
-{
-  "$schema": "./schema/config.json",
-  "protocol": "redis",
-  "transport": {
-    "type": "tcp",
-    "host": "localhost",
-    "port": 6379,
-    "nodelay": true,
-    "keepalive": true
-  },
-  "workload": {
-    "duration": "300s",
-    "rate": 10000,
-    "connections": 50,
-    "warmup": "30s"
-  },
-  "protocol_config": {
-    "operation": "get",
-    "key_pattern": "user:{id}",
-    "pipeline": 10
-  },
-  "output": {
-    "format": "json",
-    "file": "results.json",
-    "pretty": true
-  },
-  "statistics": {
-    "sketch": "ddsketch",
-    "percentiles": [50, 95, 99, 99.9]
-  }
-}
-```
-
-## Generating Schema
-
-The schema can be generated from Rust code:
-
-```bash
-cargo run --bin generate-schema > schema/config.json
+[output]
+format = "json"
+file = "/tmp/redis-bench-results.json"
 ```
 
 ## See Also
 
 - [Configuration Guide](../guide/configuration.md)
-- [JSON Schema Documentation](https://json-schema.org/)
+- [CLI Reference](../guide/cli-reference.md)
+- [Example Profiles](https://github.com/minhuw/xylem/tree/main/profiles)
