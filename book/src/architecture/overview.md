@@ -35,10 +35,6 @@ Xylem's architecture follows several core design principles. The system employs 
 
 The architecture enables composability through clean interfaces. Protocols and transports can be combined freely - Redis can run over TCP, UDP, or Unix domain sockets; HTTP over TCP or Unix sockets; and Memcached over any supported transport. This flexibility allows Xylem to adapt to different testing scenarios without code modifications.
 
-Performance considerations are integrated throughout the design. The implementation minimizes data copies, uses an event-driven architecture with `mio` for I/O multiplexing, employs lock-free data structures for statistics collection, and optimizes memory allocation patterns for high-throughput operations.
-
-Extensibility is achieved through trait-based interfaces. New protocols implement the `Protocol` trait, and new transports implement the `Transport` trait. These well-defined contracts allow custom implementations to integrate with the existing codebase without modifying core components.
-
 ## Key Components
 
 ### Core Engine
@@ -56,10 +52,6 @@ Handles network communication including connection establishment, data transmiss
 ## Data Flow
 
 The system processes requests through a defined pipeline. Users provide workload configuration via TOML profile files. The core engine reads the configuration during initialization to instantiate the appropriate protocols and transports. During execution, the event loop generates requests according to the configured pattern and collects responses as they arrive. Statistics are gathered throughout the run, tracking latency, throughput, and error rates. Upon completion, results are formatted according to the output configuration and presented to the user.
-
-## Threading Model
-
-Xylem uses a multi-threaded design where each thread runs an independent event loop. Threads are pinned to specific CPU cores for optimal performance, and each maintains its own set of connections and statistics. This design eliminates lock contention and provides predictable, scalable performance.
 
 ## See Also
 
