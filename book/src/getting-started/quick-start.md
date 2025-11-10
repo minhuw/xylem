@@ -129,7 +129,7 @@ max_pending_per_connection = 1
 type = "unlimited"
 
 [traffic_groups.policy]
-type = "closed_loop"
+type = "closed-loop"
 ```
 
 Run with:

@@ -83,7 +83,9 @@ rate = 50000.0
 - `strategy` (string, required): Distribution strategy
   - `"uniform"`: Uniform distribution
   - `"zipfian"`: Zipfian distribution (power law)
-- `n` (integer, required): Key space size (total number of keys)
+  - `"random"`: Random distribution
+- `n` (integer, required for uniform/zipfian): Key space size (total number of keys)
+- `max` (integer, required for random): Maximum key value
 - `theta` (float, required for zipfian): Skew parameter (0.0 to 1.0)
   - 0.99 = high skew (typical for caches)
   - 0.5 = moderate skew

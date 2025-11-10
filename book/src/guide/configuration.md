@@ -44,7 +44,6 @@ protocol = "redis"
 transport = "tcp"
 address = "localhost:6379"
 
-[workload]
 [workload.keys]
 strategy = "zipfian"
 n = 10000
@@ -61,7 +60,7 @@ max_pending_per_connection = 1
 type = "unlimited"
 
 [traffic_groups.policy]
-type = "closed_loop"
+type = "closed-loop"
 
 [output]
 format = "json"

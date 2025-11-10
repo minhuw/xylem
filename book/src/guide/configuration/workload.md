@@ -66,7 +66,7 @@ max = 100000
 Size of values in bytes.
 
 ```toml
-[workload]
+[workload.keys]
 value_size = 1024  # 1KB values
 ```
 
@@ -74,4 +74,4 @@ value_size = 1024  # 1KB values
 
 - [Transport Configuration](./transport.md)
 - [Protocol Configuration](./protocol.md)
-- [Traffic Groups](../cli-reference.md#traffic-groups)
+- [Traffic Groups](../reference/schema.md#traffic-groups)
