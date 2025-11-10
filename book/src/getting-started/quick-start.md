@@ -1,6 +1,6 @@
 # Quick Start
 
-This guide will help you run your first benchmark with Xylem in just a few minutes.
+This guide will help you run your first benchmark with Xylem.
 
 ## Prerequisites
 
@@ -20,7 +20,7 @@ cargo build --release
 # The binary will be at target/release/xylem
 ```
 
-## Running a Simple Redis Benchmark
+## Running a Redis Benchmark
 
 ### 1. Start a Redis Server
 
@@ -45,14 +45,39 @@ This profile runs a Redis GET benchmark with a Zipfian key distribution.
 ### 3. Understanding the Output
 
 Xylem will display statistics about the benchmark, including:
-- Latency percentiles (p50, p95, p99, p99.9, etc.)
-- Throughput (requests per second)
-- Error rates
-- Per-thread statistics
+- **Latency percentiles** (p50, p95, p99, p99.9, etc.)
+- **Throughput** (requests per second)
+- **Error rates**
+- **Per-thread statistics**
+
+## Configuration-First Design
+
+Xylem uses TOML configuration files (called "profiles") to define experiments. This ensures reproducibility and simplifies complex workload specifications.
+
+### Basic Syntax
+
+```bash
+xylem -P <profile.toml>
+```
+
+### Example Profiles
+
+Xylem includes example profiles in the `profiles/` directory:
+
+```bash
+# Run a Redis GET benchmark with Zipfian distribution
+xylem -P profiles/redis-get-zipfian.toml
+
+# Run an HTTP load test
+xylem -P profiles/http-spike.toml
+
+# Run a Memcached benchmark
+xylem -P profiles/memcached-ramp.toml
+```
 
 ## Customizing the Benchmark
 
-You can override configuration values using the `--set` flag:
+You can override configuration values using the `--set` flag with dot notation:
 
 ```bash
 # Change target address
@@ -101,9 +126,46 @@ Run with:
 ./target/release/xylem -P my-benchmark.toml
 ```
 
+## Profile File Structure
+
+A typical profile file includes:
+
+```toml
+# Experiment configuration
+[experiment]
+duration = "60s"
+seed = 123
+
+# Target service configuration
+[target]
+protocol = "redis"
+address = "127.0.0.1:6379"
+
+# Workload configuration
+[workload]
+# ... workload parameters
+
+# Traffic groups (thread assignment and rate control)
+[[traffic_groups]]
+name = "group-1"
+threads = [0, 1, 2, 3]
+# ... rate control parameters
+```
+
+## Logging
+
+Control logging verbosity:
+
+```bash
+# Debug level logging
+xylem -P profiles/redis.toml --log-level debug
+
+# Using RUST_LOG environment variable
+RUST_LOG=debug xylem -P profiles/redis.toml
+```
+
 ## Next Steps
 
-- Learn more about [Basic Usage](./basic-usage.md)
-- Explore [Configuration options](../guide/configuration.md)
-- See more [Examples](../examples/redis.md)
+- Explore [CLI Reference](../guide/cli-reference.md) for all available options
+- Learn about [Configuration](../guide/configuration.md) file format
 - Check out example profiles in the `profiles/` directory

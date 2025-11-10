@@ -5,7 +5,6 @@
 # Getting Started
 
 - [Quick Start](./getting-started/quick-start.md)
-- [Basic Usage](./getting-started/basic-usage.md)
 
 # User Guide
 
@@ -30,22 +29,6 @@
 - [Protocol Layer](./architecture/protocols.md)
 - [Transport Layer](./architecture/transports.md)
 
-# Examples
-
-- [Redis Benchmarking](./examples/redis.md)
-- [HTTP Load Testing](./examples/http.md)
-- [Multi-Protocol Workloads](./examples/multi-protocol.md)
-
-# Advanced Topics
-
-- [Extending Xylem](./advanced/extending.md)
-
-# Contributing
-
-- [Development Setup](./contributing/setup.md)
-
 # Reference
 
-- [JSON Schema](./reference/schema.md)
-- [Changelog](./reference/changelog.md)
-- [License](./reference/license.md)
+- [Configuration Schema](./reference/schema.md)
