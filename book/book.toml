@@ -1,0 +1,42 @@
+[book]
+authors = ["Xylem Contributors"]
+language = "en"
+multilingual = false
+src = "src"
+title = "Xylem Documentation"
+description = "Documentation for Xylem - A high-performance and modular traffic generator and measurement tool for RPC workloads"
+
+[build]
+build-dir = "book"
+create-missing = true
+
+[output.html]
+git-repository-url = "https://github.com/minhuw/xylem"
+git-repository-icon = "fa-github"
+edit-url-template = "https://github.com/minhuw/xylem/edit/main/book/{path}"
+additional-css = []
+additional-js = []
+no-section-label = false
+smart-punctuation = true
+
+[output.html.fold]
+enable = false
+level = 0
+
+[output.html.search]
+enable = true
+limit-results = 30
+teaser-word-count = 30
+use-boolean-and = true
+boost-title = 2
+boost-hierarchy = 1
+boost-paragraph = 1
+expand = true
+heading-split-level = 3
+
+[output.html.playground]
+editable = false
+copyable = true
+copy-js = true
+line-numbers = false
+runnable = true
