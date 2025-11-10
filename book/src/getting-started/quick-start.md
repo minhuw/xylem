@@ -108,17 +108,28 @@ seed = 123
 
 [target]
 protocol = "redis"
+transport = "tcp"
 address = "localhost:6379"
 
 [workload]
-# Workload configuration
-keys = { type = "zipfian", n = 10000, s = 0.99 }
+[workload.keys]
+strategy = "zipfian"
+n = 10000
+theta = 0.99
 value_size = 100
 
 [[traffic_groups]]
 name = "main"
+protocol = "redis"
 threads = [0, 1, 2, 3]
-rate_control = { type = "closed_loop", concurrency = 50 }
+connections_per_thread = 10
+max_pending_per_connection = 1
+
+[traffic_groups.sampling_policy]
+type = "unlimited"
+
+[traffic_groups.policy]
+type = "closed_loop"
 ```
 
 Run with:

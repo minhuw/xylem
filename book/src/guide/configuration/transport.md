@@ -1,13 +1,21 @@
 # Transport Configuration
 
-Transport is inferred from the `address` field in the `[target]` section.
+Transport is explicitly specified in the `[target]` section along with the connection address.
 
-## Address Format
+## Available Transports
+
+- `tcp` - TCP/IP connections
+- `udp` - UDP connections  
+- `unix` - Unix domain sockets
+
+## Configuration
 
 ### TCP (hostname:port)
 
 ```toml
 [target]
+protocol = "redis"
+transport = "tcp"
 address = "localhost:6379"
 ```
 
@@ -15,11 +23,20 @@ address = "localhost:6379"
 
 ```toml
 [target]
+protocol = "redis"
+transport = "unix"
 address = "/var/run/redis/redis.sock"
 ```
 
 ### UDP (hostname:port)
 
 UDP support depends on the protocol implementation.
+
+```toml
+[target]
+protocol = "memcached-binary"
+transport = "udp"
+address = "localhost:11211"
+```
 
 See the [Architecture - Transport Layer](../../architecture/transports.md) for implementation details.

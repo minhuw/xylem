@@ -66,8 +66,6 @@ transport = "tcp"
 The `[workload]` section defines the workload pattern and key distribution.
 
 ```toml
-[workload]
-
 [workload.keys]
 strategy = "zipfian"
 n = 1000000

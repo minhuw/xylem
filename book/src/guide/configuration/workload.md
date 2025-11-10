@@ -6,13 +6,16 @@ Define workload patterns, key distributions, and runtime parameters in the `[wor
 
 ```toml
 [workload]
-keys = { type = "zipfian", n = 10000, s = 0.99 }
+[workload.keys]
+strategy = "zipfian"
+n = 10000
+theta = 0.99
 value_size = 100
 ```
 
 ## Key Distribution
 
-### `keys.type`
+### `strategy`
 
 **Type:** String  
 **Required:** Yes
@@ -22,31 +25,35 @@ The key distribution pattern to use.
 **Options:**
 - `"zipfian"` - Zipfian distribution (realistic cache workload with hot keys)
 - `"uniform"` - Uniform random distribution
-- `"sequential"` - Sequential key access
+- `"random"` - Random key access
 
 ### Zipfian Distribution
 
 ```toml
-[workload]
-keys = { type = "zipfian", n = 100000, s = 0.99 }
+[workload.keys]
+strategy = "zipfian"
+n = 100000
+theta = 0.99
 ```
 
 **Parameters:**
 - `n` - Number of keys in the key space
-- `s` - Skew parameter (higher values = more skewed, typical: 0.99)
+- `theta` - Skew parameter (higher values = more skewed, typical: 0.99)
 
 ### Uniform Distribution
 
 ```toml
-[workload]
-keys = { type = "uniform", n = 100000 }
+[workload.keys]
+strategy = "uniform"
+n = 100000
 ```
 
-### Sequential Distribution
+### Random Distribution
 
 ```toml
-[workload]
-keys = { type = "sequential", start = 0, n = 100000 }
+[workload.keys]
+strategy = "random"
+max = 100000
 ```
 
 ## Value Size
