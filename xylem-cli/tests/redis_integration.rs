@@ -87,7 +87,6 @@ struct RedisStats {
 }
 
 #[test]
-#[ignore] // Run with: cargo test --test redis_integration -- --ignored
 fn test_redis_single_thread() {
     // Start Redis server (will auto-cleanup on drop)
     let _redis = common::redis::RedisGuard::new().expect("Failed to start Redis");
@@ -190,7 +189,6 @@ fn test_redis_single_thread() {
 }
 
 #[test]
-#[ignore] // Run with: cargo test --test redis_integration -- --ignored
 fn test_redis_multi_thread() {
     // Start Redis server (will auto-cleanup on drop)
     let _redis = common::redis::RedisGuard::new().expect("Failed to start Redis");
@@ -294,7 +292,6 @@ fn test_redis_multi_thread() {
 }
 
 #[test]
-#[ignore] // Run with: cargo test --test redis_integration -- --ignored
 fn test_redis_rate_limited() {
     // Start Redis server (will auto-cleanup on drop)
     let _redis = common::redis::RedisGuard::new().expect("Failed to start Redis");

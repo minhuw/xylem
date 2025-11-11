@@ -53,7 +53,6 @@ impl<P: xylem_protocols::Protocol> xylem_core::threading::worker::Protocol for P
 
 /// Test Memcached Binary protocol with single thread
 #[test]
-#[ignore] // Run with: cargo test --test memcached_integration -- --ignored
 fn test_memcached_binary_single_thread() {
     let _memcached = common::memcached::MemcachedGuard::new().expect("Failed to start Memcached");
 
@@ -106,7 +105,6 @@ fn test_memcached_binary_single_thread() {
 
 /// Test Memcached ASCII protocol with single thread
 #[test]
-#[ignore] // Run with: cargo test --test memcached_integration -- --ignored
 fn test_memcached_ascii_single_thread() {
     let _memcached = common::memcached::MemcachedGuard::new().expect("Failed to start Memcached");
 
@@ -159,7 +157,6 @@ fn test_memcached_ascii_single_thread() {
 
 /// Test Memcached Binary protocol with multiple threads
 #[test]
-#[ignore] // Run with: cargo test --test memcached_integration -- --ignored
 fn test_memcached_binary_multi_thread() {
     let _memcached = common::memcached::MemcachedGuard::new().expect("Failed to start Memcached");
 
@@ -215,7 +212,6 @@ fn test_memcached_binary_multi_thread() {
 
 /// Test Memcached ASCII protocol with rate limiting
 #[test]
-#[ignore] // Run with: cargo test --test memcached_integration -- --ignored
 fn test_memcached_ascii_rate_limited() {
     let _memcached = common::memcached::MemcachedGuard::new().expect("Failed to start Memcached");
 

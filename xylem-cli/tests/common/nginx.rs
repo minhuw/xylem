@@ -4,8 +4,12 @@
 //! Uses docker-compose for Nginx lifecycle management.
 
 use std::process::Command;
+use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
+
+// Global lock to prevent concurrent Nginx container start/stop
+static NGINX_LOCK: Mutex<()> = Mutex::new(());
 
 /// Guard for Nginx that ensures cleanup
 ///
@@ -30,6 +34,24 @@ impl NginxGuard {
     /// - Nginx fails to start
     /// - Nginx doesn't become ready within 30 seconds
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        // Acquire lock to prevent concurrent start attempts
+        let _lock = NGINX_LOCK.lock().unwrap();
+
+        // Get path to docker-compose.yml first
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let workspace_root =
+            std::path::Path::new(manifest_dir).parent().ok_or("No parent directory")?;
+        let compose_file = workspace_root.join("tests/nginx/docker-compose.yml");
+
+        if !compose_file.exists() {
+            return Err(format!("docker-compose.yml not found at {:?}", compose_file).into());
+        }
+
+        // Check if Nginx is already running
+        if Self::is_nginx_ready() {
+            return Ok(Self { started: false, compose_file });
+        }
+
         // Check if Docker is available
         let docker_check = Command::new("docker").arg("--version").output()?;
         if !docker_check.status.success() {
@@ -56,16 +78,6 @@ impl NginxGuard {
                 "docker-compose not available (tried 'docker-compose' and 'docker compose')".into(),
             );
         };
-
-        // Get path to docker-compose.yml
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let workspace_root =
-            std::path::Path::new(manifest_dir).parent().ok_or("No parent directory")?;
-        let compose_file = workspace_root.join("tests/nginx/docker-compose.yml");
-
-        if !compose_file.exists() {
-            return Err(format!("docker-compose.yml not found at {:?}", compose_file).into());
-        }
 
         // Start Nginx using docker-compose up -d
         let mut cmd = Command::new(compose_cmd[0]);

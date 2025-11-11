@@ -1,6 +1,6 @@
-//! Integration tests for Redis protocol with pipelining
+//! Pipelining integration tests
 //!
-//! These tests demonstrate the pipelined worker with multiple outstanding requests.
+//! Tests pipelining behavior with Redis - multiple outstanding requests per connection.
 
 use std::time::Duration;
 use xylem_core::threading::{Worker, WorkerConfig};
@@ -50,7 +50,6 @@ impl<P: xylem_protocols::Protocol> xylem_core::threading::worker::Protocol for P
 }
 
 #[test]
-#[ignore]
 fn test_redis_pipelined_single_connection() {
     let _guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
@@ -104,7 +103,6 @@ fn test_redis_pipelined_single_connection() {
 }
 
 #[test]
-#[ignore]
 fn test_redis_pipelined_multiple_connections() {
     let _guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
@@ -158,7 +156,6 @@ fn test_redis_pipelined_multiple_connections() {
 }
 
 #[test]
-#[ignore]
 fn test_redis_pipelined_rate_limited() {
     let _guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
 

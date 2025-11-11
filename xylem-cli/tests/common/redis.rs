@@ -4,8 +4,12 @@
 //! Uses docker-compose for Redis lifecycle management.
 
 use std::process::Command;
+use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
+
+// Global lock to prevent concurrent Redis container start/stop
+static REDIS_LOCK: Mutex<()> = Mutex::new(());
 
 /// Guard for Redis that ensures cleanup
 ///
@@ -30,6 +34,25 @@ impl RedisGuard {
     /// - Redis fails to start
     /// - Redis doesn't become ready within 30 seconds
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        // Acquire lock to prevent concurrent start attempts
+        let _lock = REDIS_LOCK.lock().unwrap();
+
+        // Get path to docker-compose.yml first
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let workspace_root =
+            std::path::Path::new(manifest_dir).parent().ok_or("No parent directory")?;
+        let compose_file = workspace_root.join("tests/redis/docker-compose.yml");
+
+        if !compose_file.exists() {
+            return Err(format!("docker-compose.yml not found at {:?}", compose_file).into());
+        }
+
+        // Check if Redis is already running
+        if Self::is_redis_ready() {
+            // Redis is already running, just return a guard that won't stop it
+            return Ok(Self { started: false, compose_file });
+        }
+
         // Check if Docker is available
         let docker_check = Command::new("docker").arg("--version").output()?;
         if !docker_check.status.success() {
@@ -56,16 +79,6 @@ impl RedisGuard {
                 "docker-compose not available (tried 'docker-compose' and 'docker compose')".into(),
             );
         };
-
-        // Get path to docker-compose.yml
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let workspace_root =
-            std::path::Path::new(manifest_dir).parent().ok_or("No parent directory")?;
-        let compose_file = workspace_root.join("tests/redis/docker-compose.yml");
-
-        if !compose_file.exists() {
-            return Err(format!("docker-compose.yml not found at {:?}", compose_file).into());
-        }
 
         // Start Redis using docker-compose up -d
         let mut cmd = Command::new(compose_cmd[0]);

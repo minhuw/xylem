@@ -1,7 +1,7 @@
-//! Integration test for RoundRobin scheduler with Redis
+//! Scheduler integration tests
 //!
-//! This test verifies that the RoundRobin scheduler properly distributes requests
-//! across multiple Redis connections.
+//! This test suite verifies scheduler behavior (RoundRobin, etc.) with real Redis instances.
+//! Tests require Docker and use RedisGuard to manage containers.
 
 mod common;
 

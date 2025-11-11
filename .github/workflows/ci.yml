@@ -22,11 +22,22 @@ jobs:
       - name: Setup Magic Nix Cache
         uses: DeterminateSystems/magic-nix-cache-action@main
 
+      - name: Cache cargo-nextest
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-nextest
+          key: ${{ runner.os }}-cargo-nextest-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-nextest-
+
+      - name: Install cargo-nextest
+        run: |
+          if ! command -v cargo-nextest &> /dev/null; then
+            nix develop --command cargo install cargo-nextest --locked
+          fi
+
       - name: Build
         run: nix develop --command cargo build --verbose
-
-      - name: Run tests
-        run: nix develop --command cargo test --verbose --workspace
 
       - name: Install redis-cli for integration tests
         run: sudo apt-get update && sudo apt-get install -y redis-tools
@@ -34,8 +45,11 @@ jobs:
       - name: Verify Docker is available
         run: docker --version && docker compose version
 
+      - name: Run unit tests
+        run: nix develop --command cargo nextest run --profile unit --workspace
+
       - name: Run integration tests
-        run: nix develop --command cargo test --tests -- --ignored --test-threads=1 --nocapture
+        run: nix develop --command cargo nextest run --profile integration --workspace
 
       - name: Cleanup Docker containers
         if: always()

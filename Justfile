@@ -10,9 +10,10 @@ DEFAULT_MEMCACHED_PORT := "11211"
 _default:
     @just --list
 
-# Run all tests
-test: test-unit test-integration
-    @echo "✅ All tests passed!"
+# Run all tests (unit + integration)
+test:
+    @echo "🚀 Running all tests (unit + integration)..."
+    cargo nextest run --workspace
 
 # Run all examples to validate they work
 examples:
@@ -32,14 +33,12 @@ examples:
 # Run fast unit tests only (no integration tests)
 test-unit:
     @echo "🚀 Running unit tests..."
-    cargo test --workspace
+    cargo nextest run --profile unit --workspace
 
-# Run integration tests only (requires Redis/Memcached)
-# RUST_LOG=error suppresses verbose dependency logs
+# Run integration tests only (requires Docker)
 test-integration:
-    @echo "🔌 Running integration tests (requires Redis/Memcached)..."
-    @echo "This will take around 30-60 seconds..."
-    RUST_LOG=error cargo test --workspace -- --ignored --test-threads=1
+    @echo "🔌 Running integration tests only..."
+    cargo nextest run --profile integration --workspace
 
 # Clean up test Docker containers
 test-cleanup:
@@ -48,30 +47,20 @@ test-cleanup:
     @docker ps -aq --filter name=redis-cluster | xargs -r docker rm -f || true
     @echo "✅ Test containers cleaned up"
 
-# Run only Redis integration tests
+# Run Redis-related integration tests
 test-redis:
     @echo "🎯 Running Redis integration tests..."
-    RUST_LOG=error cargo test --test redis_integration -- --ignored --test-threads=1 --nocapture
+    cargo nextest run --profile integration -E 'test(redis_integration) or test(redis_cluster) or test(pipelining)'
 
-# Run only Memcached integration tests
+# Run Memcached integration tests
 test-memcached:
     @echo "🎯 Running Memcached integration tests..."
-    RUST_LOG=error cargo test --test memcached_integration -- --ignored --nocapture
+    cargo nextest run --profile integration -E 'test(memcached_integration)'
 
-# Run scheduler integration tests (these run by default)
-test-scheduler:
-    @echo "⚙️  Running scheduler integration tests..."
-    RUST_LOG=error cargo test --test scheduler_round_robin -- --nocapture --test-threads=1
-
-# Run rate accuracy tests (timing-sensitive, takes longer)
-test-rate:
-    @echo "⏱️  Running rate accuracy tests..."
-    RUST_LOG=error cargo test --test rate_accuracy -- --ignored --test-threads=1 --nocapture
-
-# Run only pipelined worker tests
-test-pipelined:
-    @echo "🚰 Running pipelined worker tests..."
-    cargo test -p xylem-core --lib threading::pipelined_worker -- --nocapture
+# Run HTTP integration tests
+test-http:
+    @echo "🌐 Running HTTP integration tests..."
+    cargo nextest run --profile integration -E 'test(http_integration)'
 
 # Build debug version
 build:
@@ -138,7 +127,7 @@ flamegraph *args:
 # Generate flamegraph for integration test (performance profiling)
 flamegraph-test:
     @echo "🔥 Generating flamegraph for scheduler test..."
-    cargo flamegraph --test scheduler_round_robin -- --nocapture
+    cargo flamegraph --test scheduler_integration -- --nocapture
 
 # Run a quick benchmark (Redis, 10k requests, single connection)
 bench-quick:
@@ -230,12 +219,11 @@ help:
     @echo ""
     @echo "📊 Testing:"
     @echo "  just test              - Run ALL tests (unit + integration)"
-    @echo "  just test-unit         - Unit tests only (fast, no Redis/Memcached)"
-    @echo "  just test-integration  - Integration tests only (requires Redis/Memcached)"
-    @echo "  just test-redis        - Redis tests only"
-    @echo "  just test-memcached    - Memcached tests only"
-    @echo "  just test-scheduler    - Scheduler integration tests"
-    @echo "  just test-pipelined    - Pipelined worker tests"
+    @echo "  just test-unit         - Unit tests only (fast, no Docker)"
+    @echo "  just test-integration  - All integration tests (requires Docker)"
+    @echo "  just test-redis        - Redis-related integration tests"
+    @echo "  just test-memcached    - Memcached integration tests"
+    @echo "  just test-http         - HTTP integration tests"
     @echo "  just examples          - Run all examples"
     @echo ""
     @echo "🔨 Building:"

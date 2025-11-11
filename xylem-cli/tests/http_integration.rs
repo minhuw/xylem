@@ -64,7 +64,6 @@ impl<P: xylem_protocols::Protocol> xylem_core::threading::worker::Protocol for P
 }
 
 #[test]
-#[ignore] // Run with: cargo test --test http_integration -- --ignored
 fn test_http_get_single_thread() {
     let _nginx = common::nginx::NginxGuard::new().expect("Failed to start nginx");
 
@@ -129,7 +128,6 @@ fn test_http_get_single_thread() {
 }
 
 #[test]
-#[ignore] // Run with: cargo test --test http_integration -- --ignored
 fn test_http_post_single_thread() {
     let _nginx = common::nginx::NginxGuard::new().expect("Failed to start nginx");
 
@@ -183,7 +181,6 @@ fn test_http_post_single_thread() {
 }
 
 #[test]
-#[ignore] // Run with: cargo test --test http_integration -- --ignored
 fn test_http_multi_thread() {
     let _nginx = common::nginx::NginxGuard::new().expect("Failed to start nginx");
 
@@ -260,7 +257,6 @@ fn test_http_multi_thread() {
 }
 
 #[test]
-#[ignore] // Run with: cargo test --test http_integration -- --ignored
 fn test_http_rate_limited() {
     let _nginx = common::nginx::NginxGuard::new().expect("Failed to start nginx");
 
@@ -316,7 +312,6 @@ fn test_http_rate_limited() {
 }
 
 #[test]
-#[ignore] // Run with: cargo test --test http_integration -- --ignored
 fn test_http_put_request() {
     let _nginx = common::nginx::NginxGuard::new().expect("Failed to start nginx");
 
@@ -365,7 +360,6 @@ fn test_http_put_request() {
 }
 
 #[test]
-#[ignore] // Run with: cargo test --test http_integration -- --ignored
 fn test_http_pipelined() {
     let _nginx = common::nginx::NginxGuard::new().expect("Failed to start nginx");
 

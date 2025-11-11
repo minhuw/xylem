@@ -9,7 +9,6 @@ use common::redis_cluster::RedisClusterGuard;
 use std::process::Command;
 
 #[test]
-#[ignore] // Requires Docker
 fn test_cluster_startup_and_connectivity() {
     let cluster = RedisClusterGuard::new().expect("Failed to start cluster");
 
@@ -26,7 +25,6 @@ fn test_cluster_startup_and_connectivity() {
 }
 
 #[test]
-#[ignore] // Requires Docker
 fn test_cluster_topology_discovery() {
     let _cluster = RedisClusterGuard::new().expect("Failed to start cluster");
 
@@ -60,7 +58,6 @@ fn test_cluster_topology_discovery() {
 }
 
 #[test]
-#[ignore] // Requires Docker
 fn test_cluster_key_routing() {
     let _cluster = RedisClusterGuard::new().expect("Failed to start cluster");
 
@@ -95,7 +92,6 @@ fn test_cluster_key_routing() {
 }
 
 #[test]
-#[ignore] // Requires Docker
 fn test_cluster_hash_tag_routing() {
     let _cluster = RedisClusterGuard::new().expect("Failed to start cluster");
 
@@ -133,7 +129,6 @@ fn test_cluster_hash_tag_routing() {
 }
 
 #[test]
-#[ignore] // Requires Docker
 fn test_moved_redirect_response() {
     let _cluster = RedisClusterGuard::new().expect("Failed to start cluster");
 
@@ -165,7 +160,6 @@ fn test_moved_redirect_response() {
 }
 
 #[test]
-#[ignore] // Requires Docker and redis-cli commands
 fn test_slot_migration_ask_redirect() {
     let _cluster = RedisClusterGuard::new().expect("Failed to start cluster");
 
@@ -183,7 +177,6 @@ fn test_slot_migration_ask_redirect() {
 }
 
 #[test]
-#[ignore] // Requires Docker
 fn test_cluster_info_command() {
     let cluster = RedisClusterGuard::new().expect("Failed to start cluster");
 
@@ -215,7 +208,6 @@ fn test_cluster_info_command() {
 }
 
 #[test]
-#[ignore] // Requires Docker
 fn test_cluster_nodes_command() {
     let _cluster = RedisClusterGuard::new().expect("Failed to start cluster");
 

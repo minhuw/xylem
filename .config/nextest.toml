@@ -1,0 +1,27 @@
+# Nextest configuration for xylem
+# See https://nexte.st/book/configuration.html
+
+[profile.default]
+# Run tests in parallel with better isolation
+retries = 0
+slow-timeout = { period = "60s" }
+leak-timeout = "100ms"
+
+# Integration tests group - slower tests that require Docker
+[[profile.default.overrides]]
+filter = 'test(/integration/)'
+threads-required = 1  # Integration tests share Docker containers
+slow-timeout = { period = "120s" }
+
+# Unit tests profile - fast tests that don't require external services
+# Excludes test files with "_integration" in their name
+[profile.unit]
+default-filter = 'not binary(~_integration)'
+
+# Integration tests profile - requires Docker services
+# Includes only test files with "_integration" in their name
+[profile.integration]
+default-filter = 'binary(~_integration)'
+test-threads = 1  # Run integration tests serially to avoid Docker conflicts
+slow-timeout = { period = "120s" }
+retries = 0

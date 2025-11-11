@@ -57,7 +57,6 @@ impl<P: xylem_protocols::Protocol> xylem_core::threading::worker::Protocol for P
 }
 
 #[test]
-#[ignore] // Run with: cargo test --test multi_protocol_integration -- --ignored
 fn test_multi_protocol_redis_memcached_http() {
     eprintln!("Testing multi-protocol with Redis + Memcached + HTTP on different targets");
 
@@ -199,7 +198,6 @@ fn run_multi_protocol_test() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-#[ignore]
 fn test_multi_protocol_same_thread() {
     // Simpler test: just Redis on same thread (tests multi-group architecture)
     let _redis = common::redis::RedisGuard::new().expect("Failed to start Redis");

@@ -1,7 +1,7 @@
-//! Rate control accuracy tests
+//! Rate control integration tests
 //!
-//! These tests verify that open-loop rate control achieves the target rate accurately
-//! across different configurations and rate targets.
+//! Tests verifying that rate control mechanisms achieve target rates accurately
+//! across different configurations. Requires Redis Docker container.
 
 use std::time::Duration;
 use xylem_core::threading::{Worker, WorkerConfig};
@@ -87,7 +87,6 @@ fn run_rate_experiment(target_rate: f64, duration_secs: u64, conn_count: usize) 
 }
 
 #[test]
-#[ignore]
 fn test_rate_accuracy_low_rate() {
     let _guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
@@ -107,7 +106,6 @@ fn test_rate_accuracy_low_rate() {
 }
 
 #[test]
-#[ignore]
 fn test_rate_accuracy_medium_rate() {
     let _guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
@@ -127,7 +125,6 @@ fn test_rate_accuracy_medium_rate() {
 }
 
 #[test]
-#[ignore]
 fn test_rate_accuracy_high_rate() {
     let _guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
@@ -148,7 +145,6 @@ fn test_rate_accuracy_high_rate() {
 }
 
 #[test]
-#[ignore]
 fn test_rate_accuracy_very_high_rate() {
     let _guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
@@ -166,7 +162,6 @@ fn test_rate_accuracy_very_high_rate() {
 }
 
 #[test]
-#[ignore]
 fn test_rate_sweep() {
     let _guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
@@ -214,7 +209,6 @@ fn test_rate_sweep() {
 }
 
 #[test]
-#[ignore]
 fn test_rate_consistency() {
     let _guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
@@ -246,7 +240,6 @@ fn test_rate_consistency() {
 }
 
 #[test]
-#[ignore]
 fn test_rate_with_multiple_connections() {
     let _guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
@@ -276,7 +269,6 @@ fn test_rate_with_multiple_connections() {
 }
 
 #[test]
-#[ignore]
 fn test_rate_vs_throughput_saturation() {
     let _guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
