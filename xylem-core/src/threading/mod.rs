@@ -13,7 +13,7 @@ pub mod worker;
 
 // Re-export main types
 pub use affinity::{get_core_count, pin_thread, CpuPinning};
-pub use worker::{Protocol, Worker, WorkerConfig};
+pub use worker::{ParseResult, Protocol, RetryRequest, Worker, WorkerConfig};
 
 /// Multi-threaded runtime for spawning and managing workers
 pub struct ThreadingRuntime {

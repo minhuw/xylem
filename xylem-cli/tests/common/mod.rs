@@ -4,6 +4,8 @@
 
 #![allow(dead_code)]
 
+pub mod redis_cluster;
+
 use std::net::{TcpListener, UdpSocket};
 use std::process::{Child, Command};
 use std::sync::Mutex;

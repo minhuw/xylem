@@ -45,12 +45,33 @@ pub struct TargetConfig {
     #[serde(default)]
     pub address: Option<String>,
     /// Default protocol for traffic groups that don't specify their own
-    /// Valid: redis, memcached-binary, memcached-ascii, http
+    /// Valid: redis, redis-cluster, memcached-binary, memcached-ascii, http
     #[serde(default)]
     pub protocol: Option<String>,
     /// Transport: tcp, udp, tls
     #[serde(default = "default_transport")]
     pub transport: String,
+    /// Redis Cluster configuration (only used when protocol = "redis-cluster")
+    #[serde(default)]
+    pub redis_cluster: Option<RedisClusterConfig>,
+}
+
+/// Redis Cluster configuration
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct RedisClusterConfig {
+    /// Cluster nodes with their slot assignments
+    pub nodes: Vec<RedisClusterNodeConfig>,
+}
+
+/// Redis Cluster node configuration
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct RedisClusterNodeConfig {
+    /// Node address (e.g., "127.0.0.1:7000")
+    pub address: String,
+    /// Start of slot range (0-16383)
+    pub slot_start: u16,
+    /// End of slot range (0-16383)
+    pub slot_end: u16,
 }
 
 fn default_transport() -> String {

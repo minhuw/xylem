@@ -1,0 +1,68 @@
+# Basic Redis Cluster Load Testing Example
+#
+# This example shows how to configure xylem to test a 3-node Redis Cluster.
+# It uses automatic slot-based routing to distribute requests across cluster nodes.
+
+[experiment]
+name = "redis-cluster-basic"
+description = "Basic Redis Cluster load test with GET operations"
+duration = "60s"
+seed = 42  # For reproducible results
+
+[target]
+# Protocol must be "redis-cluster" for cluster support
+protocol = "redis-cluster"
+transport = "tcp"
+
+# Redis Cluster node configuration
+# Each node has a slot range assignment
+[target.redis_cluster]
+[[target.redis_cluster.nodes]]
+address = "127.0.0.1:7000"
+slot_start = 0
+slot_end = 5460
+
+[[target.redis_cluster.nodes]]
+address = "127.0.0.1:7001"
+slot_start = 5461
+slot_end = 10921
+
+[[target.redis_cluster.nodes]]
+address = "127.0.0.1:7002"
+slot_start = 10922
+slot_end = 16383
+
+[workload]
+# Key distribution - random access across full keyspace
+[workload.keys]
+strategy = "random"
+max = 1000000
+value_size = 128
+
+# Constant load pattern
+[workload.pattern]
+type = "constant"
+rate = 10000.0
+
+# Operations - 100% GET requests
+[workload.operations]
+strategy = "fixed"
+operation = "get"
+
+[[traffic_groups]]
+name = "redis-cluster-benchmark"
+threads = [0]
+connections_per_thread = 20
+max_pending_per_connection = 10  # Pipeline depth
+
+[traffic_groups.policy]
+type = "closed-loop"
+
+[traffic_groups.sampling_policy]
+type = "limited"
+rate = 1.0
+max_samples = 100000
+
+[output]
+format = "json"
+file = "results/redis-cluster-basic.json"

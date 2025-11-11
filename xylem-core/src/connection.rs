@@ -108,6 +108,19 @@ impl<T: Transport, ReqId: Eq + Hash + Clone + std::fmt::Debug> Connection<T, Req
         Ok(())
     }
 
+    /// Send data without tracking (e.g., preparation commands like ASKING)
+    ///
+    /// This sends data on the connection without creating a pending request.
+    /// Use this for protocol-level commands that don't expect tracked responses.
+    pub fn send_untracked(&mut self, data: &[u8]) -> Result<()> {
+        if self.closed {
+            return Err(crate::Error::Connection("Connection is closed".to_string()));
+        }
+
+        let _ = self.transport.send(data)?;
+        Ok(())
+    }
+
     /// Poll if this connection has data ready to read
     pub fn poll_readable(&mut self) -> Result<bool> {
         Ok(self.transport.poll_readable()?)

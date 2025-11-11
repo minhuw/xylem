@@ -112,6 +112,33 @@ impl<P: xylem_protocols::Protocol> xylem_core::threading::Protocol for ProtocolA
         self.inner.parse_response(conn_id, data)
     }
 
+    fn parse_response_extended(
+        &mut self,
+        conn_id: usize,
+        data: &[u8],
+    ) -> anyhow::Result<xylem_core::threading::ParseResult<Self::RequestId>> {
+        // Convert xylem_protocols::ParseResult to xylem_core::threading::ParseResult
+        match self.inner.parse_response_extended(conn_id, data)? {
+            xylem_protocols::ParseResult::Complete { bytes_consumed, request_id } => {
+                Ok(xylem_core::threading::ParseResult::Complete { bytes_consumed, request_id })
+            }
+            xylem_protocols::ParseResult::Incomplete => {
+                Ok(xylem_core::threading::ParseResult::Incomplete)
+            }
+            xylem_protocols::ParseResult::Retry(retry) => {
+                Ok(xylem_core::threading::ParseResult::Retry(xylem_core::threading::RetryRequest {
+                    bytes_consumed: retry.bytes_consumed,
+                    original_request_id: retry.original_request_id,
+                    key: retry.key,
+                    value_size: retry.value_size,
+                    target_conn_id: retry.target_conn_id,
+                    prepare_commands: retry.prepare_commands,
+                    attempt: retry.attempt,
+                }))
+            }
+        }
+    }
+
     fn name(&self) -> &'static str {
         self.inner.name()
     }
@@ -337,6 +364,44 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                             ))
                         };
                     xylem_cli::multi_protocol::create_redis_protocol(group_redis_selector)
+                }
+                "redis-cluster" => {
+                    // Create a new selector for this group
+                    let group_redis_selector =
+                        if let Some(ref ops_config) = config_for_worker.workload.operations {
+                            ops_config.to_redis_selector(config_for_worker.experiment.seed)?
+                        } else {
+                            // Default to GET if no operations config specified
+                            Box::new(xylem_protocols::FixedCommandSelector::new(
+                                xylem_protocols::RedisOp::Get,
+                            ))
+                        };
+
+                    // Get cluster config from target
+                    let cluster_config =
+                        config_for_worker.target.redis_cluster.as_ref().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "redis-cluster protocol requires target.redis_cluster configuration"
+                            )
+                        })?;
+
+                    // Convert config to multi_protocol format
+                    let cluster_proto_config = xylem_cli::multi_protocol::RedisClusterConfig {
+                        nodes: cluster_config
+                            .nodes
+                            .iter()
+                            .map(|n| xylem_cli::multi_protocol::RedisClusterNode {
+                                address: n.address.clone(),
+                                slot_start: n.slot_start,
+                                slot_end: n.slot_end,
+                            })
+                            .collect(),
+                    };
+
+                    xylem_cli::multi_protocol::create_redis_cluster_protocol(
+                        group_redis_selector,
+                        cluster_proto_config,
+                    )?
                 }
                 "memcached-binary" => xylem_cli::multi_protocol::create_memcached_binary_protocol(),
                 "memcached-ascii" => xylem_cli::multi_protocol::create_memcached_ascii_protocol(),

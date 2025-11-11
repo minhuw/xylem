@@ -1,0 +1,83 @@
+version: '3.8'
+
+services:
+  redis-node-1:
+    image: redis:7-alpine
+    container_name: redis-cluster-node-1
+    ports:
+      - "7000:7000"
+      - "17000:17000"  # Cluster bus port
+    command: >
+      redis-server
+      --port 7000
+      --cluster-enabled yes
+      --cluster-config-file nodes.conf
+      --cluster-node-timeout 5000
+      --appendonly no
+      --save ""
+    networks:
+      redis-cluster-net:
+        ipv4_address: 172.28.0.101
+
+  redis-node-2:
+    image: redis:7-alpine
+    container_name: redis-cluster-node-2
+    ports:
+      - "7001:7001"
+      - "17001:17001"
+    command: >
+      redis-server
+      --port 7001
+      --cluster-enabled yes
+      --cluster-config-file nodes.conf
+      --cluster-node-timeout 5000
+      --appendonly no
+      --save ""
+    networks:
+      redis-cluster-net:
+        ipv4_address: 172.28.0.102
+
+  redis-node-3:
+    image: redis:7-alpine
+    container_name: redis-cluster-node-3
+    ports:
+      - "7002:7002"
+      - "17002:17002"
+    command: >
+      redis-server
+      --port 7002
+      --cluster-enabled yes
+      --cluster-config-file nodes.conf
+      --cluster-node-timeout 5000
+      --appendonly no
+      --save ""
+    networks:
+      redis-cluster-net:
+        ipv4_address: 172.28.0.103
+
+  # Cluster initialization container
+  redis-cluster-init:
+    image: redis:7-alpine
+    container_name: redis-cluster-init
+    depends_on:
+      - redis-node-1
+      - redis-node-2
+      - redis-node-3
+    command: >
+      sh -c "
+      sleep 5 &&
+      redis-cli --cluster create
+      172.28.0.101:7000
+      172.28.0.102:7001
+      172.28.0.103:7002
+      --cluster-yes
+      "
+    networks:
+      - redis-cluster-net
+
+networks:
+  redis-cluster-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

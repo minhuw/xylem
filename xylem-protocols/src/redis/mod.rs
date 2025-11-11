@@ -1,10 +1,14 @@
 //! Redis protocol (RESP) implementation
 
+pub mod cluster;
 pub mod command_selector;
 pub mod command_template;
+pub mod crc16;
+pub mod slot;
 
 use crate::Protocol;
 use anyhow::{anyhow, Result};
+use cluster::{parse_redirect, RedirectType};
 use command_selector::CommandSelector;
 use command_template::CommandTemplate;
 
@@ -32,6 +36,9 @@ pub struct RedisProtocol {
     conn_send_seq: std::collections::HashMap<usize, u64>,
     /// Per-connection sequence numbers for receive
     conn_recv_seq: std::collections::HashMap<usize, u64>,
+    /// Track redirect statistics (for cluster support)
+    moved_redirects: u64,
+    ask_redirects: u64,
 }
 
 impl RedisProtocol {
@@ -41,6 +48,8 @@ impl RedisProtocol {
             command_selector,
             conn_send_seq: std::collections::HashMap::new(),
             conn_recv_seq: std::collections::HashMap::new(),
+            moved_redirects: 0,
+            ask_redirects: 0,
         }
     }
 
@@ -58,6 +67,17 @@ impl RedisProtocol {
         let result = *seq;
         *seq += 1;
         result
+    }
+
+    /// Get redirect statistics (for monitoring cluster behavior)
+    pub fn redirect_stats(&self) -> (u64, u64) {
+        (self.moved_redirects, self.ask_redirects)
+    }
+
+    /// Reset redirect statistics
+    pub fn reset_redirect_stats(&mut self) {
+        self.moved_redirects = 0;
+        self.ask_redirects = 0;
     }
 }
 
@@ -150,7 +170,35 @@ impl Protocol for RedisProtocol {
                 let seq = self.next_recv_seq(conn_id);
                 Ok((consumed, Some((conn_id, seq))))
             }
-            b'-' => Err(anyhow!("Redis error: {}", String::from_utf8_lossy(&data[1..consumed]))),
+            b'-' => {
+                // Check if this is a cluster redirect (MOVED or ASK)
+                match parse_redirect(data) {
+                    Ok(Some(RedirectType::Moved { slot, addr })) => {
+                        // MOVED redirect - permanent slot reassignment
+                        self.moved_redirects += 1;
+                        Err(anyhow!(
+                            "MOVED redirect: slot {} moved to {} (total MOVED: {})",
+                            slot,
+                            addr,
+                            self.moved_redirects
+                        ))
+                    }
+                    Ok(Some(RedirectType::Ask { slot, addr })) => {
+                        // ASK redirect - temporary migration state
+                        self.ask_redirects += 1;
+                        Err(anyhow!(
+                            "ASK redirect: slot {} temporarily at {} (total ASK: {})",
+                            slot,
+                            addr,
+                            self.ask_redirects
+                        ))
+                    }
+                    Ok(None) | Err(_) => {
+                        // Regular Redis error (not a redirect)
+                        Err(anyhow!("Redis error: {}", String::from_utf8_lossy(&data[1..consumed])))
+                    }
+                }
+            }
             _ => Err(anyhow!("Invalid RESP response")),
         }
     }
@@ -572,5 +620,88 @@ mod tests {
         // Empty data should return 0
         let result = protocol.find_resp_message_end(&[]).unwrap();
         assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn test_moved_redirect_detection() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let moved_error = b"-MOVED 3999 127.0.0.1:7001\r\n";
+        let result = protocol.parse_response(0, moved_error);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("MOVED redirect"));
+        assert!(err.contains("3999"));
+        assert!(err.contains("127.0.0.1:7001"));
+
+        // Check statistics
+        let (moved, ask) = protocol.redirect_stats();
+        assert_eq!(moved, 1);
+        assert_eq!(ask, 0);
+    }
+
+    #[test]
+    fn test_ask_redirect_detection() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let ask_error = b"-ASK 5000 127.0.0.1:7002\r\n";
+        let result = protocol.parse_response(0, ask_error);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("ASK redirect"));
+        assert!(err.contains("5000"));
+        assert!(err.contains("127.0.0.1:7002"));
+
+        // Check statistics
+        let (moved, ask) = protocol.redirect_stats();
+        assert_eq!(moved, 0);
+        assert_eq!(ask, 1);
+    }
+
+    #[test]
+    fn test_multiple_redirects_statistics() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
+        let mut protocol = RedisProtocol::new(selector);
+
+        // Simulate multiple MOVED redirects
+        let _ = protocol.parse_response(0, b"-MOVED 100 127.0.0.1:7001\r\n");
+        let _ = protocol.parse_response(0, b"-MOVED 200 127.0.0.1:7002\r\n");
+
+        // Simulate ASK redirects
+        let _ = protocol.parse_response(0, b"-ASK 300 127.0.0.1:7003\r\n");
+
+        let (moved, ask) = protocol.redirect_stats();
+        assert_eq!(moved, 2);
+        assert_eq!(ask, 1);
+
+        // Reset stats
+        protocol.reset_redirect_stats();
+        let (moved, ask) = protocol.redirect_stats();
+        assert_eq!(moved, 0);
+        assert_eq!(ask, 0);
+    }
+
+    #[test]
+    fn test_regular_error_vs_redirect() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
+        let mut protocol = RedisProtocol::new(selector);
+
+        // Regular error should not increment redirect stats
+        let regular_error = b"-ERR unknown command\r\n";
+        let result = protocol.parse_response(0, regular_error);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Redis error"));
+        assert!(!err.contains("redirect"));
+
+        // Stats should be zero
+        let (moved, ask) = protocol.redirect_stats();
+        assert_eq!(moved, 0);
+        assert_eq!(ask, 0);
     }
 }

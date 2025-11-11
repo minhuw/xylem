@@ -5,6 +5,7 @@ use xylem_protocols::Protocol;
 /// This allows different traffic groups to use different protocols
 pub enum MultiProtocol {
     Redis(xylem_protocols::redis::RedisProtocol),
+    RedisCluster(Box<xylem_protocols::RedisClusterProtocol>),
     MemcachedBinary(xylem_protocols::memcached::MemcachedBinaryProtocol),
     MemcachedAscii(xylem_protocols::memcached::MemcachedAsciiProtocol),
     Http(xylem_protocols::http::HttpProtocol),
@@ -22,6 +23,12 @@ impl Protocol for MultiProtocol {
     ) -> (Vec<u8>, Self::RequestId) {
         match self {
             MultiProtocol::Redis(p) => p.generate_request(conn_id, key, value_size),
+            MultiProtocol::RedisCluster(p) => {
+                let (data, (_orig_conn, _slot, (_target_conn, seq))) =
+                    p.generate_request(conn_id, key, value_size);
+                // Map cluster request ID to simple request ID
+                (data, (conn_id, seq))
+            }
             MultiProtocol::MemcachedBinary(p) => p.generate_request(conn_id, key, value_size),
             MultiProtocol::MemcachedAscii(p) => p.generate_request(conn_id, key, value_size),
             MultiProtocol::Http(p) => p.generate_request(conn_id, key, value_size),
@@ -39,6 +46,13 @@ impl Protocol for MultiProtocol {
     ) -> Result<(usize, Option<Self::RequestId>)> {
         match self {
             MultiProtocol::Redis(p) => p.parse_response(conn_id, data),
+            MultiProtocol::RedisCluster(p) => {
+                let (consumed, cluster_req_id) = p.parse_response(conn_id, data)?;
+                // Map cluster request ID to simple request ID
+                let req_id =
+                    cluster_req_id.map(|(orig_conn, _slot, (_target_conn, seq))| (orig_conn, seq));
+                Ok((consumed, req_id))
+            }
             MultiProtocol::MemcachedBinary(p) => p.parse_response(conn_id, data),
             MultiProtocol::MemcachedAscii(p) => p.parse_response(conn_id, data),
             MultiProtocol::Http(p) => p.parse_response(conn_id, data),
@@ -52,6 +66,7 @@ impl Protocol for MultiProtocol {
     fn name(&self) -> &'static str {
         match self {
             MultiProtocol::Redis(p) => p.name(),
+            MultiProtocol::RedisCluster(p) => p.name(),
             MultiProtocol::MemcachedBinary(p) => p.name(),
             MultiProtocol::MemcachedAscii(p) => p.name(),
             MultiProtocol::Http(p) => p.name(),
@@ -62,6 +77,7 @@ impl Protocol for MultiProtocol {
     fn reset(&mut self) {
         match self {
             MultiProtocol::Redis(p) => p.reset(),
+            MultiProtocol::RedisCluster(p) => p.reset(),
             MultiProtocol::MemcachedBinary(p) => p.reset(),
             MultiProtocol::MemcachedAscii(p) => p.reset(),
             MultiProtocol::Http(p) => p.reset(),
@@ -109,6 +125,55 @@ pub fn create_xylem_echo_protocol() -> MultiProtocol {
     MultiProtocol::XylemEcho(xylem_protocols::xylem_echo::XylemEchoProtocol::default())
 }
 
+/// Configuration for Redis Cluster nodes
+#[derive(Debug, Clone)]
+pub struct RedisClusterConfig {
+    /// Cluster node addresses with slot ranges
+    pub nodes: Vec<RedisClusterNode>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RedisClusterNode {
+    /// Node address (e.g., "127.0.0.1:7000")
+    pub address: String,
+    /// Start slot (0-16383)
+    pub slot_start: u16,
+    /// End slot (0-16383)
+    pub slot_end: u16,
+}
+
+pub fn create_redis_cluster_protocol(
+    redis_selector: Box<dyn xylem_protocols::CommandSelector<xylem_protocols::RedisOp>>,
+    cluster_config: RedisClusterConfig,
+) -> Result<MultiProtocol> {
+    use xylem_protocols::{ClusterTopology, SlotRange};
+
+    let mut protocol = xylem_protocols::RedisClusterProtocol::new(redis_selector);
+
+    // Register connections and build topology
+    let mut ranges = Vec::new();
+    for (idx, node) in cluster_config.nodes.iter().enumerate() {
+        let addr: std::net::SocketAddr = node
+            .address
+            .parse()
+            .map_err(|e| anyhow::anyhow!("Invalid node address '{}': {}", node.address, e))?;
+
+        protocol.register_connection(addr, idx);
+
+        ranges.push(SlotRange {
+            start: node.slot_start,
+            end: node.slot_end,
+            master: addr,
+            replicas: vec![],
+        });
+    }
+
+    let topology = ClusterTopology::from_slot_ranges(ranges);
+    protocol.update_topology(topology);
+
+    Ok(MultiProtocol::RedisCluster(Box::new(protocol)))
+}
+
 // Legacy function for backward compatibility with tests
 pub fn create_protocol(
     name: &str,
@@ -146,7 +211,7 @@ pub fn create_protocol(
             xylem_protocols::xylem_echo::XylemEchoProtocol::default(),
         )),
         _ => bail!(
-            "Unknown protocol '{}'. Supported: redis, memcached-binary, memcached-ascii, http, xylem-echo",
+            "Unknown protocol '{}'. Supported: redis, redis-cluster, memcached-binary, memcached-ascii, http, xylem-echo",
             name
         ),
     }

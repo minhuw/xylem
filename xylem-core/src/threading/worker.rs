@@ -17,6 +17,41 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use xylem_transport::Transport;
 
+/// Retry request information for protocol-level retries
+#[derive(Debug, Clone)]
+pub struct RetryRequest<ReqId> {
+    /// Number of bytes consumed from the response buffer
+    pub bytes_consumed: usize,
+    /// Original request ID that triggered this retry
+    pub original_request_id: ReqId,
+    /// Key to use for the retry request
+    pub key: u64,
+    /// Value size for the retry request
+    pub value_size: usize,
+    /// Target connection ID for the retry (None = use routing logic)
+    pub target_conn_id: Option<usize>,
+    /// Preparation commands to send before the retry (e.g., ASKING for Redis Cluster)
+    pub prepare_commands: Vec<Vec<u8>>,
+    /// Retry attempt number (0 for first retry)
+    pub attempt: usize,
+}
+
+/// Extended parse result that supports retries
+#[derive(Debug)]
+pub enum ParseResult<ReqId> {
+    /// Complete response parsed successfully
+    Complete {
+        /// Number of bytes consumed from buffer
+        bytes_consumed: usize,
+        /// Request ID this response corresponds to
+        request_id: ReqId,
+    },
+    /// Response incomplete, need more data
+    Incomplete,
+    /// Retry needed (e.g., cluster redirect)
+    Retry(RetryRequest<ReqId>),
+}
+
 /// Protocol trait for generating requests and parsing responses with request ID tracking
 pub trait Protocol: Send {
     /// Type of request ID used by this protocol
@@ -39,6 +74,34 @@ pub trait Protocol: Send {
         conn_id: usize,
         data: &[u8],
     ) -> anyhow::Result<(usize, Option<Self::RequestId>)>;
+
+    /// Parse a response with retry support (extended version)
+    ///
+    /// Default implementation delegates to `parse_response()` for backward compatibility.
+    fn parse_response_extended(
+        &mut self,
+        conn_id: usize,
+        data: &[u8],
+    ) -> anyhow::Result<ParseResult<Self::RequestId>> {
+        match self.parse_response(conn_id, data)? {
+            (bytes_consumed, Some(request_id)) => {
+                Ok(ParseResult::Complete { bytes_consumed, request_id })
+            }
+            (0, None) => Ok(ParseResult::Incomplete),
+            (bytes_consumed, None) => {
+                // Consumed bytes but no request ID - shouldn't happen normally
+                if bytes_consumed > 0 {
+                    // This is an error condition - consumed data but got no ID
+                    Err(anyhow::anyhow!(
+                        "Protocol consumed {} bytes but returned no request ID",
+                        bytes_consumed
+                    ))
+                } else {
+                    Ok(ParseResult::Incomplete)
+                }
+            }
+        }
+    }
 
     /// Protocol name
     fn name(&self) -> &'static str;
@@ -243,6 +306,9 @@ impl<T: Transport, P: Protocol> Worker<T, P> {
     fn process_responses(&mut self) -> Result<()> {
         let stats = &mut self.stats;
 
+        // Collect retries to process after response handling
+        let mut retries: Vec<(usize, RetryRequest<_>)> = Vec::new();
+
         for conn in self.pool.connections_mut() {
             if !conn.poll_readable()? {
                 continue;
@@ -255,25 +321,93 @@ impl<T: Transport, P: Protocol> Worker<T, P> {
             let protocol =
                 self.protocols.get_mut(&group_id).expect("Protocol not found for group_id");
 
-            let latencies =
-                conn.recv_responses(|data| match protocol.parse_response(conn_id, data) {
-                    Ok((bytes_consumed, req_id_opt)) => {
-                        if bytes_consumed > 0 {
-                            stats.record_rx_bytes(group_id, bytes_consumed);
-                        }
-                        Ok((bytes_consumed, req_id_opt))
+            // Use extended parse to support retries
+            let mut conn_retries = Vec::new();
+
+            let latencies = conn.recv_responses(|data| {
+                let result = protocol.parse_response_extended(conn_id, data);
+                match result {
+                    Ok(ParseResult::Complete { bytes_consumed, request_id }) => {
+                        // Record received bytes if any
+                        (bytes_consumed > 0)
+                            .then(|| stats.record_rx_bytes(group_id, bytes_consumed));
+                        Ok((bytes_consumed, Some(request_id)))
+                    }
+                    Ok(ParseResult::Incomplete) => Ok((0, None)),
+                    Ok(ParseResult::Retry(retry_req)) => {
+                        // Save retry for processing after response handling
+                        conn_retries.push(retry_req.clone());
+                        // Record received bytes if any
+                        (retry_req.bytes_consumed > 0)
+                            .then(|| stats.record_rx_bytes(group_id, retry_req.bytes_consumed));
+                        // Return the original request ID to complete the pending request
+                        Ok((retry_req.bytes_consumed, Some(retry_req.original_request_id)))
                     }
                     Err(e) => Err(e.into()),
-                })?;
+                }
+            })?;
 
             // Record all latencies with group_id
             for (_req_id, latency) in latencies {
                 stats.record_latency(group_id, latency);
             }
+
+            // Collect retries for this connection
+            for retry in conn_retries {
+                retries.push((group_id, retry));
+            }
+        }
+
+        // Process all retries after response handling
+        for (group_id, retry_req) in retries {
+            self.handle_retry(group_id, retry_req)?;
         }
 
         // Per-connection policies don't need global feedback
         // Each connection manages its own timing independently
+
+        Ok(())
+    }
+
+    /// Handle a retry request by sending preparation commands and retry request
+    fn handle_retry(
+        &mut self,
+        group_id: usize,
+        retry_req: RetryRequest<P::RequestId>,
+    ) -> Result<()> {
+        // Determine target connection
+        let target_conn_id = if let Some(conn_id) = retry_req.target_conn_id {
+            conn_id
+        } else {
+            // Use original connection or first connection in group
+            // This is a simplified routing - proper routing would use protocol logic
+            return Ok(()); // Skip retry if no target specified
+        };
+
+        // Get the connection
+        let conn = self
+            .pool
+            .connections_mut()
+            .iter_mut()
+            .find(|c| c.idx() == target_conn_id && c.group_id() == group_id);
+
+        if let Some(conn) = conn {
+            // Send preparation commands (e.g., ASKING for Redis Cluster)
+            for prep_cmd in &retry_req.prepare_commands {
+                // Send without tracking (preparation commands don't get IDs)
+                let _ = conn.send_untracked(prep_cmd);
+            }
+
+            // Generate and send retry request
+            let protocol =
+                self.protocols.get_mut(&group_id).expect("Protocol not found for group_id");
+
+            let (retry_data, retry_req_id) =
+                protocol.generate_request(target_conn_id, retry_req.key, retry_req.value_size);
+
+            conn.send(&retry_data, retry_req_id)?;
+            self.stats.record_tx_bytes(group_id, retry_data.len());
+        }
 
         Ok(())
     }

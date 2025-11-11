@@ -1,0 +1,94 @@
+# Advanced Redis Cluster Load Testing Example
+#
+# This example demonstrates:
+# - Mixed read/write workload (70% GET, 30% SET)
+# - Zipfian key distribution for realistic hot-key patterns
+# - Variable value sizes
+# - Multiple traffic groups
+
+[experiment]
+name = "redis-cluster-mixed"
+description = "Redis Cluster load test with mixed operations and hot keys"
+duration = "120s"
+seed = 42
+
+[target]
+protocol = "redis-cluster"
+transport = "tcp"
+
+# 3-node Redis Cluster configuration
+[target.redis_cluster]
+[[target.redis_cluster.nodes]]
+address = "127.0.0.1:7000"
+slot_start = 0
+slot_end = 5460
+
+[[target.redis_cluster.nodes]]
+address = "127.0.0.1:7001"
+slot_start = 5461
+slot_end = 10921
+
+[[target.redis_cluster.nodes]]
+address = "127.0.0.1:7002"
+slot_start = 10922
+slot_end = 16383
+
+[workload]
+# Zipfian distribution creates realistic hot-key patterns
+[workload.keys]
+strategy = "zipfian"
+n = 1000000
+theta = 0.99  # High skew - 20% of keys get 80% of requests
+value_size = 256
+
+# Ramp load pattern - gradually increase load
+[workload.pattern]
+type = "ramp"
+start_rate = 1000.0
+end_rate = 50000.0
+duration = "120s"
+
+# Mixed read/write workload
+[workload.operations]
+strategy = "weighted"
+
+[[workload.operations.commands]]
+name = "get"
+weight = 0.7  # 70% reads
+
+[[workload.operations.commands]]
+name = "set"
+weight = 0.3  # 30% writes
+
+# Per-command value sizes
+[workload.value_size]
+strategy = "per_command"
+default = { strategy = "fixed", size = 256 }
+
+[workload.value_size.commands.get]
+distribution = "fixed"
+size = 128  # Smaller reads
+
+[workload.value_size.commands.set]
+distribution = "uniform"
+min = 256
+max = 1024  # Larger, variable writes
+
+# Primary traffic group
+[[traffic_groups]]
+name = "primary-traffic"
+threads = [0, 1]
+connections_per_thread = 30
+max_pending_per_connection = 20
+
+[traffic_groups.policy]
+type = "closed-loop"
+
+[traffic_groups.sampling_policy]
+type = "limited"
+rate = 1.0
+max_samples = 200000
+
+[output]
+format = "json"
+file = "results/redis-cluster-mixed.json"

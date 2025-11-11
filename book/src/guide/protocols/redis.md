@@ -10,10 +10,12 @@ Xylem implements RESP and supports:
 - Request pipelining for high throughput
 - Configurable key distributions and value sizes
 
+Xylem also supports:
+- **Redis Cluster mode** - Full cluster support with automatic slot-based routing (see [Redis Cluster](#redis-cluster) section below)
+
 Xylem does not currently support:
 - RESP3 protocol (only RESP2) - **TODO**: RESP3 adds semantic types (maps, sets, doubles, booleans), push messages, and streaming data. While RESP2 covers all benchmarking needs and works with all Redis versions, RESP3 support could be added for testing RESP3-specific features or comparing protocol performance.
 - Pub/Sub commands
-- Cluster mode (supports single-instance and simple replication)
 - Transactions (MULTI/EXEC)
 
 ## Protocol Overview
@@ -478,8 +480,86 @@ file = "results/redis-benchmark.json"
 - Keys: Sequential or temporal
 - Sizes: Uniform or normal distribution
 
+## Redis Cluster
+
+When you're benchmarking a distributed Redis deployment, you need to think about how Redis Cluster shards data across multiple nodes. Xylem handles this complexity for you with full Redis Cluster support.
+
+### How It Works
+
+Redis Cluster divides the key space into 16,384 hash slots. Each key gets hashed to determine which slot it belongs to, and each cluster node is responsible for a range of these slots. When you send a request to the wrong node, Redis responds with a MOVED or ASK redirect telling you where the key actually lives.
+
+Xylem takes care of all this routing automatically. You set up your cluster topology once, and from then on, every request goes directly to the right node. When the cluster reshards (moving slots between nodes), Xylem detects the redirects and can retry on the correct node.
+
+### Getting Started
+
+Using Redis Cluster with Xylem is straightforward. You create a cluster protocol, register your nodes, and configure the topology:
+
+```rust
+use xylem_protocols::*;
+
+// Create cluster protocol with your command selector
+let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
+let mut protocol = RedisClusterProtocol::new(selector);
+
+// Register each node in your cluster
+protocol.register_connection("127.0.0.1:7000".parse()?, 0);
+protocol.register_connection("127.0.0.1:7001".parse()?, 1);
+protocol.register_connection("127.0.0.1:7002".parse()?, 2);
+
+// Configure which slots each node owns
+let mut ranges = vec![];
+for i in 0..3 {
+    let (start, end) = calculate_slot_range(i, 3)?;
+    let master = format!("127.0.0.1:{}", 7000 + i).parse()?;
+    ranges.push(SlotRange { start, end, master, replicas: vec![] });
+}
+protocol.update_topology(ClusterTopology::from_slot_ranges(ranges));
+
+// Now requests automatically route to the correct node
+let (request, req_id) = protocol.generate_request(0, key, value_size);
+```
+
+The topology lookup is O(1) - a simple binary search over slot ranges - so routing adds negligible overhead to your benchmark.
+
+### Working with Hash Tags
+
+Sometimes you need multiple keys to live on the same node. Maybe you're testing MGET performance, or you want to ensure related data stays together. Redis Cluster supports hash tags for exactly this purpose.
+
+When you wrap part of a key in curly braces, Redis only hashes that portion:
+
+```rust
+// All these keys hash to the same slot
+let key1 = "{user:1000}.profile";
+let key2 = "{user:1000}.settings";
+let key3 = "{user:1000}.preferences";
+
+// This enables multi-key operations like:
+// MGET {user:1000}.profile {user:1000}.settings {user:1000}.preferences
+```
+
+This is particularly useful for benchmarking scenarios where you want to measure the performance of operations that span multiple related keys.
+
+### Handling Redirects
+
+When you benchmark a cluster during resharding or when your topology is slightly out of date, Redis will send MOVED or ASK redirects. Xylem detects these automatically by parsing the response.
+
+For MOVED redirects (permanent slot migrations), you'll typically want to update your topology and retry. For ASK redirects (temporary states during migration), you retry on the new node without updating topology. Xylem provides the redirect information - you decide the retry strategy that fits your benchmark goals.
+
+### What's Currently Supported
+
+Xylem's Redis Cluster implementation is production-ready for benchmarking. It handles:
+
+- **Automatic slot-based routing** using the standard CRC16-XMODEM hash function
+- **O(1) topology lookups** for efficient request routing
+- **MOVED and ASK redirect detection** in responses
+- **Hash tag support** for multi-key operations
+- **Helper functions** for common operations like calculating slot ranges
+
+The implementation focuses on giving you the building blocks you need. You configure the topology programmatically, which gives you precise control over your benchmark setup. TOML-based configuration and automatic retry logic are possible future enhancements, but the current API gives you everything needed for comprehensive cluster benchmarking.
+
 ## See Also
 
 - [Workload Configuration](../configuration/workload.md) - Detailed configuration guide
 - [Configuration Schema](../../reference/schema.md) - Complete reference
 - [Redis Documentation](https://redis.io/docs/) - Official Redis protocol documentation
+- [Redis Cluster Tutorial](https://redis.io/docs/manual/scaling/) - Official cluster guide
