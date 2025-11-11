@@ -3,8 +3,26 @@ name: CI
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'book/**'
+      - 'docs/**'
+      - '*.md'
+      - 'LICENSE-*'
+      - '.gitignore'
+      - '.gitattributes'
+      - '.gitmessage'
+      - '.editorconfig'
   pull_request:
     branches: [main]
+    paths-ignore:
+      - 'book/**'
+      - 'docs/**'
+      - '*.md'
+      - 'LICENSE-*'
+      - '.gitignore'
+      - '.gitattributes'
+      - '.gitmessage'
+      - '.editorconfig'
 
 env:
   CARGO_TERM_COLOR: always
@@ -21,20 +39,6 @@ jobs:
 
       - name: Setup Magic Nix Cache
         uses: DeterminateSystems/magic-nix-cache-action@main
-
-      - name: Cache cargo-nextest
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/cargo-nextest
-          key: ${{ runner.os }}-cargo-nextest-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-nextest-
-
-      - name: Install cargo-nextest
-        run: |
-          if ! command -v cargo-nextest &> /dev/null; then
-            nix develop --command cargo install cargo-nextest --locked
-          fi
 
       - name: Build
         run: nix develop --command cargo build --verbose
@@ -135,15 +139,25 @@ jobs:
       - name: Setup Magic Nix Cache
         uses: DeterminateSystems/magic-nix-cache-action@main
 
-      - name: Install tarpaulin
-        run: nix develop --command cargo install cargo-tarpaulin
+      - name: Install redis-cli for integration tests
+        run: sudo apt-get update && sudo apt-get install -y redis-tools
 
-      - name: Generate coverage
-        run: nix develop --command cargo tarpaulin --verbose --all-features --workspace --timeout 300 --out xml
+      - name: Verify Docker is available
+        run: docker --version && docker compose version
+
+      - name: Generate coverage (unit tests only for speed)
+        run: nix develop --command cargo llvm-cov nextest --all-features --workspace --lcov --output-path lcov.info --no-cfg-coverage --profile unit
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
         with:
-          file: ./cobertura.xml
+          file: ./lcov.info
           fail_ci_if_error: false
           token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Cleanup Docker containers
+        if: always()
+        run: |
+          docker ps -aq --filter name=xylem-test | xargs -r docker rm -f || true
+          docker ps -aq --filter name=redis-cluster | xargs -r docker rm -f || true
+          docker network prune -f || true

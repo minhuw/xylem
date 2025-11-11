@@ -20,7 +20,7 @@
 
         # Rust toolchain with specific components
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
-          extensions = [ "rust-src" "rust-analyzer" "clippy" "rustfmt" ];
+          extensions = [ "rust-src" "rust-analyzer" "clippy" "rustfmt" "llvm-tools-preview" ];
         };
 
         # Build inputs for the project
@@ -52,6 +52,10 @@
             pkgs.cargo-outdated
             pkgs.bacon
 
+            # Testing tools
+            pkgs.cargo-nextest
+            pkgs.cargo-llvm-cov
+
             # Pre-commit and formatting
             pkgs.pre-commit
             pkgs.git
@@ -80,11 +84,13 @@
             echo "Cargo version: $(cargo --version)"
             echo ""
             echo "Available commands:"
+            echo "  just test                      - Run all tests (nextest)"
+            echo "  just test-unit                 - Run unit tests only (fast)"
+            echo "  just test-integration          - Run integration tests (requires Docker)"
             echo "  cargo build                    - Build the project"
-            echo "  cargo test                     - Run tests"
-            echo "  cargo test -- --ignored        - Run integration tests (requires Docker)"
             echo "  cargo clippy                   - Run linter"
             echo "  cargo fmt                      - Format code"
+            echo "  cargo llvm-cov                 - Generate code coverage"
             echo "  cargo flamegraph --profile profiling -- <args>  - Profile with flamegraph"
             echo "  pre-commit install             - Install git hooks"
             echo "  bacon                          - Watch and build"
