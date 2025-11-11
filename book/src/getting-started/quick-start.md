@@ -24,10 +24,16 @@ cargo build --release
 
 ### 1. Start a Redis Server
 
-First, ensure you have a Redis server running locally:
+First, ensure you have a Redis server running. You can use Docker for easy setup:
 
 ```bash
-redis-server
+docker run -d -p 6379:6379 redis:latest
+```
+
+Or use Docker Compose with the provided test configuration:
+
+```bash
+docker compose -f tests/redis/docker-compose.yml up -d
 ```
 
 By default, Redis listens on `localhost:6379`.

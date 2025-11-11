@@ -1,10 +1,9 @@
 //! Integration tests for Redis protocol
 //!
-//! These tests automatically start and stop a Redis server for testing.
+//! These tests use Docker Compose to manage a Redis server for testing.
+//! Docker is required to run these tests.
 
-use std::process::{Child, Command};
-use std::sync::Mutex;
-use std::thread::sleep;
+use std::process::Command;
 use std::time::Duration;
 use xylem_core::stats::GroupStatsCollector;
 use xylem_core::threading::{ThreadingRuntime, Worker, WorkerConfig};
@@ -12,9 +11,6 @@ use xylem_core::workload::{KeyGeneration, RateControl, RequestGenerator};
 use xylem_transport::TcpTransport;
 
 mod common;
-
-// Global state to track Redis server process
-static REDIS_SERVER: Mutex<Option<Child>> = Mutex::new(None);
 
 // Protocol adapter to bridge xylem_protocols::Protocol with worker Protocol trait
 struct ProtocolAdapter<P: xylem_protocols::Protocol> {
@@ -56,12 +52,6 @@ impl<P: xylem_protocols::Protocol> xylem_core::threading::worker::Protocol for P
     }
 }
 
-/// Helper to check if Redis is available
-fn check_redis_available() -> bool {
-    std::net::TcpStream::connect_timeout(&"127.0.0.1:6379".parse().unwrap(), Duration::from_secs(1))
-        .is_ok()
-}
-
 /// Get Redis stats using INFO command
 fn get_redis_stats() -> Result<RedisStats, Box<dyn std::error::Error>> {
     let output = Command::new("redis-cli").args(["-p", "6379", "INFO", "stats"]).output()?;
@@ -96,70 +86,11 @@ struct RedisStats {
     total_connections_received: u64,
 }
 
-/// Start Redis server if not already running
-fn start_redis() -> Result<(), Box<dyn std::error::Error>> {
-    if check_redis_available() {
-        println!("✓ Redis already running on port 6379");
-        return Ok(());
-    }
-
-    println!("Starting Redis server...");
-
-    // Kill any existing Redis processes on port 6379
-    let _ = Command::new("pkill").args(["-f", "redis-server.*6379"]).output();
-
-    sleep(Duration::from_millis(100));
-
-    // Start Redis server in background
-    let child = Command::new("redis-server")
-        .args(["--port", "6379", "--save", "", "--appendonly", "no"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
-
-    // Store the process handle
-    *REDIS_SERVER.lock().unwrap() = Some(child);
-
-    // Wait for Redis to be ready
-    for i in 0..30 {
-        sleep(Duration::from_millis(100));
-        if check_redis_available() {
-            println!("✓ Redis server ready after {}ms", (i + 1) * 100);
-            return Ok(());
-        }
-    }
-
-    Err("Redis failed to start within 3 seconds".into())
-}
-
-/// Stop Redis server
-fn stop_redis() {
-    println!("Stopping Redis server...");
-
-    // Try to stop via redis-cli
-    let _ = Command::new("redis-cli").args(["-p", "6379", "shutdown", "nosave"]).output();
-
-    sleep(Duration::from_millis(100));
-
-    // If that didn't work, kill the process
-    if let Ok(mut guard) = REDIS_SERVER.lock() {
-        if let Some(mut child) = guard.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-
-    // Final cleanup - kill any remaining redis-server processes
-    let _ = Command::new("pkill").args(["-f", "redis-server.*6379"]).output();
-
-    println!("✓ Redis server stopped");
-}
-
 #[test]
-#[ignore] // Run with: cargo test --test redis_integration -- --ignored --test-threads=1
+#[ignore] // Run with: cargo test --test redis_integration -- --ignored
 fn test_redis_single_thread() {
     // Start Redis server (will auto-cleanup on drop)
-    let _guard = setup_redis().expect("Failed to start Redis");
+    let _redis = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
     println!("Running single-threaded test...");
 
@@ -259,10 +190,10 @@ fn test_redis_single_thread() {
 }
 
 #[test]
-#[ignore] // Run with: cargo test --test redis_integration -- --ignored --test-threads=1
+#[ignore] // Run with: cargo test --test redis_integration -- --ignored
 fn test_redis_multi_thread() {
     // Start Redis server (will auto-cleanup on drop)
-    let _guard = setup_redis().expect("Failed to start Redis");
+    let _redis = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
     println!("Running multi-threaded test...");
 
@@ -363,10 +294,10 @@ fn test_redis_multi_thread() {
 }
 
 #[test]
-#[ignore] // Run with: cargo test --test redis_integration -- --ignored --test-threads=1
+#[ignore] // Run with: cargo test --test redis_integration -- --ignored
 fn test_redis_rate_limited() {
     // Start Redis server (will auto-cleanup on drop)
-    let _guard = setup_redis().expect("Failed to start Redis");
+    let _redis = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
     println!("Running rate-limited test...");
 
@@ -416,19 +347,4 @@ fn test_redis_rate_limited() {
         rate_ratio > 0.6 && rate_ratio < 1.4,
         "Actual rate should be within 40% of target rate, got {rate_ratio:.2}x"
     );
-}
-
-/// Test cleanup guard - stops Redis when dropped
-struct RedisGuard;
-
-impl Drop for RedisGuard {
-    fn drop(&mut self) {
-        stop_redis();
-    }
-}
-
-/// Setup Redis for tests - returns a guard that will cleanup on drop
-fn setup_redis() -> Result<RedisGuard, Box<dyn std::error::Error>> {
-    start_redis()?;
-    Ok(RedisGuard)
 }

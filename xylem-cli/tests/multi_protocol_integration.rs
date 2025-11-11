@@ -2,12 +2,11 @@
 //!
 //! Tests Redis + Memcached + HTTP protocols running simultaneously on the same worker threads.
 //! This validates that the multi-protocol architecture works correctly.
+//!
+//! These tests use Docker Compose to manage services. Docker is required.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::process::{Child, Command};
-use std::sync::Mutex;
-use std::thread::sleep;
 use std::time::Duration;
 use xylem_cli::multi_protocol;
 use xylem_core::stats::{GroupStatsCollector, SamplingPolicy};
@@ -15,10 +14,7 @@ use xylem_core::threading::{ThreadingRuntime, Worker, WorkerConfig};
 use xylem_core::workload::{KeyGeneration, RateControl, RequestGenerator};
 use xylem_transport::TcpTransport;
 
-// Global state to track service processes
-static REDIS_SERVER: Mutex<Option<Child>> = Mutex::new(None);
-static MEMCACHED_SERVER: Mutex<Option<Child>> = Mutex::new(None);
-static NGINX_SERVER: Mutex<Option<Child>> = Mutex::new(None);
+mod common;
 
 // Protocol adapter to bridge xylem_protocols::Protocol with worker Protocol trait
 struct ProtocolAdapter<P: xylem_protocols::Protocol> {
@@ -60,158 +56,16 @@ impl<P: xylem_protocols::Protocol> xylem_core::threading::worker::Protocol for P
     }
 }
 
-/// Check if Redis is available
-fn check_redis_available() -> bool {
-    std::net::TcpStream::connect_timeout(
-        &"127.0.0.1:6379".parse().unwrap(),
-        Duration::from_millis(100),
-    )
-    .is_ok()
-}
-
-/// Check if Memcached is available
-fn check_memcached_available() -> bool {
-    std::net::TcpStream::connect_timeout(
-        &"127.0.0.1:11211".parse().unwrap(),
-        Duration::from_millis(100),
-    )
-    .is_ok()
-}
-
-/// Check if HTTP server is available
-fn check_http_available() -> bool {
-    std::net::TcpStream::connect_timeout(
-        &"127.0.0.1:8080".parse().unwrap(),
-        Duration::from_millis(100),
-    )
-    .is_ok()
-}
-
-/// Start Redis server
-fn start_redis() -> Result<(), Box<dyn std::error::Error>> {
-    if check_redis_available() {
-        eprintln!("Redis already running on port 6379");
-        return Ok(());
-    }
-
-    eprintln!("Starting Redis server...");
-    let child = Command::new("redis-server")
-        .args(["--port", "6379", "--save", "", "--appendonly", "no"])
-        .spawn()?;
-
-    *REDIS_SERVER.lock().unwrap() = Some(child);
-
-    // Wait for Redis to be ready
-    for _ in 0..50 {
-        if check_redis_available() {
-            eprintln!("Redis server started successfully");
-            sleep(Duration::from_millis(100));
-            return Ok(());
-        }
-        sleep(Duration::from_millis(100));
-    }
-
-    Err("Redis server failed to start".into())
-}
-
-/// Start Memcached server
-fn start_memcached() -> Result<(), Box<dyn std::error::Error>> {
-    if check_memcached_available() {
-        eprintln!("Memcached already running on port 11211");
-        return Ok(());
-    }
-
-    eprintln!("Starting Memcached server...");
-    let child = Command::new("memcached").args(["-p", "11211", "-m", "64"]).spawn()?;
-
-    *MEMCACHED_SERVER.lock().unwrap() = Some(child);
-
-    // Wait for Memcached to be ready
-    for _ in 0..50 {
-        if check_memcached_available() {
-            eprintln!("Memcached server started successfully");
-            sleep(Duration::from_millis(100));
-            return Ok(());
-        }
-        sleep(Duration::from_millis(100));
-    }
-
-    Err("Memcached server failed to start".into())
-}
-
-/// Start simple HTTP server using Python
-fn start_http_server() -> Result<(), Box<dyn std::error::Error>> {
-    if check_http_available() {
-        eprintln!("HTTP server already running on port 8080");
-        return Ok(());
-    }
-
-    eprintln!("Starting HTTP server...");
-    let child = Command::new("python3").args(["-m", "http.server", "8080"]).spawn()?;
-
-    *NGINX_SERVER.lock().unwrap() = Some(child);
-
-    // Wait for HTTP server to be ready
-    for _ in 0..50 {
-        if check_http_available() {
-            eprintln!("HTTP server started successfully");
-            sleep(Duration::from_millis(100));
-            return Ok(());
-        }
-        sleep(Duration::from_millis(100));
-    }
-
-    Err("HTTP server failed to start".into())
-}
-
-/// Stop all servers
-fn stop_servers() {
-    eprintln!("Stopping test servers...");
-
-    if let Some(mut child) = REDIS_SERVER.lock().unwrap().take() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-
-    if let Some(mut child) = MEMCACHED_SERVER.lock().unwrap().take() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-
-    if let Some(mut child) = NGINX_SERVER.lock().unwrap().take() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-
-    sleep(Duration::from_millis(500));
-}
-
 #[test]
 #[ignore] // Run with: cargo test --test multi_protocol_integration -- --ignored
 fn test_multi_protocol_redis_memcached_http() {
     eprintln!("Testing multi-protocol with Redis + Memcached + HTTP on different targets");
 
-    // Start all three servers
-    if let Err(e) = start_redis() {
-        eprintln!("Failed to start Redis: {}", e);
-        return;
-    }
+    // Start all three servers using Docker Compose
+    let _services =
+        common::multi_protocol::MultiProtocolGuard::new().expect("Failed to start services");
 
-    if let Err(e) = start_memcached() {
-        eprintln!("Failed to start Memcached: {}", e);
-        stop_servers();
-        return;
-    }
-
-    if let Err(e) = start_http_server() {
-        eprintln!("Failed to start HTTP server: {}", e);
-        stop_servers();
-        return;
-    }
-
-    let result = run_multi_protocol_test();
-    stop_servers();
-    result.expect("Multi-protocol test failed");
+    run_multi_protocol_test().expect("Multi-protocol test failed");
 }
 
 fn run_multi_protocol_test() -> Result<(), Box<dyn std::error::Error>> {
@@ -347,21 +201,10 @@ fn run_multi_protocol_test() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 #[ignore]
 fn test_multi_protocol_same_thread() {
-    // Simpler test: just Redis + Memcached on same thread
-    if let Err(e) = start_redis() {
-        eprintln!("Failed to start Redis: {}", e);
-        return;
-    }
+    // Simpler test: just Redis on same thread (tests multi-group architecture)
+    let _redis = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
-    if let Err(e) = start_memcached() {
-        eprintln!("Failed to start Memcached: {}", e);
-        stop_servers();
-        return;
-    }
-
-    let result = run_redis_memcached_test();
-    stop_servers();
-    result.expect("Redis + Memcached test failed");
+    run_redis_memcached_test().expect("Redis + Memcached test failed");
 }
 
 fn run_redis_memcached_test() -> Result<(), Box<dyn std::error::Error>> {

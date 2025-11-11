@@ -1,29 +1,20 @@
 //! Integration tests for HTTP protocol
 //!
-//! These tests automatically start and stop an nginx server for testing.
+//! These tests use Docker Compose to manage an Nginx server for testing.
+//! Docker is required to run these tests.
 //!
 //! ## Running the tests
 //!
 //! Run all HTTP integration tests:
 //! ```bash
-//! cargo test --test http_integration -- --ignored --test-threads=1
+//! cargo test --test http_integration -- --ignored
 //! ```
 //!
 //! Run a specific test:
 //! ```bash
 //! cargo test --test http_integration test_http_get_single_thread -- --ignored
 //! ```
-//!
-//! ## Requirements
-//!
-//! - nginx must be installed and available in PATH
-//! - Port 8080 must be available
-//! - Tests must be run with --test-threads=1 to avoid port conflicts
 
-use std::fs;
-use std::process::{Child, Command};
-use std::sync::Mutex;
-use std::thread::sleep;
 use std::time::Duration;
 use xylem_core::stats::GroupStatsCollector;
 use xylem_core::threading::{ThreadingRuntime, Worker, WorkerConfig};
@@ -31,9 +22,6 @@ use xylem_core::workload::{KeyGeneration, RateControl, RequestGenerator};
 use xylem_transport::TcpTransport;
 
 mod common;
-
-// Global state to track nginx server process
-static NGINX_SERVER: Mutex<Option<Child>> = Mutex::new(None);
 
 // Protocol adapter to bridge xylem_protocols::Protocol with worker Protocol trait
 struct ProtocolAdapter<P: xylem_protocols::Protocol> {
@@ -75,139 +63,10 @@ impl<P: xylem_protocols::Protocol> xylem_core::threading::worker::Protocol for P
     }
 }
 
-/// Helper to check if nginx is available
-fn check_nginx_available() -> bool {
-    std::net::TcpStream::connect_timeout(&"127.0.0.1:8080".parse().unwrap(), Duration::from_secs(1))
-        .is_ok()
-}
-
-/// Create minimal nginx configuration
-fn create_nginx_config() -> Result<String, Box<dyn std::error::Error>> {
-    let config_dir = "/tmp/xylem-nginx-test";
-    fs::create_dir_all(config_dir)?;
-    fs::create_dir_all(format!("{}/logs", config_dir))?;
-
-    let config_path = format!("{}/nginx.conf", config_dir);
-    let config_content = format!(
-        r#"
-daemon off;
-worker_processes 1;
-error_log {}/logs/error.log;
-pid {}/nginx.pid;
-
-events {{
-    worker_connections 1024;
-}}
-
-http {{
-    access_log {}/logs/access.log;
-
-    # Enable keep-alive connections
-    keepalive_timeout 65;
-    keepalive_requests 100000;  # Allow many requests per connection
-
-    server {{
-        listen 8080;
-        server_name localhost;
-
-        location / {{
-            return 200 "OK\n";
-            add_header Content-Type text/plain;
-        }}
-
-        location /test {{
-            return 200 "Test OK\n";
-            add_header Content-Type text/plain;
-        }}
-    }}
-}}
-"#,
-        config_dir, config_dir, config_dir
-    );
-
-    fs::write(&config_path, config_content)?;
-    Ok(config_path)
-}
-
-/// Start nginx server if not already running
-fn start_nginx() -> Result<(), Box<dyn std::error::Error>> {
-    if check_nginx_available() {
-        println!("✓ nginx already running on port 8080");
-        return Ok(());
-    }
-
-    println!("Starting nginx server on port 8080...");
-
-    // Kill any existing nginx processes on port 8080
-    let _ = Command::new("pkill").args(["-f", "nginx.*8080"]).output();
-    sleep(Duration::from_millis(100));
-
-    // Create config
-    let config_path = create_nginx_config()?;
-
-    // Start nginx server
-    let child = Command::new("nginx")
-        .args(["-c", &config_path])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
-
-    // Store the child process
-    let mut server = NGINX_SERVER.lock().unwrap();
-    *server = Some(child);
-
-    // Wait for server to be ready
-    for i in 0..30 {
-        sleep(Duration::from_millis(100));
-        if check_nginx_available() {
-            println!("✓ nginx started successfully after {}ms", (i + 1) * 100);
-            return Ok(());
-        }
-    }
-
-    Err("nginx failed to start within timeout".into())
-}
-
-/// Stop nginx server if running
-fn stop_nginx() {
-    println!("Stopping nginx server...");
-
-    // Try graceful shutdown
-    let _ = Command::new("nginx").args(["-s", "quit"]).output();
-    sleep(Duration::from_millis(200));
-
-    let mut server = NGINX_SERVER.lock().unwrap();
-    if let Some(mut child) = server.take() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-
-    // Cleanup
-    let _ = Command::new("pkill").args(["-f", "nginx.*8080"]).output();
-    let _ = fs::remove_dir_all("/tmp/xylem-nginx-test");
-
-    println!("✓ nginx server stopped");
-}
-
-/// Test cleanup guard - stops nginx when dropped
-struct NginxGuard;
-
-impl Drop for NginxGuard {
-    fn drop(&mut self) {
-        stop_nginx();
-    }
-}
-
-/// Setup nginx for tests - returns a guard that will cleanup on drop
-fn setup_nginx() -> Result<NginxGuard, Box<dyn std::error::Error>> {
-    start_nginx()?;
-    Ok(NginxGuard)
-}
-
 #[test]
 #[ignore] // Run with: cargo test --test http_integration -- --ignored
 fn test_http_get_single_thread() {
-    let _guard = setup_nginx().expect("Failed to start nginx");
+    let _nginx = common::nginx::NginxGuard::new().expect("Failed to start nginx");
 
     println!("Running HTTP GET single-threaded test...");
 
@@ -272,7 +131,7 @@ fn test_http_get_single_thread() {
 #[test]
 #[ignore] // Run with: cargo test --test http_integration -- --ignored
 fn test_http_post_single_thread() {
-    let _guard = setup_nginx().expect("Failed to start nginx");
+    let _nginx = common::nginx::NginxGuard::new().expect("Failed to start nginx");
 
     println!("Running HTTP POST single-threaded test...");
 
@@ -326,7 +185,7 @@ fn test_http_post_single_thread() {
 #[test]
 #[ignore] // Run with: cargo test --test http_integration -- --ignored
 fn test_http_multi_thread() {
-    let _guard = setup_nginx().expect("Failed to start nginx");
+    let _nginx = common::nginx::NginxGuard::new().expect("Failed to start nginx");
 
     println!("Running HTTP multi-threaded test...");
 
@@ -403,7 +262,7 @@ fn test_http_multi_thread() {
 #[test]
 #[ignore] // Run with: cargo test --test http_integration -- --ignored
 fn test_http_rate_limited() {
-    let _guard = setup_nginx().expect("Failed to start nginx");
+    let _nginx = common::nginx::NginxGuard::new().expect("Failed to start nginx");
 
     println!("Running HTTP rate-limited test...");
 
@@ -459,7 +318,7 @@ fn test_http_rate_limited() {
 #[test]
 #[ignore] // Run with: cargo test --test http_integration -- --ignored
 fn test_http_put_request() {
-    let _guard = setup_nginx().expect("Failed to start nginx");
+    let _nginx = common::nginx::NginxGuard::new().expect("Failed to start nginx");
 
     println!("Running HTTP PUT test...");
 
@@ -508,7 +367,7 @@ fn test_http_put_request() {
 #[test]
 #[ignore] // Run with: cargo test --test http_integration -- --ignored
 fn test_http_pipelined() {
-    let _guard = setup_nginx().expect("Failed to start nginx");
+    let _nginx = common::nginx::NginxGuard::new().expect("Failed to start nginx");
 
     println!("Running HTTP pipelined test...");
 

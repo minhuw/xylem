@@ -22,7 +22,7 @@ use std::time::Duration;
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```text
 /// match protocol.parse_response(conn_id, data) {
 ///     Err(e) => {
 ///         if let Some(redirect) = is_redirect_error(&e) {
@@ -103,7 +103,7 @@ pub fn extract_redirect(error: &anyhow::Error) -> Option<(u16, SocketAddr)> {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```text
 /// use std::time::Duration;
 ///
 /// if is_topology_stale(&protocol, Duration::from_secs(60)) {
@@ -175,7 +175,7 @@ pub fn recommended_node_counts() -> Vec<usize> {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```text
 /// // 3-node cluster: 16384 / 3 = 5461 slots per node (+ 1 remainder to last node)
 /// assert_eq!(calculate_slot_range(0, 3), Some((0, 5460)));
 /// assert_eq!(calculate_slot_range(1, 3), Some((5461, 10921)));

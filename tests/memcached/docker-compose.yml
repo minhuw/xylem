@@ -1,0 +1,6 @@
+services:
+  memcached:
+    image: memcached:1-alpine
+    container_name: xylem-test-memcached
+    ports:
+      - "11211:11211"

@@ -2,18 +2,12 @@
 //!
 //! These tests demonstrate the pipelined worker with multiple outstanding requests.
 
-use std::process::{Child, Command};
-use std::sync::Mutex;
-use std::thread::sleep;
 use std::time::Duration;
 use xylem_core::threading::{Worker, WorkerConfig};
 use xylem_core::workload::{KeyGeneration, RateControl, RequestGenerator};
 use xylem_transport::TcpTransport;
 
 mod common;
-
-// Global state to track Redis server process
-static REDIS_SERVER: Mutex<Option<Child>> = Mutex::new(None);
 
 // Protocol adapter
 struct ProtocolAdapter<P: xylem_protocols::Protocol> {
@@ -55,74 +49,10 @@ impl<P: xylem_protocols::Protocol> xylem_core::threading::worker::Protocol for P
     }
 }
 
-fn check_redis_available() -> bool {
-    std::net::TcpStream::connect_timeout(&"127.0.0.1:6379".parse().unwrap(), Duration::from_secs(1))
-        .is_ok()
-}
-
-fn start_redis() -> Result<(), Box<dyn std::error::Error>> {
-    if check_redis_available() {
-        println!("✓ Redis already running on port 6379");
-        return Ok(());
-    }
-
-    println!("Starting Redis server...");
-
-    let _ = Command::new("pkill").args(["-f", "redis-server.*6379"]).output();
-    sleep(Duration::from_millis(100));
-
-    let child = Command::new("redis-server")
-        .args(["--port", "6379", "--save", "", "--appendonly", "no"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
-
-    *REDIS_SERVER.lock().unwrap() = Some(child);
-
-    for i in 0..30 {
-        sleep(Duration::from_millis(100));
-        if check_redis_available() {
-            println!("✓ Redis server ready after {}ms", (i + 1) * 100);
-            return Ok(());
-        }
-    }
-
-    Err("Redis failed to start within 3 seconds".into())
-}
-
-fn stop_redis() {
-    println!("Stopping Redis server...");
-    let _ = Command::new("redis-cli").args(["-p", "6379", "shutdown", "nosave"]).output();
-    sleep(Duration::from_millis(100));
-
-    if let Ok(mut guard) = REDIS_SERVER.lock() {
-        if let Some(mut child) = guard.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-
-    let _ = Command::new("pkill").args(["-f", "redis-server.*6379"]).output();
-    println!("✓ Redis server stopped");
-}
-
-struct RedisGuard;
-
-impl Drop for RedisGuard {
-    fn drop(&mut self) {
-        stop_redis();
-    }
-}
-
-fn setup_redis() -> Result<RedisGuard, Box<dyn std::error::Error>> {
-    start_redis()?;
-    Ok(RedisGuard)
-}
-
 #[test]
 #[ignore]
 fn test_redis_pipelined_single_connection() {
-    let _guard = setup_redis().expect("Failed to start Redis");
+    let _guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
     println!("Running pipelined test with 1 connection...");
 
@@ -176,7 +106,7 @@ fn test_redis_pipelined_single_connection() {
 #[test]
 #[ignore]
 fn test_redis_pipelined_multiple_connections() {
-    let _guard = setup_redis().expect("Failed to start Redis");
+    let _guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
     println!("Running pipelined test with 4 connections...");
 
@@ -230,7 +160,7 @@ fn test_redis_pipelined_multiple_connections() {
 #[test]
 #[ignore]
 fn test_redis_pipelined_rate_limited() {
-    let _guard = setup_redis().expect("Failed to start Redis");
+    let _guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
     println!("Running pipelined rate-limited test...");
 

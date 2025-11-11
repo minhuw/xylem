@@ -45,7 +45,7 @@ use std::net::SocketAddr;
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```text
 /// use xylem_protocols::redis::cluster::parse_cluster_slots;
 ///
 /// let response = b"*3\r\n*4\r\n:0\r\n:5460\r\n*3\r\n$9\r\n127.0.0.1\r\n:7000\r\n$40\r\n09a...\r\n...";

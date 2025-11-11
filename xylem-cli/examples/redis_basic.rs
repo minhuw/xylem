@@ -9,13 +9,14 @@
 //! ## Prerequisites
 //!
 //! - Redis server running on localhost:6379
-//!   Start with: `redis-server --port 6379`
+//!   Start with Docker: `docker run -d -p 6379:6379 redis:latest`
+//!   Or use: `docker compose -f tests/redis/docker-compose.yml up -d`
 //!
 //! ## Running
 //!
 //! ```bash
 //! # Make sure Redis is running first
-//! redis-server --port 6379 &
+//! docker run -d -p 6379:6379 redis:latest
 //!
 //! # Run the example
 //! cargo run --example redis_basic
@@ -80,8 +81,8 @@ fn main() -> anyhow::Result<()> {
         Ok(_) => println!("✓ Redis is available on 127.0.0.1:6379\n"),
         Err(_) => {
             eprintln!("❌ Error: Redis is not running on 127.0.0.1:6379");
-            eprintln!("\nPlease start Redis with:");
-            eprintln!("  redis-server --port 6379");
+            eprintln!("\nPlease start Redis with Docker:");
+            eprintln!("  docker run -d -p 6379:6379 redis:latest");
             eprintln!("\nOr use the just command:");
             eprintln!("  just redis-start");
             std::process::exit(1);

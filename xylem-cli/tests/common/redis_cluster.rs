@@ -69,8 +69,6 @@ impl RedisClusterGuard {
             return Err(format!("docker-compose.yml not found at {:?}", compose_file).into());
         }
 
-        println!("Starting Redis Cluster via docker-compose...");
-
         // Start cluster using docker-compose up -d
         let mut cmd = Command::new(compose_cmd[0]);
         if compose_cmd.len() > 1 {
@@ -78,36 +76,24 @@ impl RedisClusterGuard {
         }
         let status = cmd
             .args(["-f", compose_file.to_str().unwrap(), "up", "-d"])
-            .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status()?;
 
         if !status.success() {
             return Err("Failed to start Redis Cluster with docker-compose".into());
         }
 
-        println!("Waiting for cluster to initialize...");
         thread::sleep(Duration::from_secs(10));
 
         // Verify cluster is ready
-        println!("Verifying cluster status...");
-        for i in 0..30 {
+        for _ in 0..30 {
             if Self::is_cluster_ready() {
-                println!("✓ Redis Cluster is ready after {} seconds", i + 10);
-                println!();
-                println!("Cluster nodes:");
-                println!("  - 127.0.0.1:7000 (slots 0-5460)");
-                println!("  - 127.0.0.1:7001 (slots 5461-10922)");
-                println!("  - 127.0.0.1:7002 (slots 10923-16383)");
-                println!();
                 return Ok(Self { started: true, compose_file });
             }
-            print!(".");
-            std::io::Write::flush(&mut std::io::stdout()).ok();
             thread::sleep(Duration::from_secs(1));
         }
 
-        println!();
         Err("Cluster failed to become ready within 30 seconds".into())
     }
 
@@ -152,8 +138,6 @@ impl RedisClusterGuard {
 impl Drop for RedisClusterGuard {
     fn drop(&mut self) {
         if self.started {
-            println!("Cleaning up Redis Cluster...");
-
             // Determine compose command (docker-compose or docker compose)
             let compose_cmd = if Command::new("docker-compose")
                 .arg("version")
@@ -177,8 +161,6 @@ impl Drop for RedisClusterGuard {
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status();
-
-            println!("Cluster stopped and cleaned up");
         }
     }
 }
@@ -252,27 +234,5 @@ fn get_node_id(port: u16) -> Result<String, Box<dyn std::error::Error>> {
     Ok(String::from_utf8(output.stdout)?.trim().to_string())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    #[ignore] // Requires Docker
-    fn test_cluster_guard_lifecycle() {
-        // Start cluster
-        let cluster = RedisClusterGuard::new().expect("Failed to start cluster");
-
-        // Verify we can get node info
-        assert_eq!(cluster.get_node_ports(), vec![7000, 7001, 7002]);
-        assert_eq!(cluster.get_seed_node(), "127.0.0.1:7000");
-
-        // Verify slot assignments
-        let assignments = cluster.get_slot_assignments();
-        assert_eq!(assignments.len(), 3);
-        assert_eq!(assignments[0], (0, 5460, 7000));
-        assert_eq!(assignments[1], (5461, 10922, 7001));
-        assert_eq!(assignments[2], (10923, 16383, 7002));
-
-        // Cluster will be cleaned up on drop
-    }
-}
+// Guard lifecycle tests moved to tests/guard_lifecycle.rs to avoid
+// duplicate container starts when multiple test binaries run in parallel

@@ -50,6 +50,8 @@ pub struct Connection<T: Transport, ReqId: Eq + Hash + Clone> {
     policy: Box<dyn Policy>,
     /// Traffic group ID this connection belongs to
     group_id: usize,
+    /// Timestamp (in nanoseconds) when this connection was last used for sending (for round-robin fairness)
+    last_active: u64,
 }
 
 impl<T: Transport, ReqId: Eq + Hash + Clone + std::fmt::Debug> Connection<T, ReqId> {
@@ -83,6 +85,7 @@ impl<T: Transport, ReqId: Eq + Hash + Clone + std::fmt::Debug> Connection<T, Req
             closed: false,
             policy,
             group_id,
+            last_active: 0,
         })
     }
 
@@ -410,29 +413,54 @@ impl<T: Transport, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionPool<T,
         Ok(Self { connections })
     }
 
-    /// Pick the next ready connection using temporal scheduling
+    /// Pick the next ready connection using temporal scheduling with round-robin fairness
     ///
     /// Queries each connection for its next send time and picks the one that's ready soonest.
-    /// Uses a min-heap for efficient O(log n) scheduling.
+    /// For closed-loop connections (None), uses least-recently-used to ensure fairness.
     ///
     /// # Returns
     /// - `Some(conn)`: The connection that's ready to send
     /// - `None`: No connection is ready yet
     pub fn pick_connection(&mut self) -> Option<&mut Connection<T, ReqId>> {
         let current_time_ns = crate::timing::time_ns();
-        let mut temporal_scheduler = crate::scheduler::TemporalScheduler::new();
 
-        // Build heap: query each connection for its next send time
+        // Collect candidate connections with their ready times
+        let mut timed_conns = Vec::new();
+        let mut closed_loop_conns = Vec::new();
+
         for conn in &mut self.connections {
-            if conn.can_send() {
-                let next_time = conn.next_send_time(current_time_ns);
-                temporal_scheduler.update_connection(conn.idx(), next_time);
+            if !conn.can_send() {
+                continue;
+            }
+
+            match conn.next_send_time(current_time_ns) {
+                None => closed_loop_conns.push(conn.idx()),
+                Some(ready_time) if ready_time <= current_time_ns => {
+                    timed_conns.push((ready_time, conn.idx()));
+                }
+                Some(_) => {} // Not ready yet
             }
         }
 
-        // Pick the connection that is ready soonest
-        if let Some(conn_idx) = temporal_scheduler.pick_ready_connection(current_time_ns) {
-            Some(&mut self.connections[conn_idx])
+        // Priority: closed-loop connections (least recently used), then earliest timed connection
+        let chosen_idx = if !closed_loop_conns.is_empty() {
+            // Pick the least recently used connection for fairness
+            closed_loop_conns
+                .iter()
+                .min_by_key(|&&idx| self.connections[idx].last_active)
+                .copied()
+        } else if !timed_conns.is_empty() {
+            // Pick connection with earliest ready time
+            timed_conns.sort_by_key(|(time, _)| *time);
+            Some(timed_conns[0].1)
+        } else {
+            None
+        };
+
+        // Update last_active timestamp for the chosen connection
+        if let Some(idx) = chosen_idx {
+            self.connections[idx].last_active = current_time_ns;
+            Some(&mut self.connections[idx])
         } else {
             None
         }

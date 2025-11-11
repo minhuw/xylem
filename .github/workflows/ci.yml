@@ -28,8 +28,21 @@ jobs:
       - name: Run tests
         run: nix develop --command cargo test --verbose --workspace
 
+      - name: Install redis-cli for integration tests
+        run: sudo apt-get update && sudo apt-get install -y redis-tools
+
+      - name: Verify Docker is available
+        run: docker --version && docker compose version
+
       - name: Run integration tests
         run: nix develop --command cargo test --tests -- --ignored --test-threads=1 --nocapture
+
+      - name: Cleanup Docker containers
+        if: always()
+        run: |
+          docker ps -aq --filter name=xylem-test | xargs -r docker rm -f || true
+          docker ps -aq --filter name=redis-cluster | xargs -r docker rm -f || true
+          docker network prune -f || true
 
       - name: Check documentation
         run: nix develop --command cargo doc --no-deps --workspace

@@ -1,10 +1,8 @@
 //! Integration tests for Memcached protocols
 //!
-//! These tests automatically start and stop a Memcached server for testing.
+//! These tests use Docker Compose to manage a Memcached server for testing.
+//! Docker is required to run these tests.
 
-use std::process::{Child, Command};
-use std::sync::Mutex;
-use std::thread::sleep;
 use std::time::Duration;
 use xylem_core::stats::GroupStatsCollector;
 use xylem_core::threading::{ThreadingRuntime, Worker, WorkerConfig};
@@ -12,9 +10,6 @@ use xylem_core::workload::{KeyGeneration, RateControl, RequestGenerator};
 use xylem_transport::TcpTransport;
 
 mod common;
-
-// Global state to track Memcached server process
-static MEMCACHED_SERVER: Mutex<Option<Child>> = Mutex::new(None);
 
 // Protocol adapter to bridge xylem_protocols::Protocol with worker Protocol trait
 struct ProtocolAdapter<P: xylem_protocols::Protocol> {
@@ -56,69 +51,11 @@ impl<P: xylem_protocols::Protocol> xylem_core::threading::worker::Protocol for P
     }
 }
 
-/// Helper to check if Memcached is available
-fn check_memcached_available() -> bool {
-    std::net::TcpStream::connect_timeout(
-        &"127.0.0.1:11211".parse().unwrap(),
-        Duration::from_secs(1),
-    )
-    .is_ok()
-}
-
-/// Start Memcached server if not already running
-fn start_memcached() -> Result<(), Box<dyn std::error::Error>> {
-    if check_memcached_available() {
-        println!("✓ Memcached already running on port 11211");
-        return Ok(());
-    }
-
-    println!("Starting Memcached server on port 11211...");
-
-    let child = Command::new("memcached")
-        .args([
-            "-p", "11211", // Port
-            "-m", "64", // 64MB memory
-            "-c", "1024", // Max connections
-            "-vv",  // Very verbose
-        ])
-        .spawn()?;
-
-    // Store the child process
-    let mut server = MEMCACHED_SERVER.lock().unwrap();
-    *server = Some(child);
-
-    // Wait for server to be ready
-    for _ in 0..30 {
-        sleep(Duration::from_millis(100));
-        if check_memcached_available() {
-            println!("✓ Memcached started successfully");
-            return Ok(());
-        }
-    }
-
-    Err("Memcached failed to start within timeout".into())
-}
-
-/// Stop Memcached server if running
-fn stop_memcached() {
-    let mut server = MEMCACHED_SERVER.lock().unwrap();
-    if let Some(mut child) = server.take() {
-        let _ = child.kill();
-        let _ = child.wait();
-        println!("✓ Memcached server stopped");
-    }
-}
-
-/// Setup function to ensure Memcached is running
-fn setup() -> Result<(), Box<dyn std::error::Error>> {
-    start_memcached()
-}
-
 /// Test Memcached Binary protocol with single thread
 #[test]
 #[ignore] // Run with: cargo test --test memcached_integration -- --ignored
 fn test_memcached_binary_single_thread() {
-    setup().expect("Failed to start Memcached");
+    let _memcached = common::memcached::MemcachedGuard::new().expect("Failed to start Memcached");
 
     let runtime = ThreadingRuntime::new(1);
     let target_addr = "127.0.0.1:11211".parse().unwrap();
@@ -171,7 +108,7 @@ fn test_memcached_binary_single_thread() {
 #[test]
 #[ignore] // Run with: cargo test --test memcached_integration -- --ignored
 fn test_memcached_ascii_single_thread() {
-    setup().expect("Failed to start Memcached");
+    let _memcached = common::memcached::MemcachedGuard::new().expect("Failed to start Memcached");
 
     let runtime = ThreadingRuntime::new(1);
     let target_addr = "127.0.0.1:11211".parse().unwrap();
@@ -224,7 +161,7 @@ fn test_memcached_ascii_single_thread() {
 #[test]
 #[ignore] // Run with: cargo test --test memcached_integration -- --ignored
 fn test_memcached_binary_multi_thread() {
-    setup().expect("Failed to start Memcached");
+    let _memcached = common::memcached::MemcachedGuard::new().expect("Failed to start Memcached");
 
     let runtime = ThreadingRuntime::new(4);
     let target_addr = "127.0.0.1:11211".parse().unwrap();
@@ -280,7 +217,7 @@ fn test_memcached_binary_multi_thread() {
 #[test]
 #[ignore] // Run with: cargo test --test memcached_integration -- --ignored
 fn test_memcached_ascii_rate_limited() {
-    setup().expect("Failed to start Memcached");
+    let _memcached = common::memcached::MemcachedGuard::new().expect("Failed to start Memcached");
 
     let runtime = ThreadingRuntime::new(1);
     let target_addr = "127.0.0.1:11211".parse().unwrap();
@@ -328,10 +265,4 @@ fn test_memcached_ascii_rate_limited() {
     // Allow 10% deviation from target rate
     let rate_error = (actual_rate - target_rate).abs() / target_rate;
     assert!(rate_error < 0.10, "Rate error should be < 10%, got {:.1}%", rate_error * 100.0);
-}
-
-/// Cleanup function
-#[test]
-fn cleanup() {
-    stop_memcached();
 }

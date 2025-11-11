@@ -113,6 +113,18 @@ impl Transport for TcpTransport {
 
                 // Copy data from buffer
                 let data = self.recv_buffer[..n].to_vec();
+
+                // For edge-triggered epoll, we must read until WouldBlock to reset the trigger.
+                // Drain any remaining data in the socket buffer.
+                loop {
+                    let mut dummy = [0u8; 1024];
+                    match stream.read(&mut dummy) {
+                        Ok(0) => break,    // Connection closed
+                        Ok(_) => continue, // More data - keep draining
+                        Err(_) => break,   // Error or WouldBlock - done draining
+                    }
+                }
+
                 Ok((data, timestamp))
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -126,8 +138,9 @@ impl Transport for TcpTransport {
     fn poll_readable(&mut self) -> Result<bool> {
         let mut events = Events::with_capacity(1);
 
-        // Zero timeout - return immediately
-        self.poll.poll(&mut events, Some(Duration::ZERO))?;
+        // Use 1 microsecond timeout to force actual poll
+        // Duration::ZERO might return cached state with edge-triggered epoll
+        self.poll.poll(&mut events, Some(Duration::from_micros(1)))?;
 
         Ok(!events.is_empty())
     }

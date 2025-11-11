@@ -4,16 +4,18 @@
 
 #![allow(dead_code)]
 
+// Docker-based service guards
+pub mod memcached;
+pub mod multi_protocol;
+pub mod nginx;
+pub mod redis;
 pub mod redis_cluster;
 
 use std::net::{TcpListener, UdpSocket};
 use std::process::{Child, Command};
-use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 use xylem_core::stats::GroupStatsCollector;
-
-static REDIS_PORT: Mutex<Option<u16>> = Mutex::new(None);
 
 /// Get an available port from the OS
 pub fn get_available_port() -> u16 {
@@ -23,84 +25,6 @@ pub fn get_available_port() -> u16 {
     drop(listener); // Close immediately so port becomes available
     thread::sleep(Duration::from_millis(10)); // Small delay to ensure port is released
     port
-}
-
-/// Guard for Redis server that ensures cleanup
-pub struct RedisServerGuard {
-    process: Option<Child>,
-    port: u16,
-}
-
-impl RedisServerGuard {
-    pub fn port(&self) -> u16 {
-        self.port
-    }
-}
-
-impl Drop for RedisServerGuard {
-    fn drop(&mut self) {
-        if let Some(mut process) = self.process.take() {
-            let _ = process.kill();
-            let _ = process.wait();
-        }
-    }
-}
-
-/// Start Redis server on an available port
-pub fn start_redis() -> Result<RedisServerGuard, Box<dyn std::error::Error>> {
-    // Check if we already have a Redis server running
-    if let Ok(mut guard) = REDIS_PORT.lock() {
-        if let Some(port) = *guard {
-            // Check if it's still alive
-            if std::net::TcpStream::connect_timeout(
-                &format!("127.0.0.1:{}", port).parse().unwrap(),
-                Duration::from_millis(100),
-            )
-            .is_ok()
-            {
-                return Ok(RedisServerGuard { process: None, port });
-            }
-        }
-
-        // Start new Redis server
-        let port = get_available_port();
-
-        let mut process = Command::new("redis-server")
-            .arg("--port")
-            .arg(port.to_string())
-            .arg("--save")
-            .arg("")
-            .arg("--appendonly")
-            .arg("no")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()?;
-
-        // Wait for Redis to be ready
-        for _ in 0..50 {
-            thread::sleep(Duration::from_millis(100));
-
-            if std::net::TcpStream::connect_timeout(
-                &format!("127.0.0.1:{}", port).parse().unwrap(),
-                Duration::from_millis(100),
-            )
-            .is_ok()
-            {
-                *guard = Some(port);
-                return Ok(RedisServerGuard { process: Some(process), port });
-            }
-
-            // Check if process died
-            if let Ok(Some(_)) = process.try_wait() {
-                return Err("Redis server died immediately".into());
-            }
-        }
-
-        let _ = process.kill();
-        Err("Redis server failed to start within timeout".into())
-    } else {
-        Err("Failed to acquire Redis port lock".into())
-    }
 }
 
 /// Guard for Echo server that ensures cleanup

@@ -41,6 +41,13 @@ test-integration:
     @echo "This will take around 30-60 seconds..."
     RUST_LOG=error cargo test --workspace -- --ignored --test-threads=1
 
+# Clean up test Docker containers
+test-cleanup:
+    @echo "🧹 Cleaning up test containers..."
+    @docker ps -aq --filter name=xylem-test | xargs -r docker rm -f || true
+    @docker ps -aq --filter name=redis-cluster | xargs -r docker rm -f || true
+    @echo "✅ Test containers cleaned up"
+
 # Run only Redis integration tests
 test-redis:
     @echo "🎯 Running Redis integration tests..."
@@ -52,11 +59,8 @@ test-memcached:
     RUST_LOG=error cargo test --test memcached_integration -- --ignored --nocapture
 
 # Run scheduler integration tests (these run by default)
-# Note: Requires Redis to be running
-# If tests fail, try: just redis-start first
 test-scheduler:
     @echo "⚙️  Running scheduler integration tests..."
-    @echo "Make sure Redis is running (use: just redis-status)"
     RUST_LOG=error cargo test --test scheduler_round_robin -- --nocapture --test-threads=1
 
 # Run rate accuracy tests (timing-sensitive, takes longer)
@@ -146,30 +150,30 @@ bench-full:
     @echo "⚡ Running full benchmark..."
     cargo run --release --bin {{BINARY_NAME}} -- -z "127.0.0.1:6379" -n 100000 -c 4 -t 2
 
-# Start Redis server (if not running)
+# Start Redis server using Docker
 redis-start:
-    @echo "🎯 Starting Redis server on port {{DEFAULT_REDIS_PORT}}..."
-    @redis-server --port {{DEFAULT_REDIS_PORT}} --save '' --appendonly no &
-    @sleep 1
+    @echo "🎯 Starting Redis server on port {{DEFAULT_REDIS_PORT}} (Docker)..."
+    @docker compose -f tests/redis/docker-compose.yml up -d
+    @sleep 2
     @echo "✅ Redis started"
 
 # Stop Redis server
 redis-stop:
     @echo "🛑 Stopping Redis server..."
-    @redis-cli -p {{DEFAULT_REDIS_PORT}} shutdown || true
+    @docker compose -f tests/redis/docker-compose.yml down -v
     @echo "✅ Redis stopped"
 
-# Start Memcached server (if not running)
+# Start Memcached server using Docker
 memcached-start:
-    @echo "🎯 Starting Memcached server on port {{DEFAULT_MEMCACHED_PORT}}..."
-    @memcached -p {{DEFAULT_MEMCACHED_PORT}} -m 64 &
-    @sleep 1
+    @echo "🎯 Starting Memcached server on port {{DEFAULT_MEMCACHED_PORT}} (Docker)..."
+    @docker compose -f tests/memcached/docker-compose.yml up -d
+    @sleep 2
     @echo "✅ Memcached started"
 
 # Stop Memcached server
 memcached-stop:
     @echo "🛑 Stopping Memcached server..."
-    @killall memcached || true
+    @docker compose -f tests/memcached/docker-compose.yml down -v
     @echo "✅ Memcached stopped"
 
 # Start both Redis and Memcached for testing
@@ -187,9 +191,9 @@ servers-restart: servers-stop servers-start
 servers-status:
     @echo "📊 Checking server status..."
     @echo "Redis (port {{DEFAULT_REDIS_PORT}}):"
-    @redis-cli -p {{DEFAULT_REDIS_PORT}} ping 2>/dev/null || echo "   ❌ Not running"
+    @docker ps --filter name=xylem-test-redis --format "{{{{.Status}}}}" | grep -q "Up" && echo "   ✅ Running" || echo "   ❌ Not running"
     @echo "Memcached (port {{DEFAULT_MEMCACHED_PORT}}):"
-    @echo "stats" | nc localhost {{DEFAULT_MEMCACHED_PORT}} | head -1 || echo "   ❌ Not running"
+    @docker ps --filter name=xylem-test-memcached --format "{{{{.Status}}}}" | grep -q "Up" && echo "   ✅ Running" || echo "   ❌ Not running"
 
 # Test release build with current Git commit as version
 test-release:

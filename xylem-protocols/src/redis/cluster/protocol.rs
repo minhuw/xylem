@@ -50,7 +50,7 @@ struct RequestMetadata {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```text
 /// use xylem_protocols::redis::cluster::RedisClusterProtocol;
 ///
 /// let mut protocol = RedisClusterProtocol::new(command_selector)?;
@@ -101,7 +101,7 @@ impl RedisClusterProtocol {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```text
     /// use xylem_protocols::redis::cluster::RedisClusterProtocol;
     /// use xylem_protocols::FixedCommandSelector;
     /// use xylem_protocols::RedisOp;
@@ -134,7 +134,7 @@ impl RedisClusterProtocol {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```text
     /// protocol.register_connection("127.0.0.1:7000".parse()?, 0);
     /// protocol.register_connection("127.0.0.1:7001".parse()?, 1);
     /// ```
@@ -156,7 +156,7 @@ impl RedisClusterProtocol {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```text
     /// use xylem_protocols::ClusterTopology;
     ///
     /// let topology = ClusterTopology::from_slot_ranges(ranges);

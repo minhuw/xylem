@@ -38,22 +38,25 @@ fn test_cluster_topology_discovery() {
 
     let response = String::from_utf8_lossy(&output.stdout);
 
-    // Verify we have 3 slot ranges
-    // Expected output format:
-    // 1) 1) (integer) 0
-    //    2) (integer) 5460
-    //    3) 1) "172.28.0.101"
-    //       2) (integer) 7000
-    //       ...
-    // 2) ...
-    // 3) ...
+    // Verify we have 3 slot ranges by checking for the expected start slots
+    // The output format from redis-cli is line-based with values:
+    // start_slot
+    // end_slot
+    // host
+    // port
+    // node_id
+    // (repeat for each range)
 
-    // Count the number of slot range entries
-    let range_count = response.matches("(integer) 0\n").count()
-        + response.matches("(integer) 5461\n").count()
-        + response.matches("(integer) 10923\n").count();
+    // Look for the three expected start slots
+    let has_range_1 = response.lines().any(|line| line.trim() == "0");
+    let has_range_2 = response.lines().any(|line| line.trim() == "5461");
+    let has_range_3 = response.lines().any(|line| line.trim() == "10923");
 
-    assert!(range_count >= 3, "Expected 3 slot ranges, found evidence of {}", range_count);
+    assert!(
+        has_range_1 && has_range_2 && has_range_3,
+        "Expected 3 slot ranges (0, 5461, 10923), got output:\n{}",
+        response
+    );
 }
 
 #[test]
@@ -146,14 +149,18 @@ fn test_moved_redirect_response() {
         .output()
         .expect("Failed to GET key");
 
-    let response = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
 
     // Should get a MOVED redirect error
     // Format: "MOVED 14788 172.28.0.103:7002" or "MOVED 14788 127.0.0.1:7002"
+    // redis-cli outputs MOVED redirects to stdout
+    let combined = format!("{}{}", stdout, stderr);
     assert!(
-        response.contains("MOVED") || response.contains("moved"),
-        "Expected MOVED redirect, got: {}",
-        response
+        combined.contains("MOVED") || combined.contains("moved"),
+        "Expected MOVED redirect, got stdout: '{}', stderr: '{}'",
+        stdout,
+        stderr
     );
 }
 

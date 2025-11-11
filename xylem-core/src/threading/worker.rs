@@ -310,10 +310,14 @@ impl<T: Transport, P: Protocol> Worker<T, P> {
         let mut retries: Vec<(usize, RetryRequest<_>)> = Vec::new();
 
         for conn in self.pool.connections_mut() {
-            if !conn.poll_readable()? {
+            // Skip connections with no pending requests
+            if conn.pending_count() == 0 {
                 continue;
             }
 
+            if !conn.poll_readable()? {
+                continue;
+            }
             let conn_id = conn.idx();
             let group_id = conn.group_id();
 
@@ -324,7 +328,7 @@ impl<T: Transport, P: Protocol> Worker<T, P> {
             // Use extended parse to support retries
             let mut conn_retries = Vec::new();
 
-            let latencies = conn.recv_responses(|data| {
+            let latencies = match conn.recv_responses(|data| {
                 let result = protocol.parse_response_extended(conn_id, data);
                 match result {
                     Ok(ParseResult::Complete { bytes_consumed, request_id }) => {
@@ -345,7 +349,19 @@ impl<T: Transport, P: Protocol> Worker<T, P> {
                     }
                     Err(e) => Err(e.into()),
                 }
-            })?;
+            }) {
+                Ok(latencies) => latencies,
+                Err(e) => {
+                    // Handle connection errors gracefully
+                    if let crate::Error::Connection(_) = e {
+                        // Connection closed - mark it and continue
+                        let _ = conn.close();
+                        continue;
+                    }
+                    // Other errors are fatal
+                    return Err(e);
+                }
+            };
 
             // Record all latencies with group_id
             for (_req_id, latency) in latencies {

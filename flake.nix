@@ -58,9 +58,6 @@
 
             # Testing and benchmarking
             pkgs.hyperfine
-            pkgs.redis # For integration tests
-            pkgs.memcached # For integration tests
-            pkgs.nginx # For HTTP integration tests
 
             # Profiling
             pkgs.linuxPackages.perf # For flamegraph on Linux
@@ -85,12 +82,14 @@
             echo "Available commands:"
             echo "  cargo build                    - Build the project"
             echo "  cargo test                     - Run tests"
+            echo "  cargo test -- --ignored        - Run integration tests (requires Docker)"
             echo "  cargo clippy                   - Run linter"
             echo "  cargo fmt                      - Format code"
             echo "  cargo flamegraph --profile profiling -- <args>  - Profile with flamegraph"
             echo "  pre-commit install             - Install git hooks"
             echo "  bacon                          - Watch and build"
             echo ""
+            echo "⚠️  Integration tests require Docker to be installed and running"
             echo "See PROFILING.md for profiling guide"
             echo ""
 

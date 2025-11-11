@@ -3,18 +3,12 @@
 //! These tests verify that open-loop rate control achieves the target rate accurately
 //! across different configurations and rate targets.
 
-use std::process::{Child, Command};
-use std::sync::Mutex;
-use std::thread::sleep;
 use std::time::Duration;
 use xylem_core::threading::{Worker, WorkerConfig};
 use xylem_core::workload::{KeyGeneration, RateControl, RequestGenerator};
 use xylem_transport::TcpTransport;
 
 mod common;
-
-// Global Redis server state
-static REDIS_SERVER: Mutex<Option<Child>> = Mutex::new(None);
 
 // Protocol adapter
 struct ProtocolAdapter<P: xylem_protocols::Protocol> {
@@ -56,69 +50,6 @@ impl<P: xylem_protocols::Protocol> xylem_core::threading::worker::Protocol for P
     }
 }
 
-fn check_redis_available() -> bool {
-    std::net::TcpStream::connect_timeout(&"127.0.0.1:6379".parse().unwrap(), Duration::from_secs(1))
-        .is_ok()
-}
-
-fn start_redis() -> Result<(), Box<dyn std::error::Error>> {
-    if check_redis_available() {
-        println!("✓ Redis already running on port 6379");
-        return Ok(());
-    }
-
-    println!("Starting Redis server...");
-    let _ = Command::new("pkill").args(["-f", "redis-server.*6379"]).output();
-    sleep(Duration::from_millis(100));
-
-    let child = Command::new("redis-server")
-        .args(["--port", "6379", "--save", "", "--appendonly", "no"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
-
-    *REDIS_SERVER.lock().unwrap() = Some(child);
-
-    for i in 0..30 {
-        sleep(Duration::from_millis(100));
-        if check_redis_available() {
-            println!("✓ Redis server ready after {}ms", (i + 1) * 100);
-            return Ok(());
-        }
-    }
-
-    Err("Redis failed to start within 3 seconds".into())
-}
-
-fn stop_redis() {
-    println!("Stopping Redis server...");
-    let _ = Command::new("redis-cli").args(["-p", "6379", "shutdown", "nosave"]).output();
-    sleep(Duration::from_millis(100));
-
-    if let Ok(mut guard) = REDIS_SERVER.lock() {
-        if let Some(mut child) = guard.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-
-    let _ = Command::new("pkill").args(["-f", "redis-server.*6379"]).output();
-    println!("✓ Redis server stopped");
-}
-
-struct RedisGuard;
-
-impl Drop for RedisGuard {
-    fn drop(&mut self) {
-        stop_redis();
-    }
-}
-
-fn setup_redis() -> Result<RedisGuard, Box<dyn std::error::Error>> {
-    start_redis()?;
-    Ok(RedisGuard)
-}
-
 /// Run a rate-limited experiment and return (target_rate, actual_rate, error_percent)
 fn run_rate_experiment(target_rate: f64, duration_secs: u64, conn_count: usize) -> (f64, f64, f64) {
     let target_addr = "127.0.0.1:6379".parse().unwrap();
@@ -158,7 +89,7 @@ fn run_rate_experiment(target_rate: f64, duration_secs: u64, conn_count: usize) 
 #[test]
 #[ignore]
 fn test_rate_accuracy_low_rate() {
-    let _guard = setup_redis().expect("Failed to start Redis");
+    let _guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
     println!("\n=== Testing Low Rate (100 req/s) ===");
     let (target, actual, error) = run_rate_experiment(100.0, 5, 1);
@@ -178,7 +109,7 @@ fn test_rate_accuracy_low_rate() {
 #[test]
 #[ignore]
 fn test_rate_accuracy_medium_rate() {
-    let _guard = setup_redis().expect("Failed to start Redis");
+    let _guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
     println!("\n=== Testing Medium Rate (1000 req/s) ===");
     let (target, actual, error) = run_rate_experiment(1000.0, 5, 1);
@@ -198,7 +129,7 @@ fn test_rate_accuracy_medium_rate() {
 #[test]
 #[ignore]
 fn test_rate_accuracy_high_rate() {
-    let _guard = setup_redis().expect("Failed to start Redis");
+    let _guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
     println!("\n=== Testing High Rate (10000 req/s) ===");
     let (target, actual, error) = run_rate_experiment(10000.0, 5, 2);
@@ -219,7 +150,7 @@ fn test_rate_accuracy_high_rate() {
 #[test]
 #[ignore]
 fn test_rate_accuracy_very_high_rate() {
-    let _guard = setup_redis().expect("Failed to start Redis");
+    let _guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
     println!("\n=== Testing Very High Rate (50000 req/s) ===");
     let (target, actual, error) = run_rate_experiment(50000.0, 5, 4);
@@ -237,7 +168,7 @@ fn test_rate_accuracy_very_high_rate() {
 #[test]
 #[ignore]
 fn test_rate_sweep() {
-    let _guard = setup_redis().expect("Failed to start Redis");
+    let _guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
     println!("\n=== Rate Accuracy Sweep ===");
     println!(
@@ -285,7 +216,7 @@ fn test_rate_sweep() {
 #[test]
 #[ignore]
 fn test_rate_consistency() {
-    let _guard = setup_redis().expect("Failed to start Redis");
+    let _guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
     println!("\n=== Testing Rate Consistency (5 runs at 1000 req/s) ===");
 
@@ -317,7 +248,7 @@ fn test_rate_consistency() {
 #[test]
 #[ignore]
 fn test_rate_with_multiple_connections() {
-    let _guard = setup_redis().expect("Failed to start Redis");
+    let _guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
     println!("\n=== Testing Rate Control with Multiple Connections ===");
 
@@ -347,7 +278,7 @@ fn test_rate_with_multiple_connections() {
 #[test]
 #[ignore]
 fn test_rate_vs_throughput_saturation() {
-    let _guard = setup_redis().expect("Failed to start Redis");
+    let _guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
     println!("\n=== Testing Rate vs Throughput Saturation ===");
     println!("Finding maximum achievable throughput...\n");
