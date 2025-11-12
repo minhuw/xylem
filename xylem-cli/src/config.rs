@@ -91,6 +91,9 @@ pub struct WorkloadConfig {
     /// Operations/command configuration (optional, defaults to GET for redis)
     #[serde(default)]
     pub operations: Option<OperationsConfig>,
+    /// Data import configuration (optional, for testing with real data)
+    #[serde(default)]
+    pub data_import: Option<DataImportConfig>,
 }
 
 /// Key generation configuration (SPATIAL level)
@@ -248,6 +251,9 @@ pub struct CommandWeightConfig {
     /// Additional parameters for specific commands
     #[serde(flatten)]
     pub params: Option<CommandParams>,
+    /// Optional per-command key distribution (overrides workload.keys for this command)
+    #[serde(default)]
+    pub keys: Option<KeysConfig>,
 }
 
 /// Additional parameters for specific command types
@@ -260,6 +266,35 @@ pub enum CommandParams {
     Wait { num_replicas: usize, timeout_ms: u64 },
     /// Custom command template
     Custom { template: String },
+}
+
+/// Data import configuration
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct DataImportConfig {
+    /// Path to CSV file containing test data
+    pub file: PathBuf,
+    /// Verification mode
+    #[serde(default)]
+    pub verification: Option<VerificationConfig>,
+}
+
+/// Verification configuration
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct VerificationConfig {
+    /// When to verify: "during" (sample during test), "after" (verify all after test), "only" (no load, just verify)
+    #[serde(default = "default_verification_mode")]
+    pub mode: String,
+    /// Sample rate for "during" mode (0.0-1.0, default 0.1 = 10%)
+    #[serde(default = "default_sample_rate")]
+    pub sample_rate: f64,
+}
+
+fn default_verification_mode() -> String {
+    "after".to_string()
+}
+
+fn default_sample_rate() -> f64 {
+    0.1
 }
 
 /// Output configuration
@@ -831,6 +866,25 @@ impl CommandValueSizeConfig {
 }
 
 impl OperationsConfig {
+    /// Helper: Process a command with per-command keys
+    fn process_command_with_keys(
+        cmd_cfg: &CommandWeightConfig,
+        master_seed: Option<u64>,
+    ) -> anyhow::Result<(xylem_protocols::RedisOp, Box<dyn xylem_protocols::KeyGenerator>)> {
+        let op = Self::parse_redis_op(&cmd_cfg.name, cmd_cfg.params.as_ref())?;
+
+        if let Some(ref keys_config) = cmd_cfg.keys {
+            let key_gen = keys_config.to_key_generation(master_seed)?;
+            Ok((op, Box::new(key_gen) as Box<dyn xylem_protocols::KeyGenerator>))
+        } else {
+            anyhow::bail!(
+                "When using per-command keys, all commands must specify 'keys'. \
+                 Command '{}' is missing keys configuration.",
+                cmd_cfg.name
+            )
+        }
+    }
+
     /// Convert to a Redis CommandSelector
     pub fn to_redis_selector(
         &self,
@@ -845,13 +899,37 @@ impl OperationsConfig {
                 Ok(Box::new(FixedCommandSelector::new(op)))
             }
             Self::Weighted { commands } => {
-                let mut weighted_ops = Vec::new();
-                for cmd_cfg in commands {
-                    let op = Self::parse_redis_op(&cmd_cfg.name, cmd_cfg.params.as_ref())?;
-                    weighted_ops.push((op, cmd_cfg.weight));
+                // Check if any command has per-command keys
+                let has_per_command_keys = commands.iter().any(|cmd| cmd.keys.is_some());
+
+                if has_per_command_keys {
+                    // Create selector with per-command key generators
+                    let mut weighted_ops = Vec::new();
+                    let mut key_generators: Vec<Box<dyn xylem_protocols::KeyGenerator>> =
+                        Vec::new();
+
+                    for cmd_cfg in commands {
+                        let (op, key_gen) = Self::process_command_with_keys(cmd_cfg, master_seed)?;
+                        weighted_ops.push((op, cmd_cfg.weight));
+                        key_generators.push(key_gen);
+                    }
+
+                    let seed = master_seed.map(|s| derive_seed(s, "command_selector"));
+                    Ok(Box::new(WeightedCommandSelector::with_per_command_keys(
+                        weighted_ops,
+                        key_generators,
+                        seed,
+                    )?))
+                } else {
+                    // Traditional mode: no per-command keys
+                    let mut weighted_ops = Vec::new();
+                    for cmd_cfg in commands {
+                        let op = Self::parse_redis_op(&cmd_cfg.name, cmd_cfg.params.as_ref())?;
+                        weighted_ops.push((op, cmd_cfg.weight));
+                    }
+                    let seed = master_seed.map(|s| derive_seed(s, "command_selector"));
+                    Ok(Box::new(WeightedCommandSelector::with_seed(weighted_ops, seed)?))
                 }
-                let seed = master_seed.map(|s| derive_seed(s, "command_selector"));
-                Ok(Box::new(WeightedCommandSelector::with_seed(weighted_ops, seed)?))
             }
         }
     }

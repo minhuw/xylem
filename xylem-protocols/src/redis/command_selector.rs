@@ -15,6 +15,17 @@ where
     /// Select the next command to execute
     fn next_command(&mut self) -> T;
 
+    /// Check if this selector has per-command key generators
+    fn has_per_command_keys(&self) -> bool {
+        false
+    }
+
+    /// Generate key for the current command (if per-command keys are enabled)
+    /// Returns None if per-command keys are not supported
+    fn generate_key_for_command(&mut self, _command: &T) -> Option<u64> {
+        None
+    }
+
     /// Reset the selector state
     fn reset(&mut self) {
         // Default: no-op for stateless selectors
@@ -38,11 +49,23 @@ impl<T: Clone + Send> CommandSelector<T> for FixedCommandSelector<T> {
     }
 }
 
+/// Key generator trait re-exported from xylem_core
+/// We use a trait object to avoid tight coupling to KeyGeneration enum
+pub trait KeyGenerator: Send {
+    fn next_key(&mut self) -> u64;
+    fn reset(&mut self);
+}
+
 /// Weighted command selector - selects commands with specified probabilities
 pub struct WeightedCommandSelector<T> {
     commands: Vec<T>,
     weights: WeightedIndex<f64>,
     rng: SmallRng,
+    /// Optional per-command key generators
+    /// If present, maps command index to its key generator
+    per_command_keys: Option<Vec<Box<dyn KeyGenerator>>>,
+    /// Track the last selected command index for key generation
+    last_command_idx: Option<usize>,
 }
 
 impl<T: Clone> WeightedCommandSelector<T> {
@@ -90,14 +113,69 @@ impl<T: Clone> WeightedCommandSelector<T> {
             None => SmallRng::from_os_rng(),
         };
 
-        Ok(Self { commands, weights: weights_idx, rng })
+        Ok(Self {
+            commands,
+            weights: weights_idx,
+            rng,
+            per_command_keys: None,
+            last_command_idx: None,
+        })
+    }
+
+    /// Create a weighted selector with per-command key generators
+    ///
+    /// # Parameters
+    /// - `commands_weights`: Vector of (command, weight) pairs
+    /// - `key_generators`: Per-command key generators (must match length of commands)
+    /// - `seed`: Optional seed for reproducibility (None = use entropy)
+    ///
+    /// # Returns
+    /// Error if weights are invalid or key_generators length doesn't match commands
+    pub fn with_per_command_keys(
+        commands_weights: Vec<(T, f64)>,
+        key_generators: Vec<Box<dyn KeyGenerator>>,
+        seed: Option<u64>,
+    ) -> anyhow::Result<Self> {
+        if commands_weights.len() != key_generators.len() {
+            anyhow::bail!(
+                "Number of key generators ({}) must match number of commands ({})",
+                key_generators.len(),
+                commands_weights.len()
+            );
+        }
+
+        let mut selector = Self::with_seed(commands_weights, seed)?;
+        selector.per_command_keys = Some(key_generators);
+        Ok(selector)
     }
 }
 
 impl<T: Clone + Send> CommandSelector<T> for WeightedCommandSelector<T> {
     fn next_command(&mut self) -> T {
         let idx = self.weights.sample(&mut self.rng);
+        self.last_command_idx = Some(idx);
         self.commands[idx].clone()
+    }
+
+    fn has_per_command_keys(&self) -> bool {
+        self.per_command_keys.is_some()
+    }
+
+    fn generate_key_for_command(&mut self, _command: &T) -> Option<u64> {
+        if let (Some(key_gens), Some(idx)) = (&mut self.per_command_keys, self.last_command_idx) {
+            Some(key_gens[idx].next_key())
+        } else {
+            None
+        }
+    }
+
+    fn reset(&mut self) {
+        self.last_command_idx = None;
+        if let Some(key_gens) = &mut self.per_command_keys {
+            for gen in key_gens.iter_mut() {
+                gen.reset();
+            }
+        }
     }
 }
 

@@ -1,0 +1,51 @@
+# Example: Data Import and Verification
+# Demonstrates: Import test data from CSV, run workload, verify correctness
+
+[experiment]
+name = "redis-data-import"
+description = "Test with imported data and verification"
+duration = "2s"
+seed = 42
+
+[target]
+address = "127.0.0.1:6379"
+protocol = "redis"
+transport = "tcp"
+
+[workload]
+# Data import from CSV file
+[workload.data_import]
+file = "/tmp/test-data.csv"
+
+[workload.data_import.verification]
+mode = "after"  # Verify all data after test completes
+sample_rate = 1.0  # Verify 100% of data
+
+# Key generation (used if data_import is not specified)
+[workload.keys]
+strategy = "random"
+max = 1000
+value_size = 128
+
+[workload.pattern]
+type = "constant"
+rate = 1000.0
+
+[[traffic_groups]]
+name = "import-test"
+threads = [0]
+connections_per_thread = 10
+max_pending_per_connection = 10
+
+[traffic_groups.policy]
+type = "closed-loop"
+
+[traffic_groups.sampling_policy]
+type = "limited"
+rate = 1.0
+max_samples = 10000
+
+[output]
+format = "json"
+file = "/tmp/redis-data-import.json"
+real_time = false

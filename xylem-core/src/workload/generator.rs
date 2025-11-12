@@ -6,6 +6,12 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use std::time::{Duration, Instant};
 
+/// Trait for key generation (to enable per-command key generators)
+pub trait KeyGeneratorTrait: Send {
+    fn next_key(&mut self) -> u64;
+    fn reset(&mut self);
+}
+
 /// Key generation strategy
 #[derive(Debug)]
 pub enum KeyGeneration {
@@ -28,6 +34,52 @@ pub enum KeyGeneration {
         /// Underlying normal distribution
         dist: NormalDistribution,
     },
+}
+
+// Implement KeyGeneratorTrait for KeyGeneration
+impl KeyGeneratorTrait for KeyGeneration {
+    fn next_key(&mut self) -> u64 {
+        // Call the inherent next_key method
+        match self {
+            Self::Sequential { current, .. } => {
+                let key = *current;
+                *current = current.wrapping_add(1);
+                key
+            }
+            Self::Random { max, rng } => rng.random_range(0..*max),
+            Self::RoundRobin { max, current } => {
+                let key = *current;
+                *current = (*current + 1) % *max;
+                key
+            }
+            Self::Zipfian(dist) => dist.sample_key(),
+            Self::Gaussian { max, dist, .. } => {
+                let sample = dist.sample();
+                let clamped = sample.max(0.0).min(*max as f64 - 1.0);
+                clamped as u64
+            }
+        }
+    }
+
+    fn reset(&mut self) {
+        match self {
+            Self::Sequential { start, current } => {
+                *current = *start;
+            }
+            Self::Random { .. } => {
+                // RNG state cannot be easily reset
+            }
+            Self::RoundRobin { current, .. } => {
+                *current = 0;
+            }
+            Self::Zipfian(dist) => {
+                dist.reset();
+            }
+            Self::Gaussian { dist, .. } => {
+                dist.reset();
+            }
+        }
+    }
 }
 
 // Manual Clone implementation
@@ -240,6 +292,8 @@ pub struct RequestGenerator {
     value_size_gen: Box<dyn ValueSizeGenerator>,
     last_request_time: Option<Instant>,
     request_count: u64,
+    /// Optional data importer for testing with real data
+    data_importer: Option<super::data_import::DataImporter>,
 }
 
 impl RequestGenerator {
@@ -255,7 +309,29 @@ impl RequestGenerator {
             value_size_gen,
             last_request_time: None,
             request_count: 0,
+            data_importer: None,
         }
+    }
+
+    /// Create a request generator with imported data
+    pub fn with_imported_data(
+        data_importer: super::data_import::DataImporter,
+        rate_control: RateControl,
+        value_size_gen: Box<dyn ValueSizeGenerator>,
+    ) -> Self {
+        Self {
+            key_gen: KeyGeneration::sequential(0), // Unused when importing
+            rate_control,
+            value_size_gen,
+            last_request_time: None,
+            request_count: 0,
+            data_importer: Some(data_importer),
+        }
+    }
+
+    /// Check if this generator is using imported data
+    pub fn is_using_imported_data(&self) -> bool {
+        self.data_importer.is_some()
     }
 
     /// Generate the next request parameters (key, value_size)
@@ -272,6 +348,25 @@ impl RequestGenerator {
         let value_size = self.value_size_gen.next_size_for_command(command);
         self.request_count += 1;
         (key, value_size)
+    }
+
+    /// Generate request from imported data (returns key as string and value as bytes)
+    ///
+    /// # Returns
+    /// - `(key, value_bytes)` tuple where key is the string key and value_bytes is the data
+    ///
+    /// # Panics
+    /// Panics if called when no data importer is configured
+    pub fn next_request_from_import(&mut self) -> (String, Vec<u8>) {
+        let importer = self
+            .data_importer
+            .as_mut()
+            .expect("next_request_from_import called but no data importer configured");
+
+        let entry = importer.next_random();
+        self.request_count += 1;
+
+        (entry.key.clone(), entry.value_bytes())
     }
 
     /// Calculate delay until next request should be sent
@@ -310,6 +405,9 @@ impl RequestGenerator {
     pub fn reset(&mut self) {
         self.key_gen.reset();
         self.value_size_gen.reset();
+        if let Some(importer) = &mut self.data_importer {
+            importer.reset();
+        }
         self.last_request_time = None;
         self.request_count = 0;
     }

@@ -12,6 +12,22 @@ pub enum MultiProtocol {
     XylemEcho(xylem_protocols::xylem_echo::XylemEchoProtocol),
 }
 
+impl MultiProtocol {
+    /// Generate a SET request with imported data (string key + value bytes)
+    /// Only supported for Redis protocols
+    pub fn generate_set_with_imported_data(
+        &mut self,
+        conn_id: usize,
+        key: &str,
+        value: &[u8],
+    ) -> (Vec<u8>, (usize, u64)) {
+        match self {
+            MultiProtocol::Redis(p) => p.generate_set_with_imported_data(conn_id, key, value),
+            _ => panic!("generate_set_with_imported_data only supported for Redis protocol"),
+        }
+    }
+}
+
 impl Protocol for MultiProtocol {
     type RequestId = (usize, u64);
 
@@ -267,5 +283,45 @@ mod tests {
     fn test_create_unknown_protocol_fails() {
         let protocol = create_protocol("unknown", None, None);
         assert!(protocol.is_err());
+    }
+
+    #[test]
+    fn test_multi_protocol_generate_set_with_imported_data_redis() {
+        let selector =
+            Box::new(xylem_protocols::FixedCommandSelector::new(xylem_protocols::RedisOp::Set));
+        let mut protocol = create_redis_protocol(selector);
+
+        let key = "test:key";
+        let value = b"test_value";
+        let (request, id) = protocol.generate_set_with_imported_data(0, key, value);
+
+        // Verify request ID
+        assert_eq!(id, (0, 0));
+
+        // Verify it's a valid RESP SET command
+        let request_str = String::from_utf8_lossy(&request);
+        assert!(request_str.contains("SET"));
+        assert!(request_str.contains(key));
+        assert!(request_str.contains("test_value"));
+    }
+
+    #[test]
+    #[should_panic(expected = "only supported for Redis protocol")]
+    fn test_multi_protocol_generate_set_with_imported_data_http_panics() {
+        let protocol_result = create_protocol("http", Some(("/", "localhost")), None);
+        let mut protocol = protocol_result.unwrap();
+
+        // This should panic because HTTP doesn't support imported data
+        protocol.generate_set_with_imported_data(0, "key", b"value");
+    }
+
+    #[test]
+    #[should_panic(expected = "only supported for Redis protocol")]
+    fn test_multi_protocol_generate_set_with_imported_data_memcached_panics() {
+        let protocol_result = create_protocol("memcached-binary", None, None);
+        let mut protocol = protocol_result.unwrap();
+
+        // This should panic because Memcached doesn't support imported data
+        protocol.generate_set_with_imported_data(0, "key", b"value");
     }
 }

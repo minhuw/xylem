@@ -82,18 +82,21 @@ enum Commands {
 }
 
 // Protocol adapter to bridge xylem_protocols::Protocol with xylem_core Protocol trait
-struct ProtocolAdapter<P: xylem_protocols::Protocol> {
+// For simplicity, we use a common RequestId type for protocols that support it
+struct ProtocolAdapter<P: xylem_protocols::Protocol<RequestId = (usize, u64)> + 'static> {
     inner: P,
 }
 
-impl<P: xylem_protocols::Protocol> ProtocolAdapter<P> {
+impl<P: xylem_protocols::Protocol<RequestId = (usize, u64)> + 'static> ProtocolAdapter<P> {
     fn new(protocol: P) -> Self {
         Self { inner: protocol }
     }
 }
 
-impl<P: xylem_protocols::Protocol> xylem_core::threading::Protocol for ProtocolAdapter<P> {
-    type RequestId = P::RequestId;
+impl<P: xylem_protocols::Protocol<RequestId = (usize, u64)> + 'static>
+    xylem_core::threading::Protocol for ProtocolAdapter<P>
+{
+    type RequestId = (usize, u64);
 
     fn generate_request(
         &mut self,
@@ -102,6 +105,29 @@ impl<P: xylem_protocols::Protocol> xylem_core::threading::Protocol for ProtocolA
         value_size: usize,
     ) -> (Vec<u8>, Self::RequestId) {
         self.inner.generate_request(conn_id, key, value_size)
+    }
+
+    fn generate_set_with_imported_data(
+        &mut self,
+        conn_id: usize,
+        key: &str,
+        value: &[u8],
+    ) -> (Vec<u8>, Self::RequestId) {
+        // Check if P is MultiProtocol (which can dispatch to Redis)
+        use std::any::TypeId;
+        let p_type = TypeId::of::<P>();
+        let multi_type = TypeId::of::<xylem_cli::multi_protocol::MultiProtocol>();
+
+        if p_type == multi_type {
+            // SAFETY: We just checked that P is MultiProtocol
+            let multi = unsafe {
+                &mut *(&mut self.inner as *mut P as *mut xylem_cli::multi_protocol::MultiProtocol)
+            };
+            multi.generate_set_with_imported_data(conn_id, key, value)
+        } else {
+            // If not MultiProtocol, it's not supported
+            panic!("generate_set_with_imported_data only supported for MultiProtocol (Redis), got type: {:?}", std::any::type_name::<P>())
+        }
     }
 
     fn parse_response(
@@ -117,8 +143,10 @@ impl<P: xylem_protocols::Protocol> xylem_core::threading::Protocol for ProtocolA
         conn_id: usize,
         data: &[u8],
     ) -> anyhow::Result<xylem_core::threading::ParseResult<Self::RequestId>> {
+        let result = self.inner.parse_response_extended(conn_id, data)?;
+
         // Convert xylem_protocols::ParseResult to xylem_core::threading::ParseResult
-        match self.inner.parse_response_extended(conn_id, data)? {
+        match result {
             xylem_protocols::ParseResult::Complete { bytes_consumed, request_id } => {
                 Ok(xylem_core::threading::ParseResult::Complete { bytes_consumed, request_id })
             }
@@ -348,9 +376,13 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                 .expect("Protocol must be specified (validated in config)");
 
             // Create protocol using multi_protocol factory
-            let protocol = match protocol_name.as_str() {
+            let protocol_adapted = match protocol_name.as_str() {
                 "http" => {
-                    xylem_cli::multi_protocol::create_http_protocol("/", &target_address_for_http)?
+                    let p = xylem_cli::multi_protocol::create_http_protocol(
+                        "/",
+                        &target_address_for_http,
+                    )?;
+                    ProtocolAdapter::new(p)
                 }
                 "redis" => {
                     // Create a new selector for this group
@@ -363,7 +395,8 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                                 xylem_protocols::RedisOp::Get,
                             ))
                         };
-                    xylem_cli::multi_protocol::create_redis_protocol(group_redis_selector)
+                    let p = xylem_cli::multi_protocol::create_redis_protocol(group_redis_selector);
+                    ProtocolAdapter::new(p)
                 }
                 "redis-cluster" => {
                     // Create a new selector for this group
@@ -398,26 +431,64 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                             .collect(),
                     };
 
-                    xylem_cli::multi_protocol::create_redis_cluster_protocol(
+                    let p = xylem_cli::multi_protocol::create_redis_cluster_protocol(
                         group_redis_selector,
                         cluster_proto_config,
-                    )?
+                    )?;
+                    ProtocolAdapter::new(p)
                 }
-                "memcached-binary" => xylem_cli::multi_protocol::create_memcached_binary_protocol(),
-                "memcached-ascii" => xylem_cli::multi_protocol::create_memcached_ascii_protocol(),
-                "xylem-echo" => xylem_cli::multi_protocol::create_xylem_echo_protocol(),
+                "memcached-binary" => {
+                    let p = xylem_cli::multi_protocol::create_memcached_binary_protocol();
+                    ProtocolAdapter::new(p)
+                }
+                "memcached-ascii" => {
+                    let p = xylem_cli::multi_protocol::create_memcached_ascii_protocol();
+                    ProtocolAdapter::new(p)
+                }
+                "xylem-echo" => {
+                    // Skip xylem-echo since it has incompatible RequestId type (u64 instead of (usize, u64))
+                    return Err(anyhow::anyhow!(
+                        "xylem-echo protocol not supported with current architecture"
+                    )
+                    .into());
+                }
                 other => return Err(anyhow::anyhow!("Unknown protocol: {}", other).into()),
             };
 
-            // Wrap in ProtocolAdapter
-            let protocol_adapted = ProtocolAdapter::new(protocol);
             protocols.insert(*group_id, protocol_adapted);
         }
 
         // Create a shared request generator for this thread
         // All groups share the same key generation but may have different traffic policies
-        let generator =
-            RequestGenerator::new(key_gen.clone(), RateControl::ClosedLoop, value_size_gen);
+        let generator = if let Some(ref data_import_config) = config_for_worker.workload.data_import
+        {
+            // Use imported data instead of generated keys
+            tracing::info!(
+                "Thread {}: Loading imported data from {}",
+                thread_idx,
+                data_import_config.file.display()
+            );
+
+            let data_importer = xylem_core::workload::DataImporter::from_csv_with_seed(
+                &data_import_config.file,
+                config_for_worker.experiment.seed,
+            )?;
+
+            tracing::info!(
+                "Thread {}: Loaded {} entries from CSV",
+                thread_idx,
+                data_importer.len()
+            );
+
+            RequestGenerator::with_imported_data(
+                data_importer,
+                RateControl::ClosedLoop,
+                value_size_gen,
+            )
+        } else {
+            // Normal mode: generate keys synthetically
+            RequestGenerator::new(key_gen.clone(), RateControl::ClosedLoop, value_size_gen)
+        };
 
         // Initialize group stats collector and register all groups
         let mut stats = xylem_core::stats::GroupStatsCollector::new();

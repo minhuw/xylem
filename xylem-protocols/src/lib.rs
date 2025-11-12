@@ -130,6 +130,7 @@ pub trait Protocol: Send {
 }
 
 pub mod http;
+pub mod key_generation_adapter;
 pub mod masstree;
 pub mod memcached;
 pub mod protocol;
@@ -138,16 +139,21 @@ pub mod xylem_echo;
 
 // Re-export commonly used types
 pub use http::HttpMethod;
+pub use http::HttpProtocol;
 pub use masstree::MasstreeOp;
+pub use memcached::{MemcachedAsciiProtocol, MemcachedBinaryProtocol};
 pub use redis::cluster::{
     generate_asking_command, generate_cluster_slots_command, parse_redirect, ClusterNode,
     ClusterRequestId, ClusterTopology, RedirectStats, RedirectType, RedisClusterProtocol,
     SlotRange,
 };
-pub use redis::command_selector::{CommandSelector, FixedCommandSelector, WeightedCommandSelector};
+pub use redis::command_selector::{
+    CommandSelector, FixedCommandSelector, KeyGenerator, WeightedCommandSelector,
+};
 pub use redis::command_template::CommandTemplate;
 pub use redis::crc16::crc16;
 pub use redis::slot::{
     calculate_slot, calculate_slot_str, extract_hash_tag, has_hash_tag, CLUSTER_SLOTS,
 };
-pub use redis::RedisOp;
+pub use redis::{RedisOp, RedisProtocol};
+pub use xylem_echo::XylemEchoProtocol;

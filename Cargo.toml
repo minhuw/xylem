@@ -64,6 +64,9 @@ bytes = "1.9"
 # TLS certificate handling
 rustls-pemfile = "2.2"
 
+# CSV parsing
+csv = "1.3"
+
 [workspace.lints.clippy]
 uninlined_format_args = "allow"
 

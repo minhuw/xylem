@@ -113,22 +113,81 @@ impl RedisProtocol {
     }
 }
 
-impl Protocol for RedisProtocol {
-    type RequestId = (usize, u64); // (conn_id, sequence)
+impl RedisProtocol {
+    /// Check if protocol has per-command key generation enabled
+    pub fn has_per_command_keys(&self) -> bool {
+        self.command_selector.has_per_command_keys()
+    }
 
-    fn generate_request(
+    /// Generate request using per-command key generation
+    /// This variant selects the command first, generates key for that command,
+    /// then creates the request
+    pub fn generate_request_with_command_keys(
         &mut self,
         conn_id: usize,
-        key: u64,
         value_size: usize,
-    ) -> (Vec<u8>, Self::RequestId) {
+    ) -> (Vec<u8>, (usize, u64)) {
         let seq = self.next_send_seq(conn_id);
         let id = (conn_id, seq);
 
-        // Select which command to execute
+        // Select command first
         let operation = self.command_selector.next_command();
 
-        let request_data = match operation {
+        // Generate key for this specific command
+        let key = self
+            .command_selector
+            .generate_key_for_command(&operation)
+            .expect("Per-command key generation should be available");
+
+        let request_data = self.format_command(&operation, key, value_size);
+        (request_data, id)
+    }
+
+    /// Generate a SET request with imported data (string key + value bytes)
+    pub fn generate_set_with_imported_data(
+        &mut self,
+        conn_id: usize,
+        key: &str,
+        value: &[u8],
+    ) -> (Vec<u8>, (usize, u64)) {
+        let seq = self.next_send_seq(conn_id);
+        let id = (conn_id, seq);
+
+        // Format: *3\r\n$3\r\nSET\r\n$<keylen>\r\n<key>\r\n$<vallen>\r\n<value>\r\n
+        let mut request = Vec::new();
+        request.extend_from_slice(b"*3\r\n$3\r\nSET\r\n");
+        request.extend_from_slice(format!("${}\r\n", key.len()).as_bytes());
+        request.extend_from_slice(key.as_bytes());
+        request.extend_from_slice(b"\r\n");
+        request.extend_from_slice(format!("${}\r\n", value.len()).as_bytes());
+        request.extend_from_slice(value);
+        request.extend_from_slice(b"\r\n");
+
+        (request, id)
+    }
+
+    /// Generate a GET request with imported data (string key)
+    pub fn generate_get_with_imported_data(
+        &mut self,
+        conn_id: usize,
+        key: &str,
+    ) -> (Vec<u8>, (usize, u64)) {
+        let seq = self.next_send_seq(conn_id);
+        let id = (conn_id, seq);
+
+        // Format: *2\r\n$3\r\nGET\r\n$<keylen>\r\n<key>\r\n
+        let mut request = Vec::new();
+        request.extend_from_slice(b"*2\r\n$3\r\nGET\r\n");
+        request.extend_from_slice(format!("${}\r\n", key.len()).as_bytes());
+        request.extend_from_slice(key.as_bytes());
+        request.extend_from_slice(b"\r\n");
+
+        (request, id)
+    }
+
+    /// Format a Redis command into RESP bytes
+    fn format_command(&self, operation: &RedisOp, key: u64, value_size: usize) -> Vec<u8> {
+        match operation {
             RedisOp::Get => {
                 format!("*2\r\n$3\r\nGET\r\n${}\r\nkey:{}\r\n", key.to_string().len() + 4, key)
                     .into_bytes()
@@ -149,10 +208,8 @@ impl Protocol for RedisProtocol {
                     .into_bytes()
             }
             RedisOp::MGet { count } => {
-                // MGET key:0 key:1 key:2 ... key:(count-1)
-                // Format: *{count+1}\r\n$4\r\nMGET\r\n${len}\r\nkey:{n}\r\n...
                 let mut request = format!("*{}\r\n$4\r\nMGET\r\n", count + 1);
-                for i in 0..count {
+                for i in 0..*count {
                     let curr_key = key.wrapping_add(i as u64);
                     let key_str = format!("key:{}", curr_key);
                     request.push_str(&format!("${}\r\n{}\r\n", key_str.len(), key_str));
@@ -160,8 +217,6 @@ impl Protocol for RedisProtocol {
                 request.into_bytes()
             }
             RedisOp::Wait { num_replicas, timeout_ms } => {
-                // WAIT num_replicas timeout_ms
-                // Format: *3\r\n$4\r\nWAIT\r\n${len}\r\n{num}\r\n${len}\r\n{timeout}\r\n
                 let num_str = num_replicas.to_string();
                 let timeout_str = timeout_ms.to_string();
                 format!(
@@ -175,7 +230,6 @@ impl Protocol for RedisProtocol {
             }
             RedisOp::Auth { username, password } => {
                 if let Some(user) = username {
-                    // Redis 6.0+ ACL: AUTH username password
                     format!(
                         "*3\r\n$4\r\nAUTH\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
                         user.len(),
@@ -185,7 +239,6 @@ impl Protocol for RedisProtocol {
                     )
                     .into_bytes()
                 } else {
-                    // Legacy: AUTH password
                     format!("*2\r\n$4\r\nAUTH\r\n${}\r\n{}\r\n", password.len(), password)
                         .into_bytes()
                 }
@@ -241,7 +294,26 @@ impl Protocol for RedisProtocol {
             }
             RedisOp::ClusterSlots => b"*2\r\n$7\r\nCLUSTER\r\n$5\r\nSLOTS\r\n".to_vec(),
             RedisOp::Custom(template) => template.generate_request(key, value_size),
-        };
+        }
+    }
+}
+
+impl Protocol for RedisProtocol {
+    type RequestId = (usize, u64); // (conn_id, sequence)
+
+    fn generate_request(
+        &mut self,
+        conn_id: usize,
+        key: u64,
+        value_size: usize,
+    ) -> (Vec<u8>, Self::RequestId) {
+        let seq = self.next_send_seq(conn_id);
+        let id = (conn_id, seq);
+
+        // Select which command to execute
+        let operation = self.command_selector.next_command();
+        let request_data = self.format_command(&operation, key, value_size);
+
         (request_data, id)
     }
 
@@ -1138,5 +1210,94 @@ mod tests {
         let protocol = RedisProtocol::new(selector);
 
         assert_eq!(protocol.resp_version, 2); // Default to RESP2
+    }
+
+    #[test]
+    fn test_generate_set_with_imported_data() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Set));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let key = "user:1000";
+        let value = b"alice";
+        let (request, id) = protocol.generate_set_with_imported_data(0, key, value);
+
+        // Verify request ID
+        assert_eq!(id, (0, 0));
+
+        // Verify RESP format: *3\r\n$3\r\nSET\r\n$<keylen>\r\n<key>\r\n$<vallen>\r\n<value>\r\n
+        let request_str = String::from_utf8_lossy(&request);
+        assert!(request_str.starts_with("*3\r\n")); // Array with 3 elements
+        assert!(request_str.contains("$3\r\nSET\r\n")); // SET command
+        assert!(request_str.contains(&format!("${}\r\n{}\r\n", key.len(), key))); // Key
+        assert!(request_str.contains(&format!("${}\r\n", value.len()))); // Value length
+        assert!(request_str.contains("alice")); // Value content
+    }
+
+    #[test]
+    fn test_generate_set_with_imported_data_binary() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Set));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let key = "session:abc";
+        let value = b"\x00\x01\x02\x03\xff\xfe"; // Binary data
+        let (request, id) = protocol.generate_set_with_imported_data(1, key, value);
+
+        // Verify request ID
+        assert_eq!(id, (1, 0));
+
+        // Verify RESP format is correct for binary data
+        let request_str = String::from_utf8_lossy(&request);
+        assert!(request_str.starts_with("*3\r\n$3\r\nSET\r\n"));
+        assert!(request_str.contains(&format!("${}\r\n{}\r\n", key.len(), key)));
+        assert!(request_str.contains(&format!("${}\r\n", value.len())));
+
+        // Verify binary data is preserved
+        assert!(request.len() > 30); // Should have all the data
+    }
+
+    #[test]
+    fn test_generate_set_with_imported_data_empty_value() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Set));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let key = "empty:key";
+        let value = b"";
+        let (request, id) = protocol.generate_set_with_imported_data(0, key, value);
+
+        assert_eq!(id, (0, 0));
+
+        // Should still be valid RESP with $0\r\n\r\n for empty value
+        let request_str = String::from_utf8_lossy(&request);
+        assert!(request_str.contains("$0\r\n\r\n"));
+    }
+
+    #[test]
+    fn test_generate_set_with_imported_data_sequence() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Set));
+        let mut protocol = RedisProtocol::new(selector);
+
+        // Generate multiple requests, verify sequence numbers increment
+        let (_, id1) = protocol.generate_set_with_imported_data(0, "key1", b"val1");
+        let (_, id2) = protocol.generate_set_with_imported_data(0, "key2", b"val2");
+        let (_, id3) = protocol.generate_set_with_imported_data(0, "key3", b"val3");
+
+        assert_eq!(id1, (0, 0));
+        assert_eq!(id2, (0, 1));
+        assert_eq!(id3, (0, 2));
+    }
+
+    #[test]
+    fn test_generate_set_with_imported_data_multiple_connections() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Set));
+        let mut protocol = RedisProtocol::new(selector);
+
+        // Different connections should have independent sequences
+        let (_, id1) = protocol.generate_set_with_imported_data(0, "key1", b"val1");
+        let (_, id2) = protocol.generate_set_with_imported_data(1, "key2", b"val2");
+        let (_, id3) = protocol.generate_set_with_imported_data(0, "key3", b"val3");
+
+        assert_eq!(id1, (0, 0));
+        assert_eq!(id2, (1, 0)); // Conn 1, sequence 0
+        assert_eq!(id3, (0, 1)); // Conn 0, sequence 1
     }
 }

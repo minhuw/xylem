@@ -1,0 +1,68 @@
+# Example: Per-Command Key Patterns
+# Demonstrates realistic cache workload: uniform writes, Zipfian reads
+
+[experiment]
+name = "redis-per-command-keys"
+description = "Test per-command key patterns: Random writes (uniform), Zipfian reads (hotspot)"
+duration = "3s"
+seed = 42
+
+[target]
+address = "127.0.0.1:6379"
+protocol = "redis"
+transport = "tcp"
+
+[workload]
+# Default key configuration (used when command doesn't override)
+[workload.keys]
+strategy = "random"
+max = 100000
+value_size = 512
+
+# Weighted command selection with per-command key patterns
+[workload.operations]
+strategy = "weighted"
+
+# SET: Random/uniform distribution (new data spread across keyspace)
+[[workload.operations.commands]]
+name = "set"
+weight = 0.3
+
+[workload.operations.commands.keys]
+strategy = "random"
+max = 100000
+value_size = 512
+
+# GET: Zipfian distribution (reads concentrate on hot keys)
+[[workload.operations.commands]]
+name = "get"
+weight = 0.7
+
+[workload.operations.commands.keys]
+strategy = "zipfian"
+n = 100000
+theta = 0.99  # Typical YCSB workload: 80/20-ish distribution
+value_size = 512
+
+[workload.pattern]
+type = "constant"
+rate = 50000.0
+
+[[traffic_groups]]
+name = "cache-workload"
+threads = [0, 1]
+connections_per_thread = 50
+max_pending_per_connection = 10
+
+[traffic_groups.policy]
+type = "closed-loop"
+
+[traffic_groups.sampling_policy]
+type = "limited"
+rate = 1.0
+max_samples = 100000
+
+[output]
+format = "json"
+file = "/tmp/redis-per-command-keys.json"
+real_time = true

@@ -12,10 +12,19 @@ use crate::stats::GroupStatsCollector;
 use crate::timing;
 use crate::workload::RequestGenerator;
 use crate::Result;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::time::Duration;
 use xylem_transport::Transport;
+
+/// Helper function to compute hash of a string key
+fn hash_string_key(key: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    hasher.finish()
+}
 
 /// Retry request information for protocol-level retries
 #[derive(Debug, Clone)]
@@ -65,6 +74,17 @@ pub trait Protocol: Send {
         key: u64,
         value_size: usize,
     ) -> (Vec<u8>, Self::RequestId);
+
+    /// Generate a SET request with imported data (string key + value bytes)
+    /// Default implementation panics - protocols that support imported data should override this
+    fn generate_set_with_imported_data(
+        &mut self,
+        _conn_id: usize,
+        _key: &str,
+        _value: &[u8],
+    ) -> (Vec<u8>, Self::RequestId) {
+        unimplemented!("generate_set_with_imported_data not supported by this protocol")
+    }
 
     /// Parse a response and return the request ID it corresponds to
     /// Returns Ok((bytes_consumed, Some(request_id))) if complete response found
@@ -241,10 +261,6 @@ impl<T: Transport, P: Protocol> Worker<T, P> {
 
             // SEND PHASE: Send requests while we're ahead of schedule
             while now_ns >= next_tx_ns {
-                // Generate request first to get the key for scheduler
-                let (key, value_size) = self.generator.next_request();
-                self.current_key = key;
-
                 // Pick a connection that can accept more requests
                 let conn = match self.pool.pick_connection() {
                     Some(c) => c,
@@ -257,7 +273,19 @@ impl<T: Transport, P: Protocol> Worker<T, P> {
                 // Look up protocol for this connection's traffic group
                 let protocol =
                     self.protocols.get_mut(&group_id).expect("Protocol not found for group_id");
-                let (request_data, req_id) = protocol.generate_request(conn_id, key, value_size);
+
+                // Generate request - check if using imported data
+                let (request_data, req_id) = if self.generator.is_using_imported_data() {
+                    let (key_string, value_bytes) = self.generator.next_request_from_import();
+                    // Use string key hash for scheduler (not perfect but works)
+                    self.current_key = hash_string_key(&key_string);
+                    protocol.generate_set_with_imported_data(conn_id, &key_string, &value_bytes)
+                } else {
+                    // Normal synthetic data generation
+                    let (key, value_size) = self.generator.next_request();
+                    self.current_key = key;
+                    protocol.generate_request(conn_id, key, value_size)
+                };
 
                 // Send request and notify policy
                 let sent_time_ns = timing::time_ns();
