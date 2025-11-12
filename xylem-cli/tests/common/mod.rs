@@ -9,6 +9,8 @@ pub mod memcached;
 pub mod multi_protocol;
 pub mod nginx;
 pub mod redis;
+pub mod redis_acl;
+pub mod redis_auth;
 pub mod redis_cluster;
 
 use std::net::{TcpListener, UdpSocket};

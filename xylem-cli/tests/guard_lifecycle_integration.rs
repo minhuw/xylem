@@ -6,7 +6,6 @@
 mod common;
 
 #[test]
-#[ignore]
 fn test_redis_guard_lifecycle() {
     use common::redis::RedisGuard;
 
@@ -18,7 +17,6 @@ fn test_redis_guard_lifecycle() {
 }
 
 #[test]
-#[ignore]
 fn test_memcached_guard_lifecycle() {
     use common::memcached::MemcachedGuard;
 
@@ -28,7 +26,6 @@ fn test_memcached_guard_lifecycle() {
 }
 
 #[test]
-#[ignore]
 fn test_nginx_guard_lifecycle() {
     use common::nginx::NginxGuard;
 
@@ -38,7 +35,6 @@ fn test_nginx_guard_lifecycle() {
 }
 
 #[test]
-#[ignore]
 fn test_redis_cluster_guard_lifecycle() {
     use common::redis_cluster::RedisClusterGuard;
 
@@ -48,7 +44,6 @@ fn test_redis_cluster_guard_lifecycle() {
 }
 
 #[test]
-#[ignore]
 fn test_multi_protocol_guard_lifecycle() {
     use common::multi_protocol::MultiProtocolGuard;
 

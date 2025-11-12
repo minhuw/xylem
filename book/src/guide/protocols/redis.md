@@ -1,413 +1,134 @@
-# Redis Protocol
+# Benchmarking Redis with Xylem
 
-Redis uses the RESP (Redis Serialization Protocol) for client-server communication. This document explains the protocol format, common commands, and how Xylem supports benchmarking Redis workloads.
+When you're benchmarking Redis, you're speaking RESP—the Redis Serialization Protocol. It's the language Redis uses to understand your commands and send back responses. This guide walks you through how RESP works, what commands Xylem knows how to speak, and how to craft realistic Redis workloads for your benchmarks.
 
-## What Xylem Supports
+## What Xylem Brings to the Table
 
-Xylem implements RESP and supports:
-- Standard Redis commands (GET, SET, INCR, MGET, WAIT)
-- Custom command templates for any Redis operation
-- Request pipelining for high throughput
-- Configurable key distributions and value sizes
+Xylem speaks Redis fluently. It understands the core commands you'd use in production: GET for reads, SET for writes, INCR for counters, MGET when you need multiple keys at once, and WAIT when you care about replication. Beyond the basics, Xylem handles authentication (both the simple password kind and Redis 6.0's newer ACL system with usernames), database selection for multi-tenant setups, and protocol negotiation between RESP2 and RESP3.
 
-Xylem also supports:
-- **Redis Cluster mode** - Full cluster support with automatic slot-based routing (see [Redis Cluster](#redis-cluster) section below)
+Need to test cache expiry? Use SETEX to set keys with a TTL. Working with large values? SETRANGE and GETRANGE let you read and write at specific offsets. Running a cluster? Xylem supports CLUSTER SLOTS for topology discovery and automatically routes requests to the right node based on hash slots.
 
-Xylem does not currently support:
-- RESP3 protocol (only RESP2) - **TODO**: RESP3 adds semantic types (maps, sets, doubles, booleans), push messages, and streaming data. While RESP2 covers all benchmarking needs and works with all Redis versions, RESP3 support could be added for testing RESP3-specific features or comparing protocol performance.
-- Pub/Sub commands
-- Transactions (MULTI/EXEC)
+But here's where it gets interesting: Xylem's command templates let you benchmark any Redis operation, not just the built-in ones. Want to test ZADD for sorted sets, HSET for hashes, or LPUSH for lists? Write a template with placeholders like `__key__` and `__data__`, and Xylem generates the proper RESP format.
 
-## Protocol Overview
+Xylem also understands RESP3, Redis's modern protocol version. RESP3 brings semantic types—actual nulls, booleans, doubles, maps, and sets—instead of encoding everything as strings and arrays. If you're testing Redis 6.0 or later, you can negotiate RESP3 with the HELLO command and benchmark how your application behaves with the richer type system.
 
-Redis commands are sent as text-based protocol messages. The key characteristics:
+What Xylem doesn't cover yet: Pub/Sub (since benchmarking message queues needs different semantics), transactions (MULTI/EXEC blocks), and Lua scripting. These are workloads with unique characteristics that don't fit the request-response pattern Xylem is built for.
 
-**Text-based** - Human-readable format using printable ASCII characters and CRLF line endings
+Oh, and one more thing: Xylem fully supports Redis Cluster. It calculates hash slots, routes requests to the correct nodes, and handles MOVED and ASK redirects during resharding. We'll dig into that later.
 
-**Binary-safe** - Bulk strings can contain any binary data with explicit length encoding
+## Understanding RESP
 
-**Request-response** - Client sends command, server sends response (pipelining allows multiple pending requests)
+RESP is elegantly simple. Commands look almost like what you'd type at a Redis CLI, but they're formatted in a way that machines can parse efficiently. Everything is text-based—printable ASCII with CRLF line endings—which makes debugging easy. You can literally read RESP messages in a network capture.
 
-**Stateless** - Each command is independent (except for transactions and pub/sub)
+But don't let the text format fool you. RESP is binary-safe. When you send a value, you tell Redis exactly how many bytes to expect, so you can store JPEGs, protocol buffers, or any binary blob without escaping special characters. Redis doesn't care what's in your data; it just reads the exact number of bytes you promised and sends it back when you ask for it.
 
-## RESP Wire Format
+The communication pattern is straightforward: you send a command, Redis sends back a response. One command, one response. But here's the clever part: you don't have to wait for the response before sending the next command. This is called pipelining, and it's how you get serious throughput. Send a batch of GET commands back-to-back, and Redis will send back a batch of responses in the same order. No request IDs needed—FIFO ordering per connection keeps everything straight.
 
-RESP (REdis Serialization Protocol) is Redis's wire protocol. All commands and responses use this format.
+Each command stands alone. Redis doesn't maintain conversation state (except for transactions and pub/sub, which are special cases). This statelessness is what makes Redis fast and scalable.
 
-### RESP Data Types
+### The Wire Format
 
-RESP has five data types, each identified by its first byte:
+RESP speaks in five types, each starting with a special character:
 
-**Simple Strings** - Start with `+`, terminated by `\r\n`
+**Simple strings** (`+`) are for short status messages. When you SET a key, Redis responds with `+OK\r\n`. That's it—a plus sign, the message, and a newline.
+
+**Errors** (`-`) look similar but start with a minus. `-ERR unknown command\r\n` tells you something went wrong. The distinction between simple strings and errors lets clients handle success and failure differently without parsing the message content.
+
+**Integers** (`:`) are for numeric results. When you INCR a counter, Redis might send back `:42\r\n`—that's the new count. The colon says "interpret what follows as a number."
+
+**Bulk strings** (`$`) are where it gets interesting. These can hold any binary data of any size. The format is `$<length>\r\n<data>\r\n`. So `$5\r\nhello\r\n` is a 5-byte string containing "hello". The length-prefix is what makes RESP binary-safe—Redis knows exactly how many bytes to read, regardless of what's in them. A null value is `$-1\r\n`, which is how Redis says "this key doesn't exist."
+
+**Arrays** (`*`) let you send or receive multiple values. The format is `*<count>\r\n` followed by that many elements. Each element can be any RESP type—strings, integers, even nested arrays. This is how commands work: `GET key:1234` becomes `*2\r\n$3\r\nGET\r\n$8\r\nkey:1234\r\n`—an array of two bulk strings.
+
+RESP3 adds more types: true nulls (`_\r\n`), booleans (`#t\r\n` or `#f\r\n`), doubles for floating-point numbers (`,3.14\r\n`), maps (`%<count>\r\n`) for key-value pairs, sets (`~<count>\r\n`) for unique collections, and a few others. These semantic types make client libraries simpler because they don't have to guess whether a bulk string is a number or text.
+
+### Commands on the Wire
+
+Every Redis command is an array of bulk strings. Even simple ones. `GET key:1234` becomes:
 ```
-+OK\r\n
-```
-Used for status replies.
-
-**Errors** - Start with `-`, terminated by `\r\n`
-```
--ERR unknown command\r\n
-```
-Used for error messages.
-
-**Integers** - Start with `:`, terminated by `\r\n`
-```
-:42\r\n
-```
-Used for numeric results (INCR, DECR, counter values).
-
-**Bulk Strings** - Start with `$`, followed by length and data
-```
-$5\r\nhello\r\n
-```
-- `$5` - Length in bytes
-- `hello` - Actual data
-- `\r\n` - Terminator
-
-Null bulk string (key not found):
-```
-$-1\r\n
+*2\r\n           # Array with 2 elements
+$3\r\nGET\r\n    # First element: "GET" (3 bytes)
+$8\r\nkey:1234\r\n  # Second element: "key:1234" (8 bytes)
 ```
 
-**Arrays** - Start with `*`, followed by element count
+SET looks similar but with three elements:
 ```
-*3\r\n$5\r\nhello\r\n$5\r\nworld\r\n:42\r\n
-```
-- `*3` - Array with 3 elements
-- Three elements: two bulk strings and one integer
-
-### Request Format
-
-All Redis commands are sent as RESP arrays of bulk strings.
-
-**GET command:**
-```
-*2\r\n$3\r\nGET\r\n$8\r\nkey:1234\r\n
-```
-- `*2` - Array with 2 elements
-- `$3\r\nGET\r\n` - Command name (3 bytes)
-- `$8\r\nkey:1234\r\n` - Key name (8 bytes)
-
-**SET command:**
-```
-*3\r\n$3\r\nSET\r\n$8\r\nkey:1234\r\n$128\r\n<128 bytes>\r\n
-```
-- `*3` - Array with 3 elements
-- Command: SET
-- Key: key:1234
-- Value: 128 bytes of data
-
-**MGET command (multiple keys):**
-```
-*11\r\n$4\r\nMGET\r\n$8\r\nkey:1000\r\n$8\r\nkey:1001\r\n...<8 more keys>...\r\n
-```
-- `*11` - Command + 10 keys = 11 elements
-- MGET followed by 10 bulk strings
-
-**INCR command:**
-```
-*2\r\n$4\r\nINCR\r\n$7\r\ncounter\r\n
+*3\r\n                    # Array with 3 elements
+$3\r\nSET\r\n            # Command
+$8\r\nkey:1234\r\n       # Key
+$128\r\n<128 bytes>\r\n   # Value
 ```
 
-### Response Format
+Responses match what the command returns. A successful GET sends back the value as a bulk string. A missing key sends `$-1\r\n`. SET responds with `+OK\r\n`. INCR returns an integer like `:43\r\n`.
 
-Response type depends on the command:
+### Pipelining: The Secret to Throughput
 
-**GET (successful):**
-```
-$128\r\n<128 bytes of data>\r\n
-```
-Returns bulk string with value.
+Here's where Redis shines. Instead of this:
+1. Send GET key1
+2. Wait for response
+3. Send GET key2
+4. Wait for response
 
-**GET (key not found):**
-```
-$-1\r\n
-```
-Returns null bulk string.
+You do this:
+1. Send GET key1, GET key2, GET key3
+2. Read three responses
 
-**SET:**
-```
-+OK\r\n
-```
-Returns simple string for success.
+The latency savings are dramatic. If each round-trip takes 1ms, the first approach takes 2ms for two GETs. Pipelining takes just over 1ms total. With 10 keys, you go from 10ms to ~1ms. The more you pipeline, the closer you get to wire speed.
 
-**INCR:**
-```
-:43\r\n
-```
-Returns integer (new counter value).
+Redis guarantees responses come back in the same order you sent requests, per connection. You don't need to tag requests with IDs—just keep track of how many you've sent and match them up with responses as they arrive. This is what Xylem does automatically with the `max_pending_per_connection` setting.
 
-**MGET:**
-```
-*3\r\n$5\r\nvalue1\r\n$5\r\nvalue2\r\n$-1\r\n
-```
-Returns array with:
-- Two values (bulk strings)
-- One null (missing key)
+## The Commands
 
-**WAIT:**
-```
-:2\r\n
-```
-Returns integer (number of replicas that acknowledged).
+Let's talk about what these commands actually do and when you'd use them in benchmarks.
 
-## Common Redis Commands
+**GET** retrieves a value. It's your bread-and-butter read operation. Benchmark GET to measure read latency, cache hit rates, and how Redis handles concurrent readers. When the key doesn't exist, you get back a null (`$-1\r\n`).
 
-### GET key
+**SET** stores a value. This is your write operation. Redis overwrites any existing value, so SET is idempotent—run it twice and you get the same result. Benchmark SET to test write throughput, persistence overhead (if you have AOF or RDB enabled), and replication lag.
 
-Retrieves the value of a key.
+**SETEX** combines SET with an expiration time. `SETEX session:abc123 1800 <data>` stores the session and tells Redis to delete it in 30 minutes. This is atomic—no race between SET and EXPIRE. Use it to benchmark TTL accuracy, eviction behavior, and how expiring keys affect memory management.
 
-**Request:** `GET key:1234`
-**Response:** Bulk string with value, or null if key doesn't exist
-**Use case:** Read operations, cache lookups
+**INCR** atomically increments a counter. If the key doesn't exist, Redis treats it as zero and increments to one. This is crucial for testing atomic operations, counters (like rate limiters or page view trackers), and how Redis handles numeric operations under concurrency.
 
-### SET key value [options]
+**MGET** fetches multiple keys in one command: `MGET key:1 key:2 key:3`. The response is an array of values (or nulls for missing keys). Use this to benchmark batch operations and see if your network round-trip time dominates your latency.
 
-Sets a key to hold a string value.
+**WAIT** blocks until previous writes replicate to N replicas or a timeout expires: `WAIT 2 1000` waits for 2 replicas with a 1-second timeout. The response is how many replicas acknowledged. This lets you benchmark replication lag and consistency guarantees.
 
-**Request:** `SET key:1234 <data>`
-**Response:** `+OK` on success
-**Options:** Can include EX/PX for expiration, NX/XX for conditional sets
-**Use case:** Write operations, cache updates
+**SETRANGE** and **GETRANGE** work on offsets within a value. `SETRANGE key:1000 5 hello` overwrites 5 bytes starting at offset 5. `GETRANGE key:1000 5 -1` reads from offset 5 to the end. These are useful for large-value workloads where you only modify or read part of the data—think partial updates to binary structures or reading substrings from log entries.
 
-### INCR key
+**AUTH** authenticates your connection. With simple password auth, it's `AUTH mypassword`. With Redis 6.0+ ACL, it's `AUTH username password`. You'll need this to benchmark production-like setups where Redis isn't publicly accessible.
 
-Increments the integer value of a key by one.
+**SELECT** switches databases. Redis has 16 logical databases by default (numbered 0-15). `SELECT 5` moves to database 5. Keys in different databases are isolated. Use this to test multi-tenant scenarios or benchmark how database switching affects performance.
 
-**Request:** `INCR counter:visits`
-**Response:** Integer (new value after increment)
-**Behavior:** Creates key with value 0 if it doesn't exist, then increments
-**Use case:** Counters, rate limiting, analytics
+**HELLO** negotiates the protocol version. `HELLO 2` sticks with RESP2. `HELLO 3` upgrades to RESP3. The response includes server version, supported features, and other metadata. Benchmark this if you care about RESP3 adoption or client compatibility.
 
-### DECR key
+**CLUSTER SLOTS** returns the cluster topology: which slots are assigned to which nodes. The response is a nested array with start slot, end slot, and node addresses for each range. Use this to benchmark topology discovery and test how clients handle cluster reconfiguration.
 
-Decrements the integer value of a key by one.
+### Custom Commands via Templates
 
-**Request:** `DECR counter:stock`
-**Response:** Integer (new value after decrement)
-**Use case:** Inventory tracking, quota management
-
-### MGET key [key ...]
-
-Returns values of all specified keys.
-
-**Request:** `MGET key:1 key:2 key:3`
-**Response:** Array of bulk strings (null for missing keys)
-**Efficiency:** Single round-trip for multiple keys
-**Use case:** Batch reads, fetching related data
-
-### WAIT numreplicas timeout
-
-Blocks until all previous write commands are replicated to at least numreplicas.
-
-**Request:** `WAIT 2 1000` (wait for 2 replicas, timeout 1000ms)
-**Response:** Integer (number of replicas that acknowledged)
-**Use case:** Testing replication lag, consistency verification
-**Note:** Only meaningful in replicated Redis setups
-
-### Custom Commands
-
-Redis supports hundreds of commands for different data structures:
-
-**Lists:** LPUSH, RPUSH, LPOP, RPOP, LRANGE
-**Sets:** SADD, SREM, SMEMBERS, SINTER
-**Sorted Sets:** ZADD, ZREM, ZRANGE, ZRANGEBYSCORE
-**Hashes:** HSET, HGET, HMGET, HGETALL
-**Strings:** APPEND, STRLEN, GETRANGE, SETRANGE
-
-Xylem supports these through custom command templates (see Command Selection section below).
-
-## Pipelining
-
-Redis supports pipelining: sending multiple commands without waiting for responses.
-
-**Benefits:**
-- Reduces round-trip latency
-- Increases throughput
-- Efficient use of network bandwidth
-
-**How it works:**
-```
-Client sends:    GET key1    GET key2    GET key3
-                 ─────────────────────────────────>
-Server responds: <value1>    <value2>    <value3>
-                 <─────────────────────────────────
-```
-
-**Xylem support:** Configure `max_pending_per_connection` to control pipeline depth.
-
-## Benchmarking with Xylem
-
-Xylem allows you to configure various aspects of Redis workloads:
-
-| Aspect | Candidate Choices | Config Key |
-|--------|------------------|------------|
-| **Command Selection** | `fixed`, `weighted` | `workload.operations.strategy` |
-| **Commands** | `get`, `set`, `incr`, `mget`, `wait`, `custom` | `workload.operations.commands[].name` |
-| **Key Distribution** | `sequential`, `random`, `round-robin`, `zipfian`, `gaussian` | `workload.keys.strategy` |
-| **Value Size** | `fixed`, `uniform`, `normal`, `per_command` | `workload.value_size.strategy` |
-| **Pipelining** | 1-N pending requests per connection | `traffic_groups[].max_pending_per_connection` |
-| **Load Pattern** | `constant`, `ramp`, `spike`, `sinusoidal` | `workload.pattern.type` |
-
-### Basic Configuration
-
-```toml
-[target]
-protocol = "redis"
-address = "127.0.0.1:6379"
-transport = "tcp"
-```
-
-### Command Selection
-
-**Single command:**
-```toml
-[workload.operations]
-strategy = "fixed"
-operation = "get"  # Options: get, set, incr
-```
-
-**Mixed workload with weighted distribution:**
-```toml
-[workload.operations]
-strategy = "weighted"
-
-[[workload.operations.commands]]
-name = "get"
-weight = 0.7  # 70% reads
-
-[[workload.operations.commands]]
-name = "set"
-weight = 0.3  # 30% writes
-```
-
-**Batch operations (MGET):**
-```toml
-[[workload.operations.commands]]
-name = "mget"
-weight = 0.2
-count = 10  # Fetch 10 keys per request
-```
-
-**Replication testing (WAIT):**
-```toml
-[[workload.operations.commands]]
-name = "wait"
-weight = 0.1
-num_replicas = 2
-timeout_ms = 1000
-```
-
-**Custom commands with templates:**
+Xylem's command templates are your escape hatch for anything not built-in. Want to test sorted sets? Write:
 ```toml
 [[workload.operations.commands]]
 name = "custom"
-weight = 0.1
 template = "ZADD leaderboard __value_size__ player:__key__"
 ```
 
-Template variables: `__key__`, `__data__`, `__value_size__`
+Xylem replaces `__key__` with the current key, `__value_size__` with the value size, and `__data__` with generated data. The template becomes a proper RESP array. You can benchmark HSET, LPUSH, SADD, GEOADD—anything Redis supports.
 
-### Key Distribution
+## Building Realistic Workloads
 
-**Sequential access:**
+Real applications don't just GET and SET uniformly distributed keys. They have patterns: hot keys, read-heavy ratios, varied value sizes, bursts of traffic. Xylem lets you model all of this.
+
+### Command Mixes
+
+Start simple. A pure GET workload tests read performance:
 ```toml
-[workload.keys]
-strategy = "sequential"
-start = 0
-max = 100000
-```
-
-**Uniform random:**
-```toml
-[workload.keys]
-strategy = "random"
-max = 1000000
-```
-
-**Zipfian (hot-key patterns):**
-```toml
-[workload.keys]
-strategy = "zipfian"
-exponent = 0.99
-max = 1000000
-```
-
-**Gaussian (temporal locality):**
-```toml
-[workload.keys]
-strategy = "gaussian"
-mean_pct = 0.5
-std_dev_pct = 0.1
-max = 10000
-```
-
-### Value Size Distribution
-
-**Fixed size:**
-```toml
-[workload.value_size]
+[workload.operations]
 strategy = "fixed"
-size = 128
+operation = "get"
 ```
 
-**Uniform distribution:**
+But production is rarely pure reads. Model a cache with 70% reads and 30% writes:
 ```toml
-[workload.value_size]
-strategy = "uniform"
-min = 64
-max = 4096
-```
-
-**Normal distribution:**
-```toml
-[workload.value_size]
-strategy = "normal"
-mean = 512.0
-std_dev = 128.0
-min = 64
-max = 4096
-```
-
-**Per-command sizes:**
-```toml
-[workload.value_size]
-strategy = "per_command"
-default = { strategy = "fixed", size = 256 }
-
-[workload.value_size.commands.get]
-distribution = "fixed"
-size = 64
-
-[workload.value_size.commands.set]
-distribution = "uniform"
-min = 128
-max = 1024
-```
-
-## Complete Example
-
-```toml
-[experiment]
-name = "redis-realistic-workload"
-description = "Mixed operations with hot keys and varied sizes"
-duration = "60s"
-seed = 42  # Reproducible results
-
-[target]
-address = "127.0.0.1:6379"
-protocol = "redis"
-transport = "tcp"
-
-[workload]
-# Hot-key pattern: Zipfian distribution
-[workload.keys]
-strategy = "zipfian"
-exponent = 0.99
-max = 1000000
-value_size = 512
-
-# 70% reads, 30% writes
 [workload.operations]
 strategy = "weighted"
 
@@ -418,95 +139,121 @@ weight = 0.7
 [[workload.operations.commands]]
 name = "set"
 weight = 0.3
+```
 
-# Per-command value sizes
+Xylem picks commands randomly based on their weights. Over time, you'll see 70% GETs and 30% SETs.
+
+Add INCR for counters, MGET for batch reads, and WAIT to test replication:
+```toml
+[[workload.operations.commands]]
+name = "incr"
+weight = 0.1
+
+[[workload.operations.commands]]
+name = "mget"
+weight = 0.05
+count = 10  # Fetch 10 keys per MGET
+
+[[workload.operations.commands]]
+name = "wait"
+weight = 0.02
+num_replicas = 2
+timeout_ms = 1000
+```
+
+Now you're testing a realistic mix: mostly GETs, some SETs, occasional counter increments, batch reads, and periodic replication checks.
+
+### Key Distributions
+
+Uniform random keys are easy to understand but unrealistic. Real workloads have hot keys—some data gets accessed way more than others.
+
+**Zipfian** distribution models this. With a Zipfian exponent of 0.99, a tiny fraction of keys get most of the traffic:
+```toml
+[workload.keys]
+strategy = "zipfian"
+exponent = 0.99
+max = 1000000
+```
+
+This is perfect for CDN caching (some content is always popular), user sessions (active users generate more requests), or product catalogs (bestsellers dominate).
+
+**Gaussian** (normal) distribution clusters keys around a mean. This models temporal locality—recent data is hot, older data cools off:
+```toml
+[workload.keys]
+strategy = "gaussian"
+mean_pct = 0.5  # Center at 50% of key space
+std_dev_pct = 0.1  # 10% spread
+max = 10000
+```
+
+Use this for time-series data, sliding windows, or any scenario where "recent" matters.
+
+**Sequential** access walks through keys in order. Good for range scans or import/export workloads:
+```toml
+[workload.keys]
+strategy = "sequential"
+start = 0
+max = 100000
+```
+
+**Random** is truly uniform. Every key has equal probability. This is your baseline for understanding Redis's raw performance without hot keys skewing results.
+
+### Value Sizes
+
+Fixed-size values are clean for benchmarking:
+```toml
+[workload.value_size]
+strategy = "fixed"
+size = 128  # All values are 128 bytes
+```
+
+But production has variation. Some cache entries are tiny (user preferences), others are huge (HTML fragments). Model this with distributions:
+```toml
+[workload.value_size]
+strategy = "normal"
+mean = 512.0
+std_dev = 128.0
+min = 64
+max = 4096
+```
+
+Or make value sizes command-specific. Small GETs, large SETs:
+```toml
 [workload.value_size]
 strategy = "per_command"
-default = { strategy = "fixed", size = 256 }
 
 [workload.value_size.commands.get]
 distribution = "fixed"
 size = 64
 
 [workload.value_size.commands.set]
-distribution = "normal"
-mean = 512.0
-std_dev = 128.0
-min = 128
+distribution = "uniform"
+min = 256
 max = 2048
-
-[workload.pattern]
-type = "constant"
-rate = 10000.0
-
-[[traffic_groups]]
-name = "redis-benchmark"
-threads = [0]
-connections_per_thread = 20
-max_pending_per_connection = 10  # Pipelining depth
-
-[traffic_groups.policy]
-type = "closed-loop"
-
-[traffic_groups.sampling_policy]
-type = "limited"
-rate = 1.0
-max_samples = 100000
-
-[output]
-format = "json"
-file = "results/redis-benchmark.json"
 ```
 
-## Common Workload Patterns
+This models scenarios like caching API responses (small reads) and storing rendered pages (large writes).
 
-**Cache workload (CDN, API responses):**
-- Commands: 90-95% GET, 5-10% SET
-- Keys: Zipfian (persistent hot content)
-- Sizes: Small reads (64B), larger writes (256-1024B)
+## Cluster Benchmarking
 
-**Session store:**
-- Commands: 70% GET, 30% SET
-- Keys: Gaussian (temporal locality)
-- Sizes: Small lookups (64B), varied session data (128-1024B)
+When you're testing Redis Cluster, you're really testing how well your client handles distributed systems. Redis Cluster shards data across nodes using hash slots. There are 16,384 slots, and every key hashes to one of them. Each node owns a range of slots. When you send a command to the wrong node, Redis tells you where to go with a MOVED or ASK redirect.
 
-**Counter system (rate limiting, analytics):**
-- Commands: 50% GET, 50% INCR
-- Keys: Random or uniform
-- Sizes: Small fixed (64B)
+Xylem handles this for you. You tell it about your cluster topology—which nodes own which slots—and it routes every request to the right node from the start. No trial and error, no unnecessary redirects.
 
-**Write-heavy (logging, time-series):**
-- Commands: 20-30% GET, 70-80% SET
-- Keys: Sequential or temporal
-- Sizes: Uniform or normal distribution
-
-## Redis Cluster
-
-When you're benchmarking a distributed Redis deployment, you need to think about how Redis Cluster shards data across multiple nodes. Xylem handles this complexity for you with full Redis Cluster support.
-
-### How It Works
-
-Redis Cluster divides the key space into 16,384 hash slots. Each key gets hashed to determine which slot it belongs to, and each cluster node is responsible for a range of these slots. When you send a request to the wrong node, Redis responds with a MOVED or ASK redirect telling you where the key actually lives.
-
-Xylem takes care of all this routing automatically. You set up your cluster topology once, and from then on, every request goes directly to the right node. When the cluster reshards (moving slots between nodes), Xylem detects the redirects and can retry on the correct node.
-
-### Getting Started
-
-Using Redis Cluster with Xylem is straightforward. You create a cluster protocol, register your nodes, and configure the topology:
-
+Here's the setup:
 ```rust
 use xylem_protocols::*;
 
-// Create cluster protocol with your command selector
+// Create a cluster-aware protocol
 let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
 let mut protocol = RedisClusterProtocol::new(selector);
 
-// Register each node in your cluster
+// Register your nodes
 protocol.register_connection("127.0.0.1:7000".parse()?, 0);
 protocol.register_connection("127.0.0.1:7001".parse()?, 1);
 protocol.register_connection("127.0.0.1:7002".parse()?, 2);
 
-// Configure which slots each node owns
+// Define the topology
 let mut ranges = vec![];
 for i in 0..3 {
     let (start, end) = calculate_slot_range(i, 3)?;
@@ -515,47 +262,56 @@ for i in 0..3 {
 }
 protocol.update_topology(ClusterTopology::from_slot_ranges(ranges));
 
-// Now requests automatically route to the correct node
+// Now every request goes to the right node
 let (request, req_id) = protocol.generate_request(0, key, value_size);
 ```
 
-The topology lookup is O(1) - a simple binary search over slot ranges - so routing adds negligible overhead to your benchmark.
+The slot calculation is CRC16-XMODEM of the key. Xylem does a binary search over slot ranges to find the owner—O(log N) in the number of ranges, but with typical cluster sizes (3-10 nodes), this is effectively free.
 
-### Working with Hash Tags
+### Hash Tags for Multi-Key Operations
 
-Sometimes you need multiple keys to live on the same node. Maybe you're testing MGET performance, or you want to ensure related data stays together. Redis Cluster supports hash tags for exactly this purpose.
+Sometimes you need multiple keys on the same node. MGET won't work across nodes—Redis can't fetch `{key:1, key:2, key:3}` if they're on different shards. Hash tags solve this.
 
-When you wrap part of a key in curly braces, Redis only hashes that portion:
-
+When you use curly braces in a key name, Redis only hashes what's inside the braces:
 ```rust
-// All these keys hash to the same slot
 let key1 = "{user:1000}.profile";
 let key2 = "{user:1000}.settings";
 let key3 = "{user:1000}.preferences";
-
-// This enables multi-key operations like:
-// MGET {user:1000}.profile {user:1000}.settings {user:1000}.preferences
 ```
 
-This is particularly useful for benchmarking scenarios where you want to measure the performance of operations that span multiple related keys.
+All three hash to the same slot because they share `{user:1000}`. Now you can MGET them together, or use MULTI/EXEC for atomic multi-key operations.
 
 ### Handling Redirects
 
-When you benchmark a cluster during resharding or when your topology is slightly out of date, Redis will send MOVED or ASK redirects. Xylem detects these automatically by parsing the response.
+Even with perfect topology knowledge, clusters reshard. Slots migrate between nodes during scale-up, rebalancing, or failover. When you hit a moving slot, Redis sends a redirect.
 
-For MOVED redirects (permanent slot migrations), you'll typically want to update your topology and retry. For ASK redirects (temporary states during migration), you retry on the new node without updating topology. Xylem provides the redirect information - you decide the retry strategy that fits your benchmark goals.
+**MOVED** means the slot permanently moved. Update your topology and retry. MOVED is a signal to refresh your cluster map.
 
-### What's Currently Supported
+**ASK** means the slot is temporarily migrating. Retry on the new node (with an ASKING command first), but don't update your topology—the migration might not complete.
 
-Xylem's Redis Cluster implementation is production-ready for benchmarking. It handles:
+Xylem detects both. It parses the redirect response, extracts the target node address, and returns this info so you can decide: update topology, retry immediately, log the event, whatever makes sense for your benchmark.
 
-- **Automatic slot-based routing** using the standard CRC16-XMODEM hash function
-- **O(1) topology lookups** for efficient request routing
-- **MOVED and ASK redirect detection** in responses
-- **Hash tag support** for multi-key operations
-- **Helper functions** for common operations like calculating slot ranges
+## Common Workload Patterns
 
-The implementation focuses on giving you the building blocks you need. You configure the topology programmatically, which gives you precise control over your benchmark setup. TOML-based configuration and automatic retry logic are possible future enhancements, but the current API gives you everything needed for comprehensive cluster benchmarking.
+Let me paint some pictures of real-world workloads and how to model them.
+
+**CDN Edge Cache**: 95% GETs, 5% SETs. Zipfian key distribution (popular content dominates). Small reads (64B for metadata), medium writes (512B average, normal distribution for HTML snippets and JSON). High throughput, moderate pipelining. Watch for cache hit rates and P99 latency on those few misses that go to origin.
+
+**Session Store**: 70% GETs, 30% SETs. Gaussian distribution (recent sessions are hot). Small uniform values (256-512B for session tokens and user state). Low latency is critical—sessions are in the critical path. Use SETEX with realistic TTLs (30-60 minutes) and measure how eviction affects memory and performance.
+
+**Rate Limiter**: 50% GET (check current count), 50% INCR (increment count). Random or round-robin keys (different users/IPs). Tiny values (just counters). Extremely high throughput, short TTLs (60 seconds for sliding windows). Focus on atomic operation latency and throughput under contention.
+
+**Write-Heavy Logging**: 80% SET, 20% GET. Sequential keys (time-ordered logs). Uniform value sizes (log entry length is predictable). High write throughput with pipelining. Test persistence overhead (AOF fsync), replication lag, and memory growth.
+
+**E-Commerce Product Catalog**: 90% GET (browsing), 10% SET (inventory updates). Zipfian (bestsellers are hot). Medium values (1-4KB for product details with images). Add MGET for "customers who bought this also bought" features. Benchmark cache stampede behavior when popular items update.
+
+## Wrapping Up
+
+Redis benchmarking is about understanding your workload and translating it into RESP commands. Xylem gives you the tools: command mixes, key distributions, value sizes, pipelining control, cluster routing. The trick is using them to model what your production system actually does.
+
+Start simple. Benchmark pure GETs and SETs with uniform keys to understand Redis's baseline. Then add complexity: hot keys with Zipfian distribution, mixed command ratios, varied value sizes. Pipeline aggressively to see maximum throughput. Test failure modes: what happens during resharding, replication lag, eviction under memory pressure?
+
+Your benchmarks should tell a story. Not just "Redis can do 100K QPS," but "our session store can handle 10K users with P99 latency under 2ms, and we can lose a cluster node without dropping requests." That's the insight that lets you ship with confidence.
 
 ## See Also
 

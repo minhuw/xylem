@@ -66,7 +66,6 @@ fn start_unix_echo_server(path: std::path::PathBuf) -> thread::JoinHandle<()> {
 }
 
 #[test]
-#[ignore] // Ignore by default as it requires UDP port availability
 fn test_udp_transport_echo() {
     // Start UDP echo server on a random port
     let port = 19999;
@@ -126,7 +125,6 @@ fn test_udp_transport_echo() {
 
 #[test]
 #[cfg(unix)]
-#[ignore] // Ignore by default as it requires file system access
 fn test_unix_socket_transport_echo() {
     // Create temporary directory for Unix socket
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -173,7 +171,6 @@ fn test_unix_socket_transport_echo() {
 }
 
 #[test]
-#[ignore] // Ignore by default
 fn test_udp_xylem_echo_protocol() {
     // Start Xylem echo server with UDP support (if available)
     // For now, just test basic UDP functionality
@@ -200,7 +197,6 @@ fn test_udp_xylem_echo_protocol() {
 
 #[test]
 #[cfg(unix)]
-#[ignore] // Ignore by default
 fn test_unix_socket_multiple_connections() {
     // Test that we can create multiple Unix socket connections
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -239,7 +235,6 @@ fn test_unix_socket_multiple_connections() {
 }
 
 #[test]
-#[ignore] // Ignore by default
 fn test_udp_packet_loss_handling() {
     // Test that UDP transport handles packet loss gracefully
     let port = 19997;

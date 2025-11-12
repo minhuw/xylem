@@ -1,0 +1,7 @@
+services:
+  redis-auth:
+    image: redis:7-alpine
+    container_name: xylem-test-redis-auth
+    ports:
+      - "6380:6379"
+    command: redis-server --requirepass testpassword --save "" --appendonly no

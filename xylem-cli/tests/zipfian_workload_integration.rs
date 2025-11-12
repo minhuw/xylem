@@ -9,7 +9,6 @@ use std::time::Duration;
 use xylem_core::workload::generator::KeyGeneration;
 
 #[test]
-#[ignore] // Run with: cargo test zipfian_workload -- --ignored
 fn test_zipfian_workload_distribution() {
     // Test Zipfian distribution properties without server
     let mut keygen = KeyGeneration::zipfian(1000, 0.99).expect("Failed to create Zipfian");
@@ -44,7 +43,6 @@ fn test_zipfian_workload_distribution() {
 }
 
 #[test]
-#[ignore] // Run with: cargo test zipfian_cli -- --ignored
 fn test_zipfian_cli_integration() {
     // Start echo server on a random port
     let server = common::start_echo_server().expect("Failed to start echo server");

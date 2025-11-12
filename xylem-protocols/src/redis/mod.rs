@@ -26,6 +26,34 @@ pub enum RedisOp {
         num_replicas: usize,
         timeout_ms: u64,
     },
+    /// AUTH - Authenticate with Redis
+    Auth {
+        username: Option<String>, // For Redis 6.0+ ACL
+        password: String,
+    },
+    /// SELECT - Select database
+    SelectDb {
+        db: u32,
+    },
+    /// HELLO - Set RESP protocol version
+    Hello {
+        version: u8, // 2 or 3
+    },
+    /// SETEX - Set with expiry in seconds
+    SetEx {
+        ttl_seconds: u32,
+    },
+    /// SETRANGE - Write at specific offset
+    SetRange {
+        offset: usize,
+    },
+    /// GETRANGE - Read from offset to end
+    GetRange {
+        offset: usize,
+        end: i64, // -1 for end of string
+    },
+    /// CLUSTER SLOTS - Query cluster topology
+    ClusterSlots,
     /// Custom command from template
     Custom(CommandTemplate),
 }
@@ -39,6 +67,9 @@ pub struct RedisProtocol {
     /// Track redirect statistics (for cluster support)
     moved_redirects: u64,
     ask_redirects: u64,
+    /// RESP protocol version (2 or 3)
+    #[allow(dead_code)] // Reserved for future RESP3-specific features
+    resp_version: u8,
 }
 
 impl RedisProtocol {
@@ -50,6 +81,7 @@ impl RedisProtocol {
             conn_recv_seq: std::collections::HashMap::new(),
             moved_redirects: 0,
             ask_redirects: 0,
+            resp_version: 2, // Default to RESP2
         }
     }
 
@@ -141,6 +173,73 @@ impl Protocol for RedisProtocol {
                 )
                 .into_bytes()
             }
+            RedisOp::Auth { username, password } => {
+                if let Some(user) = username {
+                    // Redis 6.0+ ACL: AUTH username password
+                    format!(
+                        "*3\r\n$4\r\nAUTH\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                        user.len(),
+                        user,
+                        password.len(),
+                        password
+                    )
+                    .into_bytes()
+                } else {
+                    // Legacy: AUTH password
+                    format!("*2\r\n$4\r\nAUTH\r\n${}\r\n{}\r\n", password.len(), password)
+                        .into_bytes()
+                }
+            }
+            RedisOp::SelectDb { db } => {
+                let db_str = db.to_string();
+                format!("*2\r\n$6\r\nSELECT\r\n${}\r\n{}\r\n", db_str.len(), db_str).into_bytes()
+            }
+            RedisOp::Hello { version } => {
+                format!("*2\r\n$5\r\nHELLO\r\n$1\r\n{}\r\n", version).into_bytes()
+            }
+            RedisOp::SetEx { ttl_seconds } => {
+                let value = "x".repeat(value_size);
+                let ttl_str = ttl_seconds.to_string();
+                format!(
+                    "*4\r\n$5\r\nSETEX\r\n${}\r\nkey:{}\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                    key.to_string().len() + 4,
+                    key,
+                    ttl_str.len(),
+                    ttl_str,
+                    value_size,
+                    value
+                )
+                .into_bytes()
+            }
+            RedisOp::SetRange { offset } => {
+                let value = "x".repeat(value_size);
+                let offset_str = offset.to_string();
+                format!(
+                    "*4\r\n$8\r\nSETRANGE\r\n${}\r\nkey:{}\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                    key.to_string().len() + 4,
+                    key,
+                    offset_str.len(),
+                    offset_str,
+                    value_size,
+                    value
+                )
+                .into_bytes()
+            }
+            RedisOp::GetRange { offset, end } => {
+                let offset_str = offset.to_string();
+                let end_str = end.to_string();
+                format!(
+                    "*4\r\n$8\r\nGETRANGE\r\n${}\r\nkey:{}\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                    key.to_string().len() + 4,
+                    key,
+                    offset_str.len(),
+                    offset_str,
+                    end_str.len(),
+                    end_str
+                )
+                .into_bytes()
+            }
+            RedisOp::ClusterSlots => b"*2\r\n$7\r\nCLUSTER\r\n$5\r\nSLOTS\r\n".to_vec(),
             RedisOp::Custom(template) => template.generate_request(key, value_size),
         };
         (request_data, id)
@@ -164,8 +263,9 @@ impl Protocol for RedisProtocol {
 
         // Validate response
         match data[0] {
-            b'+' | b':' | b'$' | b'*' => {
-                // Valid response - return the next expected ID for this connection
+            b'+' | b':' | b'$' | b'*' | b'_' | b',' | b'#' | b'(' | b'%' | b'~' | b'|' | b'!'
+            | b'=' => {
+                // Valid response (RESP2 and RESP3 types) - return the next expected ID for this connection
                 // (Redis guarantees FIFO ordering per connection)
                 let seq = self.next_recv_seq(conn_id);
                 Ok((consumed, Some((conn_id, seq))))
@@ -216,6 +316,7 @@ impl Protocol for RedisProtocol {
 
 impl RedisProtocol {
     /// Find the end of a complete RESP message, returns bytes consumed
+    /// Supports both RESP2 and RESP3 types
     fn find_resp_message_end(&self, data: &[u8]) -> Result<usize> {
         if data.is_empty() {
             return Ok(0);
@@ -223,15 +324,16 @@ impl RedisProtocol {
 
         match data[0] {
             b'+' | b'-' | b':' => {
-                // Simple strings, errors, integers end with \r\n
+                // RESP2: Simple strings, errors, integers end with \r\n
                 if let Some(pos) = data.windows(2).position(|w| w == b"\r\n") {
                     Ok(pos + 2)
                 } else {
                     Ok(0) // Incomplete
                 }
             }
-            b'$' => {
-                // Bulk string: $<length>\r\n<data>\r\n
+            b'$' | b'!' | b'=' => {
+                // RESP2: Bulk string ($)
+                // RESP3: Blob error (!), Verbatim string (=)
                 if let Some(first_crlf) = data.windows(2).position(|w| w == b"\r\n") {
                     let length_str = std::str::from_utf8(&data[1..first_crlf])
                         .map_err(|e| anyhow!("Invalid bulk string length: {e}"))?;
@@ -254,11 +356,38 @@ impl RedisProtocol {
                     Ok(0) // Incomplete
                 }
             }
-            b'*' => {
-                // Array - for simplicity, just find the end marker
+            b'*' | b'%' | b'~' | b'|' => {
+                // RESP2: Array (*)
+                // RESP3: Map (%), Set (~), Attribute (|)
+                // For simplicity, just find the end marker
                 // This is simplified; real implementation would need recursive parsing
                 if let Some(pos) = data.windows(2).position(|w| w == b"\r\n") {
                     Ok(pos + 2)
+                } else {
+                    Ok(0) // Incomplete
+                }
+            }
+            b'_' => {
+                // RESP3: Null (_\r\n)
+                if data.len() >= 3 && &data[0..3] == b"_\r\n" {
+                    Ok(3)
+                } else {
+                    Ok(0) // Incomplete
+                }
+            }
+            b',' | b'(' => {
+                // RESP3: Double (,<floating-point-number>\r\n)
+                // RESP3: Big number ((<big-number>\r\n)
+                if let Some(pos) = data.windows(2).position(|w| w == b"\r\n") {
+                    Ok(pos + 2)
+                } else {
+                    Ok(0) // Incomplete
+                }
+            }
+            b'#' => {
+                // RESP3: Boolean (#t\r\n or #f\r\n)
+                if data.len() >= 4 && &data[2..4] == b"\r\n" {
+                    Ok(4)
                 } else {
                     Ok(0) // Incomplete
                 }
@@ -703,5 +832,311 @@ mod tests {
         let (moved, ask) = protocol.redirect_stats();
         assert_eq!(moved, 0);
         assert_eq!(ask, 0);
+    }
+
+    // Tests for new commands (AUTH, SELECT, HELLO, etc.)
+
+    #[test]
+    fn test_generate_auth_simple() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Auth {
+            username: None,
+            password: "mypassword".to_string(),
+        }));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, id) = protocol.generate_request(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert_eq!(id, (0, 0));
+        assert!(request_str.starts_with("*2\r\n"));
+        assert!(request_str.contains("AUTH"));
+        assert!(request_str.contains("mypassword"));
+        assert!(!request_str.contains("username")); // Simple auth has no username
+    }
+
+    #[test]
+    fn test_generate_auth_acl() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Auth {
+            username: Some("myuser".to_string()),
+            password: "mypassword".to_string(),
+        }));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, id) = protocol.generate_request(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert_eq!(id, (0, 0));
+        assert!(request_str.starts_with("*3\r\n")); // 3 elements for ACL auth
+        assert!(request_str.contains("AUTH"));
+        assert!(request_str.contains("myuser"));
+        assert!(request_str.contains("mypassword"));
+    }
+
+    #[test]
+    fn test_generate_select_db() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::SelectDb { db: 5 }));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*2\r\n"));
+        assert!(request_str.contains("SELECT"));
+        assert!(request_str.contains("5"));
+    }
+
+    #[test]
+    fn test_generate_hello_resp2() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Hello { version: 2 }));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*2\r\n"));
+        assert!(request_str.contains("HELLO"));
+        assert!(request_str.contains("2"));
+    }
+
+    #[test]
+    fn test_generate_hello_resp3() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Hello { version: 3 }));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*2\r\n"));
+        assert!(request_str.contains("HELLO"));
+        assert!(request_str.contains("3"));
+    }
+
+    #[test]
+    fn test_generate_setex() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::SetEx { ttl_seconds: 300 }));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request(0, 100, 10);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*4\r\n")); // 4 elements: SETEX key ttl value
+        assert!(request_str.contains("SETEX"));
+        assert!(request_str.contains("key:100"));
+        assert!(request_str.contains("300")); // TTL
+        assert!(request_str.contains("xxxxxxxxxx")); // 10 x's
+    }
+
+    #[test]
+    fn test_generate_setrange() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::SetRange { offset: 5 }));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request(0, 100, 3);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*4\r\n"));
+        assert!(request_str.contains("SETRANGE"));
+        assert!(request_str.contains("key:100"));
+        assert!(request_str.contains("5")); // offset
+        assert!(request_str.contains("xxx")); // 3 x's
+    }
+
+    #[test]
+    fn test_generate_getrange() {
+        let selector =
+            Box::new(FixedCommandSelector::new(RedisOp::GetRange { offset: 10, end: -1 }));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request(0, 100, 64);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*4\r\n"));
+        assert!(request_str.contains("GETRANGE"));
+        assert!(request_str.contains("key:100"));
+        assert!(request_str.contains("10")); // offset
+        assert!(request_str.contains("-1")); // end
+    }
+
+    #[test]
+    fn test_generate_cluster_slots() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::ClusterSlots));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*2\r\n"));
+        assert!(request_str.contains("CLUSTER"));
+        assert!(request_str.contains("SLOTS"));
+    }
+
+    // RESP3 response parsing tests
+
+    #[test]
+    fn test_parse_resp3_null() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let response = b"_\r\n";
+        let result = protocol.parse_response(0, response);
+
+        assert!(result.is_ok());
+        let (consumed, id) = result.unwrap();
+        assert_eq!(consumed, 3);
+        assert_eq!(id, Some((0, 0)));
+    }
+
+    #[test]
+    fn test_parse_resp3_boolean_true() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let response = b"#t\r\n";
+        let result = protocol.parse_response(0, response);
+
+        assert!(result.is_ok());
+        let (consumed, id) = result.unwrap();
+        assert_eq!(consumed, 4);
+        assert_eq!(id, Some((0, 0)));
+    }
+
+    #[test]
+    fn test_parse_resp3_boolean_false() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let response = b"#f\r\n";
+        let result = protocol.parse_response(0, response);
+
+        assert!(result.is_ok());
+        let (consumed, _) = result.unwrap();
+        assert_eq!(consumed, 4);
+    }
+
+    #[test]
+    fn test_parse_resp3_double() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let response = b",3.14159\r\n";
+        let result = protocol.parse_response(0, response);
+
+        assert!(result.is_ok());
+        let (consumed, _) = result.unwrap();
+        assert_eq!(consumed, 10);
+    }
+
+    #[test]
+    fn test_parse_resp3_big_number() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let response = b"(3492890328409238509324850943850943825024385\r\n";
+        let result = protocol.parse_response(0, response);
+
+        assert!(result.is_ok());
+        let (consumed, _) = result.unwrap();
+        assert_eq!(consumed, 46); // 1 + 43 digits + 2 (\r\n)
+    }
+
+    #[test]
+    fn test_parse_resp3_blob_error() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let response = b"!21\r\nSYNTAX invalid syntax\r\n";
+        let result = protocol.parse_response(0, response);
+
+        assert!(result.is_ok());
+        let (consumed, _) = result.unwrap();
+        assert_eq!(consumed, 28);
+    }
+
+    #[test]
+    fn test_parse_resp3_verbatim_string() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let response = b"=15\r\ntxt:Some string\r\n";
+        let result = protocol.parse_response(0, response);
+
+        assert!(result.is_ok());
+        let (consumed, _) = result.unwrap();
+        assert_eq!(consumed, 22); // =15\r\n (4) + txt:Some string (15) + \r\n (2) + 1 = 22
+    }
+
+    #[test]
+    fn test_parse_resp3_map() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let response = b"%2\r\n";
+        let result = protocol.parse_response(0, response);
+
+        assert!(result.is_ok());
+        let (consumed, _) = result.unwrap();
+        assert_eq!(consumed, 4);
+    }
+
+    #[test]
+    fn test_parse_resp3_set() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let response = b"~5\r\n";
+        let result = protocol.parse_response(0, response);
+
+        assert!(result.is_ok());
+        let (consumed, _) = result.unwrap();
+        assert_eq!(consumed, 4);
+    }
+
+    #[test]
+    fn test_parse_resp3_attribute() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let response = b"|1\r\n";
+        let result = protocol.parse_response(0, response);
+
+        assert!(result.is_ok());
+        let (consumed, _) = result.unwrap();
+        assert_eq!(consumed, 4);
+    }
+
+    #[test]
+    fn test_parse_resp3_incomplete_null() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let response = b"_\r"; // Missing \n
+        let result = protocol.parse_response(0, response);
+
+        assert!(result.is_ok());
+        let (consumed, id) = result.unwrap();
+        assert_eq!(consumed, 0); // Incomplete
+        assert_eq!(id, None);
+    }
+
+    #[test]
+    fn test_parse_resp3_incomplete_boolean() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let response = b"#t"; // Missing \r\n
+        let result = protocol.parse_response(0, response);
+
+        assert!(result.is_ok());
+        let (consumed, id) = result.unwrap();
+        assert_eq!(consumed, 0); // Incomplete
+        assert_eq!(id, None);
+    }
+
+    #[test]
+    fn test_resp_version_default() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
+        let protocol = RedisProtocol::new(selector);
+
+        assert_eq!(protocol.resp_version, 2); // Default to RESP2
     }
 }

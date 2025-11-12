@@ -13,7 +13,10 @@ _default:
 # Run all tests (unit + integration)
 test:
     @echo "🚀 Running all tests (unit + integration)..."
-    cargo nextest run --workspace
+    @echo "   Running unit tests first..."
+    cargo nextest run --profile unit --workspace
+    @echo "   Running integration tests (serially to avoid Docker conflicts)..."
+    cargo nextest run --profile integration --workspace
 
 # Run all examples to validate they work
 examples:
