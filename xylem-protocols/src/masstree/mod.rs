@@ -23,6 +23,7 @@ use rmp::decode;
 use rmp::encode;
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
+use zeropool::BufferPool;
 
 // Masstree command codes
 const CMD_GET: u8 = 2;
@@ -86,6 +87,8 @@ pub struct MasstreeProtocol {
     conn_send_seq: HashMap<usize, u16>,
     /// Per-connection handshake state
     conn_handshake_done: HashMap<usize, bool>,
+    /// Buffer pool for request generation
+    pool: BufferPool,
 }
 
 impl MasstreeProtocol {
@@ -94,6 +97,7 @@ impl MasstreeProtocol {
             operation,
             conn_send_seq: HashMap::new(),
             conn_handshake_done: HashMap::new(),
+            pool: BufferPool::new(),
         }
     }
 
@@ -114,7 +118,8 @@ impl MasstreeProtocol {
 
     /// Build a handshake request: [0, 14, {"core": -1, "maxkeylen": 255}]
     fn build_handshake(&self) -> Result<Vec<u8>> {
-        let mut buf = Vec::new();
+        let mut buf = self.pool.get(128);
+        buf.clear(); // Clear any old data
 
         // Array of 3 elements: [seq, cmd, map]
         encode::write_array_len(&mut buf, 3)?;
@@ -136,12 +141,13 @@ impl MasstreeProtocol {
         encode::write_str(&mut buf, "maxkeylen")?;
         encode::write_uint(&mut buf, 255)?;
 
-        Ok(buf)
+        Ok(buf.to_vec())
     }
 
     /// Build a GET request: [seq, 2, key_str]
     fn build_get_request(&self, seq: u16, key: &str) -> Result<Vec<u8>> {
-        let mut buf = Vec::new();
+        let mut buf = self.pool.get(256);
+        buf.clear(); // Clear any old data
 
         // Array of 3 elements: [seq, cmd, key]
         encode::write_array_len(&mut buf, 3)?;
@@ -155,12 +161,13 @@ impl MasstreeProtocol {
         // key as string
         encode::write_str(&mut buf, key)?;
 
-        Ok(buf)
+        Ok(buf.to_vec())
     }
 
     /// Build a SET/REPLACE request: [seq, 8, key_str, value_str]
     fn build_set_request(&self, seq: u16, key: &str, value: &[u8]) -> Result<Vec<u8>> {
-        let mut buf = Vec::new();
+        let mut buf = self.pool.get(256 + value.len());
+        buf.clear(); // Clear any old data
 
         // Array of 4 elements: [seq, cmd, key, value]
         encode::write_array_len(&mut buf, 4)?;
@@ -178,7 +185,7 @@ impl MasstreeProtocol {
         encode::write_str_len(&mut buf, value.len() as u32)?;
         buf.write_all(value)?;
 
-        Ok(buf)
+        Ok(buf.to_vec())
     }
 
     /// Build a PUT request: [seq, 6, key_str, col_idx, value, col_idx, value, ...]
@@ -188,7 +195,10 @@ impl MasstreeProtocol {
         key: &str,
         columns: &[(u32, Vec<u8>)],
     ) -> Result<Vec<u8>> {
-        let mut buf = Vec::new();
+        // Estimate size: header + key + column data
+        let total_value_size: usize = columns.iter().map(|(_, v)| v.len()).sum();
+        let mut buf = self.pool.get(256 + total_value_size);
+        buf.clear(); // Clear any old data
 
         // Array size: seq, cmd, key, + (col_idx, value) pairs
         let array_len = 3 + (columns.len() * 2);
@@ -210,12 +220,13 @@ impl MasstreeProtocol {
             buf.write_all(value)?;
         }
 
-        Ok(buf)
+        Ok(buf.to_vec())
     }
 
     /// Build a REMOVE request: [seq, 10, key_str]
     fn build_remove_request(&self, seq: u16, key: &str) -> Result<Vec<u8>> {
-        let mut buf = Vec::new();
+        let mut buf = self.pool.get(256);
+        buf.clear(); // Clear any old data
 
         // Array of 3 elements: [seq, cmd, key]
         encode::write_array_len(&mut buf, 3)?;
@@ -229,7 +240,7 @@ impl MasstreeProtocol {
         // key as string
         encode::write_str(&mut buf, key)?;
 
-        Ok(buf)
+        Ok(buf.to_vec())
     }
 
     /// Build a SCAN request: [seq, 4, firstkey_str, count_i32, field1_idx, field2_idx, ...]
@@ -240,7 +251,8 @@ impl MasstreeProtocol {
         count: u32,
         fields: &[u32],
     ) -> Result<Vec<u8>> {
-        let mut buf = Vec::new();
+        let mut buf = self.pool.get(256 + (fields.len() * 4));
+        buf.clear(); // Clear any old data
 
         // Array size: seq, cmd, firstkey, count, + field indices
         let array_len = 4 + fields.len();
@@ -263,12 +275,13 @@ impl MasstreeProtocol {
             encode::write_u32(&mut buf, *field_idx)?;
         }
 
-        Ok(buf)
+        Ok(buf.to_vec())
     }
 
     /// Build a CHECKPOINT request: [seq, 12]
     fn build_checkpoint_request(&self, seq: u16) -> Result<Vec<u8>> {
-        let mut buf = Vec::new();
+        let mut buf = self.pool.get(64);
+        buf.clear(); // Clear any old data
 
         // Array of 2 elements: [seq, cmd]
         encode::write_array_len(&mut buf, 2)?;
@@ -279,7 +292,7 @@ impl MasstreeProtocol {
         // cmd = 12 (Cmd_Checkpoint)
         encode::write_u8(&mut buf, CMD_CHECKPOINT)?;
 
-        Ok(buf)
+        Ok(buf.to_vec())
     }
 }
 

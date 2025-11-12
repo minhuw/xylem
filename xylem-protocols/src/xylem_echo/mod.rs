@@ -19,17 +19,23 @@
 
 use crate::Protocol;
 use anyhow::Result;
+use zeropool::BufferPool;
 
 const MESSAGE_SIZE: usize = 16; // 8 bytes request_id + 8 bytes delay_us
 
 pub struct XylemEchoProtocol {
     /// Default delay in microseconds if not specified
     default_delay_us: u64,
+    /// Buffer pool for request generation
+    pool: BufferPool,
 }
 
 impl XylemEchoProtocol {
     pub fn new(default_delay_us: u64) -> Self {
-        Self { default_delay_us }
+        Self {
+            default_delay_us,
+            pool: BufferPool::new(),
+        }
     }
 }
 
@@ -51,7 +57,8 @@ impl Protocol for XylemEchoProtocol {
         // Use a composite ID: high 32 bits = conn_id, low 32 bits = key
         let request_id = ((conn_id as u64) << 32) | (key & 0xFFFFFFFF);
 
-        let mut buf = Vec::with_capacity(MESSAGE_SIZE);
+        let mut buf = self.pool.get(MESSAGE_SIZE);
+        buf.clear();
 
         // Write request_id (8 bytes, little-endian)
         buf.extend_from_slice(&request_id.to_le_bytes());
@@ -59,7 +66,7 @@ impl Protocol for XylemEchoProtocol {
         // Write delay_us (8 bytes, little-endian)
         buf.extend_from_slice(&self.default_delay_us.to_le_bytes());
 
-        (buf, request_id)
+        (buf.to_vec(), request_id)
     }
 
     fn parse_response(

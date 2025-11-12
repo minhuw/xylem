@@ -8,6 +8,7 @@
 use crate::Protocol;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
+use zeropool::BufferPool;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpMethod {
@@ -34,6 +35,8 @@ pub struct HttpProtocol {
     conn_seq: HashMap<usize, u64>,
     /// Per-connection expected response sequence (RX side - responses are FIFO)
     conn_response_seq: HashMap<usize, u64>,
+    /// Buffer pool for request generation
+    pool: BufferPool,
 }
 
 impl HttpProtocol {
@@ -44,6 +47,7 @@ impl HttpProtocol {
             host,
             conn_seq: HashMap::new(),
             conn_response_seq: HashMap::new(),
+            pool: BufferPool::new(),
         }
     }
 
@@ -100,8 +104,11 @@ impl Protocol for HttpProtocol {
         let body = match self.method {
             HttpMethod::Get => None,
             HttpMethod::Post | HttpMethod::Put => {
-                // Generate body filled with 'x' for POST/PUT
-                Some(vec![b'x'; value_size])
+                // Generate body filled with 'x' for POST/PUT using pool
+                let mut buf = self.pool.get(value_size);
+                buf.clear();
+                buf.resize(value_size, b'x');
+                Some(buf.to_vec())
             }
         };
 

@@ -5,6 +5,7 @@
 use crate::Protocol;
 use anyhow::Result;
 use std::collections::HashMap;
+use zeropool::BufferPool;
 
 // Command opcodes
 const CMD_GETK: u8 = 0x0c;
@@ -74,6 +75,8 @@ pub struct MemcachedBinaryProtocol {
     conn_send_seq: HashMap<usize, u64>,
     /// Per-connection sequence numbers for receive
     conn_recv_seq: HashMap<usize, u64>,
+    /// Buffer pool for request generation
+    pool: BufferPool,
 }
 
 impl MemcachedBinaryProtocol {
@@ -82,6 +85,7 @@ impl MemcachedBinaryProtocol {
             operation,
             conn_send_seq: HashMap::new(),
             conn_recv_seq: HashMap::new(),
+            pool: BufferPool::new(),
         }
     }
 
@@ -126,10 +130,11 @@ impl Protocol for MemcachedBinaryProtocol {
                 let body_len = key_len as u32;
                 let header = BmcHeader::new_request(CMD_GETK, key_len, 0, body_len);
 
-                let mut buf = Vec::with_capacity(BmcHeader::SIZE + key_len as usize);
+                let mut buf = self.pool.get(BmcHeader::SIZE + key_len as usize);
+                buf.clear();
                 buf.extend_from_slice(&header.as_bytes());
                 buf.extend_from_slice(key_bytes);
-                buf
+                buf.to_vec()
             }
             MemcachedOp::Set => {
                 // SET: header + extras (8 bytes: flags + expiration) + key + value
@@ -137,9 +142,10 @@ impl Protocol for MemcachedBinaryProtocol {
                 let body_len = extras_len as u32 + key_len as u32 + value_size as u32;
                 let header = BmcHeader::new_request(CMD_SET, key_len, extras_len, body_len);
 
-                let mut buf = Vec::with_capacity(
-                    BmcHeader::SIZE + extras_len as usize + key_len as usize + value_size,
-                );
+                let mut buf = self
+                    .pool
+                    .get(BmcHeader::SIZE + extras_len as usize + key_len as usize + value_size);
+                buf.clear();
                 buf.extend_from_slice(&header.as_bytes());
 
                 // Extras: 4 bytes flags (0) + 4 bytes expiration (0)
@@ -151,7 +157,7 @@ impl Protocol for MemcachedBinaryProtocol {
                 // Value
                 buf.resize(buf.len() + value_size, b'x');
 
-                buf
+                buf.to_vec()
             }
         };
 

@@ -11,6 +11,7 @@ use anyhow::{anyhow, Result};
 use cluster::{parse_redirect, RedirectType};
 use command_selector::CommandSelector;
 use command_template::CommandTemplate;
+use zeropool::BufferPool;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RedisOp {
@@ -84,6 +85,8 @@ pub struct RedisProtocol {
     resp_version: u8,
     /// Track transaction state per connection
     conn_in_transaction: std::collections::HashMap<usize, bool>,
+    /// Buffer pool for request generation
+    pool: BufferPool,
 }
 
 impl RedisProtocol {
@@ -97,6 +100,7 @@ impl RedisProtocol {
             ask_redirects: 0,
             resp_version: 2, // Default to RESP2
             conn_in_transaction: std::collections::HashMap::new(),
+            pool: BufferPool::new(),
         }
     }
 
@@ -179,7 +183,8 @@ impl RedisProtocol {
         let id = (conn_id, seq);
 
         // Format: *3\r\n$3\r\nSET\r\n$<keylen>\r\n<key>\r\n$<vallen>\r\n<value>\r\n
-        let mut request = Vec::new();
+        let mut request = self.pool.get(256 + key.len() + value.len());
+        request.clear();
         request.extend_from_slice(b"*3\r\n$3\r\nSET\r\n");
         request.extend_from_slice(format!("${}\r\n", key.len()).as_bytes());
         request.extend_from_slice(key.as_bytes());
@@ -188,7 +193,7 @@ impl RedisProtocol {
         request.extend_from_slice(value);
         request.extend_from_slice(b"\r\n");
 
-        (request, id)
+        (request.to_vec(), id)
     }
 
     /// Generate a GET request with imported data (string key)
@@ -201,13 +206,14 @@ impl RedisProtocol {
         let id = (conn_id, seq);
 
         // Format: *2\r\n$3\r\nGET\r\n$<keylen>\r\n<key>\r\n
-        let mut request = Vec::new();
+        let mut request = self.pool.get(256 + key.len());
+        request.clear();
         request.extend_from_slice(b"*2\r\n$3\r\nGET\r\n");
         request.extend_from_slice(format!("${}\r\n", key.len()).as_bytes());
         request.extend_from_slice(key.as_bytes());
         request.extend_from_slice(b"\r\n");
 
-        (request, id)
+        (request.to_vec(), id)
     }
 
     /// Format a Redis command into RESP bytes

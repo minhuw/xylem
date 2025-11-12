@@ -5,6 +5,7 @@
 use crate::Protocol;
 use anyhow::Result;
 use std::collections::HashMap;
+use zeropool::BufferPool;
 
 #[derive(Debug, Clone, Copy)]
 pub enum MemcachedOp {
@@ -18,6 +19,8 @@ pub struct MemcachedAsciiProtocol {
     conn_send_seq: HashMap<usize, u64>,
     /// Per-connection sequence numbers for receive
     conn_recv_seq: HashMap<usize, u64>,
+    /// Buffer pool for request generation
+    pool: BufferPool,
 }
 
 impl MemcachedAsciiProtocol {
@@ -26,6 +29,7 @@ impl MemcachedAsciiProtocol {
             operation,
             conn_send_seq: HashMap::new(),
             conn_recv_seq: HashMap::new(),
+            pool: BufferPool::new(),
         }
     }
 
@@ -63,12 +67,25 @@ impl Protocol for MemcachedAsciiProtocol {
         let request_data = match self.operation {
             MemcachedOp::Get => {
                 // Format: get key:N\r\n
-                format!("get key:{key}\r\n").into_bytes()
+                let mut buf = self.pool.get(64);
+                buf.clear();
+                buf.extend_from_slice(b"get key:");
+                buf.extend_from_slice(key.to_string().as_bytes());
+                buf.extend_from_slice(b"\r\n");
+                buf.to_vec()
             }
             MemcachedOp::Set => {
                 // Format: set key:N 0 0 <value_len>\r\n<value>\r\n
-                let value = "x".repeat(value_size);
-                format!("set key:{key} 0 0 {value_size}\r\n{value}\r\n").into_bytes()
+                let mut buf = self.pool.get(256 + value_size);
+                buf.clear();
+                buf.extend_from_slice(b"set key:");
+                buf.extend_from_slice(key.to_string().as_bytes());
+                buf.extend_from_slice(b" 0 0 ");
+                buf.extend_from_slice(value_size.to_string().as_bytes());
+                buf.extend_from_slice(b"\r\n");
+                buf.resize(buf.len() + value_size, b'x');
+                buf.extend_from_slice(b"\r\n");
+                buf.to_vec()
             }
         };
         (request_data, (conn_id, seq))

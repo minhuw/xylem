@@ -2,20 +2,6 @@
 
 When you're benchmarking Redis, you're speaking RESP—the Redis Serialization Protocol. It's the language Redis uses to understand your commands and send back responses. This guide walks you through how RESP works, what commands Xylem knows how to speak, and how to craft realistic Redis workloads for your benchmarks.
 
-## What Xylem Brings to the Table
-
-Xylem speaks Redis fluently. It understands the core commands you'd use in production: GET for reads, SET for writes, INCR for counters, MGET when you need multiple keys at once, and WAIT when you care about replication. Beyond the basics, Xylem handles authentication (both the simple password kind and Redis 6.0's newer ACL system with usernames), database selection for multi-tenant setups, and protocol negotiation between RESP2 and RESP3.
-
-Need to test cache expiry? Use SETEX to set keys with a TTL. Working with large values? SETRANGE and GETRANGE let you read and write at specific offsets. Running a cluster? Xylem supports CLUSTER SLOTS for topology discovery and automatically routes requests to the right node based on hash slots.
-
-But here's where it gets interesting: Xylem's command templates let you benchmark any Redis operation, not just the built-in ones. Want to test ZADD for sorted sets, HSET for hashes, or LPUSH for lists? Write a template with placeholders like `__key__` and `__data__`, and Xylem generates the proper RESP format.
-
-Xylem also understands RESP3, Redis's modern protocol version. RESP3 brings semantic types—actual nulls, booleans, doubles, maps, and sets—instead of encoding everything as strings and arrays. If you're testing Redis 6.0 or later, you can negotiate RESP3 with the HELLO command and benchmark how your application behaves with the richer type system.
-
-What Xylem doesn't cover yet: Pub/Sub (since benchmarking message queues needs different semantics), transactions (MULTI/EXEC blocks), and Lua scripting. These are workloads with unique characteristics that don't fit the request-response pattern Xylem is built for.
-
-Oh, and one more thing: Xylem fully supports Redis Cluster. It calculates hash slots, routes requests to the correct nodes, and handles MOVED and ASK redirects during resharding. We'll dig into that later.
-
 ## Understanding RESP
 
 RESP is elegantly simple. Commands look almost like what you'd type at a Redis CLI, but they're formatted in a way that machines can parse efficiently. Everything is text-based—printable ASCII with CRLF line endings—which makes debugging easy. You can literally read RESP messages in a network capture.
