@@ -27,6 +27,7 @@ sha2 = "0.10"
 sketches-ddsketch = "0.3.0"
 tdigest = "0.2"
 hdrhistogram = "7.5"
+zeropool = "0.2"
 
 [features]
 schema = ["schemars"]

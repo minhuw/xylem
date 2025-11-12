@@ -140,7 +140,7 @@ pub mod xylem_echo;
 // Re-export commonly used types
 pub use http::HttpMethod;
 pub use http::HttpProtocol;
-pub use masstree::MasstreeOp;
+pub use masstree::{MasstreeOp, MasstreeProtocol, ResultCode};
 pub use memcached::{MemcachedAsciiProtocol, MemcachedBinaryProtocol};
 pub use redis::cluster::{
     generate_asking_command, generate_cluster_slots_command, parse_redirect, ClusterNode,
