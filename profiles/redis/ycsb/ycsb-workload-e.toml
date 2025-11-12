@@ -1,0 +1,105 @@
+# YCSB Workload E: Short Ranges
+#
+# Application Example: Threaded conversations, where each scan is for the posts in a given thread
+#
+# Characteristics:
+# - 95% scans, 5% inserts
+# - Zipfian request distribution for scan starting points
+# - Short range scans (1-100 records)
+# - Values: 1KB (simulating 10 fields × 100 bytes each)
+#
+# This workload represents scenarios where range queries are common,
+# such as fetching a page of results or reading related records.
+#
+# NOTE: Redis SCAN iterates over keys, not ordered ranges. For true ordered
+# range queries, you'd need sorted sets (ZRANGE). This configuration uses
+# SCAN with COUNT to limit results per scan operation.
+
+[experiment]
+name = "ycsb-workload-e"
+description = "YCSB Workload E: Short Ranges (95% scan, 5% insert)"
+duration = "60s"
+seed = 42
+
+[target]
+address = "127.0.0.1:6379"
+protocol = "redis"
+transport = "tcp"
+
+# Workload Configuration
+[workload]
+# Default key configuration (used for inserts)
+[workload.keys]
+strategy = "sequential"
+start = 1000000      # insertstart=1000000
+value_size = 1000    # fieldcount=10 × fieldlength=100
+
+# Operation Mix: 95% scans, 5% inserts
+[workload.operations]
+strategy = "weighted"
+
+# SCAN operations - short range scans
+# Redis SCAN with COUNT hint (typically returns ~10-100 keys per scan)
+[[workload.operations.commands]]
+name = "scan"
+weight = 0.95  # scanproportion=0.95
+
+# Note: This requires defining a Scan operation in the command selector
+# For now, this is a placeholder showing the intent.
+# In practice, you'd configure SCAN operations with:
+# - cursor: 0 (or tracking cursor state)
+# - count: Some(100) (maxscanlength=100)
+# - pattern: None (or Some("key:*") to match key pattern)
+
+# SET operations - insert new records
+[[workload.operations.commands]]
+name = "set"
+weight = 0.05  # insertproportion=0.05
+
+[workload.operations.commands.keys]
+strategy = "sequential"
+start = 1000000
+
+# Load Pattern: Constant rate
+[workload.pattern]
+type = "constant"
+rate = 5000.0  # 5K ops/sec (scans are more expensive than point queries)
+
+# Traffic Configuration
+[[traffic_groups]]
+name = "workload-e"
+threads = [0, 1, 2, 3]           # Use 4 threads
+connections_per_thread = 25      # 100 total connections
+max_pending_per_connection = 5   # Lower pipelining for scan operations
+
+[traffic_groups.policy]
+type = "fixed-rate"
+
+[traffic_groups.sampling_policy]
+type = "limited"
+rate = 1.0           # Sample 100% of requests
+max_samples = 100000 # Limit stored samples
+
+# Output Configuration
+[output]
+format = "json"
+file = "/tmp/ycsb-workload-e.json"
+real_time = true
+
+# IMPORTANT NOTES:
+#
+# 1. Redis SCAN vs. Ordered Ranges:
+#    - Redis SCAN iterates over keys in arbitrary order (hash table traversal)
+#    - For true ordered range queries, use Redis Sorted Sets with ZRANGE
+#    - YCSB typically expects ordered ranges (e.g., records 100-200)
+#
+# 2. Implementing Ordered Ranges:
+#    If you need ordered ranges, consider:
+#    - Using sorted sets: ZADD key score member, ZRANGE key start stop
+#    - Custom command template: "ZRANGE myset {key} {key+100}"
+#    - This would require extending the protocol to support ZRANGE operations
+#
+# 3. SCAN Configuration:
+#    To properly use SCAN in weighted operations, you need to create
+#    a custom command selector that includes RedisOp::Scan with appropriate
+#    cursor management and COUNT parameters.

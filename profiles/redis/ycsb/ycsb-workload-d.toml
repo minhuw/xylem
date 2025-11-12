@@ -1,0 +1,92 @@
+# YCSB Workload D: Read Latest
+#
+# Application Example: User status updates; people want to read the latest statuses
+#
+# Characteristics:
+# - 95% reads, 5% inserts
+# - Latest distribution (reads favor recently inserted records)
+# - Growing keyspace (inserts add new records)
+# - Values: 1KB (simulating 10 fields × 100 bytes each)
+#
+# This workload represents a scenario where new records are continuously inserted
+# and reads favor the most recently inserted records (recency pattern).
+#
+# NOTE: This configuration simulates "latest" behavior using sequential keys.
+# Reads use high-numbered keys (most recent) via reverse sequential or
+# a separate read keyspace starting from a high offset.
+
+[experiment]
+name = "ycsb-workload-d"
+description = "YCSB Workload D: Read Latest (95% read latest, 5% insert)"
+duration = "60s"
+seed = 42
+
+[target]
+address = "127.0.0.1:6379"
+protocol = "redis"
+transport = "tcp"
+
+# Workload Configuration
+[workload]
+# Default key configuration (used for inserts - sequential new records)
+[workload.keys]
+strategy = "sequential"
+start = 1000000      # insertstart=1000000 (insert after initial load)
+value_size = 1000    # fieldcount=10 × fieldlength=100
+
+# Operation Mix: 95% reads (latest), 5% inserts
+# Per-command key patterns to simulate "read latest" behavior
+[workload.operations]
+strategy = "weighted"
+
+# GET operations favor recently inserted keys (high-numbered keys)
+# Using Zipfian with high offset to simulate "latest" distribution
+[[workload.operations.commands]]
+name = "get"
+weight = 0.95  # readproportion=0.95
+
+[workload.operations.commands.keys]
+strategy = "zipfian"
+n = 1000000          # Read from last 1M records
+theta = 0.99         # Skewed toward highest keys (most recent)
+# Note: In practice, you'd want keys to start from current insert position
+# This configuration reads from a range representing "recent" records
+
+# SET operations insert new sequential records
+[[workload.operations.commands]]
+name = "set"
+weight = 0.05  # insertproportion=0.05
+
+[workload.operations.commands.keys]
+strategy = "sequential"
+start = 1000000      # Start inserting after initial dataset
+
+# Load Pattern: Constant rate
+[workload.pattern]
+type = "constant"
+rate = 15000.0  # 15K ops/sec
+
+# Traffic Configuration
+[[traffic_groups]]
+name = "workload-d"
+threads = [0, 1, 2, 3]           # Use 4 threads
+connections_per_thread = 25      # 100 total connections
+max_pending_per_connection = 10  # Pipelining for throughput
+
+[traffic_groups.policy]
+type = "fixed-rate"
+
+[traffic_groups.sampling_policy]
+type = "limited"
+rate = 1.0           # Sample 100% of requests
+max_samples = 100000 # Limit stored samples
+
+# Output Configuration
+[output]
+format = "json"
+file = "/tmp/ycsb-workload-d.json"
+real_time = true
+
+# Note: For true "read latest" behavior, you may want to implement a custom
+# distribution that tracks the current insert position and biases reads toward
+# recently inserted keys. This configuration approximates the behavior.

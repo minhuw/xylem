@@ -54,6 +54,18 @@ pub enum RedisOp {
     },
     /// CLUSTER SLOTS - Query cluster topology
     ClusterSlots,
+    /// SCAN - Iterate over keys in the database
+    Scan {
+        cursor: u64,
+        count: Option<usize>,    // SCAN cursor [COUNT count]
+        pattern: Option<String>, // SCAN cursor [MATCH pattern]
+    },
+    /// MULTI - Start a transaction
+    Multi,
+    /// EXEC - Execute all commands in transaction
+    Exec,
+    /// DISCARD - Discard all commands in transaction
+    Discard,
     /// Custom command from template
     Custom(CommandTemplate),
 }
@@ -70,6 +82,8 @@ pub struct RedisProtocol {
     /// RESP protocol version (2 or 3)
     #[allow(dead_code)] // Reserved for future RESP3-specific features
     resp_version: u8,
+    /// Track transaction state per connection
+    conn_in_transaction: std::collections::HashMap<usize, bool>,
 }
 
 impl RedisProtocol {
@@ -82,6 +96,7 @@ impl RedisProtocol {
             moved_redirects: 0,
             ask_redirects: 0,
             resp_version: 2, // Default to RESP2
+            conn_in_transaction: std::collections::HashMap::new(),
         }
     }
 
@@ -110,6 +125,16 @@ impl RedisProtocol {
     pub fn reset_redirect_stats(&mut self) {
         self.moved_redirects = 0;
         self.ask_redirects = 0;
+    }
+
+    /// Check if a connection is in a transaction
+    pub fn is_in_transaction(&self, conn_id: usize) -> bool {
+        self.conn_in_transaction.get(&conn_id).copied().unwrap_or(false)
+    }
+
+    /// Mark a connection as being in a transaction
+    fn set_transaction_state(&mut self, conn_id: usize, in_transaction: bool) {
+        self.conn_in_transaction.insert(conn_id, in_transaction);
     }
 }
 
@@ -293,6 +318,37 @@ impl RedisProtocol {
                 .into_bytes()
             }
             RedisOp::ClusterSlots => b"*2\r\n$7\r\nCLUSTER\r\n$5\r\nSLOTS\r\n".to_vec(),
+            RedisOp::Scan { cursor, count, pattern } => {
+                let cursor_str = cursor.to_string();
+                let mut parts = vec![];
+                let mut num_args = 2; // SCAN + cursor
+
+                // Build SCAN cursor
+                parts.push(format!("$4\r\nSCAN\r\n${}\r\n{}\r\n", cursor_str.len(), cursor_str));
+
+                // Add COUNT if specified
+                if let Some(c) = count {
+                    num_args += 2; // COUNT + value
+                    let count_str = c.to_string();
+                    parts.push(format!("$5\r\nCOUNT\r\n${}\r\n{}\r\n", count_str.len(), count_str));
+                }
+
+                // Add MATCH if specified
+                if let Some(p) = pattern {
+                    num_args += 2; // MATCH + pattern
+                    parts.push(format!("$5\r\nMATCH\r\n${}\r\n{}\r\n", p.len(), p));
+                }
+
+                // Build final request
+                let mut request = format!("*{}\r\n", num_args);
+                for part in parts {
+                    request.push_str(&part);
+                }
+                request.into_bytes()
+            }
+            RedisOp::Multi => b"*1\r\n$5\r\nMULTI\r\n".to_vec(),
+            RedisOp::Exec => b"*1\r\n$4\r\nEXEC\r\n".to_vec(),
+            RedisOp::Discard => b"*1\r\n$7\r\nDISCARD\r\n".to_vec(),
             RedisOp::Custom(template) => template.generate_request(key, value_size),
         }
     }
@@ -312,6 +368,14 @@ impl Protocol for RedisProtocol {
 
         // Select which command to execute
         let operation = self.command_selector.next_command();
+
+        // Update transaction state based on command
+        match &operation {
+            RedisOp::Multi => self.set_transaction_state(conn_id, true),
+            RedisOp::Exec | RedisOp::Discard => self.set_transaction_state(conn_id, false),
+            _ => {}
+        }
+
         let request_data = self.format_command(&operation, key, value_size);
 
         (request_data, id)
@@ -382,6 +446,7 @@ impl Protocol for RedisProtocol {
     fn reset(&mut self) {
         self.conn_send_seq.clear();
         self.conn_recv_seq.clear();
+        self.conn_in_transaction.clear();
         self.command_selector.reset();
     }
 }
@@ -1299,5 +1364,279 @@ mod tests {
         assert_eq!(id1, (0, 0));
         assert_eq!(id2, (1, 0)); // Conn 1, sequence 0
         assert_eq!(id3, (0, 1)); // Conn 0, sequence 1
+    }
+
+    #[test]
+    fn test_generate_scan_basic() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Scan {
+            cursor: 0,
+            count: None,
+            pattern: None,
+        }));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*2\r\n")); // 2 elements: SCAN + cursor
+        assert!(request_str.contains("$4\r\nSCAN\r\n"));
+        assert!(request_str.contains("$1\r\n0\r\n")); // cursor = 0
+        assert!(!request_str.contains("COUNT"));
+        assert!(!request_str.contains("MATCH"));
+    }
+
+    #[test]
+    fn test_generate_scan_with_count() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Scan {
+            cursor: 10,
+            count: Some(100),
+            pattern: None,
+        }));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*4\r\n")); // 4 elements: SCAN + cursor + COUNT + count
+        assert!(request_str.contains("SCAN"));
+        assert!(request_str.contains("10")); // cursor
+        assert!(request_str.contains("COUNT"));
+        assert!(request_str.contains("100")); // count value
+    }
+
+    #[test]
+    fn test_generate_scan_with_pattern() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Scan {
+            cursor: 5,
+            count: None,
+            pattern: Some("user:*".to_string()),
+        }));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*4\r\n")); // 4 elements: SCAN + cursor + MATCH + pattern
+        assert!(request_str.contains("SCAN"));
+        assert!(request_str.contains("5")); // cursor
+        assert!(request_str.contains("MATCH"));
+        assert!(request_str.contains("user:*")); // pattern
+    }
+
+    #[test]
+    fn test_generate_scan_with_count_and_pattern() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Scan {
+            cursor: 100,
+            count: Some(50),
+            pattern: Some("key:*".to_string()),
+        }));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*6\r\n")); // 6 elements: SCAN + cursor + COUNT + count + MATCH + pattern
+        assert!(request_str.contains("SCAN"));
+        assert!(request_str.contains("100")); // cursor
+        assert!(request_str.contains("COUNT"));
+        assert!(request_str.contains("50")); // count value
+        assert!(request_str.contains("MATCH"));
+        assert!(request_str.contains("key:*")); // pattern
+    }
+
+    #[test]
+    fn test_generate_scan_sequence() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Scan {
+            cursor: 0,
+            count: Some(10),
+            pattern: None,
+        }));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (_, id1) = protocol.generate_request(0, 1, 64);
+        let (_, id2) = protocol.generate_request(0, 2, 64);
+        let (_, id3) = protocol.generate_request(0, 3, 64);
+
+        assert_eq!(id1, (0, 0));
+        assert_eq!(id2, (0, 1));
+        assert_eq!(id3, (0, 2));
+    }
+
+    #[test]
+    fn test_parse_scan_response() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Scan {
+            cursor: 0,
+            count: None,
+            pattern: None,
+        }));
+        let mut protocol = RedisProtocol::new(selector);
+
+        // SCAN returns an array with 2 elements: [cursor, [key1, key2, ...]]
+        // Simplified response: *2\r\n (array marker only for this test)
+        let response = b"*2\r\n";
+        let result = protocol.parse_response(0, response);
+
+        assert!(result.is_ok());
+        let (consumed, id) = result.unwrap();
+        assert_eq!(consumed, 4);
+        assert_eq!(id, Some((0, 0)));
+    }
+
+    #[test]
+    fn test_generate_multi() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Multi));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*1\r\n")); // 1 element: MULTI
+        assert!(request_str.contains("$5\r\nMULTI\r\n"));
+    }
+
+    #[test]
+    fn test_generate_exec() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Exec));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*1\r\n")); // 1 element: EXEC
+        assert!(request_str.contains("$4\r\nEXEC\r\n"));
+    }
+
+    #[test]
+    fn test_generate_discard() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Discard));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*1\r\n")); // 1 element: DISCARD
+        assert!(request_str.contains("$7\r\nDISCARD\r\n"));
+    }
+
+    #[test]
+    fn test_transaction_state_tracking() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Multi));
+        let mut protocol = RedisProtocol::new(selector);
+
+        // Initially not in transaction
+        assert!(!protocol.is_in_transaction(0));
+
+        // After MULTI, should be in transaction
+        protocol.generate_request(0, 42, 64);
+        assert!(protocol.is_in_transaction(0));
+
+        // Switch to EXEC command
+        protocol.command_selector = Box::new(FixedCommandSelector::new(RedisOp::Exec));
+        protocol.generate_request(0, 42, 64);
+
+        // After EXEC, should not be in transaction
+        assert!(!protocol.is_in_transaction(0));
+    }
+
+    #[test]
+    fn test_transaction_state_with_discard() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Multi));
+        let mut protocol = RedisProtocol::new(selector);
+
+        // Start transaction
+        protocol.generate_request(0, 42, 64);
+        assert!(protocol.is_in_transaction(0));
+
+        // Switch to DISCARD command
+        protocol.command_selector = Box::new(FixedCommandSelector::new(RedisOp::Discard));
+        protocol.generate_request(0, 42, 64);
+
+        // After DISCARD, should not be in transaction
+        assert!(!protocol.is_in_transaction(0));
+    }
+
+    #[test]
+    fn test_transaction_state_per_connection() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Multi));
+        let mut protocol = RedisProtocol::new(selector);
+
+        // Start transaction on connection 0
+        protocol.generate_request(0, 42, 64);
+        assert!(protocol.is_in_transaction(0));
+        assert!(!protocol.is_in_transaction(1)); // Connection 1 not in transaction
+
+        // Start transaction on connection 1
+        protocol.generate_request(1, 42, 64);
+        assert!(protocol.is_in_transaction(0));
+        assert!(protocol.is_in_transaction(1));
+
+        // End transaction on connection 0
+        protocol.command_selector = Box::new(FixedCommandSelector::new(RedisOp::Exec));
+        protocol.generate_request(0, 42, 64);
+        assert!(!protocol.is_in_transaction(0));
+        assert!(protocol.is_in_transaction(1)); // Connection 1 still in transaction
+    }
+
+    #[test]
+    fn test_parse_multi_response() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Multi));
+        let mut protocol = RedisProtocol::new(selector);
+
+        // MULTI responds with +OK
+        let response = b"+OK\r\n";
+        let result = protocol.parse_response(0, response);
+
+        assert!(result.is_ok());
+        let (consumed, id) = result.unwrap();
+        assert_eq!(consumed, 5);
+        assert_eq!(id, Some((0, 0)));
+    }
+
+    #[test]
+    fn test_parse_queued_response() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Set));
+        let mut protocol = RedisProtocol::new(selector);
+
+        // Commands in transaction respond with +QUEUED
+        let response = b"+QUEUED\r\n";
+        let result = protocol.parse_response(0, response);
+
+        assert!(result.is_ok());
+        let (consumed, id) = result.unwrap();
+        assert_eq!(consumed, 9);
+        assert_eq!(id, Some((0, 0)));
+    }
+
+    #[test]
+    fn test_parse_exec_response() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Exec));
+        let mut protocol = RedisProtocol::new(selector);
+
+        // EXEC responds with an array of results
+        // Simplified: *2\r\n (array with 2 elements)
+        let response = b"*2\r\n";
+        let result = protocol.parse_response(0, response);
+
+        assert!(result.is_ok());
+        let (consumed, id) = result.unwrap();
+        assert_eq!(consumed, 4);
+        assert_eq!(id, Some((0, 0)));
+    }
+
+    #[test]
+    fn test_transaction_reset() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Multi));
+        let mut protocol = RedisProtocol::new(selector);
+
+        // Start transactions on multiple connections
+        protocol.generate_request(0, 42, 64);
+        protocol.generate_request(1, 42, 64);
+        assert!(protocol.is_in_transaction(0));
+        assert!(protocol.is_in_transaction(1));
+
+        // Reset should clear all transaction state
+        protocol.reset();
+        assert!(!protocol.is_in_transaction(0));
+        assert!(!protocol.is_in_transaction(1));
     }
 }

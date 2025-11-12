@@ -1,0 +1,136 @@
+# YCSB Workload F: Read-Modify-Write
+#
+# Application Example: User database, where user records are read and modified by the user or to record user activity
+#
+# Characteristics:
+# - 50% reads, 50% read-modify-write (atomic)
+# - Zipfian request distribution (hot keys)
+# - 1 million record keyspace
+# - Values: 1KB (simulating 10 fields × 100 bytes each)
+# - RMW operations must be atomic (use Redis transactions)
+#
+# This workload represents scenarios where data must be read, modified, and
+# written back atomically to prevent race conditions in concurrent environments.
+#
+# Redis Transaction Sequence for RMW:
+#   MULTI
+#   GET key:X
+#   SET key:X new_value
+#   EXEC
+
+[experiment]
+name = "ycsb-workload-f"
+description = "YCSB Workload F: Read-Modify-Write (50% read, 50% RMW)"
+duration = "60s"
+seed = 42
+
+[target]
+address = "127.0.0.1:6379"
+protocol = "redis"
+transport = "tcp"
+
+# Workload Configuration
+[workload]
+# Key space: 1 million records with Zipfian distribution
+[workload.keys]
+strategy = "zipfian"
+n = 1000000          # recordcount=1000000
+theta = 0.99         # YCSB default (hot-key pattern)
+value_size = 1000    # fieldcount=10 × fieldlength=100
+
+# Operation Mix: 50% reads, 50% read-modify-write
+#
+# NOTE: Currently, this shows the operation proportions, but true atomic
+# RMW requires implementing transaction sequences. This would need:
+#
+# 1. A transaction-aware command selector that generates:
+#    - MULTI command
+#    - GET command
+#    - SET command
+#    - EXEC command
+#    as a sequence for each RMW operation
+#
+# 2. Or a custom "read-modify-write" operation type that internally
+#    manages the MULTI/GET/SET/EXEC sequence
+#
+# For now, this configuration shows separate reads and writes:
+
+[workload.operations]
+strategy = "weighted"
+
+# Regular GET operations (50%)
+[[workload.operations.commands]]
+name = "get"
+weight = 0.5  # readproportion=0.5
+
+# SET operations representing the "write" part of RMW (50%)
+# In true YCSB Workload F, these would be atomic RMW transactions
+[[workload.operations.commands]]
+name = "set"
+weight = 0.5  # readmodifywriteproportion=0.5
+
+# Load Pattern: Constant rate
+[workload.pattern]
+type = "constant"
+rate = 8000.0  # 8K ops/sec (transactions have higher overhead)
+
+# Traffic Configuration
+[[traffic_groups]]
+name = "workload-f"
+threads = [0, 1, 2, 3]           # Use 4 threads
+connections_per_thread = 25      # 100 total connections
+max_pending_per_connection = 5   # Lower pipelining for transactions
+
+[traffic_groups.policy]
+type = "fixed-rate"
+
+[traffic_groups.sampling_policy]
+type = "limited"
+rate = 1.0           # Sample 100% of requests
+max_samples = 100000 # Limit stored samples
+
+# Output Configuration
+[output]
+format = "json"
+file = "/tmp/ycsb-workload-f.json"
+real_time = true
+
+# ============================================================================
+# IMPLEMENTING TRUE ATOMIC READ-MODIFY-WRITE
+# ============================================================================
+#
+# To properly implement YCSB Workload F with atomic RMW, you need to:
+#
+# 1. Create a transaction sequence command selector:
+#
+#    For each RMW operation, generate this sequence:
+#      - RedisOp::Multi
+#      - RedisOp::Get
+#      - RedisOp::Set
+#      - RedisOp::Exec
+#
+# 2. Use a custom command selector that tracks transaction state:
+#
+#    pub struct TransactionCommandSelector {
+#        in_transaction: bool,
+#        transaction_step: u8,
+#        // ...
+#    }
+#
+#    When selected for RMW, it cycles through:
+#      Step 0: Emit MULTI
+#      Step 1: Emit GET
+#      Step 2: Emit SET
+#      Step 3: Emit EXEC
+#      Step 4: Reset to 0
+#
+# 3. Or implement a macro-operation that wraps the transaction:
+#
+#    RedisOp::ReadModifyWrite {
+#        key: u64,
+#        // This internally generates the MULTI/GET/SET/EXEC sequence
+#    }
+#
+# The current implementation provides the building blocks (MULTI/EXEC support)
+# but requires extending the command selector to generate transaction sequences
+# for true atomic RMW operations as specified in YCSB Workload F.

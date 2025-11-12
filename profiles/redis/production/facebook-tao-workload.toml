@@ -1,0 +1,135 @@
+# Facebook TAO Workload: Social Graph Cache
+#
+# Based on: "Workload Analysis of a Large-Scale Key-Value Store" (Facebook, 2012)
+# and TAOBench (2023)
+#
+# TAO (The Associations and Objects) is Facebook's distributed data store for the social graph.
+# It handles queries like "get friend list", "get recent posts", "get photo tags", etc.
+#
+# Characteristics (from production traces):
+# - 99.8% reads, 0.2% writes (extremely read-heavy)
+# - High key locality (social graphs have clustering)
+# - Small objects: median ~100 bytes
+# - Object size distribution: long-tail (most small, some large)
+# - Access patterns: bursty (follows user activity patterns)
+# - Query patterns: mostly point queries with some multi-gets
+# - Diurnal patterns: follows human activity cycles
+#
+# Key Insights:
+# - Friend/follower lists accessed much more than posts
+# - "Hot" users (celebrities) create extreme skew
+# - Most accesses are for recent content (temporal locality)
+# - Multi-get operations are common (fetch multiple related objects)
+
+[experiment]
+name = "facebook-tao-workload"
+description = "Facebook TAO social graph cache workload (99.8% read, 0.2% write)"
+duration = "120s"  # Longer duration to capture diurnal patterns
+seed = 42
+
+[target]
+address = "127.0.0.1:6379"
+protocol = "redis"
+transport = "tcp"
+
+# Workload Configuration
+[workload]
+# Social graph keyspace: 100M objects (representing users, posts, photos, etc.)
+[workload.keys]
+strategy = "zipfian"
+n = 100000000        # 100M objects
+theta = 1.2          # Higher skew than YCSB (celebrities cause extreme hot keys)
+value_size = 100     # Median object size from TAO traces
+
+# Operation Mix: 99.8% reads, 0.2% writes
+[workload.operations]
+strategy = "weighted"
+
+# GET: Single object fetch (most common)
+[[workload.operations.commands]]
+name = "get"
+weight = 0.898  # 89.8% - Single object reads
+
+# MGET: Fetch multiple related objects (friend lists, photo albums)
+[[workload.operations.commands]]
+name = "mget"
+weight = 0.100  # 10% - Multi-get operations (common pattern in social graphs)
+
+# SET: Update operations (post new content, update profile)
+[[workload.operations.commands]]
+name = "set"
+weight = 0.002  # 0.2% - Writes
+
+# Load Pattern: Sinusoidal to simulate diurnal patterns
+# Peak during "daytime" hours, lower at "night"
+[workload.pattern]
+type = "sinusoidal"
+min_rate = 20000.0   # Night traffic
+max_rate = 100000.0  # Peak daytime traffic
+period = "120s"      # One full cycle in benchmark duration
+phase_shift = 0.0
+
+# Traffic Configuration
+# High connection count to simulate many concurrent users
+[[traffic_groups]]
+name = "social-graph-cache"
+threads = [0, 1, 2, 3, 4, 5, 6, 7]  # 8 threads for high concurrency
+connections_per_thread = 50          # 400 total connections
+max_pending_per_connection = 20      # High pipelining (TAO uses aggressive pipelining)
+
+[traffic_groups.policy]
+type = "fixed-rate"
+
+[traffic_groups.sampling_policy]
+type = "limited"
+rate = 0.01          # Sample 1% (TAO handles billions of requests)
+max_samples = 100000
+
+# Output Configuration
+[output]
+format = "json"
+file = "/tmp/facebook-tao-workload.json"
+real_time = true
+
+# ============================================================================
+# NOTES ON TAO CHARACTERISTICS
+# ============================================================================
+#
+# 1. Object Types in TAO:
+#    - Objects: Users, posts, photos, pages, events
+#    - Associations: Friendships, likes, comments, tags, group memberships
+#    - Objects tend to be larger, associations are smaller
+#
+# 2. Query Patterns:
+#    - assoc_get: Get edges of a certain type from a node (e.g., friends of user X)
+#    - obj_get: Get object by ID
+#    - assoc_count: Count edges (e.g., number of friends)
+#    - assoc_range: Get range of associations (e.g., latest 20 posts)
+#
+# 3. Caching Strategy:
+#    - Write-through cache (writes go to DB, then invalidate cache)
+#    - Cache miss triggers DB query
+#    - Aggressive pre-fetching for common patterns
+#
+# 4. Production Observations (from Facebook papers):
+#    - 99.8% of operations are reads
+#    - Get-hit ratio: ~96% (very effective caching)
+#    - Median object size: ~100 bytes
+#    - P99 object size: ~2KB
+#    - Multi-get batching reduces round trips by 50%
+#
+# 5. Key Locality Patterns:
+#    - Strong temporal locality: Recent posts/photos accessed more
+#    - Strong spatial locality: Related objects accessed together
+#    - Social graph clustering: Friends-of-friends pattern
+#
+# 6. Scaling Characteristics:
+#    - Horizontal partitioning by object ID
+#    - Replication for read scaling
+#    - Regional caches to reduce latency
+#
+# 7. Limitations of This Simulation:
+#    - Real TAO uses custom protocol optimizations
+#    - Association queries not directly mappable to Redis GET/SET
+#    - Would need sorted sets (ZRANGE) for assoc_range queries
+#    - True TAO has sophisticated invalidation and consistency protocols

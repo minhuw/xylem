@@ -1,0 +1,66 @@
+# YCSB Workload C: Read Only
+#
+# Application Example: User profile cache, where profiles are constructed elsewhere (e.g., Hadoop)
+#
+# Characteristics:
+# - 100% reads
+# - Zipfian request distribution (hot keys)
+# - 1 million record keyspace
+# - Values: 1KB (simulating 10 fields × 100 bytes each)
+#
+# This workload represents a pure read scenario, typical for applications
+# where data is loaded once and then only read (no updates during benchmark).
+
+[experiment]
+name = "ycsb-workload-c"
+description = "YCSB Workload C: Read Only (100% read)"
+duration = "60s"
+seed = 42
+
+[target]
+address = "127.0.0.1:6379"
+protocol = "redis"
+transport = "tcp"
+
+# Workload Configuration
+[workload]
+# Key space: 1 million records with Zipfian distribution
+[workload.keys]
+strategy = "zipfian"
+n = 1000000          # recordcount=1000000
+theta = 0.99         # YCSB default (hot-key pattern)
+value_size = 1000    # fieldcount=10 × fieldlength=100
+
+# Operation Mix: 100% reads
+[workload.operations]
+strategy = "weighted"
+
+[[workload.operations.commands]]
+name = "get"
+weight = 1.0  # readproportion=1.0
+
+# Load Pattern: Constant rate
+[workload.pattern]
+type = "constant"
+rate = 50000.0  # 50K ops/sec (read-only achieves highest throughput)
+
+# Traffic Configuration
+[[traffic_groups]]
+name = "workload-c"
+threads = [0, 1, 2, 3]           # Use 4 threads
+connections_per_thread = 25      # 100 total connections
+max_pending_per_connection = 10  # Pipelining for throughput
+
+[traffic_groups.policy]
+type = "fixed-rate"
+
+[traffic_groups.sampling_policy]
+type = "limited"
+rate = 1.0           # Sample 100% of requests
+max_samples = 100000 # Limit stored samples
+
+# Output Configuration
+[output]
+format = "json"
+file = "/tmp/ycsb-workload-c.json"
+real_time = true
