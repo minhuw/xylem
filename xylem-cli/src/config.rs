@@ -982,7 +982,7 @@ mod tests {
 
     #[test]
     fn test_load_redis_zipfian_profile() {
-        let config = ProfileConfig::from_file("../profiles/redis-get-zipfian.toml")
+        let config = ProfileConfig::from_file("../tests/redis/redis-get-zipfian.toml")
             .expect("Failed to load redis-get-zipfian profile");
 
         assert_eq!(config.experiment.name, "redis-get-zipfian");
@@ -1098,7 +1098,7 @@ mod tests {
 
     #[test]
     fn test_load_redis_bench_profile() {
-        let config = ProfileConfig::from_file("../profiles/redis-bench.toml")
+        let config = ProfileConfig::from_file("../tests/redis/redis-bench.toml")
             .expect("Failed to load redis-bench profile");
 
         assert_eq!(config.experiment.name, "redis-bench");
@@ -1135,7 +1135,7 @@ mod tests {
     #[test]
     fn test_config_with_overrides() {
         let config = ProfileConfig::from_file_with_overrides(
-            "../profiles/redis-get-zipfian.toml",
+            "../tests/redis/redis-get-zipfian.toml",
             &[
                 "target.address=192.168.1.100:6379".to_string(),
                 "experiment.duration=60s".to_string(),
@@ -1253,7 +1253,7 @@ file = "results/test.json"
 
     #[test]
     fn test_invalid_config_validation() {
-        let config = ProfileConfig::from_file("../profiles/redis-get-zipfian.toml")
+        let config = ProfileConfig::from_file("../tests/redis/redis-get-zipfian.toml")
             .expect("Failed to load profile");
 
         assert_eq!(config.experiment.name, "redis-get-zipfian");
@@ -1261,7 +1261,7 @@ file = "results/test.json"
 
     #[test]
     fn test_key_generation_conversion() {
-        let config = ProfileConfig::from_file("../profiles/redis-get-zipfian.toml")
+        let config = ProfileConfig::from_file("../tests/redis/redis-get-zipfian.toml")
             .expect("Failed to load profile");
 
         let key_gen = config
@@ -1278,7 +1278,7 @@ file = "results/test.json"
 
     #[test]
     fn test_value_size_extraction() {
-        let config = ProfileConfig::from_file("../profiles/redis-get-zipfian.toml")
+        let config = ProfileConfig::from_file("../tests/redis/redis-get-zipfian.toml")
             .expect("Failed to load profile");
 
         let value_size = config.workload.keys.value_size();
@@ -1287,7 +1287,7 @@ file = "results/test.json"
 
     #[test]
     fn test_seed_reproducibility() {
-        let config = ProfileConfig::from_file("../profiles/redis-get-zipfian.toml")
+        let config = ProfileConfig::from_file("../tests/redis/redis-get-zipfian.toml")
             .expect("Failed to load profile");
 
         let master_seed = config.experiment.seed;
@@ -1626,7 +1626,7 @@ duration = "10s""#,
     #[test]
     fn test_set_simple_field() {
         let config = ProfileConfig::from_file_with_overrides(
-            "../profiles/redis-get-zipfian.toml",
+            "../tests/redis/redis-get-zipfian.toml",
             &["experiment.seed=42".to_string()],
         )
         .unwrap();
@@ -1636,7 +1636,7 @@ duration = "10s""#,
     #[test]
     fn test_set_nested_field() {
         let config = ProfileConfig::from_file_with_overrides(
-            "../profiles/redis-get-zipfian.toml",
+            "../tests/redis/redis-get-zipfian.toml",
             &["workload.keys.n=5000".to_string()],
         )
         .unwrap();
@@ -1652,7 +1652,7 @@ duration = "10s""#,
     #[test]
     fn test_set_array_index() {
         let config = ProfileConfig::from_file_with_overrides(
-            "../profiles/redis-bench.toml",
+            "../tests/redis/redis-bench.toml",
             &["traffic_groups.0.sampling_policy.type=unlimited".to_string()],
         )
         .unwrap();
@@ -1666,7 +1666,7 @@ duration = "10s""#,
     #[test]
     fn test_set_array_value() {
         let config = ProfileConfig::from_file_with_overrides(
-            "../profiles/redis-bench.toml",
+            "../tests/redis/redis-bench.toml",
             &["traffic_groups.0.threads=[0,1,2,3]".to_string()],
         )
         .unwrap();
@@ -1677,7 +1677,7 @@ duration = "10s""#,
     #[test]
     fn test_set_multiple_overrides() {
         let config = ProfileConfig::from_file_with_overrides(
-            "../profiles/redis-get-zipfian.toml",
+            "../tests/redis/redis-get-zipfian.toml",
             &[
                 "target.address=192.168.1.100:6379".to_string(),
                 "experiment.duration=5m".to_string(),
@@ -1696,7 +1696,7 @@ duration = "10s""#,
     #[test]
     fn test_set_type_inference_integer() {
         let config = ProfileConfig::from_file_with_overrides(
-            "../profiles/redis-get-zipfian.toml",
+            "../tests/redis/redis-get-zipfian.toml",
             &["experiment.seed=12345".to_string()],
         )
         .unwrap();
@@ -1706,7 +1706,7 @@ duration = "10s""#,
     #[test]
     fn test_set_type_inference_float() {
         let config = ProfileConfig::from_file_with_overrides(
-            "../profiles/redis-bench.toml",
+            "../tests/redis/redis-bench.toml",
             &["traffic_groups.1.sampling_policy.rate=0.75".to_string()],
         )
         .expect("Failed to load redis-bench.toml with overrides");
@@ -1722,7 +1722,7 @@ duration = "10s""#,
     #[test]
     fn test_set_type_inference_boolean() {
         let config = ProfileConfig::from_file_with_overrides(
-            "../profiles/redis-get-zipfian.toml",
+            "../tests/redis/redis-get-zipfian.toml",
             &["output.real_time=true".to_string()],
         )
         .unwrap();
@@ -1732,7 +1732,7 @@ duration = "10s""#,
     #[test]
     fn test_set_type_inference_string() {
         let config = ProfileConfig::from_file_with_overrides(
-            "../profiles/redis-get-zipfian.toml",
+            "../tests/redis/redis-get-zipfian.toml",
             &["target.protocol=http".to_string()],
         )
         .unwrap();
@@ -1742,7 +1742,7 @@ duration = "10s""#,
     #[test]
     fn test_set_invalid_path() {
         let result = ProfileConfig::from_file_with_overrides(
-            "../profiles/redis-get-zipfian.toml",
+            "../tests/redis/redis-get-zipfian.toml",
             &["nonexistent.field=value".to_string()],
         );
         let _ = result;
@@ -1751,7 +1751,7 @@ duration = "10s""#,
     #[test]
     fn test_set_invalid_format() {
         let result = ProfileConfig::from_file_with_overrides(
-            "../profiles/redis-get-zipfian.toml",
+            "../tests/redis/redis-get-zipfian.toml",
             &["invalid_no_equals".to_string()],
         );
         assert!(result.is_err());
@@ -1761,7 +1761,7 @@ duration = "10s""#,
     #[test]
     fn test_set_array_out_of_bounds() {
         let result = ProfileConfig::from_file_with_overrides(
-            "../profiles/redis-bench.toml",
+            "../tests/redis/redis-bench.toml",
             &["traffic_groups.999.sampling_rate=0.5".to_string()],
         );
         assert!(result.is_err());
@@ -1770,7 +1770,7 @@ duration = "10s""#,
     #[test]
     fn test_set_duration_string() {
         let config = ProfileConfig::from_file_with_overrides(
-            "../profiles/redis-get-zipfian.toml",
+            "../tests/redis/redis-get-zipfian.toml",
             &["experiment.duration=2h".to_string()],
         )
         .unwrap();

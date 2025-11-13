@@ -43,7 +43,7 @@ By default, Redis listens on `localhost:6379`.
 Use one of the included example profiles:
 
 ```bash
-./target/release/xylem -P profiles/redis-get-zipfian.toml
+./target/release/xylem -P tests/redis/redis-get-zipfian.toml
 ```
 
 This profile runs a Redis GET benchmark with a Zipfian key distribution.
@@ -72,7 +72,7 @@ Xylem includes example profiles in the `profiles/` directory:
 
 ```bash
 # Run a Redis GET benchmark with Zipfian distribution
-xylem -P profiles/redis-get-zipfian.toml
+xylem -P tests/redis/redis-get-zipfian.toml
 
 # Run an HTTP load test
 xylem -P profiles/http-spike.toml
@@ -87,15 +87,15 @@ You can override configuration values using the `--set` flag with dot notation:
 
 ```bash
 # Change target address
-./target/release/xylem -P profiles/redis-get-zipfian.toml \
+./target/release/xylem -P tests/redis/redis-get-zipfian.toml \
   --set target.address=192.168.1.100:6379
 
 # Change experiment duration
-./target/release/xylem -P profiles/redis-get-zipfian.toml \
+./target/release/xylem -P tests/redis/redis-get-zipfian.toml \
   --set experiment.duration=120s
 
 # Change multiple parameters
-./target/release/xylem -P profiles/redis-get-zipfian.toml \
+./target/release/xylem -P tests/redis/redis-get-zipfian.toml \
   --set experiment.duration=60s \
   --set experiment.seed=42 \
   --set workload.keys.n=1000000

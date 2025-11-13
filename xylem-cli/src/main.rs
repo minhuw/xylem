@@ -22,10 +22,10 @@ use output::ExperimentResults;
 /// This ensures reproducibility and simplifies complex workload specifications.
 ///
 /// Example usage:
-///   xylem -P profiles/redis-get-zipfian.toml
+///   xylem -P tests/redis/redis-get-zipfian.toml
 ///   xylem -P profiles/http-spike.toml --set target.address=192.168.1.100:8080
 ///   xylem -P profiles/memcached-ramp.toml --set experiment.duration=120s --set experiment.seed=12345
-///   xylem -P profiles/redis-bench.toml --set traffic_groups.0.sampling_rate=0.5
+///   xylem -P tests/redis/redis-bench.toml --set traffic_groups.0.sampling_rate=0.5
 ///   xylem completions bash > ~/.local/share/bash-completion/completions/xylem
 ///
 /// Override any config value using dot notation:
@@ -446,11 +446,8 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                     ProtocolAdapter::new(p)
                 }
                 "xylem-echo" => {
-                    // Skip xylem-echo since it has incompatible RequestId type (u64 instead of (usize, u64))
-                    return Err(anyhow::anyhow!(
-                        "xylem-echo protocol not supported with current architecture"
-                    )
-                    .into());
+                    let p = xylem_cli::multi_protocol::create_xylem_echo_protocol();
+                    ProtocolAdapter::new(p)
                 }
                 other => return Err(anyhow::anyhow!("Unknown protocol: {}", other).into()),
             };

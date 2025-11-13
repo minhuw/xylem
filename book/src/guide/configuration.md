@@ -87,7 +87,7 @@ xylem -P profile.toml --set experiment.duration=60s --set experiment.seed=999
 Use the `-P` or `--profile` flag to load a profile file:
 
 ```bash
-xylem -P profiles/redis-get-zipfian.toml
+xylem -P tests/redis/redis-get-zipfian.toml
 ```
 
 ## See Also

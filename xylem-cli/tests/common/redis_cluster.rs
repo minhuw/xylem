@@ -69,6 +69,12 @@ impl RedisClusterGuard {
             return Err(format!("docker-compose.yml not found at {:?}", compose_file).into());
         }
 
+        // Check if cluster is already running and ready
+        if Self::is_cluster_ready() {
+            eprintln!("Redis Cluster already running and ready");
+            return Ok(Self { started: false, compose_file });
+        }
+
         // Start cluster using docker-compose up -d
         let mut cmd = Command::new(compose_cmd[0]);
         if compose_cmd.len() > 1 {
@@ -84,14 +90,16 @@ impl RedisClusterGuard {
             return Err("Failed to start Redis Cluster with docker-compose".into());
         }
 
-        thread::sleep(Duration::from_secs(10));
+        // Wait for cluster to initialize with shorter initial sleep
+        thread::sleep(Duration::from_millis(500));
 
-        // Verify cluster is ready
-        for _ in 0..30 {
+        // Verify cluster is ready with more frequent polling and shorter timeout
+        for attempt in 0..60 {
             if Self::is_cluster_ready() {
+                eprintln!("Redis Cluster ready after {} attempts", attempt + 1);
                 return Ok(Self { started: true, compose_file });
             }
-            thread::sleep(Duration::from_secs(1));
+            thread::sleep(Duration::from_millis(500));
         }
 
         Err("Cluster failed to become ready within 30 seconds".into())

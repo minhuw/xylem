@@ -1,0 +1,45 @@
+# Redis GET benchmark with Zipfian distribution
+# This profile is used for testing config loading and overrides
+
+[experiment]
+name = "redis-get-zipfian"
+duration = "30s"
+seed = 42
+
+[target]
+address = "127.0.0.1:6379"
+protocol = "redis"
+transport = "tcp"
+
+[workload]
+[workload.keys]
+strategy = "zipfian"
+n = 100000
+theta = 0.99
+value_size = 64
+
+[workload.operations]
+strategy = "fixed"
+operation = "get"
+
+[workload.pattern]
+type = "constant"
+rate = 10000.0
+
+[[traffic_groups]]
+name = "main"
+threads = [0, 1, 2, 3]
+connections_per_thread = 25
+max_pending_per_connection = 10
+
+[traffic_groups.policy]
+type = "fixed-rate"
+rate = 10000.0
+
+[traffic_groups.sampling_policy]
+type = "unlimited"
+
+[output]
+format = "json"
+file = "/tmp/redis-get-zipfian.json"
+real_time = false

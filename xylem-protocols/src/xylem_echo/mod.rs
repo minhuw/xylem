@@ -46,7 +46,7 @@ impl Default for XylemEchoProtocol {
 }
 
 impl Protocol for XylemEchoProtocol {
-    type RequestId = u64;
+    type RequestId = (usize, u64);
 
     fn generate_request(
         &mut self,
@@ -54,14 +54,17 @@ impl Protocol for XylemEchoProtocol {
         key: u64,
         _value_size: usize,
     ) -> (Vec<u8>, Self::RequestId) {
-        // Use a composite ID: high 32 bits = conn_id, low 32 bits = key
-        let request_id = ((conn_id as u64) << 32) | (key & 0xFFFFFFFF);
+        // Create request ID tuple (conn_id, key)
+        let request_id = (conn_id, key);
+
+        // Encode conn_id and key into 8 bytes: high 32 bits = conn_id, low 32 bits = key
+        let encoded_id = ((conn_id as u64) << 32) | (key & 0xFFFFFFFF);
 
         let mut buf = self.pool.get(MESSAGE_SIZE);
         buf.clear();
 
-        // Write request_id (8 bytes, little-endian)
-        buf.extend_from_slice(&request_id.to_le_bytes());
+        // Write encoded request_id (8 bytes, little-endian)
+        buf.extend_from_slice(&encoded_id.to_le_bytes());
 
         // Write delay_us (8 bytes, little-endian)
         buf.extend_from_slice(&self.default_delay_us.to_le_bytes());
@@ -79,10 +82,15 @@ impl Protocol for XylemEchoProtocol {
             return Ok((0, None));
         }
 
-        // Parse request_id from first 8 bytes
-        let request_id = u64::from_le_bytes([
+        // Parse encoded request_id from first 8 bytes
+        let encoded_id = u64::from_le_bytes([
             data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
         ]);
+
+        // Decode: high 32 bits = conn_id, low 32 bits = key
+        let conn_id = (encoded_id >> 32) as usize;
+        let key = encoded_id & 0xFFFFFFFF;
+        let request_id = (conn_id, key);
 
         // We could also parse delay_us from bytes 8-15 if needed for validation
         // let delay_us = u64::from_le_bytes([...]);
@@ -111,13 +119,15 @@ mod tests {
         let (request, req_id) = protocol.generate_request(0, 42, 0);
 
         assert_eq!(request.len(), MESSAGE_SIZE);
+        assert_eq!(req_id, (0, 42)); // (conn_id, key)
 
-        // Check request_id encoding
-        let request_id = u64::from_le_bytes([
+        // Check encoded request_id (high 32 bits = conn_id=0, low 32 bits = key=42)
+        let encoded_id = u64::from_le_bytes([
             request[0], request[1], request[2], request[3], request[4], request[5], request[6],
             request[7],
         ]);
-        assert_eq!(request_id, req_id);
+        assert_eq!(encoded_id >> 32, 0); // conn_id
+        assert_eq!(encoded_id & 0xFFFFFFFF, 42); // key
 
         // Check delay_us encoding
         let delay_us = u64::from_le_bytes([
@@ -137,19 +147,21 @@ mod tests {
     fn test_response_parsing() {
         let mut protocol = XylemEchoProtocol::new(100);
 
-        // Create a response (echo of request)
-        let request_id = 12345u64;
+        // Create a response (echo of request) - encode conn_id=0, key=12345
+        let conn_id = 0usize;
+        let key = 12345u64;
+        let encoded_id = ((conn_id as u64) << 32) | (key & 0xFFFFFFFF);
         let delay_us = 100u64;
 
         let mut response = Vec::new();
-        response.extend_from_slice(&request_id.to_le_bytes());
+        response.extend_from_slice(&encoded_id.to_le_bytes());
         response.extend_from_slice(&delay_us.to_le_bytes());
 
         // Parse the response
         let (consumed, parsed_id) = protocol.parse_response(0, &response).unwrap();
 
         assert_eq!(consumed, MESSAGE_SIZE);
-        assert_eq!(parsed_id, Some(request_id));
+        assert_eq!(parsed_id, Some((conn_id, key)));
     }
 
     #[test]
@@ -175,15 +187,11 @@ mod tests {
         // Connection 1, key 1 (same key, different connection)
         let (_, id1) = protocol.generate_request(1, 1, 0);
 
-        // IDs should be different
+        // IDs should be different because conn_id differs
         assert_ne!(id0, id1);
 
-        // High 32 bits should encode connection ID
-        assert_eq!(id0 >> 32, 0);
-        assert_eq!(id1 >> 32, 1);
-
-        // Low 32 bits should be the key
-        assert_eq!(id0 & 0xFFFFFFFF, 1);
-        assert_eq!(id1 & 0xFFFFFFFF, 1);
+        // Check request IDs
+        assert_eq!(id0, (0, 1)); // (conn_id=0, key=1)
+        assert_eq!(id1, (1, 1)); // (conn_id=1, key=1)
     }
 }

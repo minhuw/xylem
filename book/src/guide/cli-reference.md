@@ -7,7 +7,7 @@ Xylem uses a config-first design with TOML profile files. This ensures reproduci
 ## Basic Usage
 
 ```bash
-xylem -P profiles/redis-get-zipfian.toml
+xylem -P tests/redis/redis-get-zipfian.toml
 ```
 
 ## Global Options
@@ -33,7 +33,7 @@ xylem --help
 Path to TOML profile configuration file.
 
 ```bash
-xylem -P profiles/redis-bench.toml
+xylem -P tests/redis/redis-bench.toml
 ```
 
 ### `--set <KEY=VALUE>`

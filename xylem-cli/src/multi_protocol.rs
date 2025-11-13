@@ -48,10 +48,7 @@ impl Protocol for MultiProtocol {
             MultiProtocol::MemcachedBinary(p) => p.generate_request(conn_id, key, value_size),
             MultiProtocol::MemcachedAscii(p) => p.generate_request(conn_id, key, value_size),
             MultiProtocol::Http(p) => p.generate_request(conn_id, key, value_size),
-            MultiProtocol::XylemEcho(p) => {
-                let (data, req_id) = p.generate_request(conn_id, key, value_size);
-                (data, (conn_id, req_id))
-            }
+            MultiProtocol::XylemEcho(p) => p.generate_request(conn_id, key, value_size),
         }
     }
 
@@ -72,10 +69,7 @@ impl Protocol for MultiProtocol {
             MultiProtocol::MemcachedBinary(p) => p.parse_response(conn_id, data),
             MultiProtocol::MemcachedAscii(p) => p.parse_response(conn_id, data),
             MultiProtocol::Http(p) => p.parse_response(conn_id, data),
-            MultiProtocol::XylemEcho(p) => {
-                let (consumed, req_id) = p.parse_response(conn_id, data)?;
-                Ok((consumed, req_id.map(|id| (conn_id, id))))
-            }
+            MultiProtocol::XylemEcho(p) => p.parse_response(conn_id, data),
         }
     }
 

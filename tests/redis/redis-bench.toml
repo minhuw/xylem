@@ -1,0 +1,61 @@
+# Redis benchmark with separate latency and throughput agents
+# This profile is used for testing multi-traffic-group configurations
+
+[experiment]
+name = "redis-bench"
+duration = "30s"
+seed = 42
+
+[target]
+address = "127.0.0.1:6379"
+protocol = "redis"
+transport = "tcp"
+
+[workload]
+[workload.keys]
+strategy = "sequential"
+start = 0
+value_size = 64
+
+[workload.operations]
+strategy = "fixed"
+operation = "get"
+
+[workload.pattern]
+type = "constant"
+rate = 10000.0
+
+# Latency agent - optimized for accurate latency measurements
+[[traffic_groups]]
+name = "latency-agent"
+threads = [0]
+connections_per_thread = 10
+max_pending_per_connection = 1
+
+[traffic_groups.policy]
+type = "fixed-rate"
+rate = 5000.0
+
+[traffic_groups.sampling_policy]
+type = "unlimited"
+
+# Throughput agent - optimized for high throughput
+[[traffic_groups]]
+name = "throughput-agent"
+threads = [1, 2, 3]
+connections_per_thread = 25
+max_pending_per_connection = 32
+
+[traffic_groups.policy]
+type = "fixed-rate"
+rate = 5000.0
+
+[traffic_groups.sampling_policy]
+type = "limited"
+rate = 0.01
+max_samples = 10000
+
+[output]
+format = "json"
+file = "/tmp/redis-bench.json"
+real_time = false
