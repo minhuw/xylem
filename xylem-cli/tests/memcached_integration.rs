@@ -7,7 +7,7 @@ use std::time::Duration;
 use xylem_core::stats::GroupStatsCollector;
 use xylem_core::threading::{ThreadingRuntime, Worker, WorkerConfig};
 use xylem_core::workload::{KeyGeneration, RateControl, RequestGenerator};
-use xylem_transport::TcpTransport;
+use xylem_transport::TcpTransportFactory;
 
 mod common;
 
@@ -66,7 +66,7 @@ fn test_memcached_binary_single_thread() {
                     xylem_protocols::memcached::binary::MemcachedOp::Get,
                 ),
             );
-            let _transport = TcpTransport::new();
+            let _transport = TcpTransportFactory::default();
             let generator = RequestGenerator::new(
                 KeyGeneration::sequential(0),
                 RateControl::ClosedLoop,
@@ -81,8 +81,13 @@ fn test_memcached_binary_single_thread() {
                 max_pending_per_conn: 1,
             };
 
-            let mut worker =
-                Worker::with_closed_loop(TcpTransport::new, protocol, generator, stats, config)?;
+            let mut worker = Worker::with_closed_loop(
+                &TcpTransportFactory::default(),
+                protocol,
+                generator,
+                stats,
+                config,
+            )?;
             worker.run()?;
             Ok(worker.into_stats())
         })
@@ -118,7 +123,7 @@ fn test_memcached_ascii_single_thread() {
                     xylem_protocols::memcached::ascii::MemcachedOp::Get,
                 ),
             );
-            let _transport = TcpTransport::new();
+            let _transport = TcpTransportFactory::default();
             let generator = RequestGenerator::new(
                 KeyGeneration::sequential(0),
                 RateControl::ClosedLoop,
@@ -133,8 +138,13 @@ fn test_memcached_ascii_single_thread() {
                 max_pending_per_conn: 1,
             };
 
-            let mut worker =
-                Worker::with_closed_loop(TcpTransport::new, protocol, generator, stats, config)?;
+            let mut worker = Worker::with_closed_loop(
+                &TcpTransportFactory::default(),
+                protocol,
+                generator,
+                stats,
+                config,
+            )?;
             worker.run()?;
             Ok(worker.into_stats())
         })
@@ -170,7 +180,7 @@ fn test_memcached_binary_multi_thread() {
                     xylem_protocols::memcached::binary::MemcachedOp::Get,
                 ),
             );
-            let _transport = TcpTransport::new();
+            let _transport = TcpTransportFactory::default();
             let generator = RequestGenerator::new(
                 KeyGeneration::random(10000),
                 RateControl::ClosedLoop,
@@ -185,8 +195,13 @@ fn test_memcached_binary_multi_thread() {
                 max_pending_per_conn: 1,
             };
 
-            let mut worker =
-                Worker::with_closed_loop(TcpTransport::new, protocol, generator, stats, config)?;
+            let mut worker = Worker::with_closed_loop(
+                &TcpTransportFactory::default(),
+                protocol,
+                generator,
+                stats,
+                config,
+            )?;
             worker.run()?;
             Ok(worker.into_stats())
         })
@@ -226,7 +241,7 @@ fn test_memcached_ascii_rate_limited() {
                     xylem_protocols::memcached::ascii::MemcachedOp::Get,
                 ),
             );
-            let _transport = TcpTransport::new();
+            let _transport = TcpTransportFactory::default();
             let generator = RequestGenerator::new(
                 KeyGeneration::sequential(0),
                 RateControl::Fixed { rate: target_rate },
@@ -241,8 +256,13 @@ fn test_memcached_ascii_rate_limited() {
                 max_pending_per_conn: 1,
             };
 
-            let mut worker =
-                Worker::with_closed_loop(TcpTransport::new, protocol, generator, stats, config)?;
+            let mut worker = Worker::with_closed_loop(
+                &TcpTransportFactory::default(),
+                protocol,
+                generator,
+                stats,
+                config,
+            )?;
             worker.run()?;
             Ok(worker.into_stats())
         })

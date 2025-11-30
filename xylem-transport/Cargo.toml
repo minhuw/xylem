@@ -8,21 +8,26 @@ repository.workspace = true
 description = "Transport layer implementations for Xylem latency measurement tool"
 
 [dependencies]
-# Event loop and networking
-mio = { workspace = true }
+# Networking
 socket2 = { workspace = true }
 libc = { workspace = true }
 
-# TLS support
-rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
+# Linux-only: I/O multiplexing via nix (epoll, poll, select)
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { workspace = true }
 
-# Error handling
-anyhow = { workspace = true }
-thiserror = { workspace = true }
+# Non-Linux: I/O multiplexing via mio (kqueue on macOS/BSD, IOCP on Windows)
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+mio = { workspace = true }
 
-# Tracing
-tracing = { workspace = true }
+[dependencies.anyhow]
+workspace = true
+
+[dependencies.thiserror]
+workspace = true
+
+[dependencies.tracing]
+workspace = true
 
 [dev-dependencies]
 tempfile = "3.8"

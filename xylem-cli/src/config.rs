@@ -48,7 +48,7 @@ pub struct TargetConfig {
     /// Valid: redis, redis-cluster, memcached-binary, memcached-ascii, http
     #[serde(default)]
     pub protocol: Option<String>,
-    /// Transport: tcp, udp, tls
+    /// Transport: tcp, udp
     #[serde(default = "default_transport")]
     pub transport: String,
     /// Redis Cluster configuration (only used when protocol = "redis-cluster")
@@ -476,7 +476,7 @@ impl ProfileConfig {
             }
         }
 
-        let valid_transports = ["tcp", "udp", "tls"];
+        let valid_transports = ["tcp", "udp"];
         if !valid_transports.contains(&self.target.transport.as_str()) {
             bail!(
                 "Invalid transport '{}'. Valid options: {}",

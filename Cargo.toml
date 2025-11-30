@@ -14,10 +14,11 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/minhuw/xylem"
 
 [workspace.dependencies]
-# Event loop and networking
-mio = { version = "1.1.0", features = ["os-poll", "net"] }
+# Networking
 socket2 = "0.6.1"
 libc = "0.2"
+nix = { version = "0.30", features = ["net", "poll", "event"] }
+mio = { version = "1.0", features = ["os-poll", "net"] }
 
 # CLI
 clap = { version = "4.5", features = ["derive", "cargo"] }
@@ -40,9 +41,7 @@ statrs = "0.18"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# TLS
-rustls = "0.23"
-tokio-rustls = "0.26"
+
 
 # Time
 humantime = "2.1"
@@ -61,8 +60,7 @@ httparse = "1.9"
 # Bytes utilities
 bytes = "1.9"
 
-# TLS certificate handling
-rustls-pemfile = "2.2"
+
 
 # CSV parsing
 csv = "1.3"

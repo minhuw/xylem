@@ -26,7 +26,7 @@ use std::time::Duration;
 use xylem_core::stats::{GroupStatsCollector, SamplingPolicy};
 use xylem_core::threading::{Worker, WorkerConfig};
 use xylem_core::workload::{KeyGeneration, RateControl, RequestGenerator};
-use xylem_transport::TcpTransport;
+use xylem_transport::TcpTransportFactory;
 
 // Protocol adapter to bridge xylem_protocols::Protocol with worker Protocol trait
 struct ProtocolAdapter<P: xylem_protocols::Protocol> {
@@ -131,8 +131,13 @@ fn main() -> anyhow::Result<()> {
     };
 
     // Create and configure the worker
-    let mut worker =
-        Worker::with_closed_loop(TcpTransport::new, protocol, generator, stats, worker_config)?;
+    let mut worker = Worker::with_closed_loop(
+        &TcpTransportFactory::default(),
+        protocol,
+        generator,
+        stats,
+        worker_config,
+    )?;
 
     // Run the benchmark
     println!("🚀 Starting benchmark...");

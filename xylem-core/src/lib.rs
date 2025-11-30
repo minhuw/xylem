@@ -16,6 +16,8 @@ pub mod traffic_group;
 pub mod workload;
 
 // Re-export transport types from xylem-transport
-pub use xylem_transport::{Timestamp as TransportTimestamp, Transport};
+pub use xylem_transport::{
+    ConnectionGroup, GroupConnection, Timestamp as TransportTimestamp, Transport, TransportFactory,
+};
 
 pub use error::{Error, Result};

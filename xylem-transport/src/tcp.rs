@@ -1,27 +1,37 @@
-//! TCP transport implementation using non-blocking I/O with mio
+//! TCP transport implementation using non-blocking I/O
+//!
+//! This module provides two APIs:
+//! - `TcpTransport`: Single-connection API (one multiplexer per connection)
+//! - `TcpConnectionGroup`: Multi-connection API (one multiplexer per group)
 
-use super::Transport;
-use crate::{Error, Result, Timestamp};
-use mio::net::TcpStream;
-use mio::{Events, Interest, Poll, Token};
+use crate::mux::{Interest, Multiplexer, MultiplexerType};
+use crate::{
+    ConnectionGroup, Error, GroupConnection, Result, Timestamp, Transport, TransportFactory,
+};
+use socket2::{Domain, Protocol, Socket, Type};
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
-const SOCKET_TOKEN: Token = Token(0);
+const DEFAULT_RECV_BUFFER_SIZE: usize = 8192;
 
 pub struct TcpTransport {
     stream: Option<TcpStream>,
-    poll: Poll,
+    mux: Multiplexer,
     recv_buffer: Vec<u8>,
 }
 
 impl TcpTransport {
     pub fn new() -> Self {
+        Self::with_multiplexer(MultiplexerType::default())
+    }
+
+    pub fn with_multiplexer(mux_type: MultiplexerType) -> Self {
         Self {
             stream: None,
-            poll: Poll::new().expect("Failed to create poll"),
-            recv_buffer: vec![0u8; 8192], // 8KB buffer
+            mux: Multiplexer::new(mux_type).expect("Failed to create multiplexer"),
+            recv_buffer: vec![0u8; DEFAULT_RECV_BUFFER_SIZE],
         }
     }
 }
@@ -34,41 +44,51 @@ impl Default for TcpTransport {
 
 impl Transport for TcpTransport {
     fn connect(&mut self, target: &SocketAddr) -> Result<()> {
-        // Create non-blocking TCP stream
-        let mut stream = TcpStream::connect(*target)?;
+        // Create socket with socket2 for more control
+        let domain = if target.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        };
+        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+        socket.set_nonblocking(true)?;
 
-        // Wait for connection to be established
-        let mut events = Events::with_capacity(1);
-        self.poll.registry().register(
-            &mut stream,
-            SOCKET_TOKEN,
-            Interest::WRITABLE | Interest::READABLE,
-        )?;
+        // Start non-blocking connect
+        match socket.connect(&(*target).into()) {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e.into()),
+        }
+
+        let stream: TcpStream = socket.into();
+
+        // Register for write events to detect connection completion
+        self.mux.register_fd(&stream, 0, Interest::BOTH)?;
 
         // Poll for connection complete (writable means connected)
         for _ in 0..50 {
-            // Try for up to 5 seconds
-            self.poll.poll(&mut events, Some(Duration::from_millis(100)))?;
+            let events = self.mux.wait(Some(Duration::from_millis(100)))?;
 
-            // Check if connection is ready
-            let connected =
-                events.iter().any(|event| event.token() == SOCKET_TOKEN && event.is_writable());
-
+            let connected = events.iter().any(|e| e.id == 0 && e.writable);
             if !connected {
                 continue;
             }
 
-            // Connection established - check for errors
+            // Check for connection errors
             if let Some(err) = stream.take_error()? {
+                let _ = self.mux.deregister_fd(&stream);
                 return Err(Error::Connection(format!("Connection failed: {err}")));
             }
 
             // Re-register for read events only
-            self.poll.registry().reregister(&mut stream, SOCKET_TOKEN, Interest::READABLE)?;
+            self.mux.modify_fd(&stream, 0, Interest::READABLE)?;
             self.stream = Some(stream);
             return Ok(());
         }
 
+        // Timeout - deregister before returning error
+        let _ = self.mux.deregister_fd(&stream);
         Err(Error::Connection("Connection timeout".to_string()))
     }
 
@@ -84,7 +104,6 @@ impl Transport for TcpTransport {
             match stream.write(&data[total_written..]) {
                 Ok(n) => total_written += n,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    // Socket buffer full, spin until ready
                     std::hint::spin_loop();
                     continue;
                 }
@@ -92,10 +111,7 @@ impl Transport for TcpTransport {
             }
         }
 
-        // Capture timestamp immediately after write completes
-        let timestamp = Timestamp::now();
-
-        Ok(timestamp)
+        Ok(Timestamp::now())
     }
 
     fn recv(&mut self) -> Result<(Vec<u8>, Timestamp)> {
@@ -104,52 +120,241 @@ impl Transport for TcpTransport {
             .as_mut()
             .ok_or_else(|| Error::Connection("Not connected".to_string()))?;
 
-        // Non-blocking read
         match stream.read(&mut self.recv_buffer) {
             Ok(0) => Err(Error::Connection("Connection closed by peer".to_string())),
             Ok(n) => {
-                // Capture timestamp immediately after read
                 let timestamp = Timestamp::now();
-
-                // Copy data from buffer
                 let data = self.recv_buffer[..n].to_vec();
-
-                // For edge-triggered epoll, we must read until WouldBlock to reset the trigger.
-                // Drain any remaining data in the socket buffer.
-                loop {
-                    let mut dummy = [0u8; 1024];
-                    match stream.read(&mut dummy) {
-                        Ok(0) => break,    // Connection closed
-                        Ok(_) => continue, // More data - keep draining
-                        Err(_) => break,   // Error or WouldBlock - done draining
-                    }
-                }
-
                 Ok((data, timestamp))
             }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                // No data available
-                Ok((Vec::new(), Timestamp::now()))
-            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok((Vec::new(), Timestamp::now())),
             Err(e) => Err(e.into()),
         }
     }
 
     fn poll_readable(&mut self) -> Result<bool> {
-        let mut events = Events::with_capacity(1);
-
-        // Use 1 microsecond timeout to force actual poll
-        // Duration::ZERO might return cached state with edge-triggered epoll
-        self.poll.poll(&mut events, Some(Duration::from_micros(1)))?;
-
+        let events = self.mux.wait(Some(Duration::from_micros(1)))?;
         Ok(!events.is_empty())
     }
 
     fn close(&mut self) -> Result<()> {
-        if let Some(mut stream) = self.stream.take() {
-            let _ = self.poll.registry().deregister(&mut stream);
+        if let Some(stream) = self.stream.take() {
+            let _ = self.mux.deregister_fd(&stream);
         }
         Ok(())
+    }
+}
+
+// =============================================================================
+// Connection Group API
+// =============================================================================
+
+/// A single TCP connection within a connection group
+pub struct TcpConn {
+    stream: TcpStream,
+    recv_buffer: Vec<u8>,
+    connected: bool,
+}
+
+impl TcpConn {
+    fn new(stream: TcpStream) -> Self {
+        Self {
+            stream,
+            recv_buffer: vec![0u8; DEFAULT_RECV_BUFFER_SIZE],
+            connected: true,
+        }
+    }
+}
+
+impl GroupConnection for TcpConn {
+    fn send(&mut self, data: &[u8]) -> Result<Timestamp> {
+        if !self.connected {
+            return Err(Error::Connection("Connection closed".to_string()));
+        }
+
+        let mut total_written = 0;
+        while total_written < data.len() {
+            match self.stream.write(&data[total_written..]) {
+                Ok(n) => total_written += n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    std::hint::spin_loop();
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        Ok(Timestamp::now())
+    }
+
+    fn recv(&mut self) -> Result<(Vec<u8>, Timestamp)> {
+        if !self.connected {
+            return Err(Error::Connection("Connection closed".to_string()));
+        }
+
+        match self.stream.read(&mut self.recv_buffer) {
+            Ok(0) => {
+                self.connected = false;
+                Err(Error::Connection("Connection closed by peer".to_string()))
+            }
+            Ok(n) => {
+                let timestamp = Timestamp::now();
+                let data = self.recv_buffer[..n].to_vec();
+                Ok((data, timestamp))
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok((Vec::new(), Timestamp::now())),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn is_connected(&self) -> bool {
+        self.connected
+    }
+}
+
+/// A group of TCP connections sharing a single multiplexer
+pub struct TcpConnectionGroup {
+    mux: Multiplexer,
+    connections: HashMap<usize, TcpConn>,
+    next_id: usize,
+}
+
+impl TcpConnectionGroup {
+    pub fn new() -> Result<Self> {
+        Self::with_multiplexer(MultiplexerType::default())
+    }
+
+    pub fn with_multiplexer(mux_type: MultiplexerType) -> Result<Self> {
+        Ok(Self {
+            mux: Multiplexer::new(mux_type)?,
+            connections: HashMap::new(),
+            next_id: 0,
+        })
+    }
+
+    fn connect_with_timeout(&mut self, target: &SocketAddr, conn_id: usize) -> Result<TcpStream> {
+        let domain = if target.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        };
+        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+        socket.set_nonblocking(true)?;
+
+        match socket.connect(&(*target).into()) {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e.into()),
+        }
+
+        let stream: TcpStream = socket.into();
+
+        // Use a temporary multiplexer for connection establishment to avoid
+        // mixing connection events with other connections in the group
+        let mut temp_mux = Multiplexer::new(self.mux.mux_type())?;
+        temp_mux.register_fd(&stream, 0, Interest::BOTH)?;
+
+        // Poll for connection complete
+        for _ in 0..50 {
+            let events = temp_mux.wait(Some(Duration::from_millis(100)))?;
+
+            let connected = events.iter().any(|e| e.id == 0 && e.writable);
+            if !connected {
+                continue;
+            }
+
+            if let Some(err) = stream.take_error()? {
+                return Err(Error::Connection(format!("Connection failed: {err}")));
+            }
+
+            // Connection successful - deregister from temp and register with main mux
+            let _ = temp_mux.deregister_fd(&stream);
+            self.mux.register_fd(&stream, conn_id, Interest::READABLE)?;
+            return Ok(stream);
+        }
+
+        Err(Error::Connection("Connection timeout".to_string()))
+    }
+}
+
+impl Default for TcpConnectionGroup {
+    fn default() -> Self {
+        Self::new().expect("Failed to create TcpConnectionGroup")
+    }
+}
+
+impl ConnectionGroup for TcpConnectionGroup {
+    type Conn = TcpConn;
+
+    fn add_connection(&mut self, target: &SocketAddr) -> Result<usize> {
+        let conn_id = self.next_id;
+        self.next_id += 1;
+
+        let stream = self.connect_with_timeout(target, conn_id)?;
+        let conn = TcpConn::new(stream);
+        self.connections.insert(conn_id, conn);
+
+        Ok(conn_id)
+    }
+
+    fn get(&self, conn_id: usize) -> Option<&Self::Conn> {
+        self.connections.get(&conn_id)
+    }
+
+    fn get_mut(&mut self, conn_id: usize) -> Option<&mut Self::Conn> {
+        self.connections.get_mut(&conn_id)
+    }
+
+    fn poll(&mut self, timeout: Option<Duration>) -> Result<Vec<usize>> {
+        let events = self.mux.wait(timeout)?;
+        let ready: Vec<usize> = events
+            .iter()
+            .filter(|e| e.readable)
+            .map(|e| e.id)
+            .filter(|id| self.connections.contains_key(id))
+            .collect();
+        Ok(ready)
+    }
+
+    fn len(&self) -> usize {
+        self.connections.len()
+    }
+
+    fn close(&mut self, conn_id: usize) -> Result<()> {
+        if let Some(mut conn) = self.connections.remove(&conn_id) {
+            conn.connected = false;
+            let _ = self.mux.deregister_fd(&conn.stream);
+        }
+        Ok(())
+    }
+
+    fn close_all(&mut self) -> Result<()> {
+        let conn_ids: Vec<usize> = self.connections.keys().copied().collect();
+        for conn_id in conn_ids {
+            self.close(conn_id)?;
+        }
+        Ok(())
+    }
+}
+
+/// Factory for creating TCP connection groups
+#[derive(Clone, Copy, Default)]
+pub struct TcpTransportFactory {
+    mux_type: MultiplexerType,
+}
+
+impl TcpTransportFactory {
+    pub fn new(mux_type: MultiplexerType) -> Self {
+        Self { mux_type }
+    }
+}
+
+impl TransportFactory for TcpTransportFactory {
+    type Group = TcpConnectionGroup;
+
+    fn create_group(&self) -> Result<Self::Group> {
+        TcpConnectionGroup::with_multiplexer(self.mux_type)
     }
 }
 
@@ -162,14 +367,11 @@ mod tests {
 
     #[test]
     fn test_tcp_connect() {
-        // Start a test server
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
 
-        // Spawn server thread
         thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
-            // Echo server
             let mut buf = vec![0u8; 1024];
             loop {
                 let n = socket.read(&mut buf).unwrap_or(0);
@@ -180,17 +382,14 @@ mod tests {
             }
         });
 
-        // Give server time to start
         thread::sleep(Duration::from_millis(10));
 
-        // Test client
         let mut transport = TcpTransport::new();
         assert!(transport.connect(&addr).is_ok());
     }
 
     #[test]
     fn test_tcp_send_recv() {
-        // Start echo server
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -206,20 +405,16 @@ mod tests {
             }
         });
 
-        // Give server time to start
         thread::sleep(Duration::from_millis(10));
 
-        // Test client
         let mut transport = TcpTransport::new();
         transport.connect(&addr).unwrap();
 
         let test_data = b"Hello, World!";
         let send_ts = transport.send(test_data).unwrap();
 
-        // Wait a bit for echo response
         thread::sleep(Duration::from_millis(10));
 
-        // Poll until data ready
         for _ in 0..100 {
             if transport.poll_readable().unwrap() {
                 break;
@@ -228,7 +423,6 @@ mod tests {
         }
 
         let (recv_data, recv_ts) = transport.recv().unwrap();
-
         assert_eq!(recv_data, test_data);
         assert!(recv_ts.instant >= send_ts.instant);
     }
@@ -262,5 +456,201 @@ mod tests {
         transport.connect(&addr).unwrap();
         assert!(transport.close().is_ok());
         assert!(transport.stream.is_none());
+    }
+
+    #[test]
+    fn test_tcp_with_poll_multiplexer() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = vec![0u8; 1024];
+            let n = socket.read(&mut buf).unwrap_or(0);
+            if n > 0 {
+                socket.write_all(&buf[..n]).unwrap();
+            }
+        });
+
+        thread::sleep(Duration::from_millis(10));
+
+        let mut transport = TcpTransport::with_multiplexer(MultiplexerType::Poll);
+        transport.connect(&addr).unwrap();
+        transport.send(b"hello").unwrap();
+
+        thread::sleep(Duration::from_millis(10));
+        for _ in 0..100 {
+            if transport.poll_readable().unwrap() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        let (data, _) = transport.recv().unwrap();
+        assert_eq!(data, b"hello");
+    }
+
+    // =========================================================================
+    // Connection Group Tests
+    // =========================================================================
+
+    #[test]
+    fn test_tcp_group_create() {
+        let group = TcpConnectionGroup::new();
+        assert!(group.is_ok());
+        let group = group.unwrap();
+        assert_eq!(group.len(), 0);
+        assert!(group.is_empty());
+    }
+
+    #[test]
+    fn test_tcp_group_add_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        thread::spawn(move || {
+            for _ in 0..3 {
+                let _ = listener.accept();
+            }
+        });
+
+        thread::sleep(Duration::from_millis(10));
+
+        let mut group = TcpConnectionGroup::new().unwrap();
+
+        let conn_id = group.add_connection(&addr);
+        assert!(conn_id.is_ok());
+        let conn_id = conn_id.unwrap();
+        assert_eq!(conn_id, 0);
+        assert_eq!(group.len(), 1);
+
+        let conn_id2 = group.add_connection(&addr).unwrap();
+        assert_eq!(conn_id2, 1);
+        assert_eq!(group.len(), 2);
+
+        assert!(group.get(0).is_some());
+        assert!(group.get(1).is_some());
+        assert!(group.get(99).is_none());
+    }
+
+    #[test]
+    fn test_tcp_group_send_recv() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = vec![0u8; 1024];
+            loop {
+                let n = socket.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                socket.write_all(&buf[..n]).unwrap();
+            }
+        });
+
+        thread::sleep(Duration::from_millis(10));
+
+        let mut group = TcpConnectionGroup::new().unwrap();
+        let conn_id = group.add_connection(&addr).unwrap();
+
+        let test_data = b"Hello, Group!";
+        let send_ts = group.get_mut(conn_id).unwrap().send(test_data).unwrap();
+
+        thread::sleep(Duration::from_millis(10));
+
+        let ready = group.poll(Some(Duration::from_millis(100))).unwrap();
+        assert!(!ready.is_empty());
+        assert!(ready.contains(&conn_id));
+
+        let (recv_data, recv_ts) = group.get_mut(conn_id).unwrap().recv().unwrap();
+        assert_eq!(recv_data, test_data);
+        assert!(recv_ts.instant >= send_ts.instant);
+    }
+
+    fn echo_handler(mut socket: TcpStream) {
+        let mut buf = vec![0u8; 1024];
+        while let Ok(n) = socket.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            let _ = socket.write_all(&buf[..n]);
+        }
+    }
+
+    #[test]
+    fn test_tcp_group_multiple_connections_poll() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        thread::spawn(move || {
+            while let Ok((socket, _)) = listener.accept() {
+                thread::spawn(|| echo_handler(socket));
+            }
+        });
+
+        thread::sleep(Duration::from_millis(10));
+
+        let mut group = TcpConnectionGroup::new().unwrap();
+        let conn1 = group.add_connection(&addr).unwrap();
+        let conn2 = group.add_connection(&addr).unwrap();
+        let conn3 = group.add_connection(&addr).unwrap();
+
+        group.get_mut(conn1).unwrap().send(b"msg1").unwrap();
+        group.get_mut(conn2).unwrap().send(b"msg2").unwrap();
+        group.get_mut(conn3).unwrap().send(b"msg3").unwrap();
+
+        thread::sleep(Duration::from_millis(50));
+
+        let ready = group.poll(Some(Duration::from_millis(100))).unwrap();
+        assert!(!ready.is_empty());
+
+        for id in ready {
+            let (data, _) = group.get_mut(id).unwrap().recv().unwrap();
+            assert!(!data.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_tcp_group_close() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        thread::spawn(move || {
+            for _ in 0..2 {
+                let _ = listener.accept();
+            }
+        });
+
+        thread::sleep(Duration::from_millis(10));
+
+        let mut group = TcpConnectionGroup::new().unwrap();
+        let conn1 = group.add_connection(&addr).unwrap();
+        let conn2 = group.add_connection(&addr).unwrap();
+
+        assert_eq!(group.len(), 2);
+
+        group.close(conn1).unwrap();
+        assert_eq!(group.len(), 1);
+        assert!(group.get(conn1).is_none());
+        assert!(group.get(conn2).is_some());
+
+        group.close_all().unwrap();
+        assert_eq!(group.len(), 0);
+    }
+
+    #[test]
+    fn test_tcp_transport_factory() {
+        let factory = TcpTransportFactory::default();
+        let group = factory.create_group();
+        assert!(group.is_ok());
+    }
+
+    #[test]
+    fn test_tcp_transport_factory_with_poll() {
+        let factory = TcpTransportFactory::new(MultiplexerType::Poll);
+        let group = factory.create_group();
+        assert!(group.is_ok());
     }
 }

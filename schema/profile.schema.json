@@ -651,7 +651,7 @@
           "default": null
         },
         "transport": {
-          "description": "Transport: tcp, udp, tls",
+          "description": "Transport: tcp, udp",
           "type": "string",
           "default": "tcp"
         }

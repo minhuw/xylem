@@ -6,9 +6,6 @@ use std::net::UdpSocket;
 use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
-use xylem_core::connection::ConnectionPool;
-use xylem_core::scheduler::UniformPolicyScheduler;
-use xylem_protocols::xylem_echo::XylemEchoProtocol;
 use xylem_transport::{Transport, UdpTransport};
 
 #[cfg(unix)]
@@ -74,28 +71,15 @@ fn test_udp_transport_echo() {
     // Give server time to start
     thread::sleep(Duration::from_millis(100));
 
-    // Create connection pool with UDP transport
+    // Create UDP transport and connect
     let addr = format!("127.0.0.1:{}", port).parse().unwrap();
-    let policy_scheduler = Box::new(UniformPolicyScheduler::closed_loop());
-
-    let pool = ConnectionPool::new(
-        UdpTransport::new,
-        addr,
-        2,  // 2 connections
-        10, // 10 max pending per connection
-        policy_scheduler,
-        0, // group_id
-    );
-
-    assert!(pool.is_ok(), "Failed to create UDP connection pool");
-    let mut pool = pool.unwrap();
+    let mut transport = UdpTransport::new();
+    assert!(transport.connect(&addr).is_ok(), "Failed to connect UDP transport");
 
     // Send a few packets
     for i in 0..5 {
-        if let Some(conn) = pool.pick_connection() {
-            let test_data = format!("UDP test {}", i);
-            assert!(conn.send(test_data.as_bytes(), i).is_ok());
-        }
+        let test_data = format!("UDP test {}", i);
+        assert!(transport.send(test_data.as_bytes()).is_ok());
     }
 
     // Wait for responses
@@ -103,20 +87,18 @@ fn test_udp_transport_echo() {
 
     // Receive responses
     let mut received = 0;
-    for conn in pool.connections_mut() {
-        if let Ok(latencies) = conn.recv_responses(|data| {
-            // Simple parser: return all data as one response with ID 0
-            if data.is_empty() {
-                Ok((0, None))
-            } else {
-                Ok((data.len(), Some(0u64)))
+    for _ in 0..10 {
+        if transport.poll_readable().unwrap_or(false) {
+            if let Ok((data, _)) = transport.recv() {
+                if !data.is_empty() {
+                    received += 1;
+                }
             }
-        }) {
-            received += latencies.len();
         }
+        thread::sleep(Duration::from_millis(10));
     }
 
-    pool.close_all().ok();
+    transport.close().ok();
     server_handle.join().ok();
 
     // We should have received at least some responses
@@ -171,27 +153,38 @@ fn test_unix_socket_transport_echo() {
 }
 
 #[test]
-fn test_udp_xylem_echo_protocol() {
-    // Start Xylem echo server with UDP support (if available)
-    // For now, just test basic UDP functionality
-
+fn test_udp_transport_basic() {
+    // Start UDP echo server
     let port = 19998;
     let server_handle = start_udp_echo_server(port);
 
     thread::sleep(Duration::from_millis(100));
 
-    // Create protocol and connection pool
-    let _protocol = XylemEchoProtocol::new(0); // 0us delay
+    // Create transport and connect
     let addr = format!("127.0.0.1:{}", port).parse().unwrap();
+    let mut transport = UdpTransport::new();
+    assert!(transport.connect(&addr).is_ok(), "Failed to connect");
 
-    let policy_scheduler = Box::new(UniformPolicyScheduler::closed_loop());
+    // Send test data
+    let test_data = b"Hello UDP";
+    let send_ts = transport.send(test_data).expect("Send failed");
 
-    let pool: Result<ConnectionPool<UdpTransport, u64>, _> =
-        ConnectionPool::new(UdpTransport::new, addr, 1, 5, policy_scheduler, 0);
+    // Wait for response
+    thread::sleep(Duration::from_millis(50));
 
-    assert!(pool.is_ok(), "Failed to create connection pool");
+    // Poll and receive
+    for _ in 0..100 {
+        if transport.poll_readable().unwrap_or(false) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
 
-    pool.unwrap().close_all().ok();
+    let (recv_data, recv_ts) = transport.recv().expect("Receive failed");
+    assert_eq!(recv_data, test_data);
+    assert!(recv_ts.instant >= send_ts.instant);
+
+    transport.close().ok();
     server_handle.join().ok();
 }
 

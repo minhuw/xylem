@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::time::Duration;
-use xylem_transport::Transport;
+use xylem_transport::{ConnectionGroup, TransportFactory};
 
 /// Helper function to compute hash of a string key
 fn hash_string_key(key: &str) -> u64 {
@@ -109,9 +109,7 @@ pub trait Protocol: Send {
             }
             (0, None) => Ok(ParseResult::Incomplete),
             (bytes_consumed, None) => {
-                // Consumed bytes but no request ID - shouldn't happen normally
                 if bytes_consumed > 0 {
-                    // This is an error condition - consumed data but got no ID
                     Err(anyhow::anyhow!(
                         "Protocol consumed {} bytes but returned no request ID",
                         bytes_consumed
@@ -145,8 +143,10 @@ pub struct WorkerConfig {
 }
 
 /// Worker with connection pooling and request pipelining
-pub struct Worker<T: Transport, P: Protocol> {
-    pool: ConnectionPool<T, P::RequestId>,
+///
+/// Uses `ConnectionGroup` internally for efficient I/O multiplexing.
+pub struct Worker<G: ConnectionGroup, P: Protocol> {
+    pool: ConnectionPool<G, P::RequestId>,
     /// Map of traffic group ID to protocol instance
     protocols: HashMap<usize, P>,
     generator: RequestGenerator,
@@ -156,10 +156,10 @@ pub struct Worker<T: Transport, P: Protocol> {
     current_key: u64,
 }
 
-impl<T: Transport, P: Protocol> Worker<T, P> {
+impl<G: ConnectionGroup, P: Protocol> Worker<G, P> {
     /// Create a new pipelined worker with per-connection policies
-    pub fn new(
-        transport_factory: impl Fn() -> T,
+    pub fn new<F: TransportFactory<Group = G>>(
+        factory: &F,
         protocol: P,
         generator: RequestGenerator,
         stats: GroupStatsCollector,
@@ -167,7 +167,7 @@ impl<T: Transport, P: Protocol> Worker<T, P> {
         policy_scheduler: Box<dyn crate::scheduler::PolicyScheduler>,
     ) -> Result<Self> {
         let pool = ConnectionPool::new(
-            transport_factory,
+            factory,
             config.target,
             config.conn_count,
             config.max_pending_per_conn,
@@ -176,7 +176,7 @@ impl<T: Transport, P: Protocol> Worker<T, P> {
         )?;
 
         let mut protocols = HashMap::new();
-        protocols.insert(0, protocol); // Single protocol uses group_id 0
+        protocols.insert(0, protocol);
 
         Ok(Self {
             pool,
@@ -189,27 +189,27 @@ impl<T: Transport, P: Protocol> Worker<T, P> {
     }
 
     /// Create a new pipelined worker with closed-loop policy (max throughput)
-    pub fn with_closed_loop(
-        transport_factory: impl Fn() -> T,
+    pub fn with_closed_loop<F: TransportFactory<Group = G>>(
+        factory: &F,
         protocol: P,
         generator: RequestGenerator,
         stats: GroupStatsCollector,
         config: WorkerConfig,
     ) -> Result<Self> {
         let policy_scheduler = Box::new(crate::scheduler::UniformPolicyScheduler::closed_loop());
-        Self::new(transport_factory, protocol, generator, stats, config, policy_scheduler)
+        Self::new(factory, protocol, generator, stats, config, policy_scheduler)
     }
 
     /// Create a new pipelined worker with multiple traffic groups
-    pub fn new_multi_group(
-        transport_factory: impl Fn() -> T,
+    pub fn new_multi_group<F: TransportFactory<Group = G>>(
+        factory: &F,
         protocols: HashMap<usize, P>,
         generator: RequestGenerator,
         stats: GroupStatsCollector,
         config: WorkerConfig,
         groups: Vec<(usize, usize, usize, Box<dyn crate::scheduler::PolicyScheduler>)>,
     ) -> Result<Self> {
-        let pool = ConnectionPool::new_multi_group(transport_factory, config.target, groups)?;
+        let pool = ConnectionPool::new_multi_group(factory, config.target, groups)?;
 
         Ok(Self {
             pool,
@@ -222,18 +222,15 @@ impl<T: Transport, P: Protocol> Worker<T, P> {
     }
 
     /// Create a new pipelined worker with multiple traffic groups, each with its own target
-    ///
-    /// # Parameters
-    /// - `groups`: Vec of (group_id, target, conn_count, max_pending_per_conn, policy_scheduler)
-    pub fn new_multi_group_with_targets(
-        transport_factory: impl Fn() -> T,
+    pub fn new_multi_group_with_targets<F: TransportFactory<Group = G>>(
+        factory: &F,
         protocols: HashMap<usize, P>,
         generator: RequestGenerator,
         stats: GroupStatsCollector,
         config: WorkerConfig,
         groups: Vec<TrafficGroupConfig>,
     ) -> Result<Self> {
-        let pool = ConnectionPool::new_multi_group_with_targets(transport_factory, groups)?;
+        let pool = ConnectionPool::new_multi_group_with_targets(factory, groups)?;
 
         Ok(Self {
             pool,
@@ -262,36 +259,41 @@ impl<T: Transport, P: Protocol> Worker<T, P> {
             // SEND PHASE: Send requests while we're ahead of schedule
             while now_ns >= next_tx_ns {
                 // Pick a connection that can accept more requests
-                let conn = match self.pool.pick_connection() {
-                    Some(c) => c,
+                let connection_id = match self.pool.pick_connection() {
+                    Some(id) => id,
                     None => break, // No available connections, move to receive phase
                 };
 
-                let conn_id = conn.idx();
-                let group_id = conn.group_id();
+                let state = self.pool.get_state(connection_id).expect("Connection state not found");
+                let group_id = state.group_id();
 
                 // Look up protocol for this connection's traffic group
                 let protocol =
                     self.protocols.get_mut(&group_id).expect("Protocol not found for group_id");
 
-                // Generate request - check if using imported data
+                // Generate request
                 let (request_data, req_id) = if self.generator.is_using_imported_data() {
                     let (key_string, value_bytes) = self.generator.next_request_from_import();
-                    // Use string key hash for scheduler (not perfect but works)
                     self.current_key = hash_string_key(&key_string);
-                    protocol.generate_set_with_imported_data(conn_id, &key_string, &value_bytes)
+                    protocol.generate_set_with_imported_data(
+                        connection_id,
+                        &key_string,
+                        &value_bytes,
+                    )
                 } else {
-                    // Normal synthetic data generation
                     let (key, value_size) = self.generator.next_request();
                     self.current_key = key;
-                    protocol.generate_request(conn_id, key, value_size)
+                    protocol.generate_request(connection_id, key, value_size)
                 };
 
-                // Send request and notify policy
+                // Send request
                 let sent_time_ns = timing::time_ns();
-                let group_id = conn.group_id();
-                conn.send(&request_data, req_id)?;
-                conn.on_request_sent(sent_time_ns);
+                self.pool.send(connection_id, &request_data, req_id)?;
+
+                // Notify policy and record stats
+                if let Some(state) = self.pool.get_state_mut(connection_id) {
+                    state.on_request_sent(sent_time_ns);
+                }
                 self.stats.record_tx_bytes(group_id, request_data.len());
 
                 // Mark request sent for rate control
@@ -301,24 +303,26 @@ impl<T: Transport, P: Protocol> Worker<T, P> {
                 if let Some(delay) = self.generator.delay_until_next() {
                     next_tx_ns = timing::time_ns() + delay.as_nanos() as u64;
                 } else {
-                    // Closed-loop: send immediately
                     next_tx_ns = timing::time_ns();
                 }
 
-                // Update current time
                 let now_ns = timing::time_ns();
-
-                // Break if we've caught up or exceeded the schedule
                 if now_ns < next_tx_ns {
                     break;
                 }
             }
 
-            // RECEIVE PHASE: Poll all connections for responses
-            self.process_responses()?;
-
-            // Yield to scheduler
-            std::hint::spin_loop();
+            // RECEIVE PHASE: Poll all connections for responses (single syscall)
+            let now_ns = timing::time_ns();
+            let wait_ns = next_tx_ns.saturating_sub(now_ns);
+            let poll_timeout = if wait_ns <= 1_000_000 {
+                // Within 1ms: spin with non-blocking poll for precise timing
+                Some(Duration::ZERO)
+            } else {
+                // Beyond 1ms: sleep until 1ms before next_tx, then spin for precision
+                Some(Duration::from_nanos(wait_ns - 1_000_000))
+            };
+            self.process_responses(poll_timeout)?;
         }
 
         // Drain remaining responses
@@ -331,48 +335,49 @@ impl<T: Transport, P: Protocol> Worker<T, P> {
     }
 
     /// Process responses from all connections
-    fn process_responses(&mut self) -> Result<()> {
-        let stats = &mut self.stats;
+    fn process_responses(&mut self, timeout: Option<Duration>) -> Result<()> {
+        // Poll all connections with one syscall
+        let ready_ids = self.pool.poll(timeout)?;
 
         // Collect retries to process after response handling
         let mut retries: Vec<(usize, RetryRequest<_>)> = Vec::new();
 
-        for conn in self.pool.connections_mut() {
+        for connection_id in ready_ids {
+            let state = match self.pool.get_state(connection_id) {
+                Some(s) => s,
+                None => continue,
+            };
+
             // Skip connections with no pending requests
-            if conn.pending_count() == 0 {
+            if state.pending_count() == 0 {
                 continue;
             }
 
-            if !conn.poll_readable()? {
-                continue;
-            }
-            let conn_id = conn.idx();
-            let group_id = conn.group_id();
+            let group_id = state.group_id();
 
             // Look up protocol for this connection's traffic group
             let protocol =
                 self.protocols.get_mut(&group_id).expect("Protocol not found for group_id");
 
-            // Use extended parse to support retries
-            let mut conn_retries = Vec::new();
+            let stats = &mut self.stats;
+            let mut connection_retries = Vec::new();
 
-            let latencies = match conn.recv_responses(|data| {
-                let result = protocol.parse_response_extended(conn_id, data);
+            #[allow(clippy::excessive_nesting)]
+            let latencies = match self.pool.recv_responses(connection_id, |data| {
+                let result = protocol.parse_response_extended(connection_id, data);
                 match result {
                     Ok(ParseResult::Complete { bytes_consumed, request_id }) => {
-                        // Record received bytes if any
-                        (bytes_consumed > 0)
-                            .then(|| stats.record_rx_bytes(group_id, bytes_consumed));
+                        if bytes_consumed > 0 {
+                            stats.record_rx_bytes(group_id, bytes_consumed);
+                        }
                         Ok((bytes_consumed, Some(request_id)))
                     }
                     Ok(ParseResult::Incomplete) => Ok((0, None)),
                     Ok(ParseResult::Retry(retry_req)) => {
-                        // Save retry for processing after response handling
-                        conn_retries.push(retry_req.clone());
-                        // Record received bytes if any
-                        (retry_req.bytes_consumed > 0)
-                            .then(|| stats.record_rx_bytes(group_id, retry_req.bytes_consumed));
-                        // Return the original request ID to complete the pending request
+                        connection_retries.push(retry_req.clone());
+                        if retry_req.bytes_consumed > 0 {
+                            stats.record_rx_bytes(group_id, retry_req.bytes_consumed);
+                        }
                         Ok((retry_req.bytes_consumed, Some(retry_req.original_request_id)))
                     }
                     Err(e) => Err(e.into()),
@@ -380,24 +385,21 @@ impl<T: Transport, P: Protocol> Worker<T, P> {
             }) {
                 Ok(latencies) => latencies,
                 Err(e) => {
-                    // Handle connection errors gracefully
                     if let crate::Error::Connection(_) = e {
-                        // Connection closed - mark it and continue
-                        let _ = conn.close();
+                        let _ = self.pool.close(connection_id);
                         continue;
                     }
-                    // Other errors are fatal
                     return Err(e);
                 }
             };
 
             // Record all latencies with group_id
             for (_req_id, latency) in latencies {
-                stats.record_latency(group_id, latency);
+                self.stats.record_latency(group_id, latency);
             }
 
             // Collect retries for this connection
-            for retry in conn_retries {
+            for retry in connection_retries {
                 retries.push((group_id, retry));
             }
         }
@@ -406,9 +408,6 @@ impl<T: Transport, P: Protocol> Worker<T, P> {
         for (group_id, retry_req) in retries {
             self.handle_retry(group_id, retry_req)?;
         }
-
-        // Per-connection policies don't need global feedback
-        // Each connection manages its own timing independently
 
         Ok(())
     }
@@ -419,39 +418,38 @@ impl<T: Transport, P: Protocol> Worker<T, P> {
         group_id: usize,
         retry_req: RetryRequest<P::RequestId>,
     ) -> Result<()> {
-        // Determine target connection
-        let target_conn_id = if let Some(conn_id) = retry_req.target_conn_id {
-            conn_id
-        } else {
-            // Use original connection or first connection in group
-            // This is a simplified routing - proper routing would use protocol logic
-            return Ok(()); // Skip retry if no target specified
+        let target_connection_id = match retry_req.target_conn_id {
+            Some(connection_id) => connection_id,
+            None => return Ok(()), // Skip retry if no target specified
         };
 
-        // Get the connection
-        let conn = self
-            .pool
-            .connections_mut()
-            .iter_mut()
-            .find(|c| c.idx() == target_conn_id && c.group_id() == group_id);
+        // Check connection exists and belongs to the group
+        let state = match self.pool.get_state(target_connection_id) {
+            Some(s) if s.group_id() == group_id => s,
+            _ => return Ok(()),
+        };
 
-        if let Some(conn) = conn {
-            // Send preparation commands (e.g., ASKING for Redis Cluster)
-            for prep_cmd in &retry_req.prepare_commands {
-                // Send without tracking (preparation commands don't get IDs)
-                let _ = conn.send_untracked(prep_cmd);
-            }
-
-            // Generate and send retry request
-            let protocol =
-                self.protocols.get_mut(&group_id).expect("Protocol not found for group_id");
-
-            let (retry_data, retry_req_id) =
-                protocol.generate_request(target_conn_id, retry_req.key, retry_req.value_size);
-
-            conn.send(&retry_data, retry_req_id)?;
-            self.stats.record_tx_bytes(group_id, retry_data.len());
+        if state.is_closed() {
+            return Ok(());
         }
+
+        // Send preparation commands
+        for prep_cmd in &retry_req.prepare_commands {
+            let _ = self.pool.send_untracked(target_connection_id, prep_cmd);
+        }
+
+        // Generate and send retry request
+        let protocol = self.protocols.get_mut(&group_id).expect("Protocol not found for group_id");
+
+        let (retry_data, retry_req_id) =
+            protocol.generate_request(target_connection_id, retry_req.key, retry_req.value_size);
+
+        // Send the retry request
+        // Note: We intentionally do NOT call state.on_request_sent() or generator.mark_request_sent()
+        // because retries are already counted as in-flight from the original request. Double-counting
+        // would skew rate limiting and statistics (especially for Redis Cluster MOVED/ASK redirects).
+        self.pool.send(target_connection_id, &retry_data, retry_req_id)?;
+        self.stats.record_tx_bytes(group_id, retry_data.len());
 
         Ok(())
     }
@@ -471,35 +469,52 @@ impl<T: Transport, P: Protocol> Worker<T, P> {
     /// Single drain iteration - returns true if any connections have pending requests
     fn drain_iteration(&mut self) -> Result<bool> {
         let mut any_pending = false;
-        let stats = &mut self.stats;
 
-        for conn in self.pool.connections_mut() {
-            if conn.pending_count() == 0 {
+        // Check if any connections have pending requests
+        for &connection_id in self.pool.connection_ids() {
+            if let Some(state) = self.pool.get_state(connection_id) {
+                if state.pending_count() > 0 {
+                    any_pending = true;
+                    break;
+                }
+            }
+        }
+
+        if !any_pending {
+            return Ok(false);
+        }
+
+        // Poll for ready connections
+        let ready_ids = self.pool.poll(Some(Duration::from_millis(10)))?;
+
+        for connection_id in ready_ids {
+            let state = match self.pool.get_state(connection_id) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            if state.pending_count() == 0 {
                 continue;
             }
 
-            any_pending = true;
-
-            if !conn.poll_readable()? {
-                continue;
-            }
-
-            let conn_id = conn.idx();
-            let group_id = conn.group_id();
-
-            // Look up protocol for this connection's traffic group
+            let group_id = state.group_id();
             let protocol =
                 self.protocols.get_mut(&group_id).expect("Protocol not found for group_id");
 
-            let _ = conn.recv_responses(|data| match protocol.parse_response(conn_id, data) {
-                Ok((bytes_consumed, req_id_opt)) => {
-                    if bytes_consumed > 0 {
-                        stats.record_rx_bytes(group_id, bytes_consumed);
+            let stats = &mut self.stats;
+
+            #[allow(clippy::excessive_nesting)]
+            let _ = self.pool.recv_responses(connection_id, |data| {
+                match protocol.parse_response(connection_id, data) {
+                    Ok((bytes_consumed, req_id_opt)) => {
+                        if bytes_consumed > 0 {
+                            stats.record_rx_bytes(group_id, bytes_consumed);
+                        }
+                        Ok((bytes_consumed, req_id_opt))
                     }
-                    Ok((bytes_consumed, req_id_opt))
+                    Err(e) => Err(e.into()),
                 }
-                Err(e) => Err(e.into()),
-            })?;
+            });
         }
 
         Ok(any_pending)
@@ -523,7 +538,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
-    use xylem_transport::TcpTransport;
+    use xylem_transport::TcpTransportFactory;
 
     // Protocol adapter
     struct ProtocolAdapter<P: xylem_protocols::Protocol> {
@@ -608,9 +623,9 @@ mod tests {
             max_pending_per_conn: 1,
         };
 
+        let factory = TcpTransportFactory::default();
         let mut worker =
-            Worker::with_closed_loop(TcpTransport::new, protocol, generator, stats, config)
-                .unwrap();
+            Worker::with_closed_loop(&factory, protocol, generator, stats, config).unwrap();
 
         let result = worker.run();
         assert!(result.is_ok(), "Worker should complete: {:?}", result.err());
@@ -653,7 +668,7 @@ mod tests {
 
         let generator = RequestGenerator::new(
             KeyGeneration::sequential(0),
-            RateControl::ClosedLoop, // Let policy control rate
+            RateControl::ClosedLoop,
             Box::new(FixedSize::new(64)),
         );
         let mut stats = GroupStatsCollector::default();
@@ -670,9 +685,9 @@ mod tests {
         let policy_scheduler = Box::new(UniformPolicyScheduler::fixed_rate(100.0));
 
         let start = Instant::now();
+        let factory = TcpTransportFactory::default();
         let mut worker =
-            Worker::new(TcpTransport::new, protocol, generator, stats, config, policy_scheduler)
-                .unwrap();
+            Worker::new(&factory, protocol, generator, stats, config, policy_scheduler).unwrap();
 
         let result = worker.run();
         assert!(result.is_ok(), "Worker should complete: {:?}", result.err());

@@ -19,7 +19,7 @@ use std::time::Duration;
 use xylem_core::stats::GroupStatsCollector;
 use xylem_core::threading::{ThreadingRuntime, Worker, WorkerConfig};
 use xylem_core::workload::{KeyGeneration, RateControl, RequestGenerator};
-use xylem_transport::TcpTransport;
+use xylem_transport::TcpTransportFactory;
 
 mod common;
 
@@ -92,9 +92,14 @@ fn test_http_get_single_thread() {
         max_pending_per_conn: 1,
     };
 
-    let mut worker =
-        Worker::with_closed_loop(TcpTransport::new, protocol, generator, stats, worker_config)
-            .expect("Failed to create worker");
+    let mut worker = Worker::with_closed_loop(
+        &TcpTransportFactory::default(),
+        protocol,
+        generator,
+        stats,
+        worker_config,
+    )
+    .expect("Failed to create worker");
 
     println!("Starting HTTP GET test...");
     let result = worker.run();
@@ -156,9 +161,14 @@ fn test_http_post_single_thread() {
         max_pending_per_conn: 1,
     };
 
-    let mut worker =
-        Worker::with_closed_loop(TcpTransport::new, protocol, generator, stats, worker_config)
-            .expect("Failed to create worker");
+    let mut worker = Worker::with_closed_loop(
+        &TcpTransportFactory::default(),
+        protocol,
+        generator,
+        stats,
+        worker_config,
+    )
+    .expect("Failed to create worker");
 
     println!("Starting HTTP POST test...");
     let result = worker.run();
@@ -214,9 +224,14 @@ fn test_http_multi_thread() {
             conn_count: 1,
             max_pending_per_conn: 1,
         };
-        let mut worker =
-            Worker::with_closed_loop(TcpTransport::new, protocol, generator, stats, worker_config)
-                .expect("Failed to create worker");
+        let mut worker = Worker::with_closed_loop(
+            &TcpTransportFactory::default(),
+            protocol,
+            generator,
+            stats,
+            worker_config,
+        )
+        .expect("Failed to create worker");
 
         worker.run()?;
         Ok(worker.into_stats())
@@ -286,9 +301,14 @@ fn test_http_rate_limited() {
         max_pending_per_conn: 1,
     };
 
-    let mut worker =
-        Worker::with_closed_loop(TcpTransport::new, protocol, generator, stats, worker_config)
-            .expect("Failed to create worker");
+    let mut worker = Worker::with_closed_loop(
+        &TcpTransportFactory::default(),
+        protocol,
+        generator,
+        stats,
+        worker_config,
+    )
+    .expect("Failed to create worker");
 
     println!("Starting rate-limited test (target: {target_rate} req/s)...");
     let result = worker.run();
@@ -340,9 +360,14 @@ fn test_http_put_request() {
         max_pending_per_conn: 1,
     };
 
-    let mut worker =
-        Worker::with_closed_loop(TcpTransport::new, protocol, generator, stats, worker_config)
-            .expect("Failed to create worker");
+    let mut worker = Worker::with_closed_loop(
+        &TcpTransportFactory::default(),
+        protocol,
+        generator,
+        stats,
+        worker_config,
+    )
+    .expect("Failed to create worker");
 
     println!("Starting HTTP PUT test...");
     let result = worker.run();
@@ -388,9 +413,14 @@ fn test_http_pipelined() {
         max_pending_per_conn: 16, // Allow HTTP pipelining
     };
 
-    let mut worker =
-        Worker::with_closed_loop(TcpTransport::new, protocol, generator, stats, worker_config)
-            .expect("Failed to create worker");
+    let mut worker = Worker::with_closed_loop(
+        &TcpTransportFactory::default(),
+        protocol,
+        generator,
+        stats,
+        worker_config,
+    )
+    .expect("Failed to create worker");
 
     println!("Starting HTTP pipelined test (2 conns, 16 max pending each)...");
     let result = worker.run();

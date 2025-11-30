@@ -5,7 +5,7 @@
 use std::time::Duration;
 use xylem_core::threading::{Worker, WorkerConfig};
 use xylem_core::workload::{KeyGeneration, RateControl, RequestGenerator};
-use xylem_transport::TcpTransport;
+use xylem_transport::TcpTransportFactory;
 
 mod common;
 
@@ -76,8 +76,14 @@ fn test_redis_pipelined_single_connection() {
         max_pending_per_conn: 16, // Allow 16 pipelined requests
     };
 
-    let mut worker =
-        Worker::with_closed_loop(TcpTransport::new, protocol, generator, stats, config).unwrap();
+    let mut worker = Worker::with_closed_loop(
+        &TcpTransportFactory::default(),
+        protocol,
+        generator,
+        stats,
+        config,
+    )
+    .unwrap();
 
     println!("Starting pipelined test (1 conn, 16 max pending)...");
     let result = worker.run();
@@ -129,8 +135,14 @@ fn test_redis_pipelined_multiple_connections() {
         max_pending_per_conn: 16, // 16 pipelined per connection
     };
 
-    let mut worker =
-        Worker::with_closed_loop(TcpTransport::new, protocol, generator, stats, config).unwrap();
+    let mut worker = Worker::with_closed_loop(
+        &TcpTransportFactory::default(),
+        protocol,
+        generator,
+        stats,
+        config,
+    )
+    .unwrap();
 
     println!("Starting pipelined test (4 conns, 16 max pending each)...");
     let result = worker.run();
@@ -183,8 +195,14 @@ fn test_redis_pipelined_rate_limited() {
         max_pending_per_conn: 8,
     };
 
-    let mut worker =
-        Worker::with_closed_loop(TcpTransport::new, protocol, generator, stats, config).unwrap();
+    let mut worker = Worker::with_closed_loop(
+        &TcpTransportFactory::default(),
+        protocol,
+        generator,
+        stats,
+        config,
+    )
+    .unwrap();
 
     println!("Starting rate-limited test (target: {target_rate} req/s)...");
     let result = worker.run();

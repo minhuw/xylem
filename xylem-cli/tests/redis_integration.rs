@@ -8,7 +8,7 @@ use std::time::Duration;
 use xylem_core::stats::GroupStatsCollector;
 use xylem_core::threading::{ThreadingRuntime, Worker, WorkerConfig};
 use xylem_core::workload::{KeyGeneration, RateControl, RequestGenerator};
-use xylem_transport::TcpTransport;
+use xylem_transport::TcpTransportFactory;
 
 mod common;
 
@@ -124,9 +124,14 @@ fn test_redis_single_thread() {
         max_pending_per_conn: 1,
     };
 
-    let mut worker =
-        Worker::with_closed_loop(TcpTransport::new, protocol, generator, stats, worker_config)
-            .expect("Failed to create worker");
+    let mut worker = Worker::with_closed_loop(
+        &TcpTransportFactory::default(),
+        protocol,
+        generator,
+        stats,
+        worker_config,
+    )
+    .expect("Failed to create worker");
 
     // Run the worker
     println!("Starting single-threaded Redis test...");
@@ -224,9 +229,14 @@ fn test_redis_multi_thread() {
             conn_count: 1,
             max_pending_per_conn: 1,
         };
-        let mut worker =
-            Worker::with_closed_loop(TcpTransport::new, protocol, generator, stats, worker_config)
-                .expect("Failed to create worker");
+        let mut worker = Worker::with_closed_loop(
+            &TcpTransportFactory::default(),
+            protocol,
+            generator,
+            stats,
+            worker_config,
+        )
+        .expect("Failed to create worker");
 
         worker.run()?;
         Ok(worker.into_stats())
@@ -320,9 +330,14 @@ fn test_redis_rate_limited() {
         max_pending_per_conn: 1,
     };
 
-    let mut worker =
-        Worker::with_closed_loop(TcpTransport::new, protocol, generator, stats, worker_config)
-            .expect("Failed to create worker");
+    let mut worker = Worker::with_closed_loop(
+        &TcpTransportFactory::default(),
+        protocol,
+        generator,
+        stats,
+        worker_config,
+    )
+    .expect("Failed to create worker");
 
     println!("Starting rate-limited test (target: {target_rate} req/s)...");
     let result = worker.run();

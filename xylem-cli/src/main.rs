@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use xylem_core::threading::{CpuPinning, ThreadingRuntime, Worker, WorkerConfig};
 use xylem_core::workload::{RateControl, RequestGenerator};
-use xylem_transport::TcpTransport;
+use xylem_transport::{TcpTransportFactory, UdpTransportFactory};
 
 mod completions;
 mod config;
@@ -575,17 +575,36 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
             max_pending_per_conn: 1, // This will be overridden per-group
         };
 
-        let mut worker = Worker::new_multi_group_with_targets(
-            TcpTransport::new,
-            protocols,
-            generator,
-            stats,
-            worker_config,
-            groups_config,
-        )?;
-
-        worker.run()?;
-        Ok(worker.into_stats())
+        // Select transport factory based on config
+        match config_for_worker.target.transport.as_str() {
+            "tcp" => {
+                let factory = TcpTransportFactory::default();
+                let mut worker = Worker::new_multi_group_with_targets(
+                    &factory,
+                    protocols,
+                    generator,
+                    stats,
+                    worker_config,
+                    groups_config,
+                )?;
+                worker.run()?;
+                Ok(worker.into_stats())
+            }
+            "udp" => {
+                let factory = UdpTransportFactory::default();
+                let mut worker = Worker::new_multi_group_with_targets(
+                    &factory,
+                    protocols,
+                    generator,
+                    stats,
+                    worker_config,
+                    groups_config,
+                )?;
+                worker.run()?;
+                Ok(worker.into_stats())
+            }
+            other => Err(xylem_core::Error::Config(format!("Unsupported transport: {}", other)))?,
+        }
     })?;
 
     tracing::info!("Experiment completed successfully");

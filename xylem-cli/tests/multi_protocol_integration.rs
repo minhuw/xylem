@@ -12,7 +12,7 @@ use xylem_cli::multi_protocol;
 use xylem_core::stats::{GroupStatsCollector, SamplingPolicy};
 use xylem_core::threading::{ThreadingRuntime, Worker, WorkerConfig};
 use xylem_core::workload::{KeyGeneration, RateControl, RequestGenerator};
-use xylem_transport::TcpTransport;
+use xylem_transport::TcpTransportFactory;
 
 mod common;
 
@@ -161,7 +161,7 @@ fn run_multi_protocol_test() -> Result<(), Box<dyn std::error::Error>> {
             .collect();
 
         let mut worker = Worker::new_multi_group_with_targets(
-            TcpTransport::new,
+            &TcpTransportFactory::default(),
             thread_protocols,
             generator,
             stats,
@@ -269,7 +269,7 @@ fn run_redis_memcached_test() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         let mut worker = Worker::new_multi_group(
-            TcpTransport::new,
+            &TcpTransportFactory::default(),
             protocols,
             generator,
             stats,

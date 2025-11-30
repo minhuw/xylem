@@ -57,6 +57,7 @@ impl From<xylem_transport::Error> for Error {
         match err {
             xylem_transport::Error::Io(e) => Error::Io(e),
             xylem_transport::Error::Connection(msg) => Error::Connection(msg),
+            xylem_transport::Error::Config(msg) => Error::Config(msg),
             xylem_transport::Error::Other(msg) => Error::Other(msg),
         }
     }

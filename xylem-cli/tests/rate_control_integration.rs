@@ -6,7 +6,7 @@
 use std::time::Duration;
 use xylem_core::threading::{Worker, WorkerConfig};
 use xylem_core::workload::{KeyGeneration, RateControl, RequestGenerator};
-use xylem_transport::TcpTransport;
+use xylem_transport::TcpTransportFactory;
 
 mod common;
 
@@ -73,8 +73,14 @@ fn run_rate_experiment(target_rate: f64, duration_secs: u64, conn_count: usize) 
         max_pending_per_conn: 8,
     };
 
-    let mut worker =
-        Worker::with_closed_loop(TcpTransport::new, protocol, generator, stats, config).unwrap();
+    let mut worker = Worker::with_closed_loop(
+        &TcpTransportFactory::default(),
+        protocol,
+        generator,
+        stats,
+        config,
+    )
+    .unwrap();
 
     let result = worker.run();
     assert!(result.is_ok(), "Worker failed: {:?}", result.err());
@@ -153,8 +159,14 @@ fn test_rate_vs_throughput_saturation() {
         max_pending_per_conn: 16,
     };
 
-    let mut worker =
-        Worker::with_closed_loop(TcpTransport::new, protocol, generator, stats, config).unwrap();
+    let mut worker = Worker::with_closed_loop(
+        &TcpTransportFactory::default(),
+        protocol,
+        generator,
+        stats,
+        config,
+    )
+    .unwrap();
 
     worker.run().unwrap();
     let max_throughput = worker.stats().global().tx_requests() as f64 / duration.as_secs_f64();
