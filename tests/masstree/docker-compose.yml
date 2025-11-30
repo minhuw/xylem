@@ -1,0 +1,9 @@
+services:
+  masstree:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: xylem-test-masstree:latest
+    container_name: xylem-test-masstree
+    ports:
+      - "127.0.0.1:2117:2117"

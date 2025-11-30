@@ -66,6 +66,11 @@ test-http: test-cleanup
     @echo "🌐 Running HTTP integration tests..."
     cargo nextest run --profile integration -E 'test(http_integration)'
 
+# Run Masstree integration tests
+test-masstree: test-cleanup
+    @echo "🌲 Running Masstree integration tests..."
+    cargo nextest run --profile integration -E 'binary(masstree_integration)'
+
 # Build debug version
 build:
     @echo "🔨 Building debug version..."
@@ -169,12 +174,25 @@ memcached-stop:
     @docker compose -f tests/memcached/docker-compose.yml down -v
     @echo "✅ Memcached stopped"
 
-# Start both Redis and Memcached for testing
-servers-start: redis-start memcached-start
+# Build and start Masstree server using Docker
+masstree-start:
+    @echo "🎯 Building and starting Masstree server on port 2117 (Docker)..."
+    @docker compose -f tests/masstree/docker-compose.yml up -d --build
+    @sleep 3
+    @echo "✅ Masstree started"
+
+# Stop Masstree server
+masstree-stop:
+    @echo "🛑 Stopping Masstree server..."
+    @docker compose -f tests/masstree/docker-compose.yml down -v
+    @echo "✅ Masstree stopped"
+
+# Start Redis, Memcached, and Masstree for testing
+servers-start: redis-start memcached-start masstree-start
     @echo "✅ All test servers started"
 
-# Stop both servers
-servers-stop: redis-stop memcached-stop
+# Stop all servers
+servers-stop: redis-stop memcached-stop masstree-stop
     @echo "✅ All test servers stopped"
 
 # Restart test servers
@@ -187,6 +205,8 @@ servers-status:
     @docker ps --filter name=xylem-test-redis --format "{{{{.Status}}}}" | grep -q "Up" && echo "   ✅ Running" || echo "   ❌ Not running"
     @echo "Memcached (port {{DEFAULT_MEMCACHED_PORT}}):"
     @docker ps --filter name=xylem-test-memcached --format "{{{{.Status}}}}" | grep -q "Up" && echo "   ✅ Running" || echo "   ❌ Not running"
+    @echo "Masstree (port 2117):"
+    @docker ps --filter name=xylem-test-masstree --format "{{{{.Status}}}}" | grep -q "Up" && echo "   ✅ Running" || echo "   ❌ Not running"
 
 # Test release build with current Git commit as version
 test-release:

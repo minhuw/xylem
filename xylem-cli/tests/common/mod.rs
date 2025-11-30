@@ -5,6 +5,7 @@
 #![allow(dead_code)]
 
 // Docker-based service guards
+pub mod masstree;
 pub mod memcached;
 pub mod multi_protocol;
 pub mod nginx;
