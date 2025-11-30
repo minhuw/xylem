@@ -1,9 +1,13 @@
 //! Per-Connection Traffic Model Scheduler
 //!
 //! This module provides a per-connection traffic model where each connection has its own
-//! independent policy that determines when it should send requests. The temporal scheduler
-//! picks whichever connection's next request is due soonest (like an async runtime picking
-//! the next ready coroutine).
+//! independent policy that determines when it should send requests.
+//!
+//! ## Architecture
+//!
+//! - **Policy**: Each connection has a `Policy` that decides when to send the next request
+//!   (e.g., `ClosedLoopPolicy`, `FixedRatePolicy`, `PoissonPolicy`)
+//! - **ReadyHeap**: A min-heap data structure for O(log N) lookup of the next ready connection
 //!
 //! ## Example: Uniform Traffic
 //!
@@ -49,7 +53,7 @@
 //! ```
 
 pub mod policy;
-pub mod temporal;
+pub mod ready_heap;
 
 // Re-export main types
 pub use policy::{
@@ -57,4 +61,4 @@ pub use policy::{
     PerConnectionPolicyScheduler, PoissonPolicy, Policy, PolicyScheduler, UniformPolicyScheduler,
 };
 
-pub use temporal::TemporalScheduler;
+pub use ready_heap::ReadyHeap;

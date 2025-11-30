@@ -126,17 +126,60 @@ install-flamegraph:
     @echo "📊 Installing flamegraph tool..."
     cargo install flamegraph
 
-# Generate flamegraph for the CLI (requires install-flamegraph first)
-# Usage: just flamegraph <xylem-args>
-flamegraph *args:
-    @echo "🔥 Generating flamegraph..."
-    @echo "This will run xylem and create a flamegraph.svg file"
-    flamegraph --bin {{BINARY_NAME}} -- {{args}}
+# Generate flamegraph using real xylem Worker with echo protocol
+# Uses 1 xylem thread (for clear profiling) and 8 echo server threads
+flamegraph-echo:
+    #!/usr/bin/env bash
+    set -euo pipefail
 
-# Generate flamegraph for integration test (performance profiling)
-flamegraph-test:
-    @echo "🔥 Generating flamegraph for scheduler test..."
-    cargo flamegraph --test scheduler_integration -- --nocapture
+    echo "🔥 Generating flamegraph with real xylem Worker"
+    echo "   Xylem: 1 thread, 1024 connections, pipeline=1 (closed-loop)"
+    echo "   Echo server: 8 threads"
+    echo "   Duration: 30s"
+    echo ""
+
+    # Start echo server in background with 8 threads
+    echo "🚀 Starting echo server on port 19999 (8 threads)..."
+    cargo run -p xylem-echo-server --release -- --port 19999 --bind 127.0.0.1 --threads 8 &
+    SERVER_PID=$!
+    sleep 1
+
+    # Ensure server is cleaned up on exit
+    cleanup() {
+        echo ""
+        echo "🧹 Stopping echo server (PID: $SERVER_PID)..."
+        kill $SERVER_PID 2>/dev/null || true
+        wait $SERVER_PID 2>/dev/null || true
+        echo "✅ Cleanup complete"
+    }
+    trap cleanup EXIT
+
+    # Check server is running
+    if ! kill -0 $SERVER_PID 2>/dev/null; then
+        echo "❌ Echo server failed to start"
+        exit 1
+    fi
+    echo "✅ Echo server running (PID: $SERVER_PID)"
+    echo ""
+
+    # Build benchmark with profiling profile
+    echo "🔨 Building echo_benchmark with profiling profile..."
+    cargo build --profile profiling -p xylem-core --example echo_benchmark
+    echo ""
+
+    # Generate flamegraph (1 xylem thread for clear profiling)
+    echo "🔥 Running benchmark and generating flamegraph..."
+    echo "   This will take approximately 30 seconds..."
+    cargo flamegraph --profile profiling -p xylem-core --example echo_benchmark -- \
+        --target 127.0.0.1:19999 \
+        --threads 1 \
+        --connections 1024 \
+        --pipeline 1 \
+        --duration 30
+
+    echo ""
+    echo "✅ Flamegraph generated: flamegraph.svg"
+    echo "   Open it in a browser to analyze performance"
 
 # Run a quick benchmark (Redis, 10k requests, single connection)
 bench-quick:
@@ -266,9 +309,9 @@ help:
     @echo "  just precommit         - Run pre-commit checks"
     @echo ""
     @echo "🔥 Performance:"
-    @echo "  just flamegraph <args> - Generate flamegraph (requires: just install-flamegraph)"
-    @echo "  just bench-quick       - Quick benchmark"
-    @echo "  just bench-full        - Full benchmark"
+    @echo "  just flamegraph-echo     - Generate flamegraph with echo benchmark (30s)"
+    @echo "  just bench-quick         - Quick benchmark"
+    @echo "  just bench-full          - Full benchmark"
     @echo ""
     @echo "🎯 Server Management:"
     @echo "  just servers-start     - Start Redis & Memcached"

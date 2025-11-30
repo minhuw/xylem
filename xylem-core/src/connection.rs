@@ -6,7 +6,7 @@
 //! Uses `ConnectionGroup` internally for efficient I/O multiplexing - a single
 //! poll syscall checks all connections in the pool.
 
-use crate::scheduler::Policy;
+use crate::scheduler::{Policy, ReadyHeap};
 use crate::Result;
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -202,6 +202,9 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
 ///
 /// Uses a single `ConnectionGroup` internally for efficient I/O multiplexing.
 /// One `poll()` syscall checks all connections instead of O(N) syscalls.
+///
+/// Connection scheduling uses a min-heap (`TemporalScheduler`) for O(log N)
+/// `pick_connection()` instead of O(N) iteration.
 pub struct ConnectionPool<G: ConnectionGroup, ReqId: Eq + Hash + Clone> {
     /// Connection group for I/O (single multiplexer for all connections)
     group: G,
@@ -209,6 +212,8 @@ pub struct ConnectionPool<G: ConnectionGroup, ReqId: Eq + Hash + Clone> {
     connection_states: HashMap<usize, ConnectionState<ReqId>>,
     /// Ordered list of connection IDs for iteration
     connection_ids: Vec<usize>,
+    /// Min-heap for O(log N) lookup of next ready connection
+    ready_heap: ReadyHeap,
 }
 
 impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionPool<G, ReqId> {
@@ -232,10 +237,17 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         let mut group = factory.create_group()?;
         let mut connection_states = HashMap::with_capacity(connection_count);
         let mut connection_ids = Vec::with_capacity(connection_count);
+        let mut ready_heap = ReadyHeap::new();
+        let current_time_ns = crate::timing::time_ns();
 
         for idx in 0..connection_count {
             let connection_id = group.add_connection(&target)?;
-            let policy = policy_scheduler.assign_policy(idx);
+            let mut policy = policy_scheduler.assign_policy(idx);
+
+            // Get initial next_send_time and add to heap
+            let next_send_time = policy.next_send_time(current_time_ns);
+            ready_heap.push(connection_id, next_send_time);
+
             let state = ConnectionState::new(
                 connection_id,
                 target,
@@ -247,7 +259,12 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
             connection_ids.push(connection_id);
         }
 
-        Ok(Self { group, connection_states, connection_ids })
+        Ok(Self {
+            group,
+            connection_states,
+            connection_ids,
+            ready_heap,
+        })
     }
 
     /// Create a new connection pool with connections from multiple traffic groups
@@ -275,6 +292,8 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         let mut group = factory.create_group()?;
         let mut connection_states = HashMap::with_capacity(total_connections);
         let mut connection_ids = Vec::with_capacity(total_connections);
+        let mut ready_heap = ReadyHeap::new();
+        let current_time_ns = crate::timing::time_ns();
         let mut idx = 0;
 
         for (
@@ -287,7 +306,12 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         {
             for _ in 0..connection_count {
                 let connection_id = group.add_connection(&target)?;
-                let policy = policy_scheduler.assign_policy(idx);
+                let mut policy = policy_scheduler.assign_policy(idx);
+
+                // Get initial next_send_time and add to heap
+                let next_send_time = policy.next_send_time(current_time_ns);
+                ready_heap.push(connection_id, next_send_time);
+
                 let state = ConnectionState::new(
                     connection_id,
                     target,
@@ -301,7 +325,12 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
             }
         }
 
-        Ok(Self { group, connection_states, connection_ids })
+        Ok(Self {
+            group,
+            connection_states,
+            connection_ids,
+            ready_heap,
+        })
     }
 
     /// Poll all connections for readability (single syscall)
@@ -381,51 +410,39 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         state.process_recv(&data, recv_ts, process_fn)
     }
 
-    /// Pick the next ready connection using temporal scheduling with round-robin fairness
+    /// Pick the next ready connection (O(log N) via min-heap)
+    ///
+    /// Pops connections from the heap until finding one that can send.
+    /// Stale entries (connections that can't send due to full pipeline) are discarded.
     pub fn pick_connection(&mut self) -> Option<usize> {
         let current_time_ns = crate::timing::time_ns();
 
-        let mut timed_connections = Vec::new();
-        let mut closed_loop_connections = Vec::new();
-
-        for &connection_id in &self.connection_ids {
-            let state = match self.connection_states.get_mut(&connection_id) {
-                Some(s) => s,
-                None => continue,
-            };
-
-            if !state.can_send() {
-                continue;
-            }
-
-            match state.next_send_time(current_time_ns) {
-                None => closed_loop_connections.push((connection_id, state.last_active)),
-                Some(ready_time) if ready_time <= current_time_ns => {
-                    timed_connections.push((ready_time, connection_id));
-                }
-                Some(_) => {}
-            }
-        }
-
-        let chosen_id = if !closed_loop_connections.is_empty() {
-            closed_loop_connections
-                .iter()
-                .min_by_key(|(_, last_active)| *last_active)
-                .map(|(id, _)| *id)
-        } else if !timed_connections.is_empty() {
-            timed_connections.sort_by_key(|(time, _)| *time);
-            Some(timed_connections[0].1)
-        } else {
-            None
-        };
-
-        if let Some(connection_id) = chosen_id {
+        // Pop from heap until we find a connection that can actually send
+        while let Some(connection_id) = self.ready_heap.pop_ready(current_time_ns) {
             if let Some(state) = self.connection_states.get_mut(&connection_id) {
-                state.last_active = current_time_ns;
+                if state.can_send() {
+                    state.last_active = current_time_ns;
+                    return Some(connection_id);
+                }
+                // Connection can't send (pipeline full or closed) - don't re-add, it will
+                // be re-added when a response is received and pipeline has capacity
             }
         }
 
-        chosen_id
+        None
+    }
+
+    /// Re-add a connection to the heap after it becomes sendable again
+    ///
+    /// Called after receiving a response to re-enable the connection for scheduling.
+    pub fn reschedule_connection(&mut self, connection_id: usize) {
+        let current_time_ns = crate::timing::time_ns();
+        if let Some(state) = self.connection_states.get_mut(&connection_id) {
+            if state.can_send() {
+                let next_send_time = state.next_send_time(current_time_ns);
+                self.ready_heap.push(connection_id, next_send_time);
+            }
+        }
     }
 
     /// Get connection state by ID

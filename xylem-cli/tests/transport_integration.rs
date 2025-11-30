@@ -145,7 +145,7 @@ fn test_unix_socket_transport_echo() {
         let (recv_data, recv_ts) = transport.recv().expect("Failed to receive");
 
         assert_eq!(recv_data, test_data.as_bytes(), "Echo mismatch");
-        assert!(recv_ts.instant >= send_ts.instant, "Invalid timestamp order");
+        assert!(recv_ts.cycles() >= send_ts.cycles(), "Invalid timestamp order");
     }
 
     transport.close().ok();
@@ -182,7 +182,7 @@ fn test_udp_transport_basic() {
 
     let (recv_data, recv_ts) = transport.recv().expect("Receive failed");
     assert_eq!(recv_data, test_data);
-    assert!(recv_ts.instant >= send_ts.instant);
+    assert!(recv_ts.cycles() >= send_ts.cycles());
 
     transport.close().ok();
     server_handle.join().ok();

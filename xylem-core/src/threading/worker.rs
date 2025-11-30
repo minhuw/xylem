@@ -398,6 +398,9 @@ impl<G: ConnectionGroup, P: Protocol> Worker<G, P> {
                 self.stats.record_latency(group_id, latency);
             }
 
+            // Re-add connection to scheduler now that it may have capacity
+            self.pool.reschedule_connection(connection_id);
+
             // Collect retries for this connection
             for retry in connection_retries {
                 retries.push((group_id, retry));

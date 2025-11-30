@@ -122,29 +122,91 @@ impl From<std::io::Error> for Error {
 }
 
 /// Timestamp for request/response tracking
+///
+/// Uses RDTSC (Read Time-Stamp Counter) on x86_64 for minimal overhead.
+/// Falls back to `Instant` on other architectures.
 #[derive(Debug, Clone, Copy)]
 pub struct Timestamp {
-    pub instant: Instant,
-    pub nanos: u64,
+    cycles: u64,
+}
+
+/// Calibration data for converting RDTSC cycles to nanoseconds
+struct TscCalibration {
+    cycles_per_ns: f64,
+}
+
+impl TscCalibration {
+    fn calibrate() -> Self {
+        // Calibrate by measuring cycles over a known duration
+        let start_cycles = rdtsc();
+        let start_instant = Instant::now();
+
+        // Sleep for a short calibration period
+        std::thread::sleep(Duration::from_millis(10));
+
+        let end_cycles = rdtsc();
+        let elapsed_ns = start_instant.elapsed().as_nanos() as f64;
+
+        let cycles = (end_cycles - start_cycles) as f64;
+        let cycles_per_ns = cycles / elapsed_ns;
+
+        Self { cycles_per_ns }
+    }
+
+    fn cycles_to_nanos(&self, cycles: u64) -> u64 {
+        (cycles as f64 / self.cycles_per_ns) as u64
+    }
+}
+
+/// Get calibration data (initialized once)
+fn get_calibration() -> &'static TscCalibration {
+    static CALIBRATION: std::sync::OnceLock<TscCalibration> = std::sync::OnceLock::new();
+    CALIBRATION.get_or_init(TscCalibration::calibrate)
+}
+
+/// Read the CPU timestamp counter with serialization
+///
+/// Uses RDTSCP which includes a memory barrier to ensure the timestamp
+/// is taken after all previous instructions complete.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn rdtsc() -> u64 {
+    unsafe {
+        let mut _aux: u32 = 0;
+        core::arch::x86_64::__rdtscp(&mut _aux)
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn rdtsc() -> u64 {
+    // Fallback for non-x86_64: use Instant
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let start = START.get_or_init(Instant::now);
+    start.elapsed().as_nanos() as u64
 }
 
 impl Timestamp {
     /// Create a new timestamp from current time
     ///
-    /// Captures both a monotonic Instant and a nanosecond timestamp
-    /// for high-precision latency measurements.
+    /// Uses RDTSC for minimal overhead (~20 cycles vs ~200+ for clock_gettime).
+    #[inline(always)]
     pub fn now() -> Self {
-        // Get nanosecond timestamp
-        static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-        let start = START.get_or_init(Instant::now);
-        let nanos = start.elapsed().as_nanos() as u64;
-
-        Self { instant: Instant::now(), nanos }
+        Self { cycles: rdtsc() }
     }
 
     /// Calculate duration since another timestamp
+    #[inline]
     pub fn duration_since(&self, earlier: &Timestamp) -> Duration {
-        self.instant.duration_since(earlier.instant)
+        let delta_cycles = self.cycles.saturating_sub(earlier.cycles);
+        let nanos = get_calibration().cycles_to_nanos(delta_cycles);
+        Duration::from_nanos(nanos)
+    }
+
+    /// Get the raw cycle count (for comparisons)
+    #[inline]
+    pub fn cycles(&self) -> u64 {
+        self.cycles
     }
 }
 

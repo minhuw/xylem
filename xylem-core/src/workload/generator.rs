@@ -2,9 +2,10 @@
 
 use super::distributions::{Distribution, NormalDistribution, ZipfianDistribution};
 use super::value_size::ValueSizeGenerator;
+use crate::timing::time_ns;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Trait for key generation (to enable per-command key generators)
 pub trait KeyGeneratorTrait: Send {
@@ -290,7 +291,8 @@ pub struct RequestGenerator {
     key_gen: KeyGeneration,
     rate_control: RateControl,
     value_size_gen: Box<dyn ValueSizeGenerator>,
-    last_request_time: Option<Instant>,
+    /// Last request time in nanoseconds (from time_ns())
+    last_request_time_ns: Option<u64>,
     request_count: u64,
     /// Optional data importer for testing with real data
     data_importer: Option<super::data_import::DataImporter>,
@@ -307,7 +309,7 @@ impl RequestGenerator {
             key_gen,
             rate_control,
             value_size_gen,
-            last_request_time: None,
+            last_request_time_ns: None,
             request_count: 0,
             data_importer: None,
         }
@@ -323,7 +325,7 @@ impl RequestGenerator {
             key_gen: KeyGeneration::sequential(0), // Unused when importing
             rate_control,
             value_size_gen,
-            last_request_time: None,
+            last_request_time_ns: None,
             request_count: 0,
             data_importer: Some(data_importer),
         }
@@ -374,17 +376,18 @@ impl RequestGenerator {
         match self.rate_control {
             RateControl::ClosedLoop => None,
             RateControl::Fixed { rate } => {
-                let inter_arrival_time = Duration::from_secs_f64(1.0 / rate);
+                let inter_arrival_ns = (1_000_000_000.0 / rate) as u64;
 
-                if let Some(last_time) = self.last_request_time {
-                    let elapsed = last_time.elapsed();
-                    if elapsed < inter_arrival_time {
-                        Some(inter_arrival_time - elapsed)
+                if let Some(last_time_ns) = self.last_request_time_ns {
+                    let now_ns = time_ns();
+                    let elapsed_ns = now_ns.saturating_sub(last_time_ns);
+                    if elapsed_ns < inter_arrival_ns {
+                        Some(Duration::from_nanos(inter_arrival_ns - elapsed_ns))
                     } else {
                         Some(Duration::ZERO)
                     }
                 } else {
-                    self.last_request_time = Some(Instant::now());
+                    self.last_request_time_ns = Some(time_ns());
                     Some(Duration::ZERO)
                 }
             }
@@ -393,7 +396,7 @@ impl RequestGenerator {
 
     /// Mark that a request was sent (for rate control)
     pub fn mark_request_sent(&mut self) {
-        self.last_request_time = Some(Instant::now());
+        self.last_request_time_ns = Some(time_ns());
     }
 
     /// Get total request count
@@ -408,7 +411,7 @@ impl RequestGenerator {
         if let Some(importer) = &mut self.data_importer {
             importer.reset();
         }
-        self.last_request_time = None;
+        self.last_request_time_ns = None;
         self.request_count = 0;
     }
 }

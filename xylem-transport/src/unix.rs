@@ -410,7 +410,7 @@ mod tests {
 
         let (recv_data, recv_ts) = transport.recv().unwrap();
         assert_eq!(recv_data, test_data);
-        assert!(recv_ts.instant >= send_ts.instant);
+        assert!(recv_ts.cycles() >= send_ts.cycles());
     }
 
     #[test]
@@ -581,7 +581,7 @@ mod tests {
 
         let (recv_data, recv_ts) = group.get_mut(conn_id).unwrap().recv().unwrap();
         assert_eq!(recv_data, test_data);
-        assert!(recv_ts.instant >= send_ts.instant);
+        assert!(recv_ts.cycles() >= send_ts.cycles());
     }
 
     #[test]

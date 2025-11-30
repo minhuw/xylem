@@ -28,6 +28,10 @@ struct Args {
     #[arg(short, long, default_value = "0.0.0.0")]
     bind: String,
 
+    /// Number of worker threads (defaults to number of CPU cores)
+    #[arg(short, long)]
+    threads: Option<usize>,
+
     /// Maximum delay allowed (microseconds) - requests exceeding this are capped
     #[arg(long, default_value = "10000000")]
     max_delay_us: u64,
@@ -48,30 +52,31 @@ async fn handle_client(mut socket: TcpStream, max_delay_us: u64, verbose: bool) 
 
     loop {
         // Read exactly MESSAGE_SIZE bytes
-        let n = match socket.read_exact(&mut buffer).await {
-            Ok(_) => MESSAGE_SIZE,
+        match socket.read_exact(&mut buffer).await {
+            Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                // Client closed connection
+                // Client closed connection gracefully
                 if verbose {
                     println!("Client {peer_addr} disconnected after {request_count} requests");
                 }
                 break;
             }
-            Err(e) => {
-                eprintln!("Error reading from {peer_addr}: {e}");
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                // Client closed connection (RST) - normal for benchmarks
+                if verbose {
+                    println!("Client {peer_addr} reset connection after {request_count} requests");
+                }
                 break;
             }
-        };
-
-        if n == 0 {
-            break;
+            Err(e) => {
+                if verbose {
+                    eprintln!("Error reading from {peer_addr}: {e}");
+                }
+                break;
+            }
         }
 
-        // Parse the message
-        let request_id = u64::from_le_bytes([
-            buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6], buffer[7],
-        ]);
-
+        // Parse the delay from message
         let delay_us = u64::from_le_bytes([
             buffer[8], buffer[9], buffer[10], buffer[11], buffer[12], buffer[13], buffer[14],
             buffer[15],
@@ -80,12 +85,6 @@ async fn handle_client(mut socket: TcpStream, max_delay_us: u64, verbose: bool) 
         // Cap delay to max_delay_us
         let actual_delay_us = delay_us.min(max_delay_us);
 
-        if verbose && delay_us != actual_delay_us {
-            println!(
-                "Request {request_id} from {peer_addr}: delay capped from {delay_us}us to {actual_delay_us}us"
-            );
-        }
-
         // Wait for the specified delay
         if actual_delay_us > 0 {
             sleep(Duration::from_micros(actual_delay_us)).await;
@@ -93,32 +92,41 @@ async fn handle_client(mut socket: TcpStream, max_delay_us: u64, verbose: bool) 
 
         // Echo the message back
         if let Err(e) = socket.write_all(&buffer).await {
-            eprintln!("Error writing to {peer_addr}: {e}");
+            if verbose {
+                eprintln!("Error writing to {peer_addr}: {e}");
+            }
             break;
         }
 
         request_count += 1;
-
-        if verbose && request_count % 10000 == 0 {
-            println!("Client {peer_addr}: {request_count} requests processed");
-        }
-    }
-
-    if verbose {
-        println!("Connection from {peer_addr} closed (total requests: {request_count})");
     }
 
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let args = Args::parse();
 
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    if let Some(threads) = args.threads {
+        builder.worker_threads(threads);
+    }
+    builder.enable_all();
+
+    let runtime = builder.build()?;
+    runtime.block_on(run_server(args))
+}
+
+async fn run_server(args: Args) -> Result<()> {
     let addr = format!("{}:{}", args.bind, args.port);
     let listener = TcpListener::bind(&addr).await?;
 
+    let num_threads = args
+        .threads
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1));
+
     println!("Xylem Echo Server listening on {addr}");
+    println!("Worker threads: {num_threads}");
     println!("Protocol: [request_id: u64][delay_us: u64] (16 bytes)");
     println!("Max delay: {}us", args.max_delay_us);
 
@@ -127,20 +135,14 @@ async fn main() -> Result<()> {
     }
 
     loop {
-        let (socket, addr) = listener.accept().await?;
-
-        if args.verbose {
-            println!("Accepted connection from: {addr}");
-        }
+        let (socket, _addr) = listener.accept().await?;
 
         let max_delay_us = args.max_delay_us;
         let verbose = args.verbose;
 
         // Spawn a task to handle this client
         tokio::spawn(async move {
-            if let Err(e) = handle_client(socket, max_delay_us, verbose).await {
-                eprintln!("Error handling client {addr}: {e}");
-            }
+            let _ = handle_client(socket, max_delay_us, verbose).await;
         });
     }
 }
