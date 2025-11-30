@@ -352,6 +352,7 @@ pub trait TransportFactory: Send + Sync {
 // Module declarations
 // =============================================================================
 
+pub mod buffer_pool;
 pub mod mux;
 pub mod tcp;
 pub mod udp;
@@ -363,6 +364,7 @@ pub mod unix;
 // Re-exports
 // =============================================================================
 
+pub use buffer_pool::{BufferPool, MaybePooledBuffer, PooledBuffer};
 pub use mux::{Multiplexer, MultiplexerType};
 
 pub use tcp::TcpTransport;

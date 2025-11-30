@@ -6,12 +6,15 @@
 //! Protocol:
 //! - Request: [request_id: u64][delay_us: u64] (16 bytes)
 //! - Response: echoes the request after waiting delay_us microseconds
+//!
+//! Supports both TCP and Unix domain sockets.
 
 use anyhow::Result;
 use clap::Parser;
+use std::path::PathBuf;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::time::sleep;
 
 const MESSAGE_SIZE: usize = 16;
@@ -20,13 +23,17 @@ const MESSAGE_SIZE: usize = 16;
 #[command(name = "xylem-echo-server")]
 #[command(about = "Xylem Echo Protocol server for latency measurement validation")]
 struct Args {
-    /// Port to listen on
+    /// Port to listen on (for TCP mode)
     #[arg(short, long, default_value = "9999")]
     port: u16,
 
-    /// Bind address
+    /// Bind address (for TCP mode)
     #[arg(short, long, default_value = "0.0.0.0")]
     bind: String,
+
+    /// Unix socket path (enables Unix socket mode instead of TCP)
+    #[arg(short, long)]
+    unix: Option<PathBuf>,
 
     /// Number of worker threads (defaults to number of CPU cores)
     #[arg(short, long)]
@@ -41,59 +48,59 @@ struct Args {
     verbose: bool,
 }
 
-async fn handle_client(mut socket: TcpStream, max_delay_us: u64, verbose: bool) -> Result<()> {
-    let peer_addr = socket.peer_addr()?;
+async fn handle_connection<S>(
+    mut socket: S,
+    client_id: &str,
+    max_delay_us: u64,
+    verbose: bool,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     if verbose {
-        println!("New connection from: {peer_addr}");
+        println!("New connection from: {client_id}");
     }
 
     let mut buffer = vec![0u8; MESSAGE_SIZE];
     let mut request_count = 0u64;
 
     loop {
-        // Read exactly MESSAGE_SIZE bytes
         match socket.read_exact(&mut buffer).await {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                // Client closed connection gracefully
                 if verbose {
-                    println!("Client {peer_addr} disconnected after {request_count} requests");
+                    println!("Client {client_id} disconnected after {request_count} requests");
                 }
                 break;
             }
             Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
-                // Client closed connection (RST) - normal for benchmarks
                 if verbose {
-                    println!("Client {peer_addr} reset connection after {request_count} requests");
+                    println!("Client {client_id} reset connection after {request_count} requests");
                 }
                 break;
             }
             Err(e) => {
                 if verbose {
-                    eprintln!("Error reading from {peer_addr}: {e}");
+                    eprintln!("Error reading from {client_id}: {e}");
                 }
                 break;
             }
         }
 
-        // Parse the delay from message
         let delay_us = u64::from_le_bytes([
             buffer[8], buffer[9], buffer[10], buffer[11], buffer[12], buffer[13], buffer[14],
             buffer[15],
         ]);
 
-        // Cap delay to max_delay_us
         let actual_delay_us = delay_us.min(max_delay_us);
 
-        // Wait for the specified delay
         if actual_delay_us > 0 {
             sleep(Duration::from_micros(actual_delay_us)).await;
         }
 
-        // Echo the message back
         if let Err(e) = socket.write_all(&buffer).await {
             if verbose {
-                eprintln!("Error writing to {peer_addr}: {e}");
+                eprintln!("Error writing to {client_id}: {e}");
             }
             break;
         }
@@ -102,6 +109,23 @@ async fn handle_client(mut socket: TcpStream, max_delay_us: u64, verbose: bool) 
     }
 
     Ok(())
+}
+
+async fn handle_tcp_client(socket: TcpStream, max_delay_us: u64, verbose: bool) -> Result<()> {
+    let peer_addr = socket
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    handle_connection(socket, &peer_addr, max_delay_us, verbose).await
+}
+
+async fn handle_unix_client(socket: UnixStream, max_delay_us: u64, verbose: bool) -> Result<()> {
+    let peer_addr = socket
+        .peer_addr()
+        .ok()
+        .and_then(|a| a.as_pathname().map(|p| p.display().to_string()))
+        .unwrap_or_else(|| "unix-client".to_string());
+    handle_connection(socket, &peer_addr, max_delay_us, verbose).await
 }
 
 fn main() -> Result<()> {
@@ -118,31 +142,61 @@ fn main() -> Result<()> {
 }
 
 async fn run_server(args: Args) -> Result<()> {
-    let addr = format!("{}:{}", args.bind, args.port);
-    let listener = TcpListener::bind(&addr).await?;
-
     let num_threads = args
         .threads
         .unwrap_or_else(|| std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1));
 
-    println!("Xylem Echo Server listening on {addr}");
-    println!("Worker threads: {num_threads}");
-    println!("Protocol: [request_id: u64][delay_us: u64] (16 bytes)");
-    println!("Max delay: {}us", args.max_delay_us);
+    if let Some(ref unix_path) = args.unix {
+        // Unix socket mode
+        // Remove existing socket file if it exists
+        if unix_path.exists() {
+            std::fs::remove_file(unix_path)?;
+        }
 
-    if args.verbose {
-        println!("Verbose logging enabled");
-    }
+        let listener = UnixListener::bind(unix_path)?;
 
-    loop {
-        let (socket, _addr) = listener.accept().await?;
+        println!("Xylem Echo Server listening on {}", unix_path.display());
+        println!("Worker threads: {num_threads}");
+        println!("Protocol: [request_id: u64][delay_us: u64] (16 bytes)");
+        println!("Max delay: {}us", args.max_delay_us);
 
-        let max_delay_us = args.max_delay_us;
-        let verbose = args.verbose;
+        if args.verbose {
+            println!("Verbose logging enabled");
+        }
 
-        // Spawn a task to handle this client
-        tokio::spawn(async move {
-            let _ = handle_client(socket, max_delay_us, verbose).await;
-        });
+        loop {
+            let (socket, _addr) = listener.accept().await?;
+
+            let max_delay_us = args.max_delay_us;
+            let verbose = args.verbose;
+
+            tokio::spawn(async move {
+                let _ = handle_unix_client(socket, max_delay_us, verbose).await;
+            });
+        }
+    } else {
+        // TCP mode
+        let addr = format!("{}:{}", args.bind, args.port);
+        let listener = TcpListener::bind(&addr).await?;
+
+        println!("Xylem Echo Server listening on {addr}");
+        println!("Worker threads: {num_threads}");
+        println!("Protocol: [request_id: u64][delay_us: u64] (16 bytes)");
+        println!("Max delay: {}us", args.max_delay_us);
+
+        if args.verbose {
+            println!("Verbose logging enabled");
+        }
+
+        loop {
+            let (socket, _addr) = listener.accept().await?;
+
+            let max_delay_us = args.max_delay_us;
+            let verbose = args.verbose;
+
+            tokio::spawn(async move {
+                let _ = handle_tcp_client(socket, max_delay_us, verbose).await;
+            });
+        }
     }
 }

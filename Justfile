@@ -168,6 +168,14 @@ flamegraph-echo:
     echo ""
 
     # Generate flamegraph (1 xylem thread for clear profiling)
+    # Check if kernel symbols are accessible
+    if [ "$(cat /proc/sys/kernel/perf_event_paranoid)" -gt 0 ] || [ "$(cat /proc/sys/kernel/kptr_restrict)" -gt 0 ]; then
+        echo "⚠️  Kernel symbols may not be available in flamegraph."
+        echo "   To enable kernel symbols, run:"
+        echo "     sudo sysctl kernel.perf_event_paranoid=-1"
+        echo "     sudo sysctl kernel.kptr_restrict=0"
+        echo ""
+    fi
     echo "🔥 Running benchmark and generating flamegraph..."
     echo "   This will take approximately 30 seconds..."
     cargo flamegraph --profile profiling -p xylem-core --example echo_benchmark -- \
@@ -179,6 +187,72 @@ flamegraph-echo:
 
     echo ""
     echo "✅ Flamegraph generated: flamegraph.svg"
+    echo "   Open it in a browser to analyze performance"
+
+# Generate flamegraph using Unix domain sockets with echo protocol
+# Uses 1 xylem thread (for clear profiling) and 8 echo server threads
+flamegraph-echo-unix:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    SOCKET_PATH="/tmp/xylem-echo.sock"
+
+    echo "🔥 Generating flamegraph with Unix domain sockets"
+    echo "   Xylem: 1 thread, 1024 connections, pipeline=1 (closed-loop)"
+    echo "   Echo server: 8 threads"
+    echo "   Socket: $SOCKET_PATH"
+    echo "   Duration: 30s"
+    echo ""
+
+    # Start echo server in background with Unix socket
+    echo "🚀 Starting echo server on $SOCKET_PATH (8 threads)..."
+    cargo run -p xylem-echo-server --release -- --unix "$SOCKET_PATH" --threads 8 &
+    SERVER_PID=$!
+    sleep 1
+
+    # Ensure server and socket are cleaned up on exit
+    cleanup() {
+        echo ""
+        echo "🧹 Stopping echo server (PID: $SERVER_PID)..."
+        kill $SERVER_PID 2>/dev/null || true
+        wait $SERVER_PID 2>/dev/null || true
+        rm -f "$SOCKET_PATH"
+        echo "✅ Cleanup complete"
+    }
+    trap cleanup EXIT
+
+    # Check server is running
+    if ! kill -0 $SERVER_PID 2>/dev/null; then
+        echo "❌ Echo server failed to start"
+        exit 1
+    fi
+    echo "✅ Echo server running (PID: $SERVER_PID)"
+    echo ""
+
+    # Build benchmark with profiling profile
+    echo "🔨 Building echo_unix_benchmark with profiling profile..."
+    cargo build --profile profiling -p xylem-core --example echo_unix_benchmark
+    echo ""
+
+    # Check if kernel symbols are accessible
+    if [ "$(cat /proc/sys/kernel/perf_event_paranoid)" -gt 0 ] || [ "$(cat /proc/sys/kernel/kptr_restrict)" -gt 0 ]; then
+        echo "⚠️  Kernel symbols may not be available in flamegraph."
+        echo "   To enable kernel symbols, run:"
+        echo "     sudo sysctl kernel.perf_event_paranoid=-1"
+        echo "     sudo sysctl kernel.kptr_restrict=0"
+        echo ""
+    fi
+    echo "🔥 Running benchmark and generating flamegraph..."
+    echo "   This will take approximately 30 seconds..."
+    cargo flamegraph --profile profiling -p xylem-core --example echo_unix_benchmark -o flamegraph-unix.svg -- \
+        --socket "$SOCKET_PATH" \
+        --threads 1 \
+        --connections 1024 \
+        --pipeline 1 \
+        --duration 30
+
+    echo ""
+    echo "✅ Flamegraph generated: flamegraph-unix.svg"
     echo "   Open it in a browser to analyze performance"
 
 # Run a quick benchmark (Redis, 10k requests, single connection)
