@@ -49,6 +49,7 @@ weight = 0.95  # readproportion=0.95
 strategy = "zipfian"
 n = 1000000          # Read from last 1M records
 theta = 0.99         # Skewed toward highest keys (most recent)
+value_size = 1000    # fieldcount=10 × fieldlength=100
 # Note: In practice, you'd want keys to start from current insert position
 # This configuration reads from a range representing "recent" records
 
@@ -60,6 +61,7 @@ weight = 0.05  # insertproportion=0.05
 [workload.operations.commands.keys]
 strategy = "sequential"
 start = 1000000      # Start inserting after initial dataset
+value_size = 1000    # fieldcount=10 × fieldlength=100
 
 # Load Pattern: Constant rate
 [workload.pattern]
@@ -75,6 +77,7 @@ max_pending_per_connection = 10  # Pipelining for throughput
 
 [traffic_groups.policy]
 type = "fixed-rate"
+rate = 10000.0  # Match workload.pattern.rate (distributed across all threads)
 
 [traffic_groups.sampling_policy]
 type = "limited"

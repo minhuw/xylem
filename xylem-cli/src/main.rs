@@ -176,7 +176,10 @@ impl<P: xylem_protocols::Protocol<RequestId = (usize, u64)> + 'static>
     }
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() {
+    // Disable anyhow backtrace capture for cleaner error messages
+    std::env::set_var("RUST_LIB_BACKTRACE", "0");
+
     let cli = Cli::parse();
 
     // Initialize tracing
@@ -188,7 +191,7 @@ fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    match cli.command {
+    let result = match cli.command {
         Some(Commands::Completions { shell }) => {
             let bin_name = "xylem";
             match shell {
@@ -208,9 +211,13 @@ fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Schema) => {
             let schema = schema_for!(ProfileConfig);
-            let schema_json = serde_json::to_string_pretty(&schema)?;
-            println!("{}", schema_json);
-            Ok(())
+            match serde_json::to_string_pretty(&schema) {
+                Ok(schema_json) => {
+                    println!("{}", schema_json);
+                    Ok(())
+                }
+                Err(e) => Err(e.into()),
+            }
         }
         Some(Commands::CompletePaths) => {
             let paths = completions::get_config_paths();
@@ -227,10 +234,26 @@ fn main() -> anyhow::Result<()> {
             } else {
                 // No profile provided - show help
                 let mut cmd = Cli::command();
-                cmd.print_help()?;
+                if let Err(e) = cmd.print_help() {
+                    eprintln!("Error printing help: {}", e);
+                }
                 std::process::exit(1);
             }
         }
+    };
+
+    // Handle errors with clean, user-friendly messages
+    if let Err(err) = result {
+        eprintln!("Error: {}", err);
+
+        // Show error chain if available
+        let mut source = err.source();
+        while let Some(cause) = source {
+            eprintln!("  Caused by: {}", cause);
+            source = cause.source();
+        }
+
+        std::process::exit(1);
     }
 }
 
@@ -572,26 +595,86 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
     // Use global stats which aggregates all traffic groups
     let aggregated_stats = xylem_core::stats::aggregate_stats(stats.global(), duration, 0.95);
 
-    // Create results
-    let results = ExperimentResults::from_aggregated_stats(
-        output_protocol,
-        target_address_string,
-        duration,
-        aggregated_stats,
-    );
-
-    // Output results
-    results.print_human();
-
     // Write output file if configured
-    if config.output.format == "json" {
-        let path_str = config
-            .output
-            .file
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("Invalid output file path"))?;
-        results.write_json(path_str)?;
-        tracing::info!("Results written to: {}", config.output.file.display());
+    use config::OutputFormat;
+    match config.output.format {
+        OutputFormat::Json => {
+            // Simple JSON format (backward compatible)
+            let results = ExperimentResults::from_aggregated_stats(
+                output_protocol.clone(),
+                target_address_string.clone(),
+                duration,
+                aggregated_stats,
+            );
+            results.print_human();
+
+            let path_str = config
+                .output
+                .file
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("Invalid output file path"))?;
+            results.write_json(path_str)?;
+            tracing::info!("Results written to: {}", config.output.file.display());
+        }
+        OutputFormat::Human => {
+            // Human format - console output only, no file
+            let results = ExperimentResults::from_aggregated_stats(
+                output_protocol,
+                target_address_string,
+                duration,
+                aggregated_stats,
+            );
+            results.print_human();
+            tracing::debug!("Human format selected - output printed to console");
+        }
+        OutputFormat::DetailedJson | OutputFormat::Both | OutputFormat::Html => {
+            // Detailed format with per-group statistics
+            let detailed_results = output::DetailedExperimentResults::from_group_stats(
+                config.experiment.name.clone(),
+                config.experiment.description.clone(),
+                config.experiment.seed,
+                target_address_string,
+                output_protocol,
+                config.target.transport.clone(),
+                duration,
+                &stats,
+                &config.traffic_groups,
+            );
+
+            detailed_results.print_human();
+
+            let base_path = config.output.file.with_extension("");
+
+            match config.output.format {
+                OutputFormat::DetailedJson => {
+                    let json_path = base_path.with_extension("json");
+                    let path_str = json_path
+                        .to_str()
+                        .ok_or_else(|| anyhow::anyhow!("Invalid output file path"))?;
+                    detailed_results.write_json(path_str)?;
+                }
+                OutputFormat::Html => {
+                    let html_path = base_path.with_extension("html");
+                    let path_str = html_path
+                        .to_str()
+                        .ok_or_else(|| anyhow::anyhow!("Invalid output file path"))?;
+                    output::html::generate_html_report(&detailed_results, path_str)?;
+                }
+                OutputFormat::Both => {
+                    let json_path = base_path.with_extension("json");
+                    let html_path = base_path.with_extension("html");
+
+                    let json_str =
+                        json_path.to_str().ok_or_else(|| anyhow::anyhow!("Invalid JSON path"))?;
+                    let html_str =
+                        html_path.to_str().ok_or_else(|| anyhow::anyhow!("Invalid HTML path"))?;
+
+                    detailed_results.write_json(json_str)?;
+                    output::html::generate_html_report(&detailed_results, html_str)?;
+                }
+                _ => unreachable!(),
+            }
+        }
     }
 
     Ok(())

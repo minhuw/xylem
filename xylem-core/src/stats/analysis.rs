@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use statrs::distribution::{ContinuousCDF, StudentsT};
 
-use super::{AggregatedStats, StatsCollector};
+use super::{AggregatedStats, GroupStatsCollector, StatsCollector};
+use std::collections::HashMap;
 
 /// Calculate percentile from sorted samples
 ///
@@ -376,6 +377,26 @@ pub fn aggregate_stats(
         throughput_mbps,
         total_requests,
     }
+}
+
+/// Aggregate statistics for all groups individually
+///
+/// Returns a map of group_id -> AggregatedStats
+pub fn aggregate_stats_per_group(
+    group_collector: &GroupStatsCollector,
+    duration: Duration,
+    confidence_level: f64,
+) -> HashMap<usize, AggregatedStats> {
+    let mut per_group_stats = HashMap::new();
+
+    for group_id in group_collector.group_ids() {
+        if let Some(collector) = group_collector.get_group(group_id) {
+            let stats = aggregate_stats(collector, duration, confidence_level);
+            per_group_stats.insert(group_id, stats);
+        }
+    }
+
+    per_group_stats
 }
 
 #[cfg(test)]

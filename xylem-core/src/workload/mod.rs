@@ -11,8 +11,10 @@ pub use data_import::{
     DataImporter, DataVerifier, ImportedEntry, VerificationMismatch, VerificationStats,
 };
 pub use distributions::{
-    Distribution, ExponentialDistribution, NormalDistribution, UniformDistribution,
-    ZipfianDistribution,
+    BimodalDistribution, Distribution, ExponentialDistribution, FacebookInterArrivalDistribution,
+    FacebookKeySizeDistribution, FacebookValueSizeDistribution, GammaDistribution,
+    GeneralizedParetoDistribution, GevDistribution, LognormalDistribution, NormalDistribution,
+    ParetoDistribution, UniformDistribution, ZipfianDistribution,
 };
 pub use generator::{KeyGeneration, KeyGeneratorTrait, RateControl, RequestGenerator};
 pub use patterns::{

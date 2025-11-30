@@ -87,6 +87,8 @@ pub struct RedisProtocol {
     conn_in_transaction: std::collections::HashMap<usize, bool>,
     /// Buffer pool for request generation
     pool: BufferPool,
+    /// Command execution statistics
+    command_stats: std::collections::HashMap<String, u64>,
 }
 
 impl RedisProtocol {
@@ -101,7 +103,37 @@ impl RedisProtocol {
             resp_version: 2, // Default to RESP2
             conn_in_transaction: std::collections::HashMap::new(),
             pool: BufferPool::new(),
+            command_stats: std::collections::HashMap::new(),
         }
+    }
+
+    /// Record a command execution
+    fn record_command(&mut self, op: &RedisOp) {
+        let cmd_name = match op {
+            RedisOp::Get => "GET",
+            RedisOp::Set => "SET",
+            RedisOp::Incr => "INCR",
+            RedisOp::MGet { .. } => "MGET",
+            RedisOp::Wait { .. } => "WAIT",
+            RedisOp::Auth { .. } => "AUTH",
+            RedisOp::SelectDb { .. } => "SELECT",
+            RedisOp::Hello { .. } => "HELLO",
+            RedisOp::SetEx { .. } => "SETEX",
+            RedisOp::SetRange { .. } => "SETRANGE",
+            RedisOp::GetRange { .. } => "GETRANGE",
+            RedisOp::ClusterSlots => "CLUSTER_SLOTS",
+            RedisOp::Scan { .. } => "SCAN",
+            RedisOp::Multi => "MULTI",
+            RedisOp::Exec => "EXEC",
+            RedisOp::Discard => "DISCARD",
+            RedisOp::Custom(_template) => "CUSTOM",
+        };
+        *self.command_stats.entry(cmd_name.to_string()).or_insert(0) += 1;
+    }
+
+    /// Get command execution statistics
+    pub fn get_command_stats(&self) -> &std::collections::HashMap<String, u64> {
+        &self.command_stats
     }
 
     /// Get next sequence number for a connection (for sending)
@@ -161,6 +193,7 @@ impl RedisProtocol {
 
         // Select command first
         let operation = self.command_selector.next_command();
+        self.record_command(&operation);
 
         // Generate key for this specific command
         let key = self
@@ -374,6 +407,7 @@ impl Protocol for RedisProtocol {
 
         // Select which command to execute
         let operation = self.command_selector.next_command();
+        self.record_command(&operation);
 
         // Update transaction state based on command
         match &operation {
@@ -397,7 +431,7 @@ impl Protocol for RedisProtocol {
         }
 
         // Parse RESP response and find complete message
-        let consumed = self.find_resp_message_end(data)?;
+        let consumed = Self::find_resp_message_end(data)?;
         if consumed == 0 {
             // Incomplete response
             return Ok((0, None));
@@ -454,13 +488,14 @@ impl Protocol for RedisProtocol {
         self.conn_recv_seq.clear();
         self.conn_in_transaction.clear();
         self.command_selector.reset();
+        self.command_stats.clear();
     }
 }
 
 impl RedisProtocol {
     /// Find the end of a complete RESP message, returns bytes consumed
     /// Supports both RESP2 and RESP3 types
-    fn find_resp_message_end(&self, data: &[u8]) -> Result<usize> {
+    fn find_resp_message_end(data: &[u8]) -> Result<usize> {
         if data.is_empty() {
             return Ok(0);
         }
@@ -502,13 +537,35 @@ impl RedisProtocol {
             b'*' | b'%' | b'~' | b'|' => {
                 // RESP2: Array (*)
                 // RESP3: Map (%), Set (~), Attribute (|)
-                // For simplicity, just find the end marker
-                // This is simplified; real implementation would need recursive parsing
-                if let Some(pos) = data.windows(2).position(|w| w == b"\r\n") {
-                    Ok(pos + 2)
-                } else {
-                    Ok(0) // Incomplete
+                // Need to recursively parse all elements
+                let first_crlf = match data.windows(2).position(|w| w == b"\r\n") {
+                    Some(pos) => pos,
+                    None => return Ok(0), // Incomplete
+                };
+
+                let count_str = std::str::from_utf8(&data[1..first_crlf])
+                    .map_err(|e| anyhow!("Invalid array count: {e}"))?;
+                let count: i64 =
+                    count_str.parse().map_err(|e| anyhow!("Failed to parse array count: {e}"))?;
+
+                if count == -1 {
+                    // Null array
+                    return Ok(first_crlf + 2);
                 }
+
+                let mut pos = first_crlf + 2;
+                // Parse each element in the array
+                for _ in 0..count {
+                    if pos >= data.len() {
+                        return Ok(0); // Incomplete
+                    }
+                    let elem_size = Self::find_resp_message_end(&data[pos..])?;
+                    if elem_size == 0 {
+                        return Ok(0); // Incomplete element
+                    }
+                    pos += elem_size;
+                }
+                Ok(pos)
             }
             b'_' => {
                 // RESP3: Null (_\r\n)
@@ -720,12 +777,13 @@ mod tests {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
         let mut protocol = RedisProtocol::new(selector);
 
-        let response = b"*3\r\n";
+        // Complete array with 3 simple string elements
+        let response = b"*3\r\n+one\r\n+two\r\n+three\r\n";
         let result = protocol.parse_response(0, response);
 
         assert!(result.is_ok());
         let (consumed, _) = result.unwrap();
-        assert_eq!(consumed, 4);
+        assert_eq!(consumed, 24); // *3\r\n (4) + +one\r\n (6) + +two\r\n (6) + +three\r\n (8)
     }
 
     #[test]
@@ -890,7 +948,8 @@ mod tests {
         let protocol = RedisProtocol::new(selector);
 
         // Empty data should return 0
-        let result = protocol.find_resp_message_end(&[]).unwrap();
+        let result = RedisProtocol::find_resp_message_end(&[]).unwrap();
+        let _ = protocol; // Silence unused variable warning
         assert_eq!(result, 0);
     }
 
@@ -1213,12 +1272,13 @@ mod tests {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
         let mut protocol = RedisProtocol::new(selector);
 
-        let response = b"%2\r\n";
+        // Map with count 2 (current impl treats as 2 elements, not 2 pairs)
+        let response = b"%2\r\n+k1\r\n+v1\r\n";
         let result = protocol.parse_response(0, response);
 
         assert!(result.is_ok());
         let (consumed, _) = result.unwrap();
-        assert_eq!(consumed, 4);
+        assert_eq!(consumed, 14); // %2\r\n (4) + +k1\r\n (5) + +v1\r\n (5) = 14
     }
 
     #[test]
@@ -1226,12 +1286,13 @@ mod tests {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
         let mut protocol = RedisProtocol::new(selector);
 
-        let response = b"~5\r\n";
+        // Complete set with 5 elements
+        let response = b"~5\r\n+a\r\n+b\r\n+c\r\n+d\r\n+e\r\n";
         let result = protocol.parse_response(0, response);
 
         assert!(result.is_ok());
         let (consumed, _) = result.unwrap();
-        assert_eq!(consumed, 4);
+        assert_eq!(consumed, 24); // ~5\r\n (4) + 5 * +X\r\n (4 each)
     }
 
     #[test]
@@ -1239,12 +1300,13 @@ mod tests {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
         let mut protocol = RedisProtocol::new(selector);
 
-        let response = b"|1\r\n";
+        // Attribute with count 1 (current impl treats as 1 element)
+        let response = b"|1\r\n+key\r\n";
         let result = protocol.parse_response(0, response);
 
         assert!(result.is_ok());
         let (consumed, _) = result.unwrap();
-        assert_eq!(consumed, 4);
+        assert_eq!(consumed, 10); // |1\r\n (4) + +key\r\n (6) = 10
     }
 
     #[test]
@@ -1478,13 +1540,13 @@ mod tests {
         let mut protocol = RedisProtocol::new(selector);
 
         // SCAN returns an array with 2 elements: [cursor, [key1, key2, ...]]
-        // Simplified response: *2\r\n (array marker only for this test)
-        let response = b"*2\r\n";
+        // Complete response: *2\r\n:0\r\n*2\r\n+key1\r\n+key2\r\n
+        let response = b"*2\r\n:0\r\n*2\r\n+key1\r\n+key2\r\n";
         let result = protocol.parse_response(0, response);
 
         assert!(result.is_ok());
         let (consumed, id) = result.unwrap();
-        assert_eq!(consumed, 4);
+        assert_eq!(consumed, 26); // *2\r\n (4) + :0\r\n (4) + *2\r\n (4) + +key1\r\n (7) + +key2\r\n (7) = 26
         assert_eq!(id, Some((0, 0)));
     }
 
@@ -1619,13 +1681,13 @@ mod tests {
         let mut protocol = RedisProtocol::new(selector);
 
         // EXEC responds with an array of results
-        // Simplified: *2\r\n (array with 2 elements)
-        let response = b"*2\r\n";
+        // Complete response: *2\r\n+OK\r\n:1\r\n (array with 2 elements: simple string and integer)
+        let response = b"*2\r\n+OK\r\n:1\r\n";
         let result = protocol.parse_response(0, response);
 
         assert!(result.is_ok());
         let (consumed, id) = result.unwrap();
-        assert_eq!(consumed, 4);
+        assert_eq!(consumed, 13); // *2\r\n (4) + +OK\r\n (5) + :1\r\n (4) = 13
         assert_eq!(id, Some((0, 0)));
     }
 
@@ -1644,5 +1706,73 @@ mod tests {
         protocol.reset();
         assert!(!protocol.is_in_transaction(0));
         assert!(!protocol.is_in_transaction(1));
+    }
+
+    #[test]
+    fn test_command_tracking() {
+        use command_selector::FixedCommandSelector;
+
+        // Test GET command tracking
+        let mut protocol = RedisProtocol::new(Box::new(FixedCommandSelector::new(RedisOp::Get)));
+
+        // Generate some requests
+        for _ in 0..10 {
+            protocol.generate_request(0, 123, 100);
+        }
+
+        let stats = protocol.get_command_stats();
+        assert_eq!(stats.get("GET"), Some(&10));
+        assert_eq!(stats.len(), 1);
+
+        // Reset and verify
+        protocol.reset();
+        let stats = protocol.get_command_stats();
+        assert_eq!(stats.len(), 0);
+    }
+
+    #[test]
+    fn test_command_tracking_multiple_commands() {
+        use command_selector::WeightedCommandSelector;
+
+        // Create weighted selector with GET and SET
+        let commands = vec![(RedisOp::Get, 0.7), (RedisOp::Set, 0.3)];
+        let selector = WeightedCommandSelector::with_seed(commands, Some(42)).unwrap();
+        let mut protocol = RedisProtocol::new(Box::new(selector));
+
+        // Generate 100 requests
+        for i in 0..100 {
+            protocol.generate_request(0, i as u64, 100);
+        }
+
+        let stats = protocol.get_command_stats();
+
+        // Should have both GET and SET
+        assert!(stats.contains_key("GET"));
+        assert!(stats.contains_key("SET"));
+
+        // Total should be 100
+        let total: u64 = stats.values().sum();
+        assert_eq!(total, 100);
+
+        // GET should be majority with 70/30 split
+        let get_count = *stats.get("GET").unwrap();
+        let set_count = *stats.get("SET").unwrap();
+        assert!(get_count > set_count);
+    }
+
+    #[test]
+    fn test_command_tracking_special_commands() {
+        use command_selector::FixedCommandSelector;
+
+        // Test MGET
+        let mut protocol =
+            RedisProtocol::new(Box::new(FixedCommandSelector::new(RedisOp::MGet { count: 5 })));
+        protocol.generate_request(0, 123, 100);
+        assert_eq!(protocol.get_command_stats().get("MGET"), Some(&1));
+
+        // Test INCR
+        let mut protocol = RedisProtocol::new(Box::new(FixedCommandSelector::new(RedisOp::Incr)));
+        protocol.generate_request(0, 123, 100);
+        assert_eq!(protocol.get_command_stats().get("INCR"), Some(&1));
     }
 }

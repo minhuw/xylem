@@ -14,6 +14,7 @@ workspace = true
 xylem-core = { path = "../xylem-core" }
 anyhow = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 bytes = { workspace = true }
 httparse = { workspace = true }
 rand = { workspace = true }

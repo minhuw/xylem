@@ -264,6 +264,13 @@ pub enum CommandParams {
     MGet { count: usize },
     /// WAIT parameters
     Wait { num_replicas: usize, timeout_ms: u64 },
+    /// SCAN parameters
+    Scan {
+        #[serde(default)]
+        cursor: u64,
+        count: Option<usize>,
+        pattern: Option<String>,
+    },
     /// Custom command template
     Custom { template: String },
 }
@@ -300,18 +307,67 @@ fn default_sample_rate() -> f64 {
 /// Output configuration
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct OutputConfig {
-    /// Output format: json, csv
-    #[serde(default = "default_format")]
-    pub format: String,
-    /// Output file path
+    /// Output format: json, html, both, or detailed-json
+    #[serde(default = "default_output_format")]
+    pub format: OutputFormat,
+    /// Output file path (for json/html, extensions will be added automatically)
     pub file: PathBuf,
     /// Print real-time updates
     #[serde(default)]
     pub real_time: bool,
+    /// HTML chart configuration
+    #[serde(default)]
+    pub html: HtmlOutputConfig,
 }
 
-fn default_format() -> String {
-    "json".to_string()
+/// Output format options
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputFormat {
+    /// Simple JSON format (backward compatible)
+    #[default]
+    Json,
+    /// Detailed JSON with per-group breakdown
+    #[serde(rename = "detailed-json")]
+    DetailedJson,
+    /// HTML report with visualizations
+    Html,
+    /// Both detailed JSON and HTML
+    Both,
+    /// Human-readable console output only (no file)
+    Human,
+}
+
+fn default_output_format() -> OutputFormat {
+    OutputFormat::Json
+}
+
+/// HTML output configuration
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct HtmlOutputConfig {
+    /// Chart library: chartjs or plotly
+    #[serde(default = "default_chart_library")]
+    pub library: String,
+    /// Theme: light or dark
+    #[serde(default = "default_theme")]
+    pub theme: String,
+}
+
+impl Default for HtmlOutputConfig {
+    fn default() -> Self {
+        Self {
+            library: default_chart_library(),
+            theme: default_theme(),
+        }
+    }
+}
+
+fn default_chart_library() -> String {
+    "chartjs".to_string()
+}
+
+fn default_theme() -> String {
+    "light".to_string()
 }
 
 impl ProfileConfig {
@@ -459,15 +515,7 @@ impl ProfileConfig {
             xylem_core::traffic_group::ThreadGroupAssignment::from_configs(&self.traffic_groups);
         assignment.validate()?;
 
-        // Output validation
-        let valid_formats = ["json", "csv"];
-        if !valid_formats.contains(&self.output.format.as_str()) {
-            bail!(
-                "Invalid output format '{}'. Valid options: {}",
-                self.output.format,
-                valid_formats.join(", ")
-            );
-        }
+        // Output validation - format is now an enum, so always valid
 
         Ok(())
     }
@@ -959,6 +1007,18 @@ impl OperationsConfig {
                     })
                 } else {
                     anyhow::bail!("WAIT requires 'num_replicas' and 'timeout_ms' parameters")
+                }
+            }
+            "scan" => {
+                if let Some(CommandParams::Scan { cursor, count, pattern }) = params {
+                    Ok(RedisOp::Scan {
+                        cursor: *cursor,
+                        count: *count,
+                        pattern: pattern.clone(),
+                    })
+                } else {
+                    // Default SCAN with cursor=0, no count/pattern limits
+                    Ok(RedisOp::Scan { cursor: 0, count: None, pattern: None })
                 }
             }
             "custom" => {

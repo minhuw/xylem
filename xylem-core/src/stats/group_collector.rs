@@ -4,6 +4,7 @@
 //! Lancet's throughput/latency agent separation.
 
 use super::collector::{SamplingPolicy, StatsCollector};
+use super::metadata::GroupMetadataCollector;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -13,6 +14,8 @@ pub struct GroupStatsCollector {
     group_collectors: HashMap<usize, StatsCollector>,
     /// Global collector (aggregates all groups)
     global_collector: StatsCollector,
+    /// Per-group metadata collector
+    metadata_collector: GroupMetadataCollector,
 }
 
 impl GroupStatsCollector {
@@ -21,6 +24,7 @@ impl GroupStatsCollector {
         Self {
             group_collectors: HashMap::new(),
             global_collector: StatsCollector::default(),
+            metadata_collector: GroupMetadataCollector::new(),
         }
     }
 
@@ -89,6 +93,21 @@ impl GroupStatsCollector {
         ids
     }
 
+    /// Set metadata for a specific group
+    pub fn set_group_metadata(&mut self, group_id: usize, metadata: serde_json::Value) {
+        self.metadata_collector.set_group_metadata(group_id, metadata);
+    }
+
+    /// Get metadata for a specific group
+    pub fn get_group_metadata(&self, group_id: usize) -> Option<&serde_json::Value> {
+        self.metadata_collector.get_group_metadata(group_id)
+    }
+
+    /// Get reference to metadata collector
+    pub fn metadata(&self) -> &GroupMetadataCollector {
+        &self.metadata_collector
+    }
+
     /// Merge multiple group collectors (from different threads)
     pub fn merge(mut collectors: Vec<GroupStatsCollector>) -> Self {
         let mut merged = GroupStatsCollector::new();
@@ -116,10 +135,17 @@ impl GroupStatsCollector {
             }
         }
 
-        // Merge global collectors - move them out instead of cloning
-        let global_collectors: Vec<_> =
-            collectors.into_iter().map(|c| c.global_collector).collect();
+        // Merge global collectors and metadata - move them out instead of cloning
+        let mut global_collectors = Vec::new();
+        let mut metadata_collectors = Vec::new();
+
+        for collector in collectors {
+            global_collectors.push(collector.global_collector);
+            metadata_collectors.push(collector.metadata_collector);
+        }
+
         merged.global_collector = StatsCollector::merge(global_collectors);
+        merged.metadata_collector = GroupMetadataCollector::merge(metadata_collectors);
 
         merged
     }

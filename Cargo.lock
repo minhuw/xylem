@@ -1841,6 +1841,7 @@ dependencies = [
  "rmp",
  "rmp-serde",
  "serde",
+ "serde_json",
  "xylem-core",
  "zeropool",
 ]

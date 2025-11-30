@@ -9,6 +9,16 @@
 
 **XYlem** is a high-performance and modular traffic generator and measurement tool for RPC workloads built with different combinations of **X**: application **protocol** (e.g., redis, masstree, HTTP) and **Y**: **transport** protocol (e.g., TCP, UDP, UNIX Domain Socket).
 
+## Quick Start
+
+```bash
+just redis-start
+cargo run --bin xylem -- -P tests/redis/redis-bench.toml
+just redis-stop
+```
+
+This launches a Redis container, runs a throughput benchmark generating detailed results with per-group statistics and HTML visualization, then cleans up.
+
 # License
 
 XYlem is licensed under either of

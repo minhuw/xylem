@@ -77,12 +77,13 @@ rate = 8000.0  # 8K ops/sec (transactions have higher overhead)
 # Traffic Configuration
 [[traffic_groups]]
 name = "workload-f"
-threads = [0, 1, 2, 3]           # Use 4 threads
-connections_per_thread = 25      # 100 total connections
-max_pending_per_connection = 5   # Lower pipelining for transactions
+threads = [0, 1, 2, 3]
+connections_per_thread = 25
+max_pending_per_connection = 5
 
 [traffic_groups.policy]
 type = "fixed-rate"
+rate = 10000.0
 
 [traffic_groups.sampling_policy]
 type = "limited"

@@ -53,6 +53,7 @@ max_pending_per_connection = 10  # Pipelining for throughput
 
 [traffic_groups.policy]
 type = "fixed-rate"
+rate = 10000.0  # Match workload.pattern.rate (distributed across all threads)
 
 [traffic_groups.sampling_policy]
 type = "limited"

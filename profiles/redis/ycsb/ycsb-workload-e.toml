@@ -43,13 +43,12 @@ strategy = "weighted"
 [[workload.operations.commands]]
 name = "scan"
 weight = 0.95  # scanproportion=0.95
+count = 100    # maxscanlength=100
 
-# Note: This requires defining a Scan operation in the command selector
-# For now, this is a placeholder showing the intent.
-# In practice, you'd configure SCAN operations with:
-# - cursor: 0 (or tracking cursor state)
-# - count: Some(100) (maxscanlength=100)
-# - pattern: None (or Some("key:*") to match key pattern)
+[workload.operations.commands.keys]
+strategy = "sequential"
+start = 0
+value_size = 1000    # fieldcount=10 × fieldlength=100
 
 # SET operations - insert new records
 [[workload.operations.commands]]
@@ -59,6 +58,7 @@ weight = 0.05  # insertproportion=0.05
 [workload.operations.commands.keys]
 strategy = "sequential"
 start = 1000000
+value_size = 1000    # fieldcount=10 × fieldlength=100
 
 # Load Pattern: Constant rate
 [workload.pattern]
@@ -74,6 +74,7 @@ max_pending_per_connection = 5   # Lower pipelining for scan operations
 
 [traffic_groups.policy]
 type = "fixed-rate"
+rate = 10000.0  # Match workload.pattern.rate (distributed across all threads)
 
 [traffic_groups.sampling_policy]
 type = "limited"

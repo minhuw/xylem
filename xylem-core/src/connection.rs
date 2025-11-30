@@ -11,7 +11,9 @@ use std::net::SocketAddr;
 use xylem_transport::{Timestamp, Transport};
 
 /// Maximum receive buffer size per connection
-const MAX_PAYLOAD: usize = 16384;
+/// Increased to support large values (e.g., YCSB workloads with 10KB+ values)
+/// With RESP protocol overhead, 64KB supports ~50KB values
+const MAX_PAYLOAD: usize = 65536; // 64KB
 
 /// Traffic group configuration: (group_id, target, conn_count, max_pending_per_conn, policy_scheduler)
 pub type TrafficGroupConfig =
