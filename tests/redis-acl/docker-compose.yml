@@ -3,7 +3,7 @@ services:
     image: redis:7-alpine
     container_name: xylem-test-redis-acl
     ports:
-      - "6381:6379"
+      - "127.0.0.1:6381:6379"
     volumes:
       - ./redis.acl:/etc/redis/redis.acl:ro
     command: redis-server --aclfile /etc/redis/redis.acl --save "" --appendonly no

@@ -3,4 +3,4 @@ services:
     image: memcached:1-alpine
     container_name: xylem-test-memcached
     ports:
-      - "11211:11211"
+      - "127.0.0.1:11211:11211"

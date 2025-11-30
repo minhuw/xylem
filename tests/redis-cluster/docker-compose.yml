@@ -1,10 +1,10 @@
 services:
   redis-node-1:
     image: redis:7-alpine
-    container_name: redis-cluster-node-1
+    container_name: xylem-redis-cluster-node-1
     ports:
-      - "7000:7000"
-      - "17000:17000"  # Cluster bus port
+      - "127.0.0.1:7000:7000"
+      - "127.0.0.1:17000:17000"  # Cluster bus port
     command: >
       redis-server
       --port 7000
@@ -19,10 +19,10 @@ services:
 
   redis-node-2:
     image: redis:7-alpine
-    container_name: redis-cluster-node-2
+    container_name: xylem-redis-cluster-node-2
     ports:
-      - "7001:7001"
-      - "17001:17001"
+      - "127.0.0.1:7001:7001"
+      - "127.0.0.1:17001:17001"
     command: >
       redis-server
       --port 7001
@@ -37,10 +37,10 @@ services:
 
   redis-node-3:
     image: redis:7-alpine
-    container_name: redis-cluster-node-3
+    container_name: xylem-redis-cluster-node-3
     ports:
-      - "7002:7002"
-      - "17002:17002"
+      - "127.0.0.1:7002:7002"
+      - "127.0.0.1:17002:17002"
     command: >
       redis-server
       --port 7002
@@ -56,7 +56,7 @@ services:
   # Cluster initialization container
   redis-cluster-init:
     image: redis:7-alpine
-    container_name: redis-cluster-init
+    container_name: xylem-redis-cluster-init
     depends_on:
       - redis-node-1
       - redis-node-2

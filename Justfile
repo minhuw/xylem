@@ -16,6 +16,7 @@ test:
     @echo "   Running unit tests first..."
     cargo nextest run --profile unit --workspace
     @echo "   Running integration tests (serially to avoid Docker conflicts)..."
+    @just test-cleanup
     cargo nextest run --profile integration --workspace
 
 # Run all examples to validate they work
@@ -39,29 +40,29 @@ test-unit:
     cargo nextest run --profile unit --workspace
 
 # Run integration tests only (requires Docker)
-test-integration:
+test-integration: test-cleanup
     @echo "🔌 Running integration tests only..."
     cargo nextest run --profile integration --workspace
 
-# Clean up test Docker containers
+# Clean up test Docker containers (safe to run without Docker)
 test-cleanup:
     @echo "🧹 Cleaning up test containers..."
-    @docker ps -aq --filter name=xylem-test | xargs -r docker rm -f || true
-    @docker ps -aq --filter name=redis-cluster | xargs -r docker rm -f || true
+    @(docker ps -aq --filter name=xylem-test | xargs -r docker rm -f || true) 2>/dev/null || true
+    @(docker ps -aq --filter name=xylem-redis-cluster | xargs -r docker rm -f || true) 2>/dev/null || true
     @echo "✅ Test containers cleaned up"
 
 # Run Redis-related integration tests
-test-redis:
+test-redis: test-cleanup
     @echo "🎯 Running Redis integration tests..."
     cargo nextest run --profile integration -E 'test(redis_integration) or test(redis_cluster) or test(pipelining)'
 
 # Run Memcached integration tests
-test-memcached:
+test-memcached: test-cleanup
     @echo "🎯 Running Memcached integration tests..."
     cargo nextest run --profile integration -E 'test(memcached_integration)'
 
 # Run HTTP integration tests
-test-http:
+test-http: test-cleanup
     @echo "🌐 Running HTTP integration tests..."
     cargo nextest run --profile integration -E 'test(http_integration)'
 
