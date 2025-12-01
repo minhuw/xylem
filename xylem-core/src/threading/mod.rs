@@ -17,53 +17,72 @@ pub use worker::{ParseResult, Protocol, RetryRequest, Worker, WorkerConfig};
 
 /// Multi-threaded runtime for spawning and managing workers
 pub struct ThreadingRuntime {
-    num_threads: usize,
+    /// Thread IDs (used as CPU core IDs for pinning)
+    thread_ids: Vec<usize>,
     cpu_pinning: CpuPinning,
 }
 
 impl ThreadingRuntime {
-    /// Create a new threading runtime
+    /// Create a new threading runtime with contiguous thread IDs (0..num_threads)
     pub fn new(num_threads: usize) -> Self {
         Self {
-            num_threads,
+            thread_ids: (0..num_threads).collect(),
             cpu_pinning: CpuPinning::None,
         }
     }
 
-    /// Create a new threading runtime with CPU pinning
+    /// Create a new threading runtime with CPU pinning (contiguous thread IDs)
     pub fn with_cpu_pinning(num_threads: usize, cpu_pinning: CpuPinning) -> Self {
-        Self { num_threads, cpu_pinning }
+        Self {
+            thread_ids: (0..num_threads).collect(),
+            cpu_pinning,
+        }
+    }
+
+    /// Create a new threading runtime with specific thread IDs for CPU pinning
+    ///
+    /// Thread IDs are used directly as CPU core IDs for pinning.
+    /// For example, thread_ids = [2, 3, 4] will pin workers to CPU cores 2, 3, 4.
+    pub fn with_thread_ids(thread_ids: Vec<usize>, cpu_pinning: CpuPinning) -> Self {
+        Self { thread_ids, cpu_pinning }
     }
 
     /// Run multiple workers in parallel and aggregate results (generic over stats type)
     ///
     /// Uses native OS threads with a barrier for synchronization.
     /// All threads start execution simultaneously after the barrier.
+    /// The callback receives the thread ID (which may be non-contiguous).
     pub fn run_workers_generic<F, T>(&self, worker_factory: F) -> Result<Vec<T>>
     where
         F: Fn(usize) -> Result<T> + Send + Sync + Clone + 'static,
         T: Send + 'static,
     {
         // Create synchronization barrier for all threads
-        let barrier = Arc::new(Barrier::new(self.num_threads));
+        let barrier = Arc::new(Barrier::new(self.thread_ids.len()));
         let mut handles = Vec::new();
 
-        // Spawn worker threads
-        for thread_id in 0..self.num_threads {
+        // Spawn worker threads, one per thread_id
+        for &thread_id in &self.thread_ids {
             let worker_factory = worker_factory.clone();
             let barrier = barrier.clone();
             let cpu_pinning = self.cpu_pinning.clone();
 
             let handle = thread::spawn(move || {
-                // Pin thread to CPU core if requested
+                // Pin thread to CPU core based on thread_id
+                // With CpuPinning::Auto, thread_id is used as the core ID
                 if let Err(e) = affinity::pin_thread(thread_id, &cpu_pinning) {
-                    tracing::warn!("Failed to pin thread {} to CPU: {}", thread_id, e);
+                    tracing::warn!(
+                        "Failed to pin thread {} to CPU core {}: {}",
+                        thread_id,
+                        thread_id,
+                        e
+                    );
                 }
 
                 // Wait for all threads to be ready
                 barrier.wait();
 
-                // Run the worker
+                // Run the worker with the actual thread_id
                 worker_factory(thread_id)
             });
 
@@ -95,7 +114,7 @@ impl ThreadingRuntime {
 
     /// Get number of threads
     pub fn num_threads(&self) -> usize {
-        self.num_threads
+        self.thread_ids.len()
     }
 }
 

@@ -5,7 +5,6 @@ use std::io::Write;
 use tempfile::TempDir;
 
 #[test]
-#[ignore] // Requires Redis server running
 fn test_data_import_end_to_end() -> Result<()> {
     // Create temporary directory for test files
     let temp_dir = TempDir::new()?;

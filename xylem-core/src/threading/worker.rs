@@ -149,7 +149,10 @@ pub struct Worker<G: ConnectionGroup, P: Protocol> {
     pool: ConnectionPool<G, P::RequestId>,
     /// Map of traffic group ID to protocol instance
     protocols: HashMap<usize, P>,
-    generator: RequestGenerator,
+    /// Map of traffic group ID to request generator (per-group key/value generation)
+    generators: HashMap<usize, RequestGenerator>,
+    /// Legacy single generator (for backward compatibility)
+    legacy_generator: Option<RequestGenerator>,
     stats: GroupStatsCollector,
     config: WorkerConfig,
     /// Track keys for scheduler feedback
@@ -181,7 +184,8 @@ impl<G: ConnectionGroup, P: Protocol> Worker<G, P> {
         Ok(Self {
             pool,
             protocols,
-            generator,
+            generators: HashMap::new(),
+            legacy_generator: Some(generator),
             stats,
             config,
             current_key: 0,
@@ -200,7 +204,7 @@ impl<G: ConnectionGroup, P: Protocol> Worker<G, P> {
         Self::new(factory, protocol, generator, stats, config, policy_scheduler)
     }
 
-    /// Create a new pipelined worker with multiple traffic groups
+    /// Create a new pipelined worker with multiple traffic groups (legacy - shared generator)
     pub fn new_multi_group<F: TransportFactory<Group = G>>(
         factory: &F,
         protocols: HashMap<usize, P>,
@@ -214,7 +218,8 @@ impl<G: ConnectionGroup, P: Protocol> Worker<G, P> {
         Ok(Self {
             pool,
             protocols,
-            generator,
+            generators: HashMap::new(),
+            legacy_generator: Some(generator),
             stats,
             config,
             current_key: 0,
@@ -222,6 +227,7 @@ impl<G: ConnectionGroup, P: Protocol> Worker<G, P> {
     }
 
     /// Create a new pipelined worker with multiple traffic groups, each with its own target
+    /// (legacy - shared generator)
     pub fn new_multi_group_with_targets<F: TransportFactory<Group = G>>(
         factory: &F,
         protocols: HashMap<usize, P>,
@@ -235,18 +241,68 @@ impl<G: ConnectionGroup, P: Protocol> Worker<G, P> {
         Ok(Self {
             pool,
             protocols,
-            generator,
+            generators: HashMap::new(),
+            legacy_generator: Some(generator),
             stats,
             config,
             current_key: 0,
         })
     }
 
+    /// Create a new pipelined worker with multiple traffic groups, each with its own generator
+    ///
+    /// This is the recommended constructor for multi-group workloads where each group
+    /// needs its own key distribution, value sizes, or data import configuration.
+    pub fn new_multi_group_with_generators<F: TransportFactory<Group = G>>(
+        factory: &F,
+        protocols: HashMap<usize, P>,
+        generators: HashMap<usize, RequestGenerator>,
+        stats: GroupStatsCollector,
+        config: WorkerConfig,
+        groups: Vec<TrafficGroupConfig>,
+    ) -> Result<Self> {
+        let pool = ConnectionPool::new_multi_group_with_targets(factory, groups)?;
+
+        Ok(Self {
+            pool,
+            protocols,
+            generators,
+            legacy_generator: None,
+            stats,
+            config,
+            current_key: 0,
+        })
+    }
+
+    /// Get mapping of connection ID to target address
+    ///
+    /// Useful for wiring up protocols that need to know connection routing
+    /// (e.g., Redis Cluster). Call this after construction but before run().
+    pub fn connection_targets(&self) -> Vec<(usize, SocketAddr)> {
+        self.pool.connection_targets()
+    }
+
+    /// Get mapping of connection ID to target address for a specific traffic group
+    ///
+    /// Filters connections to only those belonging to the specified group_id.
+    /// Essential for Redis Cluster to avoid routing to connections from other groups.
+    pub fn connection_targets_for_group(&self, group_id: usize) -> Vec<(usize, SocketAddr)> {
+        self.pool.connection_targets_for_group(group_id)
+    }
+
+    /// Get mutable access to protocols map
+    ///
+    /// Useful for post-construction wiring (e.g., registering cluster connections).
+    pub fn protocols_mut(&mut self) -> &mut HashMap<usize, P> {
+        &mut self.protocols
+    }
+
     /// Run the pipelined measurement loop (Lancet symmetric_tcp_main style)
     pub fn run(&mut self) -> Result<()> {
         let start_ns = timing::time_ns();
         let duration_ns = self.config.duration.as_nanos() as u64;
-        let mut next_tx_ns = start_ns;
+        // Track next allowed send time for generator-level rate control (legacy API)
+        let mut generator_next_tx_ns: Option<u64> = None;
 
         loop {
             let now_ns = timing::time_ns();
@@ -256,8 +312,19 @@ impl<G: ConnectionGroup, P: Protocol> Worker<G, P> {
                 break;
             }
 
-            // SEND PHASE: Send requests while we're ahead of schedule
-            while now_ns >= next_tx_ns {
+            // SEND PHASE: Send requests to ready connections
+            // Rate limiting comes from two sources:
+            // 1. Connection-level: pool's ready_heap (per-connection policy)
+            // 2. Generator-level: legacy_generator's RateControl (global rate limit)
+            loop {
+                // Refresh time for accurate rate control check (time passes during send loop)
+                let now_ns = timing::time_ns();
+
+                // Check generator-level rate control first (for legacy API compatibility)
+                if generator_next_tx_ns.is_some_and(|next_tx| now_ns < next_tx) {
+                    break; // Not time to send yet per generator rate control
+                }
+
                 // Pick a connection that can accept more requests
                 let connection_id = match self.pool.pick_connection() {
                     Some(id) => id,
@@ -271,9 +338,16 @@ impl<G: ConnectionGroup, P: Protocol> Worker<G, P> {
                 let protocol =
                     self.protocols.get_mut(&group_id).expect("Protocol not found for group_id");
 
+                // Get generator for this group (prefer per-group, fall back to legacy)
+                let generator = self
+                    .generators
+                    .get_mut(&group_id)
+                    .or(self.legacy_generator.as_mut())
+                    .expect("No generator found for group_id");
+
                 // Generate request
-                let (request_data, req_id) = if self.generator.is_using_imported_data() {
-                    let (key_string, value_bytes) = self.generator.next_request_from_import();
+                let (request_data, req_id) = if generator.is_using_imported_data() {
+                    let (key_string, value_bytes) = generator.next_request_from_import();
                     self.current_key = hash_string_key(&key_string);
                     protocol.generate_set_with_imported_data(
                         connection_id,
@@ -281,7 +355,7 @@ impl<G: ConnectionGroup, P: Protocol> Worker<G, P> {
                         &value_bytes,
                     )
                 } else {
-                    let (key, value_size) = self.generator.next_request();
+                    let (key, value_size) = generator.next_request();
                     self.current_key = key;
                     protocol.generate_request(connection_id, key, value_size)
                 };
@@ -296,31 +370,56 @@ impl<G: ConnectionGroup, P: Protocol> Worker<G, P> {
                 }
                 self.stats.record_tx_bytes(group_id, request_data.len());
 
-                // Mark request sent for rate control
-                self.generator.mark_request_sent();
-
-                // Schedule next transmission
-                if let Some(delay) = self.generator.delay_until_next() {
-                    next_tx_ns = timing::time_ns() + delay.as_nanos() as u64;
-                } else {
-                    next_tx_ns = timing::time_ns();
-                }
-
-                let now_ns = timing::time_ns();
-                if now_ns < next_tx_ns {
-                    break;
-                }
+                // Mark request sent and update generator-level rate control
+                generator.mark_request_sent();
+                generator_next_tx_ns =
+                    generator.delay_until_next().map(|d| timing::time_ns() + d.as_nanos() as u64);
             }
 
             // RECEIVE PHASE: Poll all connections for responses (single syscall)
+            // Derive sleep duration from the ready heap (when next connection will be ready)
+            // Also consider generator-level rate control for legacy API
             let now_ns = timing::time_ns();
-            let wait_ns = next_tx_ns.saturating_sub(now_ns);
-            let poll_timeout = if wait_ns <= 1_000_000 {
-                // Within 1ms: spin with non-blocking poll for precise timing
-                Some(Duration::ZERO)
-            } else {
-                // Beyond 1ms: sleep until 1ms before next_tx, then spin for precision
-                Some(Duration::from_nanos(wait_ns - 1_000_000))
+
+            // Calculate wait time based on connection policies
+            let pool_wait_ns = match self.pool.peek_next_ready_time() {
+                Some(next_ready_ns) if next_ready_ns > now_ns => Some(next_ready_ns - now_ns),
+                Some(_) => Some(0), // Ready now
+                None => None,       // Heap empty (all pipelines full)
+            };
+
+            // Calculate wait time based on generator rate control
+            let generator_wait_ns =
+                generator_next_tx_ns.map(|next_tx| next_tx.saturating_sub(now_ns));
+
+            // Use the minimum of pool and generator wait times
+            let wait_ns = match (pool_wait_ns, generator_wait_ns) {
+                (Some(p), Some(g)) => Some(p.min(g)),
+                (Some(p), None) => Some(p),
+                (None, Some(g)) => Some(g),
+                (None, None) => None, // Both heap empty and no generator rate limit
+            };
+
+            let poll_timeout = match wait_ns {
+                Some(0) => Some(Duration::ZERO),
+                Some(ns) if ns <= 1_000_000 => {
+                    // Within 1ms: spin with non-blocking poll for precise timing
+                    Some(Duration::ZERO)
+                }
+                Some(ns) => {
+                    // Beyond 1ms: sleep until 1ms before, then spin for precision
+                    Some(Duration::from_nanos(ns - 1_000_000))
+                }
+                None => {
+                    // Both heap empty and no generator rate limit
+                    // Block on poll until responses arrive, bounded by experiment duration
+                    let remaining_ns = (start_ns + duration_ns).saturating_sub(now_ns);
+                    if remaining_ns > 0 {
+                        Some(Duration::from_nanos(remaining_ns))
+                    } else {
+                        Some(Duration::ZERO)
+                    }
+                }
             };
             self.process_responses(poll_timeout)?;
         }
@@ -531,6 +630,33 @@ impl<G: ConnectionGroup, P: Protocol> Worker<G, P> {
     /// Consume the worker and return stats
     pub fn into_stats(self) -> GroupStatsCollector {
         self.stats
+    }
+}
+
+/// Specialized implementation for Unix domain sockets
+impl<P: Protocol> Worker<xylem_transport::UnixConnectionGroup, P> {
+    /// Create a new pipelined worker for Unix domain sockets
+    ///
+    /// This constructor handles Unix socket paths instead of SocketAddr targets.
+    pub fn new_multi_group_unix(
+        factory: &xylem_transport::UnixTransportFactory,
+        protocols: HashMap<usize, P>,
+        generators: HashMap<usize, RequestGenerator>,
+        stats: GroupStatsCollector,
+        config: WorkerConfig,
+        groups: Vec<crate::connection::UnixTrafficGroupConfig>,
+    ) -> Result<Self> {
+        let pool = ConnectionPool::new_multi_group_unix(factory, groups)?;
+
+        Ok(Self {
+            pool,
+            protocols,
+            generators,
+            legacy_generator: None,
+            stats,
+            config,
+            current_key: 0,
+        })
     }
 }
 

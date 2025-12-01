@@ -156,7 +156,8 @@ _{bin_name} "$@"
 
 /// Get all valid TOML paths for --set autocompletion
 ///
-/// This extracts paths automatically from the ProfileConfig JSON Schema.
+/// This extracts paths automatically from the ProfileConfig JSON Schema,
+/// plus manually-added paths for protocol_config which uses dynamic typing.
 pub fn get_config_paths() -> Vec<String> {
     let schema = schema_for!(ProfileConfig);
     let mut paths = BTreeSet::new();
@@ -171,7 +172,71 @@ pub fn get_config_paths() -> Vec<String> {
     // schema_for! now returns a Schema directly (which wraps serde_json::Value)
     extract_paths_from_schema_value(&schema, "", &mut paths, &defs);
 
+    // Add protocol_config paths manually since it's typed as serde_json::Value
+    // These are the common paths for Redis/Memcached/HTTP protocols
+    add_protocol_config_paths(&mut paths);
+
     paths.into_iter().collect()
+}
+
+/// Add protocol_config paths manually for shell completions
+///
+/// Since protocol_config is typed as `serde_json::Value` for flexibility,
+/// the schema walker can't discover nested paths. We add them manually here.
+fn add_protocol_config_paths(paths: &mut BTreeSet<String>) {
+    let base = "traffic_groups.0.protocol_config";
+
+    // Keys configuration (Redis, Memcached)
+    paths.insert(format!("{}.keys", base));
+    paths.insert(format!("{}.keys.strategy", base));
+    paths.insert(format!("{}.keys.n", base));
+    paths.insert(format!("{}.keys.theta", base));
+    paths.insert(format!("{}.keys.max", base));
+    paths.insert(format!("{}.keys.start", base));
+    paths.insert(format!("{}.keys.mean_pct", base));
+    paths.insert(format!("{}.keys.std_dev_pct", base));
+    paths.insert(format!("{}.keys.value_size", base));
+
+    // Operations configuration (Redis)
+    paths.insert(format!("{}.operations", base));
+    paths.insert(format!("{}.operations.strategy", base));
+    paths.insert(format!("{}.operations.operation", base));
+    paths.insert(format!("{}.operations.commands", base));
+    paths.insert(format!("{}.operations.commands.0", base));
+    paths.insert(format!("{}.operations.commands.0.name", base));
+    paths.insert(format!("{}.operations.commands.0.weight", base));
+    paths.insert(format!("{}.operations.commands.0.params", base));
+    paths.insert(format!("{}.operations.commands.0.params.count", base));
+    paths.insert(format!("{}.operations.commands.0.params.num_replicas", base));
+    paths.insert(format!("{}.operations.commands.0.params.timeout_ms", base));
+
+    // Value size configuration (Redis)
+    paths.insert(format!("{}.value_size", base));
+    paths.insert(format!("{}.value_size.strategy", base));
+    paths.insert(format!("{}.value_size.size", base));
+    paths.insert(format!("{}.value_size.min", base));
+    paths.insert(format!("{}.value_size.max", base));
+    paths.insert(format!("{}.value_size.mean", base));
+    paths.insert(format!("{}.value_size.std_dev", base));
+
+    // Data import configuration (Redis)
+    paths.insert(format!("{}.data_import", base));
+    paths.insert(format!("{}.data_import.file", base));
+    paths.insert(format!("{}.data_import.verification", base));
+    paths.insert(format!("{}.data_import.verification.mode", base));
+    paths.insert(format!("{}.data_import.verification.sample_rate", base));
+
+    // HTTP configuration
+    paths.insert(format!("{}.method", base));
+    paths.insert(format!("{}.path", base));
+    paths.insert(format!("{}.host", base));
+    paths.insert(format!("{}.body_size", base));
+
+    // Memcached configuration
+    paths.insert(format!("{}.operation", base));
+
+    // Echo configuration
+    paths.insert(format!("{}.message_size", base));
 }
 
 /// Recursively extract all valid paths from a JSON schema value
@@ -275,21 +340,45 @@ mod tests {
         // Should contain top-level sections
         assert!(paths.contains(&"experiment".to_string()));
         assert!(paths.contains(&"target".to_string()));
-        assert!(paths.contains(&"workload".to_string()));
         assert!(paths.contains(&"output".to_string()));
 
         // Should contain nested paths
         assert!(paths.contains(&"experiment.name".to_string()));
         assert!(paths.contains(&"experiment.duration".to_string()));
         assert!(paths.contains(&"experiment.seed".to_string()));
-        assert!(paths.contains(&"target.address".to_string()));
-        assert!(paths.contains(&"target.protocol".to_string()));
+        assert!(paths.contains(&"target.transport".to_string()));
 
         // Should contain array indexing for traffic_groups
         assert!(paths.contains(&"traffic_groups".to_string()));
         assert!(paths.contains(&"traffic_groups.0".to_string()));
 
-        // Ensure we have a reasonable number of paths (should be > 30)
-        assert!(paths.len() > 30, "Expected > 30 paths, got {}", paths.len());
+        // Should contain protocol_config paths (manually added for completions)
+        assert!(
+            paths.contains(&"traffic_groups.0.protocol_config".to_string()),
+            "Missing protocol_config path"
+        );
+        assert!(
+            paths.contains(&"traffic_groups.0.protocol_config.keys".to_string()),
+            "Missing protocol_config.keys path"
+        );
+        assert!(
+            paths.contains(&"traffic_groups.0.protocol_config.keys.strategy".to_string()),
+            "Missing protocol_config.keys.strategy path"
+        );
+        assert!(
+            paths.contains(&"traffic_groups.0.protocol_config.keys.n".to_string()),
+            "Missing protocol_config.keys.n path"
+        );
+        assert!(
+            paths.contains(&"traffic_groups.0.protocol_config.operations".to_string()),
+            "Missing protocol_config.operations path"
+        );
+        assert!(
+            paths.contains(&"traffic_groups.0.protocol_config.operations.strategy".to_string()),
+            "Missing protocol_config.operations.strategy path"
+        );
+
+        // Ensure we have a reasonable number of paths (should be > 60 with protocol_config)
+        assert!(paths.len() > 60, "Expected > 60 paths, got {}", paths.len());
     }
 }

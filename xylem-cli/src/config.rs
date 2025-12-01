@@ -15,7 +15,6 @@ use std::time::Duration;
 pub struct ProfileConfig {
     pub experiment: ExperimentConfig,
     pub target: TargetConfig,
-    pub workload: WorkloadConfig,
     /// Traffic groups configuration
     pub traffic_groups: Vec<xylem_core::traffic_group::TrafficGroupConfig>,
     pub output: OutputConfig,
@@ -39,16 +38,10 @@ pub struct ExperimentConfig {
 }
 
 /// Target server configuration
+/// Global target configuration (transport settings shared across all traffic groups)
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct TargetConfig {
-    /// Server address (e.g., "127.0.0.1:6379") - can be overridden via CLI
-    #[serde(default)]
-    pub address: Option<String>,
-    /// Default protocol for traffic groups that don't specify their own
-    /// Valid: redis, redis-cluster, memcached-binary, memcached-ascii, http
-    #[serde(default)]
-    pub protocol: Option<String>,
-    /// Transport: tcp, udp
+    /// Transport: tcp, udp (shared across all traffic groups)
     #[serde(default = "default_transport")]
     pub transport: String,
     /// Redis Cluster configuration (only used when protocol = "redis-cluster")
@@ -78,114 +71,8 @@ fn default_transport() -> String {
     "tcp".to_string()
 }
 
-/// Workload configuration
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct WorkloadConfig {
-    /// Key generation strategy
-    pub keys: KeysConfig,
-    /// Load pattern (MACRO level - time-varying traffic)
-    pub pattern: LoadPatternConfig,
-    /// Value size configuration (optional, defaults to fixed size from keys config)
-    #[serde(default)]
-    pub value_size: Option<ValueSizeConfig>,
-    /// Operations/command configuration (optional, defaults to GET for redis)
-    #[serde(default)]
-    pub operations: Option<OperationsConfig>,
-    /// Data import configuration (optional, for testing with real data)
-    #[serde(default)]
-    pub data_import: Option<DataImportConfig>,
-}
-
-/// Key generation configuration (SPATIAL level)
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-#[serde(tag = "strategy", rename_all = "lowercase")]
-pub enum KeysConfig {
-    Sequential {
-        start: u64,
-        value_size: usize,
-    },
-    Random {
-        max: u64,
-        value_size: usize,
-    },
-    #[serde(rename = "round-robin")]
-    RoundRobin {
-        max: u64,
-        value_size: usize,
-    },
-    Zipfian {
-        /// Number of keys in range [0, n-1]
-        n: u64,
-        /// Exponent (theta) controlling skewness
-        theta: f64,
-        value_size: usize,
-    },
-    Gaussian {
-        /// Mean as percentage of keyspace (0.0 to 1.0)
-        mean_pct: f64,
-        /// Standard deviation as percentage of keyspace (0.0 to 1.0)
-        std_dev_pct: f64,
-        /// Maximum key value (keyspace size)
-        max: u64,
-        value_size: usize,
-    },
-}
-
-/// Load pattern configuration (MACRO level - time-varying traffic)
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-#[serde(tag = "type", rename_all = "lowercase")]
-pub enum LoadPatternConfig {
-    Constant {
-        /// Requests per second
-        rate: f64,
-    },
-    Ramp {
-        start_rate: f64,
-        end_rate: f64,
-        #[serde(with = "humantime_serde")]
-        #[schemars(with = "String")]
-        duration: Duration,
-    },
-    Spike {
-        normal_rate: f64,
-        spike_rate: f64,
-        #[serde(with = "humantime_serde")]
-        #[schemars(with = "String")]
-        spike_start: Duration,
-        #[serde(with = "humantime_serde")]
-        #[schemars(with = "String")]
-        spike_duration: Duration,
-    },
-    Sinusoidal {
-        base_rate: f64,
-        amplitude: f64,
-        #[serde(with = "humantime_serde")]
-        #[schemars(with = "String")]
-        period: Duration,
-        #[serde(with = "humantime_serde", default)]
-        #[schemars(with = "Option<String>")]
-        phase_shift: Option<Duration>,
-    },
-    Step {
-        steps: Vec<StepConfig>,
-    },
-    Sawtooth {
-        min_rate: f64,
-        max_rate: f64,
-        #[serde(with = "humantime_serde")]
-        #[schemars(with = "String")]
-        period: Duration,
-    },
-}
-
-/// Step configuration for StepPattern
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct StepConfig {
-    #[serde(with = "humantime_serde")]
-    #[schemars(with = "String")]
-    pub duration: Duration,
-    pub rate: f64,
-}
+/// Re-export KeysConfig from xylem-protocols for use in config files
+pub use xylem_protocols::KeysConfig;
 
 /// Value size configuration
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -251,7 +138,7 @@ pub struct CommandWeightConfig {
     /// Additional parameters for specific commands
     #[serde(flatten)]
     pub params: Option<CommandParams>,
-    /// Optional per-command key distribution (overrides workload.keys for this command)
+    /// Optional per-command key distribution (overrides protocol_config.keys for this command)
     #[serde(default)]
     pub keys: Option<KeysConfig>,
 }
@@ -273,35 +160,6 @@ pub enum CommandParams {
     },
     /// Custom command template
     Custom { template: String },
-}
-
-/// Data import configuration
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct DataImportConfig {
-    /// Path to CSV file containing test data
-    pub file: PathBuf,
-    /// Verification mode
-    #[serde(default)]
-    pub verification: Option<VerificationConfig>,
-}
-
-/// Verification configuration
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct VerificationConfig {
-    /// When to verify: "during" (sample during test), "after" (verify all after test), "only" (no load, just verify)
-    #[serde(default = "default_verification_mode")]
-    pub mode: String,
-    /// Sample rate for "during" mode (0.0-1.0, default 0.1 = 10%)
-    #[serde(default = "default_sample_rate")]
-    pub sample_rate: f64,
-}
-
-fn default_verification_mode() -> String {
-    "after".to_string()
-}
-
-fn default_sample_rate() -> f64 {
-    0.1
 }
 
 /// Output configuration
@@ -424,59 +282,17 @@ impl ProfileConfig {
             bail!("Experiment duration must be > 0");
         }
 
-        // Target validation
-        if let Some(address) = &self.target.address {
-            if address.is_empty() {
-                bail!("Target address cannot be empty");
-            }
-        } else {
-            bail!("Target address must be specified (either in config or via --target CLI flag)");
-        }
-
         let valid_protocols = [
             "redis",
+            "redis-cluster",
             "memcached-binary",
             "memcached-ascii",
             "http",
+            "masstree",
             "xylem-echo", // Test protocol
         ];
 
-        // Validate target.protocol if specified
-        if let Some(protocol) = &self.target.protocol {
-            if !valid_protocols.contains(&protocol.as_str()) {
-                bail!(
-                    "Invalid target protocol '{}'. Valid options: {}",
-                    protocol,
-                    valid_protocols.join(", ")
-                );
-            }
-        }
-
-        // Validate that each traffic group has a protocol (either its own or from target)
-        for (i, group) in self.traffic_groups.iter().enumerate() {
-            let group_protocol = group.protocol.as_ref().or(self.target.protocol.as_ref());
-
-            if group_protocol.is_none() {
-                bail!(
-                    "Traffic group {} '{}' has no protocol specified. Either set target.protocol or traffic_groups[{}].protocol",
-                    i, group.name, i
-                );
-            }
-
-            if let Some(protocol) = group_protocol {
-                if !valid_protocols.contains(&protocol.as_str()) {
-                    bail!(
-                        "Invalid protocol '{}' for traffic group {} '{}'. Valid options: {}",
-                        protocol,
-                        i,
-                        group.name,
-                        valid_protocols.join(", ")
-                    );
-                }
-            }
-        }
-
-        let valid_transports = ["tcp", "udp"];
+        let valid_transports = ["tcp", "udp", "unix"];
         if !valid_transports.contains(&self.target.transport.as_str()) {
             bail!(
                 "Invalid transport '{}'. Valid options: {}",
@@ -485,16 +301,28 @@ impl ProfileConfig {
             );
         }
 
-        // Workload validation
-        self.validate_keys()?;
-        self.validate_pattern()?;
-
         // Traffic groups validation
         if self.traffic_groups.is_empty() {
             bail!("At least one traffic group must be defined");
         }
 
         for (i, group) in self.traffic_groups.iter().enumerate() {
+            // Validate target address
+            if group.target.is_empty() {
+                bail!("Traffic group {} '{}' must have a target address", i, group.name);
+            }
+
+            // Validate protocol
+            if !valid_protocols.contains(&group.protocol.as_str()) {
+                bail!(
+                    "Invalid protocol '{}' for traffic group {} '{}'. Valid options: {}",
+                    group.protocol,
+                    i,
+                    group.name,
+                    valid_protocols.join(", ")
+                );
+            }
+
             if group.threads.is_empty() {
                 bail!("Traffic group {} '{}' must have at least one thread", i, group.name);
             }
@@ -508,6 +336,51 @@ impl ProfileConfig {
                     group.name
                 );
             }
+
+            // Key-value protocols (Redis, Memcached) require protocol_config with keys
+            // HTTP and XylemEcho have sensible defaults and don't require protocol_config
+            let requires_protocol_config = matches!(
+                group.protocol.as_str(),
+                "redis" | "redis-cluster" | "memcached-binary" | "memcached-ascii"
+            );
+
+            if requires_protocol_config && group.protocol_config.is_none() {
+                bail!(
+                    "Traffic group {} '{}' has no protocol_config. \
+                     For {} protocol, set traffic_groups[{}].protocol_config with keys configuration.",
+                    i,
+                    group.name,
+                    group.protocol,
+                    i
+                );
+            }
+
+            // Attempt to parse protocol_config as the appropriate typed struct
+            // This validates the structure and provides better error messages
+            if let Some(ref pc) = group.protocol_config {
+                validate_protocol_config(&group.protocol, pc, i, &group.name)?;
+            }
+
+            // redis-cluster protocol requires target.redis_cluster configuration
+            if group.protocol == "redis-cluster" {
+                let cluster = self.target.redis_cluster.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Traffic group {} '{}' uses redis-cluster protocol but \
+                         [target.redis_cluster] configuration is missing. \
+                         Add a [[target.redis_cluster.nodes]] section with cluster node addresses.",
+                        i,
+                        group.name
+                    )
+                })?;
+                if cluster.nodes.is_empty() {
+                    bail!(
+                        "Traffic group {} '{}' uses redis-cluster protocol but \
+                         target.redis_cluster.nodes is empty. Add at least one cluster node.",
+                        i,
+                        group.name
+                    );
+                }
+            }
         }
 
         // Validate thread assignment
@@ -519,137 +392,76 @@ impl ProfileConfig {
 
         Ok(())
     }
+}
 
-    fn validate_keys(&self) -> Result<()> {
-        match &self.workload.keys {
-            KeysConfig::Sequential { value_size, .. } => {
-                if *value_size == 0 {
-                    bail!("value_size must be > 0");
-                }
-            }
-            KeysConfig::Random { max, value_size } => {
-                if *max == 0 {
-                    bail!("Random max must be > 0");
-                }
-                if *value_size == 0 {
-                    bail!("value_size must be > 0");
-                }
-            }
-            KeysConfig::RoundRobin { max, value_size } => {
-                if *max == 0 {
-                    bail!("RoundRobin max must be > 0");
-                }
-                if *value_size == 0 {
-                    bail!("value_size must be > 0");
-                }
-            }
-            KeysConfig::Zipfian { n, theta, value_size } => {
-                if *n == 0 {
-                    bail!("Zipfian n must be > 0");
-                }
-                if *theta < 0.0 {
-                    bail!("Zipfian theta must be >= 0.0");
-                }
-                if *value_size == 0 {
-                    bail!("value_size must be > 0");
-                }
-            }
-            KeysConfig::Gaussian { mean_pct, std_dev_pct, max, value_size } => {
-                if *max == 0 {
-                    bail!("Gaussian max must be > 0");
-                }
-                if !(0.0..=1.0).contains(mean_pct) {
-                    bail!("Gaussian mean_pct must be in range [0.0, 1.0]");
-                }
-                if !(0.0..=1.0).contains(std_dev_pct) {
-                    bail!("Gaussian std_dev_pct must be in range [0.0, 1.0]");
-                }
-                if *value_size == 0 {
-                    bail!("value_size must be > 0");
-                }
+/// Validate protocol_config by parsing it as the appropriate typed struct
+fn validate_protocol_config(
+    protocol_name: &str,
+    pc: &serde_json::Value,
+    group_idx: usize,
+    group_name: &str,
+) -> Result<()> {
+    match protocol_name {
+        "redis" | "redis-cluster" => {
+            let config: xylem_protocols::RedisConfig =
+                serde_json::from_value(pc.clone()).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Traffic group {} '{}' has invalid Redis protocol_config: {}",
+                        group_idx,
+                        group_name,
+                        e
+                    )
+                })?;
+
+            // data_import is not supported for redis-cluster (would panic at runtime)
+            if protocol_name == "redis-cluster" && config.data_import.is_some() {
+                bail!(
+                    "Traffic group {} '{}': data_import is not supported for redis-cluster protocol. \
+                     Use plain 'redis' protocol for data import workloads.",
+                    group_idx,
+                    group_name
+                );
             }
         }
-        Ok(())
-    }
-
-    fn validate_pattern(&self) -> Result<()> {
-        match &self.workload.pattern {
-            LoadPatternConfig::Constant { rate } => {
-                if *rate <= 0.0 {
-                    bail!("Constant rate must be > 0");
-                }
-            }
-            LoadPatternConfig::Ramp { start_rate, end_rate, duration } => {
-                if *start_rate <= 0.0 {
-                    bail!("Ramp start_rate must be > 0");
-                }
-                if *end_rate <= 0.0 {
-                    bail!("Ramp end_rate must be > 0");
-                }
-                if duration.as_secs() == 0 {
-                    bail!("Ramp duration must be > 0");
-                }
-            }
-            LoadPatternConfig::Spike {
-                normal_rate,
-                spike_rate,
-                spike_start,
-                spike_duration,
-            } => {
-                if *normal_rate <= 0.0 {
-                    bail!("Spike normal_rate must be > 0");
-                }
-                if *spike_rate <= 0.0 {
-                    bail!("Spike spike_rate must be > 0");
-                }
-                if spike_start.as_secs() == 0 {
-                    bail!("Spike spike_start must be > 0");
-                }
-                if spike_duration.as_secs() == 0 {
-                    bail!("Spike spike_duration must be > 0");
-                }
-            }
-            LoadPatternConfig::Sinusoidal { base_rate, amplitude, period, .. } => {
-                if *base_rate <= 0.0 {
-                    bail!("Sinusoidal base_rate must be > 0");
-                }
-                if *amplitude < 0.0 {
-                    bail!("Sinusoidal amplitude must be >= 0");
-                }
-                if period.as_secs() == 0 {
-                    bail!("Sinusoidal period must be > 0");
-                }
-            }
-            LoadPatternConfig::Step { steps } => {
-                if steps.is_empty() {
-                    bail!("Step pattern must have at least one step");
-                }
-                for (i, step) in steps.iter().enumerate() {
-                    if step.rate <= 0.0 {
-                        bail!("Step {} rate must be > 0", i);
-                    }
-                    if step.duration.as_secs() == 0 {
-                        bail!("Step {} duration must be > 0", i);
-                    }
-                }
-            }
-            LoadPatternConfig::Sawtooth { min_rate, max_rate, period } => {
-                if *min_rate <= 0.0 {
-                    bail!("Sawtooth min_rate must be > 0");
-                }
-                if *max_rate <= 0.0 {
-                    bail!("Sawtooth max_rate must be > 0");
-                }
-                if min_rate >= max_rate {
-                    bail!("Sawtooth min_rate must be < max_rate");
-                }
-                if period.as_secs() == 0 {
-                    bail!("Sawtooth period must be > 0");
-                }
-            }
+        "http" => {
+            serde_json::from_value::<xylem_protocols::HttpConfig>(pc.clone()).map_err(|e| {
+                anyhow::anyhow!(
+                    "Traffic group {} '{}' has invalid HTTP protocol_config: {}",
+                    group_idx,
+                    group_name,
+                    e
+                )
+            })?;
         }
-        Ok(())
+        "memcached-binary" | "memcached-ascii" => {
+            serde_json::from_value::<xylem_protocols::MemcachedConfig>(pc.clone()).map_err(
+                |e| {
+                    anyhow::anyhow!(
+                        "Traffic group {} '{}' has invalid Memcached protocol_config: {}",
+                        group_idx,
+                        group_name,
+                        e
+                    )
+                },
+            )?;
+        }
+        "xylem-echo" => {
+            serde_json::from_value::<xylem_protocols::XylemEchoConfig>(pc.clone()).map_err(
+                |e| {
+                    anyhow::anyhow!(
+                        "Traffic group {} '{}' has invalid XylemEcho protocol_config: {}",
+                        group_idx,
+                        group_name,
+                        e
+                    )
+                },
+            )?;
+        }
+        _ => {
+            // Unknown protocol - will be caught later during execution
+        }
     }
+    Ok(())
 }
 
 /// Parse a "key=value" string into (key, value) tuple
@@ -821,43 +633,10 @@ fn parse_value(value_str: &str) -> Result<toml::Value> {
 }
 
 // Helper methods to convert config types to runtime types
-impl KeysConfig {
-    pub fn value_size(&self) -> usize {
-        match self {
-            Self::Sequential { value_size, .. } => *value_size,
-            Self::Random { value_size, .. } => *value_size,
-            Self::RoundRobin { value_size, .. } => *value_size,
-            Self::Zipfian { value_size, .. } => *value_size,
-            Self::Gaussian { value_size, .. } => *value_size,
-        }
-    }
+// Note: These may appear unused but are kept for potential future use
+// when migrating more features to per-traffic-group configuration.
 
-    pub fn to_key_generation(
-        &self,
-        master_seed: Option<u64>,
-    ) -> Result<xylem_core::workload::KeyGeneration> {
-        use xylem_core::seed::{components, derive_seed};
-        use xylem_core::workload::KeyGeneration;
-
-        match self {
-            Self::Sequential { start, .. } => Ok(KeyGeneration::sequential(*start)),
-            Self::Random { max, .. } => {
-                let seed = master_seed.map(|s| derive_seed(s, components::RANDOM_KEYS));
-                Ok(KeyGeneration::random_with_seed(*max, seed))
-            }
-            Self::RoundRobin { max, .. } => Ok(KeyGeneration::round_robin(*max)),
-            Self::Zipfian { n, theta, .. } => {
-                let seed = master_seed.map(|s| derive_seed(s, components::ZIPFIAN_DIST));
-                KeyGeneration::zipfian_with_seed(*n, *theta, seed)
-            }
-            Self::Gaussian { mean_pct, std_dev_pct, max, .. } => {
-                let seed = master_seed.map(|s| derive_seed(s, components::GAUSSIAN_DIST));
-                KeyGeneration::gaussian_with_seed(*mean_pct, *std_dev_pct, *max, seed)
-            }
-        }
-    }
-}
-
+#[allow(dead_code)]
 impl ValueSizeConfig {
     /// Convert to a ValueSizeGenerator
     pub fn to_generator(
@@ -890,6 +669,7 @@ impl ValueSizeConfig {
     }
 }
 
+#[allow(dead_code)]
 impl CommandValueSizeConfig {
     /// Convert to a ValueSizeGenerator
     pub fn to_generator(
@@ -913,6 +693,7 @@ impl CommandValueSizeConfig {
     }
 }
 
+#[allow(dead_code)]
 impl OperationsConfig {
     /// Helper: Process a command with per-command keys
     fn process_command_with_keys(
@@ -1040,6 +821,16 @@ mod tests {
     use xylem_core::stats::collector::SamplingPolicy;
     use xylem_core::workload::KeyGeneration;
 
+    /// Helper to extract KeysConfig from protocol_config
+    fn get_keys_config(
+        config: &xylem_core::traffic_group::TrafficGroupConfig,
+    ) -> Option<KeysConfig> {
+        config
+            .protocol_config
+            .as_ref()
+            .and_then(|pc| pc.get("keys").and_then(|v| serde_json::from_value(v.clone()).ok()))
+    }
+
     #[test]
     fn test_load_redis_zipfian_profile() {
         let config = ProfileConfig::from_file("../tests/redis/redis-get-zipfian.toml")
@@ -1049,12 +840,12 @@ mod tests {
         assert_eq!(config.experiment.seed, Some(42));
         assert_eq!(config.experiment.duration, Duration::from_secs(30));
 
-        assert_eq!(config.target.address, Some("127.0.0.1:6379".to_string()));
-        assert_eq!(config.target.protocol, Some("redis".to_string()));
         assert_eq!(config.target.transport, "tcp");
 
         assert_eq!(config.traffic_groups.len(), 1);
         assert_eq!(config.traffic_groups[0].name, "main");
+        assert_eq!(config.traffic_groups[0].protocol, "redis");
+        assert_eq!(config.traffic_groups[0].target, "127.0.0.1:6379");
         assert_eq!(config.traffic_groups[0].threads, vec![0, 1, 2, 3]);
         assert_eq!(config.traffic_groups[0].connections_per_thread, 25);
     }
@@ -1068,9 +859,8 @@ mod tests {
         assert_eq!(config.experiment.seed, Some(12345));
         assert_eq!(config.experiment.duration, Duration::from_secs(60));
 
-        assert_eq!(config.target.protocol, Some("memcached-binary".to_string()));
-
         assert_eq!(config.traffic_groups.len(), 1);
+        assert_eq!(config.traffic_groups[0].protocol, "memcached-binary");
         let threads: Vec<usize> = (0..8).collect();
         assert_eq!(config.traffic_groups[0].threads, threads);
     }
@@ -1084,9 +874,8 @@ mod tests {
         assert_eq!(config.experiment.seed, Some(99999));
         assert_eq!(config.experiment.duration, Duration::from_secs(120));
 
-        assert_eq!(config.target.protocol, Some("http".to_string()));
-
         assert_eq!(config.traffic_groups.len(), 1);
+        assert_eq!(config.traffic_groups[0].protocol, "http");
         let threads: Vec<usize> = (0..16).collect();
         assert_eq!(config.traffic_groups[0].threads, threads);
     }
@@ -1113,9 +902,8 @@ mod tests {
         assert_eq!(config.experiment.seed, Some(1234567890));
         assert_eq!(config.experiment.duration, Duration::from_secs(30));
 
-        assert_eq!(config.target.protocol, Some("memcached-binary".to_string()));
-
         assert_eq!(config.traffic_groups.len(), 1);
+        assert_eq!(config.traffic_groups[0].protocol, "memcached-binary");
         let threads: Vec<usize> = (0..16).collect();
         assert_eq!(config.traffic_groups[0].threads, threads);
     }
@@ -1129,7 +917,7 @@ mod tests {
         assert_eq!(config.experiment.seed, Some(42));
         assert_eq!(config.experiment.duration, Duration::from_secs(10));
 
-        assert_eq!(config.target.protocol, Some("redis".to_string()));
+        assert_eq!(config.traffic_groups[0].protocol, "redis");
 
         assert_eq!(config.traffic_groups.len(), 2);
 
@@ -1165,9 +953,8 @@ mod tests {
         assert_eq!(config.experiment.seed, Some(42));
         assert_eq!(config.experiment.duration, Duration::from_secs(30));
 
-        assert_eq!(config.target.protocol, Some("redis".to_string()));
-
         assert_eq!(config.traffic_groups.len(), 2);
+        assert_eq!(config.traffic_groups[0].protocol, "redis");
 
         let latency_agent = &config.traffic_groups[0];
         assert_eq!(latency_agent.name, "latency-agent");
@@ -1197,49 +984,47 @@ mod tests {
         let config = ProfileConfig::from_file_with_overrides(
             "../tests/redis/redis-get-zipfian.toml",
             &[
-                "target.address=192.168.1.100:6379".to_string(),
+                "traffic_groups.0.target=192.168.1.100:6379".to_string(),
                 "experiment.duration=60s".to_string(),
                 "experiment.seed=999".to_string(),
             ],
         )
         .expect("Failed to apply overrides");
 
-        assert_eq!(config.target.address, Some("192.168.1.100:6379".to_string()));
+        assert_eq!(config.traffic_groups[0].target, "192.168.1.100:6379");
         assert_eq!(config.experiment.duration, Duration::from_secs(60));
         assert_eq!(config.experiment.seed, Some(999));
 
         assert_eq!(config.experiment.name, "redis-get-zipfian");
-        assert_eq!(config.target.protocol, Some("redis".to_string()));
+        assert_eq!(config.traffic_groups[0].protocol, "redis");
     }
 
     #[test]
-    fn test_config_with_cli_target_only() {
-        let profile_without_target = r#"
+    fn test_config_with_cli_target_override() {
+        let profile = r#"
 [experiment]
 name = "cli-target-test"
 duration = "10s"
 
 [target]
-protocol = "redis"
+transport = "tcp"
 
-[workload]
-[workload.keys]
-strategy = "sequential"
-start = 0
-value_size = 64
-
-[workload.pattern]
-type = "constant"
-rate = 1000.0
 
 [[traffic_groups]]
 name = "main"
+protocol = "redis"
+target = "127.0.0.1:6379"
 threads = [0]
 connections_per_thread = 1
 max_pending_per_connection = 1
 sampling_rate = 1.0
 
-[traffic_groups.policy]
+[traffic_groups.protocol_config.keys]
+strategy = "sequential"
+start = 0
+value_size = 64
+
+[traffic_groups.traffic_policy]
 type = "closed-loop"
 
 [output]
@@ -1249,19 +1034,19 @@ file = "results/test.json"
 
         use std::io::Write;
         let mut tmpfile = tempfile::NamedTempFile::new().unwrap();
-        tmpfile.write_all(profile_without_target.as_bytes()).unwrap();
+        tmpfile.write_all(profile.as_bytes()).unwrap();
         tmpfile.flush().unwrap();
 
         let config = ProfileConfig::from_file(tmpfile.path()).unwrap();
-        assert_eq!(config.target.address, None);
+        assert_eq!(config.traffic_groups[0].target, "127.0.0.1:6379");
 
         let config = ProfileConfig::from_file_with_overrides(
             tmpfile.path(),
-            &["target.address=127.0.0.1:6379".to_string()],
+            &["traffic_groups.0.target=192.168.1.100:6379".to_string()],
         )
         .expect("Failed to apply target override");
 
-        assert_eq!(config.target.address, Some("127.0.0.1:6379".to_string()));
+        assert_eq!(config.traffic_groups[0].target, "192.168.1.100:6379");
     }
 
     #[test]
@@ -1272,26 +1057,24 @@ name = "no-target-test"
 duration = "10s"
 
 [target]
-protocol = "redis"
+transport = "tcp"
 
-[workload]
-[workload.keys]
-strategy = "sequential"
-start = 0
-value_size = 64
-
-[workload.pattern]
-type = "constant"
-rate = 1000.0
 
 [[traffic_groups]]
 name = "main"
+protocol = "redis"
+target = ""
 threads = [0]
 connections_per_thread = 1
 max_pending_per_connection = 1
 sampling_rate = 1.0
 
-[traffic_groups.policy]
+[traffic_groups.protocol_config.keys]
+strategy = "sequential"
+start = 0
+value_size = 64
+
+[traffic_groups.traffic_policy]
 type = "closed-loop"
 
 [output]
@@ -1308,7 +1091,7 @@ file = "results/test.json"
 
         let result = config.validate();
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Target address must be specified"));
+        assert!(result.unwrap_err().to_string().contains("must have a target address"));
     }
 
     #[test]
@@ -1324,9 +1107,10 @@ file = "results/test.json"
         let config = ProfileConfig::from_file("../tests/redis/redis-get-zipfian.toml")
             .expect("Failed to load profile");
 
-        let key_gen = config
-            .workload
-            .keys
+        let keys_config = get_keys_config(&config.traffic_groups[0])
+            .expect("Expected keys config in protocol_config");
+
+        let key_gen = keys_config
             .to_key_generation(config.experiment.seed)
             .expect("Failed to convert to KeyGeneration");
 
@@ -1341,7 +1125,9 @@ file = "results/test.json"
         let config = ProfileConfig::from_file("../tests/redis/redis-get-zipfian.toml")
             .expect("Failed to load profile");
 
-        let value_size = config.workload.keys.value_size();
+        let keys_config = get_keys_config(&config.traffic_groups[0])
+            .expect("Expected keys config in protocol_config");
+        let value_size = keys_config.value_size();
         assert_eq!(value_size, 64);
     }
 
@@ -1353,16 +1139,13 @@ file = "results/test.json"
         let master_seed = config.experiment.seed;
         assert_eq!(master_seed, Some(42));
 
-        let key_gen1 = config
-            .workload
-            .keys
-            .to_key_generation(master_seed)
-            .expect("Failed to create key generation 1");
-        let key_gen2 = config
-            .workload
-            .keys
-            .to_key_generation(master_seed)
-            .expect("Failed to create key generation 2");
+        let keys = get_keys_config(&config.traffic_groups[0])
+            .expect("Expected keys config in protocol_config");
+
+        let key_gen1 =
+            keys.to_key_generation(master_seed).expect("Failed to create key generation 1");
+        let key_gen2 =
+            keys.to_key_generation(master_seed).expect("Failed to create key generation 2");
 
         match (&key_gen1, &key_gen2) {
             (KeyGeneration::Zipfian(_), KeyGeneration::Zipfian(_)) => {}
@@ -1378,27 +1161,24 @@ name = "test"
 duration = "10s"
 
 [target]
-address = "127.0.0.1:6379"
-protocol = "redis"
+transport = "tcp"
 
-[workload]
-[workload.keys]
-strategy = "sequential"
-start = 100
-value_size = 64
-
-[workload.pattern]
-type = "constant"
-rate = 1000.0
 
 [[traffic_groups]]
 name = "main"
+protocol = "redis"
+target = "127.0.0.1:6379"
 threads = [0]
 connections_per_thread = 1
 max_pending_per_connection = 1
 sampling_rate = 1.0
 
-[traffic_groups.policy]
+[traffic_groups.protocol_config.keys]
+strategy = "sequential"
+start = 100
+value_size = 64
+
+[traffic_groups.traffic_policy]
 type = "closed-loop"
 
 [output]
@@ -1412,7 +1192,8 @@ file = "test.json"
         tmpfile.flush().unwrap();
 
         let config = ProfileConfig::from_file(tmpfile.path()).unwrap();
-        let key_gen = config.workload.keys.to_key_generation(None).unwrap();
+        let keys_config = get_keys_config(&config.traffic_groups[0]).unwrap();
+        let key_gen = keys_config.to_key_generation(None).unwrap();
 
         match key_gen {
             KeyGeneration::Sequential { start, .. } => {
@@ -1433,7 +1214,8 @@ max = 10000"#,
         tmpfile.flush().unwrap();
 
         let config = ProfileConfig::from_file(tmpfile.path()).unwrap();
-        let key_gen = config.workload.keys.to_key_generation(Some(12345)).unwrap();
+        let keys_config = get_keys_config(&config.traffic_groups[0]).unwrap();
+        let key_gen = keys_config.to_key_generation(Some(12345)).unwrap();
 
         match key_gen {
             KeyGeneration::Random { max, .. } => {
@@ -1454,7 +1236,8 @@ max = 5000"#,
         tmpfile.flush().unwrap();
 
         let config = ProfileConfig::from_file(tmpfile.path()).unwrap();
-        let key_gen = config.workload.keys.to_key_generation(None).unwrap();
+        let keys_config = get_keys_config(&config.traffic_groups[0]).unwrap();
+        let key_gen = keys_config.to_key_generation(None).unwrap();
 
         match key_gen {
             KeyGeneration::RoundRobin { max, .. } => {
@@ -1466,8 +1249,7 @@ max = 5000"#,
 
     #[test]
     fn test_all_protocols_valid() {
-        let protocols =
-            vec!["redis", "memcached-binary", "memcached-ascii", "http", "masstree", "xylem-echo"];
+        let protocols = vec!["redis", "memcached-binary", "memcached-ascii", "http", "xylem-echo"];
 
         for protocol in protocols {
             let config_str = format!(
@@ -1477,27 +1259,24 @@ name = "test-{protocol}"
 duration = "10s"
 
 [target]
-address = "127.0.0.1:6379"
-protocol = "{protocol}"
+transport = "tcp"
 
-[workload]
-[workload.keys]
-strategy = "sequential"
-start = 0
-value_size = 64
-
-[workload.pattern]
-type = "constant"
-rate = 1000.0
 
 [[traffic_groups]]
 name = "main"
+protocol = "{protocol}"
+target = "127.0.0.1:6379"
 threads = [0]
 connections_per_thread = 1
 max_pending_per_connection = 1
 sampling_rate = 1.0
 
-[traffic_groups.policy]
+[traffic_groups.protocol_config.keys]
+strategy = "sequential"
+start = 0
+value_size = 64
+
+[traffic_groups.traffic_policy]
 type = "closed-loop"
 
 [output]
@@ -1513,7 +1292,7 @@ file = "test.json"
 
             let config = ProfileConfig::from_file(tmpfile.path())
                 .unwrap_or_else(|_| panic!("Failed to parse config for protocol: {}", protocol));
-            assert_eq!(config.target.protocol.as_deref(), Some(protocol));
+            assert_eq!(config.traffic_groups[0].protocol.as_str(), protocol);
         }
     }
 
@@ -1525,27 +1304,24 @@ name = "test-invalid"
 duration = "10s"
 
 [target]
-address = "127.0.0.1:6379"
-protocol = "invalid_protocol"
+transport = "tcp"
 
-[workload]
-[workload.keys]
-strategy = "sequential"
-start = 0
-value_size = 64
-
-[workload.pattern]
-type = "constant"
-rate = 1000.0
 
 [[traffic_groups]]
 name = "main"
+protocol = "invalid_protocol"
+target = "127.0.0.1:6379"
 threads = [0]
 connections_per_thread = 1
 max_pending_per_connection = 1
 sampling_rate = 1.0
 
-[traffic_groups.policy]
+[traffic_groups.protocol_config.keys]
+strategy = "sequential"
+start = 0
+value_size = 64
+
+[traffic_groups.traffic_policy]
 type = "closed-loop"
 
 [output]
@@ -1577,27 +1353,24 @@ name = "test-duration"
 duration = "2m30s"
 
 [target]
-address = "127.0.0.1:6379"
-protocol = "redis"
+transport = "tcp"
 
-[workload]
-[workload.keys]
-strategy = "sequential"
-start = 0
-value_size = 64
-
-[workload.pattern]
-type = "constant"
-rate = 1000.0
 
 [[traffic_groups]]
 name = "main"
+protocol = "redis"
+target = "127.0.0.1:6379"
 threads = [0]
 connections_per_thread = 1
 max_pending_per_connection = 1
 sampling_rate = 1.0
 
-[traffic_groups.policy]
+[traffic_groups.protocol_config.keys]
+strategy = "sequential"
+start = 0
+value_size = 64
+
+[traffic_groups.traffic_policy]
 type = "closed-loop"
 
 [output]
@@ -1622,27 +1395,24 @@ name = "no-seed"
 duration = "10s"
 
 [target]
-address = "127.0.0.1:6379"
-protocol = "redis"
+transport = "tcp"
 
-[workload]
-[workload.keys]
-strategy = "random"
-max = 1000
-value_size = 64
-
-[workload.pattern]
-type = "constant"
-rate = 1000.0
 
 [[traffic_groups]]
 name = "main"
+protocol = "redis"
+target = "127.0.0.1:6379"
 threads = [0]
 connections_per_thread = 1
 max_pending_per_connection = 1
 sampling_rate = 1.0
 
-[traffic_groups.policy]
+[traffic_groups.protocol_config.keys]
+strategy = "random"
+max = 1000
+value_size = 64
+
+[traffic_groups.traffic_policy]
 type = "closed-loop"
 
 [output]
@@ -1697,12 +1467,13 @@ duration = "10s""#,
     fn test_set_nested_field() {
         let config = ProfileConfig::from_file_with_overrides(
             "../tests/redis/redis-get-zipfian.toml",
-            &["workload.keys.n=5000".to_string()],
+            &["traffic_groups.0.protocol_config.keys.n=5000".to_string()],
         )
         .unwrap();
 
-        match config.workload.keys {
-            KeysConfig::Zipfian { n, .. } => {
+        let keys_config = get_keys_config(&config.traffic_groups[0]);
+        match keys_config {
+            Some(KeysConfig::Zipfian { n, .. }) => {
                 assert_eq!(n, 5000);
             }
             _ => panic!("Expected Zipfian keys config"),
@@ -1739,18 +1510,18 @@ duration = "10s""#,
         let config = ProfileConfig::from_file_with_overrides(
             "../tests/redis/redis-get-zipfian.toml",
             &[
-                "target.address=192.168.1.100:6379".to_string(),
+                "traffic_groups.0.target=192.168.1.100:6379".to_string(),
                 "experiment.duration=5m".to_string(),
                 "experiment.seed=999".to_string(),
-                "target.protocol=memcached-binary".to_string(),
+                "traffic_groups.0.protocol=memcached-binary".to_string(),
             ],
         )
         .unwrap();
 
-        assert_eq!(config.target.address, Some("192.168.1.100:6379".to_string()));
+        assert_eq!(config.traffic_groups[0].target, "192.168.1.100:6379");
         assert_eq!(config.experiment.duration, Duration::from_secs(300));
         assert_eq!(config.experiment.seed, Some(999));
-        assert_eq!(config.target.protocol, Some("memcached-binary".to_string()));
+        assert_eq!(config.traffic_groups[0].protocol, "memcached-binary");
     }
 
     #[test]
@@ -1793,10 +1564,10 @@ duration = "10s""#,
     fn test_set_type_inference_string() {
         let config = ProfileConfig::from_file_with_overrides(
             "../tests/redis/redis-get-zipfian.toml",
-            &["target.protocol=http".to_string()],
+            &["traffic_groups.0.protocol=http".to_string()],
         )
         .unwrap();
-        assert_eq!(config.target.protocol, Some("http".to_string()));
+        assert_eq!(config.traffic_groups[0].protocol, "http");
     }
 
     #[test]
@@ -1835,5 +1606,73 @@ duration = "10s""#,
         )
         .unwrap();
         assert_eq!(config.experiment.duration, Duration::from_secs(7200));
+    }
+
+    #[test]
+    fn test_redis_cluster_requires_cluster_config() {
+        // Changing protocol to redis-cluster without providing cluster config should fail
+        let result = ProfileConfig::from_file_with_overrides(
+            "../tests/redis/redis-get-zipfian.toml",
+            &["traffic_groups.0.protocol=redis-cluster".to_string()],
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("redis-cluster") && err.contains("target.redis_cluster"),
+            "Error should mention redis-cluster and target.redis_cluster: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_redis_cluster_rejects_data_import() {
+        // Create a minimal config with redis-cluster and data_import (should fail validation)
+        let toml_str = r#"
+[experiment]
+name = "test"
+duration = "10s"
+
+[target]
+transport = "tcp"
+
+[[target.redis_cluster.nodes]]
+address = "127.0.0.1:7000"
+slot_start = 0
+slot_end = 16383
+
+[[traffic_groups]]
+name = "main"
+protocol = "redis-cluster"
+target = "127.0.0.1:7000"
+threads = [0]
+connections_per_thread = 1
+
+[traffic_groups.protocol_config.keys]
+strategy = "sequential"
+start = 0
+value_size = 64
+
+[traffic_groups.protocol_config.data_import]
+file = "/tmp/test.csv"
+
+[traffic_groups.traffic_policy]
+type = "closed-loop"
+
+[output]
+format = "json"
+file = "/tmp/test.json"
+"#;
+        let config: Result<ProfileConfig, _> = toml::from_str(toml_str);
+        assert!(config.is_ok(), "TOML should parse");
+
+        let config = config.unwrap();
+        let result = config.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("data_import") && err.contains("redis-cluster"),
+            "Error should mention data_import not supported for redis-cluster: {}",
+            err
+        );
     }
 }

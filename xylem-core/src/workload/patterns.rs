@@ -10,7 +10,7 @@ use std::time::Duration;
 /// Load patterns control the target rate over time, enabling time-varying workloads.
 /// This is the MACRO-level control (overall traffic intensity), while timing policies
 /// provide MICRO-level control (inter-arrival distribution).
-pub trait LoadPattern: Send {
+pub trait LoadPattern: Send + Sync {
     /// Get target rate at a given time offset
     ///
     /// # Parameters

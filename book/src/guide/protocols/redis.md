@@ -93,7 +93,7 @@ Let's talk about what these commands actually do and when you'd use them in benc
 
 Xylem's command templates are your escape hatch for anything not built-in. Want to test sorted sets? Write:
 ```toml
-[[workload.operations.commands]]
+[[traffic_groups.protocol_config.operations.commands]]
 name = "custom"
 template = "ZADD leaderboard __value_size__ player:__key__"
 ```
@@ -106,23 +106,23 @@ Real applications don't just GET and SET uniformly distributed keys. They have p
 
 ### Command Mixes
 
-Start simple. A pure GET workload tests read performance:
+All workload configuration goes inside each traffic group's `protocol_config` section. Start simple. A pure GET workload tests read performance:
 ```toml
-[workload.operations]
+[traffic_groups.protocol_config.operations]
 strategy = "fixed"
 operation = "get"
 ```
 
 But production is rarely pure reads. Model a cache with 70% reads and 30% writes:
 ```toml
-[workload.operations]
+[traffic_groups.protocol_config.operations]
 strategy = "weighted"
 
-[[workload.operations.commands]]
+[[traffic_groups.protocol_config.operations.commands]]
 name = "get"
 weight = 0.7
 
-[[workload.operations.commands]]
+[[traffic_groups.protocol_config.operations.commands]]
 name = "set"
 weight = 0.3
 ```
@@ -131,20 +131,19 @@ Xylem picks commands randomly based on their weights. Over time, you'll see 70% 
 
 Add INCR for counters, MGET for batch reads, and WAIT to test replication:
 ```toml
-[[workload.operations.commands]]
+[[traffic_groups.protocol_config.operations.commands]]
 name = "incr"
 weight = 0.1
 
-[[workload.operations.commands]]
+[[traffic_groups.protocol_config.operations.commands]]
 name = "mget"
 weight = 0.05
-count = 10  # Fetch 10 keys per MGET
+params = { count = 10 }  # Fetch 10 keys per MGET
 
-[[workload.operations.commands]]
+[[traffic_groups.protocol_config.operations.commands]]
 name = "wait"
 weight = 0.02
-num_replicas = 2
-timeout_ms = 1000
+params = { num_replicas = 2, timeout_ms = 1000 }
 ```
 
 Now you're testing a realistic mix: mostly GETs, some SETs, occasional counter increments, batch reads, and periodic replication checks.
@@ -155,47 +154,55 @@ Uniform random keys are easy to understand but unrealistic. Real workloads have 
 
 **Zipfian** distribution models this. With a Zipfian exponent of 0.99, a tiny fraction of keys get most of the traffic:
 ```toml
-[workload.keys]
+[traffic_groups.protocol_config.keys]
 strategy = "zipfian"
-exponent = 0.99
-max = 1000000
+n = 1000000
+theta = 0.99
+value_size = 64
 ```
 
 This is perfect for CDN caching (some content is always popular), user sessions (active users generate more requests), or product catalogs (bestsellers dominate).
 
 **Gaussian** (normal) distribution clusters keys around a mean. This models temporal locality—recent data is hot, older data cools off:
 ```toml
-[workload.keys]
+[traffic_groups.protocol_config.keys]
 strategy = "gaussian"
 mean_pct = 0.5  # Center at 50% of key space
 std_dev_pct = 0.1  # 10% spread
 max = 10000
+value_size = 64
 ```
 
 Use this for time-series data, sliding windows, or any scenario where "recent" matters.
 
 **Sequential** access walks through keys in order. Good for range scans or import/export workloads:
 ```toml
-[workload.keys]
+[traffic_groups.protocol_config.keys]
 strategy = "sequential"
 start = 0
-max = 100000
+value_size = 64
 ```
 
-**Random** is truly uniform. Every key has equal probability. This is your baseline for understanding Redis's raw performance without hot keys skewing results.
+**Random** is truly uniform. Every key has equal probability. This is your baseline for understanding Redis's raw performance without hot keys skewing results:
+```toml
+[traffic_groups.protocol_config.keys]
+strategy = "random"
+max = 100000
+value_size = 64
+```
 
 ### Value Sizes
 
-Fixed-size values are clean for benchmarking:
+The `value_size` in keys configuration sets a fixed size. For variable sizes, add a separate `value_size` section:
 ```toml
-[workload.value_size]
+[traffic_groups.protocol_config.value_size]
 strategy = "fixed"
 size = 128  # All values are 128 bytes
 ```
 
 But production has variation. Some cache entries are tiny (user preferences), others are huge (HTML fragments). Model this with distributions:
 ```toml
-[workload.value_size]
+[traffic_groups.protocol_config.value_size]
 strategy = "normal"
 mean = 512.0
 std_dev = 128.0
@@ -203,17 +210,10 @@ min = 64
 max = 4096
 ```
 
-Or make value sizes command-specific. Small GETs, large SETs:
+Or use uniform distribution for evenly spread sizes:
 ```toml
-[workload.value_size]
-strategy = "per_command"
-
-[workload.value_size.commands.get]
-distribution = "fixed"
-size = 64
-
-[workload.value_size.commands.set]
-distribution = "uniform"
+[traffic_groups.protocol_config.value_size]
+strategy = "uniform"
 min = 256
 max = 2048
 ```

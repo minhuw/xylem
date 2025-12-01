@@ -18,47 +18,40 @@ duration = "60s"
 seed = 42
 
 [target]
-address = "127.0.0.1:6379"
-protocol = "redis"
 transport = "tcp"
 
-# Workload Configuration
-[workload]
+# Traffic Configuration
+[[traffic_groups]]
+name = "workload-a"
+protocol = "redis"
+target = "127.0.0.1:6379"
+threads = [0, 1, 2, 3]           # Use 4 threads
+connections_per_thread = 25      # 100 total connections
+max_pending_per_connection = 10  # Pipelining for throughput
+
 # Key space: 1 million records with Zipfian distribution
 # This creates a "hot key" pattern where ~20% of keys get ~80% of requests
-[workload.keys]
+[traffic_groups.protocol_config.keys]
 strategy = "zipfian"
 n = 1000000          # recordcount=1000000
 theta = 0.99         # YCSB default (skewed access pattern)
 value_size = 1000    # fieldcount=10 × fieldlength=100
 
 # Operation Mix: 50/50 read/update
-[workload.operations]
+[traffic_groups.protocol_config.operations]
 strategy = "weighted"
 
-[[workload.operations.commands]]
+[[traffic_groups.protocol_config.operations.commands]]
 name = "get"
 weight = 0.5  # readproportion=0.5
 
-[[workload.operations.commands]]
+[[traffic_groups.protocol_config.operations.commands]]
 name = "set"
 weight = 0.5  # updateproportion=0.5
 
-# Load Pattern: Constant rate
-[workload.pattern]
-type = "constant"
-rate = 10000.0  # 10K ops/sec (adjust based on system capacity)
-
-# Traffic Configuration
-[[traffic_groups]]
-name = "workload-a"
-threads = [0, 1, 2, 3]           # Use 4 threads
-connections_per_thread = 25      # 100 total connections
-max_pending_per_connection = 10  # Pipelining for throughput
-
-[traffic_groups.policy]
+[traffic_groups.traffic_policy]
 type = "fixed-rate"
-rate = 10000.0  # Match workload.pattern.rate (distributed across all threads)
+rate = 100.0  # Per-connection rate
 
 [traffic_groups.sampling_policy]
 type = "limited"

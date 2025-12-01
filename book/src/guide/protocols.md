@@ -10,12 +10,14 @@ Xylem supports multiple application protocols for different types of RPC workloa
 
 ## Protocol Selection
 
-Specify the protocol in your TOML profile configuration:
+Specify the protocol for each traffic group in your TOML profile configuration:
 
 ```toml
-[target]
+[[traffic_groups]]
+name = "main"
 protocol = "redis"
-address = "localhost:6379"
+target = "localhost:6379"
+# ...
 ```
 
 ## Protocol Architecture

@@ -9,47 +9,48 @@ seed = 7777
 duration = "60s"
 
 [target]
-address = "127.0.0.1:6379"
-protocol = "redis"
 transport = "tcp"
 
-[workload]
-[workload.keys]
-strategy = "sequential"
-start = 0
-value_size = 128
-
-[workload.pattern]
-type = "constant"
-rate = 50000.0      # Total: ~50K req/s
 
 # Traffic group 1: Slow connections (10% - 1 thread = ~12.5% of 8 threads)
 [[traffic_groups]]
-protocol = "redis"
 name = "slow-poisson"
+protocol = "redis"
+target = "127.0.0.1:6379"
 threads = [0]  # 1 thread for slow connections
 connections_per_thread = 50  # 50 slow connections
 max_pending_per_connection = 1
 
+[traffic_groups.protocol_config.keys]
+strategy = "sequential"
+start = 0
+value_size = 128
+
 [traffic_groups.sampling_policy]
 type = "unlimited"  # 100% sampling
 
-[traffic_groups.policy]
+[traffic_groups.traffic_policy]
 type = "poisson"
 rate = 1.0  # 1 req/s mean per connection
 
 # Traffic group 2: Fast connections (90% - 7 threads = ~87.5% of 8 threads)
 [[traffic_groups]]
-protocol = "redis"
 name = "fast-poisson"
+protocol = "redis"
+target = "127.0.0.1:6379"
 threads = [1, 2, 3, 4, 5, 6, 7]  # 7 threads for fast connections
 connections_per_thread = 136  # ~950 total fast connections (7 * 136)
 max_pending_per_connection = 1
 
+[traffic_groups.protocol_config.keys]
+strategy = "sequential"
+start = 0
+value_size = 128
+
 [traffic_groups.sampling_policy]
 type = "unlimited"  # 100% sampling
 
-[traffic_groups.policy]
+[traffic_groups.traffic_policy]
 type = "poisson"
 rate = 100.0  # 100 req/s mean per connection
 

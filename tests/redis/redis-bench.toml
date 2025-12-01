@@ -7,32 +7,27 @@ duration = "30s"
 seed = 42
 
 [target]
-address = "127.0.0.1:6379"
-protocol = "redis"
 transport = "tcp"
-
-[workload]
-[workload.keys]
-strategy = "sequential"
-start = 0
-value_size = 64
-
-[workload.operations]
-strategy = "fixed"
-operation = "get"
-
-[workload.pattern]
-type = "constant"
-rate = 10000.0
 
 # Latency agent - optimized for accurate latency measurements
 [[traffic_groups]]
 name = "latency-agent"
+protocol = "redis"
+target = "127.0.0.1:6379"
 threads = [0]
 connections_per_thread = 10
 max_pending_per_connection = 1
 
-[traffic_groups.policy]
+[traffic_groups.protocol_config.keys]
+strategy = "sequential"
+start = 0
+value_size = 64
+
+[traffic_groups.protocol_config.operations]
+strategy = "fixed"
+operation = "get"
+
+[traffic_groups.traffic_policy]
 type = "fixed-rate"
 rate = 5000.0
 
@@ -42,11 +37,22 @@ type = "unlimited"
 # Throughput agent - optimized for high throughput
 [[traffic_groups]]
 name = "throughput-agent"
+protocol = "redis"
+target = "127.0.0.1:6379"
 threads = [1, 2, 3]
 connections_per_thread = 25
 max_pending_per_connection = 32
 
-[traffic_groups.policy]
+[traffic_groups.protocol_config.keys]
+strategy = "sequential"
+start = 0
+value_size = 64
+
+[traffic_groups.protocol_config.operations]
+strategy = "fixed"
+operation = "get"
+
+[traffic_groups.traffic_policy]
 type = "fixed-rate"
 rate = 5000.0
 

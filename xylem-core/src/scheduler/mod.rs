@@ -57,8 +57,9 @@ pub mod ready_heap;
 
 // Re-export main types
 pub use policy::{
-    AdaptivePolicy, ClosedLoopPolicy, FactoryPolicyScheduler, FixedRatePolicy,
-    PerConnectionPolicyScheduler, PoissonPolicy, Policy, PolicyScheduler, UniformPolicyScheduler,
+    AdaptivePolicy, ClosedLoopPolicy, FactoryPolicyScheduler, FixedRatePolicy, PatternAwarePolicy,
+    PatternPolicyScheduler, PerConnectionPolicyScheduler, PoissonPolicy, Policy, PolicyScheduler,
+    UniformPolicyScheduler,
 };
 
 pub use ready_heap::ReadyHeap;

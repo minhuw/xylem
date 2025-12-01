@@ -50,27 +50,33 @@ fn test_detailed_json_output_generation() {
         }),
     );
 
-    // Create traffic group configs
+    // Create traffic group configs with required protocol_config
+    let protocol_config = Some(serde_json::json!({
+        "keys": {"strategy": "sequential", "start": 0, "value_size": 64}
+    }));
+
     let traffic_groups = vec![
         TrafficGroupConfig {
             name: "fast-group".to_string(),
             threads: vec![0, 1],
             connections_per_thread: 10,
             max_pending_per_connection: 100,
-            protocol: Some("redis".to_string()),
-            target: None,
-            policy: PolicyConfig::ClosedLoop,
+            protocol: "redis".to_string(),
+            target: "127.0.0.1:6379".to_string(),
+            traffic_policy: PolicyConfig::ClosedLoop,
             sampling_policy: policy1,
+            protocol_config: protocol_config.clone(),
         },
         TrafficGroupConfig {
             name: "slow-group".to_string(),
             threads: vec![2],
             connections_per_thread: 5,
             max_pending_per_connection: 50,
-            protocol: Some("redis-cluster".to_string()),
-            target: None,
-            policy: PolicyConfig::FixedRate { rate: 1000.0 },
+            protocol: "redis-cluster".to_string(),
+            target: "127.0.0.1:6380".to_string(),
+            traffic_policy: PolicyConfig::FixedRate { rate: 1000.0 },
             sampling_policy: policy2,
+            protocol_config: protocol_config.clone(),
         },
     ];
 
@@ -146,15 +152,20 @@ fn test_json_serialization_deserialization() {
 
     group_stats.set_group_metadata(0, serde_json::json!({"test": "data"}));
 
+    let protocol_config = Some(serde_json::json!({
+        "keys": {"strategy": "sequential", "start": 0, "value_size": 64}
+    }));
+
     let traffic_groups = vec![TrafficGroupConfig {
         name: "test".to_string(),
         threads: vec![0],
         connections_per_thread: 1,
         max_pending_per_connection: 1,
-        protocol: Some("redis".to_string()),
-        target: None,
-        policy: PolicyConfig::ClosedLoop,
+        protocol: "redis".to_string(),
+        target: "127.0.0.1:6379".to_string(),
+        traffic_policy: PolicyConfig::ClosedLoop,
         sampling_policy: policy,
+        protocol_config,
     }];
 
     let results = DetailedExperimentResults::from_group_stats(
@@ -193,15 +204,20 @@ fn test_html_report_generation() {
         group_stats.record_latency(0, Duration::from_micros(150));
     }
 
+    let protocol_config = Some(serde_json::json!({
+        "keys": {"strategy": "sequential", "start": 0, "value_size": 64}
+    }));
+
     let traffic_groups = vec![TrafficGroupConfig {
         name: "test-group".to_string(),
         threads: vec![0],
         connections_per_thread: 10,
         max_pending_per_connection: 100,
-        protocol: Some("redis".to_string()),
-        target: None,
-        policy: PolicyConfig::ClosedLoop,
+        protocol: "redis".to_string(),
+        target: "127.0.0.1:6379".to_string(),
+        traffic_policy: PolicyConfig::ClosedLoop,
         sampling_policy: policy,
+        protocol_config,
     }];
 
     let results = DetailedExperimentResults::from_group_stats(
@@ -262,26 +278,32 @@ fn test_per_group_statistics_isolation() {
         group_stats.record_latency(1, Duration::from_micros(500));
     }
 
+    let protocol_config = Some(serde_json::json!({
+        "keys": {"strategy": "sequential", "start": 0, "value_size": 64}
+    }));
+
     let traffic_groups = vec![
         TrafficGroupConfig {
             name: "fast".to_string(),
             threads: vec![0],
             connections_per_thread: 10,
             max_pending_per_connection: 100,
-            protocol: Some("redis".to_string()),
-            target: None,
-            policy: PolicyConfig::ClosedLoop,
+            protocol: "redis".to_string(),
+            target: "127.0.0.1:6379".to_string(),
+            traffic_policy: PolicyConfig::ClosedLoop,
             sampling_policy: policy1,
+            protocol_config: protocol_config.clone(),
         },
         TrafficGroupConfig {
             name: "slow".to_string(),
             threads: vec![1],
             connections_per_thread: 5,
             max_pending_per_connection: 50,
-            protocol: Some("redis".to_string()),
-            target: None,
-            policy: PolicyConfig::ClosedLoop,
+            protocol: "redis".to_string(),
+            target: "127.0.0.1:6379".to_string(),
+            traffic_policy: PolicyConfig::ClosedLoop,
             sampling_policy: policy2,
+            protocol_config,
         },
     ];
 

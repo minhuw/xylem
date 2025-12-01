@@ -23,6 +23,11 @@ const MAX_PAYLOAD: usize = 65536; // 64KB
 pub type TrafficGroupConfig =
     (usize, SocketAddr, usize, usize, Box<dyn crate::scheduler::PolicyScheduler>);
 
+/// Unix traffic group configuration: (group_id, path, conn_count, max_pending_per_conn, policy_scheduler)
+/// Uses String paths instead of SocketAddr for Unix domain sockets
+pub type UnixTrafficGroupConfig =
+    (usize, String, usize, usize, Box<dyn crate::scheduler::PolicyScheduler>);
+
 /// Pending request tracking
 #[derive(Debug)]
 struct PendingRequest {
@@ -445,6 +450,16 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         }
     }
 
+    /// Get the next time when a connection will be ready to send
+    ///
+    /// Returns `Some(time_ns)` for the earliest time a connection will be ready,
+    /// or `None` if a connection is ready now (closed-loop) or heap is empty.
+    ///
+    /// Useful for determining how long to sleep in the worker loop.
+    pub fn peek_next_ready_time(&self) -> Option<u64> {
+        self.ready_heap.peek_next_time()
+    }
+
     /// Get connection state by ID
     pub fn get_state(&self, connection_id: usize) -> Option<&ConnectionState<ReqId>> {
         self.connection_states.get(&connection_id)
@@ -458,6 +473,36 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
     /// Iterate over all connection IDs
     pub fn connection_ids(&self) -> &[usize] {
         &self.connection_ids
+    }
+
+    /// Get mapping of connection ID to target address
+    ///
+    /// Useful for protocols that need to know which connections go to which targets
+    /// (e.g., Redis Cluster routing).
+    pub fn connection_targets(&self) -> Vec<(usize, SocketAddr)> {
+        self.connection_ids
+            .iter()
+            .filter_map(|&id| self.connection_states.get(&id).map(|s| (id, s.target())))
+            .collect()
+    }
+
+    /// Get mapping of connection ID to target address for a specific traffic group
+    ///
+    /// Filters connections to only those belonging to the specified group_id.
+    /// Essential for Redis Cluster to avoid routing to connections from other groups.
+    pub fn connection_targets_for_group(&self, group_id: usize) -> Vec<(usize, SocketAddr)> {
+        self.connection_ids
+            .iter()
+            .filter_map(|&id| {
+                self.connection_states.get(&id).and_then(|s| {
+                    if s.group_id() == group_id {
+                        Some((id, s.target()))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect()
     }
 
     /// Get connection count
@@ -494,5 +539,60 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         self.connection_ids.clear();
         self.group.close_all()?;
         Ok(())
+    }
+}
+
+/// Specialized implementation for Unix domain sockets
+impl<ReqId: Eq + Hash + Clone + std::fmt::Debug>
+    ConnectionPool<xylem_transport::UnixConnectionGroup, ReqId>
+{
+    /// Create a new connection pool for Unix domain sockets with path-based targets
+    ///
+    /// This method uses string paths instead of SocketAddr for Unix socket targets.
+    pub fn new_multi_group_unix(
+        factory: &xylem_transport::UnixTransportFactory,
+        groups: Vec<UnixTrafficGroupConfig>,
+    ) -> Result<Self> {
+        let total_connections: usize = groups.iter().map(|(_, _, count, _, _)| count).sum();
+        let mut group = factory.create_group()?;
+        let mut connection_states = HashMap::with_capacity(total_connections);
+        let mut connection_ids = Vec::with_capacity(total_connections);
+        let mut ready_heap = ReadyHeap::new();
+        let current_time_ns = crate::timing::time_ns();
+        let mut idx = 0;
+
+        // Placeholder address for Unix sockets (not used for actual connections)
+        let placeholder_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+
+        for (group_id, path, connection_count, max_pending_per_connection, mut policy_scheduler) in
+            groups
+        {
+            for _ in 0..connection_count {
+                let connection_id = group.add_connection_path(&path)?;
+                let mut policy = policy_scheduler.assign_policy(idx);
+
+                // Get initial next_send_time and add to heap
+                let next_send_time = policy.next_send_time(current_time_ns);
+                ready_heap.push(connection_id, next_send_time);
+
+                let state = ConnectionState::new(
+                    connection_id,
+                    placeholder_addr, // Unix sockets don't have a SocketAddr
+                    max_pending_per_connection,
+                    policy,
+                    group_id,
+                );
+                connection_states.insert(connection_id, state);
+                connection_ids.push(connection_id);
+                idx += 1;
+            }
+        }
+
+        Ok(Self {
+            group,
+            connection_states,
+            connection_ids,
+            ready_heap,
+        })
     }
 }

@@ -148,6 +148,32 @@ impl RedisClusterProtocol {
         }
     }
 
+    /// Clear all connection registrations
+    ///
+    /// Used when re-wiring connections after pool creation.
+    pub fn clear_connections(&mut self) {
+        self.conn_to_node.clear();
+        self.node_to_conn.clear();
+        self.default_node = None;
+    }
+
+    /// Re-register connections from actual pool mappings
+    ///
+    /// Call this after ConnectionPool creation to wire up the actual connection IDs.
+    ///
+    /// # Arguments
+    ///
+    /// * `connections` - Iterator of (connection_id, target_address) pairs
+    pub fn register_connections<I>(&mut self, connections: I)
+    where
+        I: IntoIterator<Item = (usize, SocketAddr)>,
+    {
+        self.clear_connections();
+        for (conn_id, addr) in connections {
+            self.register_connection(addr, conn_id);
+        }
+    }
+
     /// Update cluster topology with new slot ranges
     ///
     /// # Arguments

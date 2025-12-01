@@ -15,48 +15,51 @@ duration = "60s"
 seed = 42  # For reproducibility
 
 [target]
-address = "127.0.0.1:6379"
-protocol = "redis"
 transport = "tcp"
 
-[workload.keys]
+
+# TRAFFIC GROUP 1: Latency Measurement (like Lancet's latency agent)
+[[traffic_groups]]
+name = "latency-measurement"
+protocol = "redis"
+target = "127.0.0.1:6379"
+threads = [0, 1]  # Explicit thread assignment
+connections_per_thread = 5
+max_pending_per_connection = 1  # Single outstanding request for accurate latency
+
+[traffic_groups.protocol_config.keys]
 strategy = "zipfian"
 n = 1000000
 theta = 0.99
 value_size = 64
 
-[workload.pattern]
-type = "constant"
-rate = 100000.0  # Total target rate across all groups
-
-# TRAFFIC GROUP 1: Latency Measurement (like Lancet's latency agent)
-[[traffic_groups]]
-protocol = "redis"
-name = "latency-measurement"
-threads = [0, 1]  # Explicit thread assignment
-connections_per_thread = 5
-max_pending_per_connection = 1  # Single outstanding request for accurate latency
-
 [traffic_groups.sampling_policy]
 type = "unlimited"  # 100% sampling - capture every request
 
-[traffic_groups.policy]
+[traffic_groups.traffic_policy]
 type = "poisson"
 rate = 2000.0  # Low rate: 2K req/s for latency measurement
 
 # TRAFFIC GROUP 2: Throughput Generation (like Lancet's throughput agent)
 [[traffic_groups]]
-protocol = "redis"
 name = "throughput-generation"
+protocol = "redis"
+target = "127.0.0.1:6379"
 threads = [2, 3, 4, 5]  # More threads for high throughput
 connections_per_thread = 25
 max_pending_per_connection = 32  # High pipelining for max throughput
+
+[traffic_groups.protocol_config.keys]
+strategy = "zipfian"
+n = 1000000
+theta = 0.99
+value_size = 64
 
 [traffic_groups.sampling_policy]
 type = "limited"
 rate = 0.01  # 1% sampling - reduce memory overhead
 
-[traffic_groups.policy]
+[traffic_groups.traffic_policy]
 type = "closed-loop"  # Max throughput mode
 
 [output]

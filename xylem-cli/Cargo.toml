@@ -28,7 +28,7 @@ workspace = true
 
 [dependencies]
 xylem-core = { path = "../xylem-core", features = ["schema"] }
-xylem-protocols = { path = "../xylem-protocols" }
+xylem-protocols = { path = "../xylem-protocols", features = ["schema"] }
 xylem-transport = { path = "../xylem-transport" }
 
 clap = { workspace = true }

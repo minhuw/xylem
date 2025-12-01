@@ -556,6 +556,152 @@ impl PolicyScheduler for FactoryPolicyScheduler {
     }
 }
 
+/// Pattern-aware policy that dynamically adjusts rate based on elapsed time
+///
+/// This policy wraps a `LoadPattern` and updates its target rate on each
+/// `next_send_time` call based on the pattern's rate at the current elapsed time.
+/// This enables truly time-varying workloads like sinusoidal, ramp, spike patterns.
+pub struct PatternAwarePolicy {
+    pattern: std::sync::Arc<dyn crate::workload::LoadPattern>,
+    start_time_ns: u64,
+    current_rate: f64,
+    inter_arrival_ns: u64,
+    last_send_time_ns: Option<u64>,
+    last_rate_update_ns: u64,
+}
+
+impl PatternAwarePolicy {
+    /// Create a new pattern-aware policy
+    ///
+    /// # Parameters
+    /// - `pattern`: The load pattern that determines rate over time
+    /// - `start_time_ns`: The experiment start time in nanoseconds
+    pub fn new(
+        pattern: std::sync::Arc<dyn crate::workload::LoadPattern>,
+        start_time_ns: u64,
+    ) -> Self {
+        let initial_rate = pattern.rate_at(Duration::ZERO);
+        let inter_arrival_ns = if initial_rate > 0.0 {
+            (1_000_000_000.0 / initial_rate) as u64
+        } else {
+            u64::MAX
+        };
+        Self {
+            pattern,
+            start_time_ns,
+            current_rate: initial_rate,
+            inter_arrival_ns,
+            last_send_time_ns: None,
+            last_rate_update_ns: start_time_ns,
+        }
+    }
+
+    /// Update the rate based on current elapsed time
+    fn update_rate(&mut self, current_time_ns: u64) {
+        // Only update rate every 10ms to avoid excessive computation
+        if current_time_ns.saturating_sub(self.last_rate_update_ns) < 10_000_000 {
+            return;
+        }
+
+        let elapsed = Duration::from_nanos(current_time_ns.saturating_sub(self.start_time_ns));
+        let new_rate = self.pattern.rate_at(elapsed);
+
+        if (new_rate - self.current_rate).abs() > 0.01 {
+            self.current_rate = new_rate;
+            self.inter_arrival_ns = if new_rate > 0.0 {
+                (1_000_000_000.0 / new_rate) as u64
+            } else {
+                u64::MAX
+            };
+        }
+        self.last_rate_update_ns = current_time_ns;
+    }
+}
+
+impl Policy for PatternAwarePolicy {
+    fn next_send_time(&mut self, current_time_ns: u64) -> Option<u64> {
+        // Update rate based on current time
+        self.update_rate(current_time_ns);
+
+        match self.last_send_time_ns {
+            Some(last_time) => Some(last_time + self.inter_arrival_ns),
+            None => Some(0), // First request: send immediately
+        }
+    }
+
+    fn on_request_sent(&mut self, sent_time_ns: u64) {
+        self.last_send_time_ns = Some(sent_time_ns);
+    }
+
+    fn reset(&mut self) {
+        self.last_send_time_ns = None;
+        self.last_rate_update_ns = self.start_time_ns;
+        self.current_rate = self.pattern.rate_at(Duration::ZERO);
+        self.inter_arrival_ns = if self.current_rate > 0.0 {
+            (1_000_000_000.0 / self.current_rate) as u64
+        } else {
+            u64::MAX
+        };
+    }
+
+    fn name(&self) -> &'static str {
+        "PatternAware"
+    }
+
+    fn set_target_rate(&mut self, rate: f64) {
+        // Override pattern rate temporarily (used by external rate controllers)
+        self.current_rate = rate;
+        self.inter_arrival_ns = if rate > 0.0 {
+            (1_000_000_000.0 / rate) as u64
+        } else {
+            u64::MAX
+        };
+    }
+}
+
+/// Pattern-based policy scheduler for time-varying traffic
+///
+/// Uses a `LoadPattern` to determine the target rate at each point in time.
+/// Each connection gets a `PatternAwarePolicy` that dynamically updates its
+/// rate based on elapsed time since the experiment started.
+///
+/// This enables realistic time-varying workloads like:
+/// - Sinusoidal (diurnal traffic patterns)
+/// - Ramp (gradual increase/decrease)
+/// - Spike (sudden bursts)
+/// - Sawtooth (repeated ramps)
+pub struct PatternPolicyScheduler {
+    pattern: std::sync::Arc<dyn crate::workload::LoadPattern>,
+    start_time_ns: Option<u64>,
+}
+
+impl PatternPolicyScheduler {
+    /// Create a new pattern-based scheduler
+    ///
+    /// # Parameters
+    /// - `pattern`: The load pattern that determines rate over time
+    pub fn new(pattern: Box<dyn crate::workload::LoadPattern>) -> Self {
+        Self {
+            pattern: std::sync::Arc::from(pattern),
+            start_time_ns: None,
+        }
+    }
+}
+
+impl PolicyScheduler for PatternPolicyScheduler {
+    fn assign_policy(&mut self, _conn_id: usize) -> Box<dyn Policy> {
+        // Initialize start time on first policy assignment
+        let start_time = *self.start_time_ns.get_or_insert_with(crate::timing::time_ns);
+
+        // Create a pattern-aware policy that dynamically updates rate
+        Box::new(PatternAwarePolicy::new(self.pattern.clone(), start_time))
+    }
+
+    fn name(&self) -> &'static str {
+        "Pattern"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -7,32 +7,27 @@ duration = "30s"
 seed = 42
 
 [target]
-address = "127.0.0.1:6379"
-protocol = "redis"
 transport = "tcp"
 
-[workload]
-[workload.keys]
+[[traffic_groups]]
+name = "main"
+protocol = "redis"
+target = "127.0.0.1:6379"
+threads = [0, 1, 2, 3]
+connections_per_thread = 25
+max_pending_per_connection = 10
+
+[traffic_groups.protocol_config.keys]
 strategy = "zipfian"
 n = 100000
 theta = 0.99
 value_size = 64
 
-[workload.operations]
+[traffic_groups.protocol_config.operations]
 strategy = "fixed"
 operation = "get"
 
-[workload.pattern]
-type = "constant"
-rate = 10000.0
-
-[[traffic_groups]]
-name = "main"
-threads = [0, 1, 2, 3]
-connections_per_thread = 25
-max_pending_per_connection = 10
-
-[traffic_groups.policy]
+[traffic_groups.traffic_policy]
 type = "fixed-rate"
 rate = 10000.0
 

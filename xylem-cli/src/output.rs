@@ -242,6 +242,7 @@ pub struct GlobalStats {
 pub struct TrafficGroupResults {
     pub id: usize,
     pub name: String,
+    pub target: String,
     pub protocol: String,
     pub threads: Vec<usize>,
     pub connections: usize,
@@ -310,9 +311,9 @@ impl DetailedExperimentResults {
         let mut traffic_groups = Vec::new();
         for (group_id, config) in traffic_group_configs.iter().enumerate() {
             if let Some(aggregated) = per_group_aggregated.get(&group_id) {
-                let protocol_name = config.protocol.as_ref().unwrap_or(&target_protocol).clone();
+                let protocol_name = config.protocol.clone();
 
-                let policy_str = match &config.policy {
+                let policy_str = match &config.traffic_policy {
                     xylem_core::traffic_group::PolicyConfig::ClosedLoop => {
                         "closed-loop".to_string()
                     }
@@ -325,11 +326,62 @@ impl DetailedExperimentResults {
                     xylem_core::traffic_group::PolicyConfig::Adaptive { .. } => {
                         "adaptive".to_string()
                     }
+                    xylem_core::traffic_group::PolicyConfig::Sinusoidal {
+                        base_rate,
+                        amplitude,
+                        period,
+                        ..
+                    } => {
+                        format!(
+                            "sinusoidal(base={}, amp={}, period={}s)",
+                            base_rate,
+                            amplitude,
+                            period.as_secs_f64()
+                        )
+                    }
+                    xylem_core::traffic_group::PolicyConfig::Ramp {
+                        start_rate,
+                        end_rate,
+                        duration,
+                    } => {
+                        format!(
+                            "ramp({} -> {} over {}s)",
+                            start_rate,
+                            end_rate,
+                            duration.as_secs_f64()
+                        )
+                    }
+                    xylem_core::traffic_group::PolicyConfig::Spike {
+                        normal_rate,
+                        spike_rate,
+                        spike_duration,
+                        ..
+                    } => {
+                        format!(
+                            "spike(normal={}, spike={}, dur={}s)",
+                            normal_rate,
+                            spike_rate,
+                            spike_duration.as_secs_f64()
+                        )
+                    }
+                    xylem_core::traffic_group::PolicyConfig::Sawtooth {
+                        min_rate,
+                        max_rate,
+                        period,
+                    } => {
+                        format!(
+                            "sawtooth({}-{}, period={}s)",
+                            min_rate,
+                            max_rate,
+                            period.as_secs_f64()
+                        )
+                    }
                 };
 
                 let group_result = TrafficGroupResults {
                     id: group_id,
                     name: config.name.clone(),
+                    target: config.target.clone(),
                     protocol: protocol_name,
                     threads: config.threads.clone(),
                     connections: config.connections_per_thread * config.threads.len(),
@@ -393,8 +445,8 @@ impl DetailedExperimentResults {
             println!("Seed: {}", seed);
         }
         println!();
-        println!("Target: {} ({})", self.target.address, self.target.protocol);
         println!("Transport: {}", self.target.transport);
+        println!("Traffic Groups: {}", self.traffic_groups.len());
         println!();
 
         println!("{}", "-".repeat(70));
@@ -422,7 +474,7 @@ impl DetailedExperimentResults {
             println!("{}", "-".repeat(70));
             println!("TRAFFIC GROUP {}: {}", i, group.name);
             println!("{}", "-".repeat(70));
-            println!("Protocol:        {}", group.protocol);
+            println!("Target:          {} ({})", group.target, group.protocol);
             println!("Policy:          {}", group.policy);
             println!("Threads:         {:?}", group.threads);
             println!("Connections:     {}", group.connections);

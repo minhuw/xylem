@@ -8,49 +8,51 @@ seed = 42
 duration = "30s"
 
 [target]
-address = "127.0.0.1:6379"  # Default address (can be overridden per group if needed)
-# No global protocol - each group specifies its own
 transport = "tcp"
 
-[workload]
-[workload.keys]
-strategy = "zipfian"
-n = 100000        # 100K key space
-theta = 0.99      # High skew
-value_size = 64
-
-[workload.pattern]
-type = "constant"
-rate = 20000.0  # 20K req/s total
 
 # Redis workload on threads 0-1
 [[traffic_groups]]
 name = "redis-load"
 protocol = "redis"
+target = "127.0.0.1:6379"
 threads = [0, 1]
 connections_per_thread = 10
 max_pending_per_connection = 8
+
+[traffic_groups.protocol_config.keys]
+strategy = "zipfian"
+n = 100000        # 100K key space
+theta = 0.99      # High skew
+value_size = 64
 
 [traffic_groups.sampling_policy]
 type = "limited"
 rate = 0.1  # 10% sampling
 
-[traffic_groups.policy]
+[traffic_groups.traffic_policy]
 type = "closed-loop"
 
 # Memcached workload on the same threads 0-1
 [[traffic_groups]]
 name = "memcached-load"
 protocol = "memcached-binary"
+target = "127.0.0.1:11211"
 threads = [0, 1]  # Same threads as Redis!
 connections_per_thread = 10
 max_pending_per_connection = 8
+
+[traffic_groups.protocol_config.keys]
+strategy = "zipfian"
+n = 100000        # 100K key space
+theta = 0.99      # High skew
+value_size = 64
 
 [traffic_groups.sampling_policy]
 type = "limited"
 rate = 0.1  # 10% sampling
 
-[traffic_groups.policy]
+[traffic_groups.traffic_policy]
 type = "closed-loop"
 
 [output]

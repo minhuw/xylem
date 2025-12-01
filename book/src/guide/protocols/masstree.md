@@ -115,31 +115,27 @@ Real database workloads exhibit patterns: read-heavy vs write-heavy ratios, hot 
 Start with pure operations. A GET-only workload tests read performance under snapshot isolation:
 
 ```toml
-[protocol]
-type = "masstree"
+[traffic_groups.protocol_config.operations]
+strategy = "fixed"
 operation = "get"
 ```
 
 But production databases handle mixed workloads. Model a typical application with 60% reads, 30% updates, 10% deletes:
 
 ```toml
-[protocol]
-type = "masstree"
-operation = "get"  # Default operation
-
-# Define a weighted mix
-[workload.operations]
+# Define a weighted mix in protocol_config
+[traffic_groups.protocol_config.operations]
 strategy = "weighted"
 
-[[workload.operations.commands]]
+[[traffic_groups.protocol_config.operations.commands]]
 name = "get"
 weight = 0.6
 
-[[workload.operations.commands]]
+[[traffic_groups.protocol_config.operations.commands]]
 name = "set"
 weight = 0.3
 
-[[workload.operations.commands]]
+[[traffic_groups.protocol_config.operations.commands]]
 name = "remove"
 weight = 0.1
 ```
@@ -147,28 +143,26 @@ weight = 0.1
 Add column-based updates to model partial record modifications:
 
 ```toml
-[[workload.operations.commands]]
+[[traffic_groups.protocol_config.operations.commands]]
 name = "put"
 weight = 0.1
 # Update columns 0 and 2 (e.g., timestamp and counter)
-columns = [[0, "2024-11-12T10:30:00Z"], [2, "42"]]
+params = { columns = [[0, "2024-11-12T10:30:00Z"], [2, "42"]] }
 ```
 
 Include range queries for analytics workloads:
 
 ```toml
-[[workload.operations.commands]]
+[[traffic_groups.protocol_config.operations.commands]]
 name = "scan"
 weight = 0.05
-firstkey = "user:0"
-count = 100
-fields = [0, 1]  # Return only fields 0 and 1
+params = { firstkey = "user:0", count = 100, fields = [0, 1] }
 ```
 
 Trigger periodic checkpoints to test persistence overhead:
 
 ```toml
-[[workload.operations.commands]]
+[[traffic_groups.protocol_config.operations.commands]]
 name = "checkpoint"
 weight = 0.001  # Once per thousand operations
 ```
@@ -182,10 +176,11 @@ Uniform random keys rarely reflect production workloads. Real systems exhibit sk
 **Zipfian** distribution models skewed access. With exponent 0.99, a small fraction of keys receive most of the traffic:
 
 ```toml
-[workload.keys]
+[traffic_groups.protocol_config.keys]
 strategy = "zipfian"
-exponent = 0.99
-max = 1000000
+n = 1000000
+theta = 0.99
+value_size = 256
 ```
 
 This models user databases where active users dominate, e-commerce where bestsellers get most queries, or social networks where popular content drives traffic.
@@ -193,11 +188,12 @@ This models user databases where active users dominate, e-commerce where bestsel
 **Gaussian** (normal) distribution clusters keys around a center, modeling temporal locality where recent records are hot:
 
 ```toml
-[workload.keys]
+[traffic_groups.protocol_config.keys]
 strategy = "gaussian"
 mean_pct = 0.5  # Center of key space
 std_dev_pct = 0.1
 max = 10000
+value_size = 256
 ```
 
 Use this for time-series data where recent timestamps matter, or any sliding-window workload.
@@ -205,20 +201,20 @@ Use this for time-series data where recent timestamps matter, or any sliding-win
 **Sequential** access walks through keys in order. Perfect for testing SCAN performance or bulk imports:
 
 ```toml
-[workload.keys]
+[traffic_groups.protocol_config.keys]
 strategy = "sequential"
 start = 0
-max = 100000
+value_size = 256
 ```
 
 This is also how you test worst-case behavior in trees—sequential inserts can stress rebalancing.
 
 ### Value Sizes
 
-Fixed-size values simplify analysis:
+The `value_size` in keys configuration sets a fixed size. For variable sizes, use the `value_size` section:
 
 ```toml
-[workload.value_size]
+[traffic_groups.protocol_config.value_size]
 strategy = "fixed"
 size = 256  # All values are 256 bytes
 ```
@@ -226,7 +222,7 @@ size = 256  # All values are 256 bytes
 But real databases have variation. Some records are small (user preferences), others are large (document content):
 
 ```toml
-[workload.value_size]
+[traffic_groups.protocol_config.value_size]
 strategy = "normal"
 mean = 1024.0
 std_dev = 256.0
@@ -234,18 +230,11 @@ min = 128
 max = 8192
 ```
 
-Or make sizes operation-specific. Small GETs (hot metadata), large SETs (batch updates):
+Or use uniform distribution for evenly spread sizes:
 
 ```toml
-[workload.value_size]
-strategy = "per_command"
-
-[workload.value_size.commands.get]
-distribution = "fixed"
-size = 128
-
-[workload.value_size.commands.set]
-distribution = "uniform"
+[traffic_groups.protocol_config.value_size]
+strategy = "uniform"
 min = 512
 max = 4096
 ```
@@ -263,25 +252,30 @@ GET operations never block on writes, and writes never block reads. This provide
 To test snapshot isolation, run concurrent readers and writers on the same keys:
 
 ```toml
-[runtime]
-num_threads = 16
+[[traffic_groups]]
+name = "mvcc-test"
+protocol = "masstree"
+target = "localhost:2117"
+threads = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
 connections_per_thread = 10
+max_pending_per_connection = 1
 
-[workload.operations]
+[traffic_groups.protocol_config.operations]
 strategy = "weighted"
 
-[[workload.operations.commands]]
+[[traffic_groups.protocol_config.operations.commands]]
 name = "get"
 weight = 0.7
 
-[[workload.operations.commands]]
+[[traffic_groups.protocol_config.operations.commands]]
 name = "set"
 weight = 0.3
 
-[workload.keys]
+[traffic_groups.protocol_config.keys]
 strategy = "zipfian"
-exponent = 1.2  # Very hot keys
-max = 1000
+n = 1000
+theta = 1.2  # Very hot keys
+value_size = 256
 ```
 
 This creates contention on hot keys. Measure:
@@ -359,18 +353,14 @@ SCAN performance depends on how much data you're fetching:
 
 ```toml
 # Small scans (10 records)
-[[workload.operations.commands]]
+[[traffic_groups.protocol_config.operations.commands]]
 name = "scan"
-firstkey = "user:0"
-count = 10
-fields = [0, 1]  # Only essential fields
+params = { firstkey = "user:0", count = 10, fields = [0, 1] }  # Only essential fields
 
 # Large scans (1000 records)
-[[workload.operations.commands]]
+[[traffic_groups.protocol_config.operations.commands]]
 name = "scan"
-firstkey = "metrics:2024-11-01"
-count = 1000
-fields = []  # All fields
+params = { firstkey = "metrics:2024-11-01", count = 1000 }  # All fields
 ```
 
 Measure:
@@ -386,12 +376,12 @@ Checkpoints serialize the database to disk, consuming time and I/O resources:
 
 ```toml
 # Frequent checkpoints (high durability, low throughput)
-[[workload.operations.commands]]
+[[traffic_groups.protocol_config.operations.commands]]
 name = "checkpoint"
 weight = 0.01  # 1% of operations
 
 # Rare checkpoints (high throughput, lower durability)
-[[workload.operations.commands]]
+[[traffic_groups.protocol_config.operations.commands]]
 name = "checkpoint"
 weight = 0.0001  # 0.01% of operations
 ```
@@ -412,9 +402,9 @@ PUT operations are more efficient than read-modify-write cycles:
 # This requires two network round-trips and full value transfer
 
 # Efficient: PUT (update specific columns)
-[[workload.operations.commands]]
+[[traffic_groups.protocol_config.operations.commands]]
 name = "put"
-columns = [[0, "new_value"]]  # Only update column 0
+params = { columns = [[0, "new_value"]] }  # Only update column 0
 ```
 
 Benchmark the difference:

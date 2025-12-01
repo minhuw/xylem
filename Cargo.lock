@@ -1639,6 +1639,7 @@ dependencies = [
  "rand_distr 0.5.1",
  "rmp",
  "rmp-serde",
+ "schemars",
  "serde",
  "serde_json",
  "xylem-core",

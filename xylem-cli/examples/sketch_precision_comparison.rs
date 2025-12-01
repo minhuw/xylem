@@ -65,27 +65,27 @@ seed = 42
 duration = "10s"
 
 [target]
-address = "127.0.0.1:{port}"
-protocol = "redis"
-
-[workload]
-[workload.keys]
-strategy = "random"
-max = 10000
-value_size = 64
-
-[workload.pattern]
-type = "constant"
-rate = 10000.0
+transport = "tcp"
 
 [[traffic_groups]]
 name = "main"
+protocol = "redis"
+target = "127.0.0.1:{port}"
 threads = [0]
 connections_per_thread = 64
 max_pending_per_connection = 1
 {sampling_policy}
 
-[traffic_groups.policy]
+[traffic_groups.protocol_config.keys]
+strategy = "random"
+max = 10000
+value_size = 64
+
+[traffic_groups.protocol_config.operations]
+strategy = "fixed"
+operation = "get"
+
+[traffic_groups.traffic_policy]
 type = "closed-loop"
 
 [output]

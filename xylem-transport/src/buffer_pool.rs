@@ -223,4 +223,120 @@ mod tests {
         let maybe = MaybePooledBuffer::owned(owned);
         assert_eq!(maybe.as_slice(), &[1, 2, 3]);
     }
+
+    #[test]
+    fn test_buffer_pool_default() {
+        let pool = BufferPool::default();
+        let buf = pool.get();
+        assert!(buf.capacity() >= DEFAULT_BUFFER_SIZE);
+        assert_eq!(pool.buffer_size(), DEFAULT_BUFFER_SIZE);
+    }
+
+    #[test]
+    fn test_buffer_pool_custom_size() {
+        let pool = BufferPool::with_capacity(8, 256);
+        assert_eq!(pool.buffer_size(), 256);
+
+        let buf = pool.get();
+        assert!(buf.capacity() >= 256);
+    }
+
+    #[test]
+    fn test_maybe_pooled_buffer_len_and_is_empty() {
+        let pool = BufferPool::with_capacity(4, 1024);
+
+        // Empty pooled buffer
+        let pooled = pool.get();
+        let maybe = MaybePooledBuffer::pooled(pooled);
+        assert_eq!(maybe.len(), 0);
+        assert!(maybe.is_empty());
+
+        // Non-empty owned buffer
+        let owned = vec![1, 2, 3, 4, 5];
+        let maybe = MaybePooledBuffer::owned(owned);
+        assert_eq!(maybe.len(), 5);
+        assert!(!maybe.is_empty());
+    }
+
+    #[test]
+    fn test_maybe_pooled_buffer_into_vec() {
+        let pool = BufferPool::with_capacity(4, 1024);
+
+        // Pooled buffer converts to owned
+        let mut pooled = pool.get();
+        pooled.extend_from_slice(b"test");
+        let maybe = MaybePooledBuffer::pooled(pooled);
+        let vec = maybe.into_vec();
+        assert_eq!(vec, b"test");
+
+        // Owned buffer passes through
+        let owned = vec![1, 2, 3];
+        let maybe = MaybePooledBuffer::owned(owned);
+        let vec = maybe.into_vec();
+        assert_eq!(vec, &[1, 2, 3]);
+    }
+
+    #[test]
+    fn test_maybe_pooled_buffer_deref() {
+        let pool = BufferPool::with_capacity(4, 1024);
+
+        let mut pooled = pool.get();
+        pooled.extend_from_slice(b"deref test");
+        let maybe = MaybePooledBuffer::pooled(pooled);
+
+        // Test Deref
+        let slice: &[u8] = &maybe;
+        assert_eq!(slice, b"deref test");
+    }
+
+    #[test]
+    fn test_maybe_pooled_buffer_as_ref() {
+        let owned = vec![5, 6, 7, 8];
+        let maybe = MaybePooledBuffer::owned(owned);
+
+        // Test AsRef
+        let slice: &[u8] = maybe.as_ref();
+        assert_eq!(slice, &[5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn test_buffer_allocator_is_valid() {
+        let allocator = BufferAllocator::new(1024);
+
+        // Valid buffer
+        let valid_buf = Vec::with_capacity(1024);
+        assert!(allocator.is_valid(&valid_buf));
+
+        // Also valid (larger capacity)
+        let larger_buf = Vec::with_capacity(2048);
+        assert!(allocator.is_valid(&larger_buf));
+
+        // Invalid buffer (too small capacity)
+        let small_buf = Vec::with_capacity(512);
+        assert!(!allocator.is_valid(&small_buf));
+    }
+
+    #[test]
+    fn test_buffer_pool_concurrent_access() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let pool = Arc::new(BufferPool::with_capacity(64, 128));
+        let mut handles = vec![];
+
+        for _ in 0..8 {
+            let pool_clone = Arc::clone(&pool);
+            handles.push(thread::spawn(move || {
+                for _ in 0..100 {
+                    let mut buf = pool_clone.get();
+                    buf.extend_from_slice(b"concurrent");
+                    assert_eq!(buf.len(), 10);
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    }
 }

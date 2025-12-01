@@ -129,6 +129,9 @@ pub trait Protocol: Send {
     fn reset(&mut self);
 }
 
+pub mod configs;
+pub mod factories;
+pub mod factory;
 pub mod http;
 pub mod key_generation_adapter;
 pub mod masstree;
@@ -138,6 +141,16 @@ pub mod redis;
 pub mod xylem_echo;
 
 // Re-export commonly used types
+pub use configs::{
+    DataImportConfig, HttpConfig, KeysConfig, MasstreeConfig, MasstreeScanConfig, MemcachedConfig,
+    RedisCommandParams, RedisCommandWeight, RedisConfig, RedisOperationsConfig, ValueSizeConfig,
+    VerificationConfig, XylemEchoConfig,
+};
+pub use factories::{
+    HttpFactory, MemcachedAsciiFactory, MemcachedBinaryFactory, ProtocolRegistry, RedisFactory,
+    XylemEchoFactory,
+};
+pub use factory::{DynProtocol, DynProtocolFactory, ProtocolFactory};
 pub use http::HttpMethod;
 pub use http::HttpProtocol;
 pub use masstree::{MasstreeOp, MasstreeProtocol, ResultCode};

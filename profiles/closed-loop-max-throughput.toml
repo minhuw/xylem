@@ -9,32 +9,27 @@ seed = 1234567890
 duration = "30s"
 
 [target]
-address = "127.0.0.1:11211"
-protocol = "memcached-binary"
 transport = "tcp"
 
-[workload]
-[workload.keys]
-strategy = "random"
-max = 1000000       # 1M key space to test cache behavior
-value_size = 64     # Small values for max throughput
-
-[workload.pattern]
-type = "constant"
-rate = 1000000.0    # Aspirational (closed-loop will achieve actual max)
 
 # Single traffic group for maximum throughput
 [[traffic_groups]]
-protocol = "memcached-binary"
 name = "max-throughput"
+protocol = "memcached-binary"
+target = "127.0.0.1:11211"
 threads = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]  # 16 threads
 connections_per_thread = 1
 max_pending_per_connection = 1
 
+[traffic_groups.protocol_config.keys]
+strategy = "random"
+max = 1000000       # 1M key space to test cache behavior
+value_size = 64     # Small values for max throughput
+
 [traffic_groups.sampling_policy]
 type = "unlimited"  # 100% sampling
 
-[traffic_groups.policy]
+[traffic_groups.traffic_policy]
 type = "closed-loop"  # Send next request immediately after response
 
 [output]

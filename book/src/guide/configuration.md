@@ -12,25 +12,32 @@ duration = "60s"
 seed = 123
 
 [target]
-protocol = "redis"
-address = "127.0.0.1:6379"
-
-[workload]
-# Workload parameters
+transport = "tcp"
 
 [[traffic_groups]]
 name = "main"
+protocol = "redis"
+target = "127.0.0.1:6379"
 threads = [0, 1, 2, 3]
+
+[traffic_groups.protocol_config.keys]
+# Key distribution parameters
+
+[traffic_groups.traffic_policy]
 # Rate control parameters
+
+[output]
+format = "json"
+file = "results.json"
 ```
 
 ## Sections
 
 The configuration is divided into several sections:
 
-- **[Workload Configuration](./configuration/workload.md)** - Define workload patterns, duration, and key distributions
+- **[Protocol Configuration](./configuration/workload.md)** - Define key distributions and operations per traffic group
 - **[Transport Configuration](./configuration/transport.md)** - Configure network transport options
-- **[Protocol Configuration](./configuration/protocol.md)** - Protocol-specific settings
+- **[Protocol Selection](./configuration/protocol.md)** - Protocol-specific settings
 
 ## Basic Example
 
@@ -40,26 +47,30 @@ duration = "60s"
 seed = 42
 
 [target]
-protocol = "redis"
 transport = "tcp"
-address = "localhost:6379"
 
-[workload.keys]
+[[traffic_groups]]
+name = "main"
+protocol = "redis"
+target = "localhost:6379"
+threads = [0, 1, 2, 3]
+connections_per_thread = 10
+max_pending_per_connection = 1
+
+[traffic_groups.protocol_config.keys]
 strategy = "zipfian"
 n = 10000
 theta = 0.99
 value_size = 100
 
-[[traffic_groups]]
-name = "group-1"
-threads = [0, 1, 2, 3]
-connections_per_thread = 10
-max_pending_per_connection = 1
+[traffic_groups.protocol_config.operations]
+strategy = "fixed"
+operation = "get"
 
 [traffic_groups.sampling_policy]
 type = "unlimited"
 
-[traffic_groups.policy]
+[traffic_groups.traffic_policy]
 type = "closed-loop"
 
 [output]
@@ -72,14 +83,11 @@ file = "results.json"
 You can override any configuration value using the `--set` flag with dot notation:
 
 ```bash
-# Override target address
-xylem -P profile.toml --set target.address=192.168.1.100:6379
+# Override target address for a traffic group
+xylem -P profile.toml --set traffic_groups.0.target=192.168.1.100:6379
 
 # Override experiment duration
 xylem -P profile.toml --set experiment.duration=120s
-
-# Override multiple parameters
-xylem -P profile.toml --set experiment.duration=60s --set experiment.seed=999
 ```
 
 ## Loading Configuration
@@ -92,7 +100,7 @@ xylem -P tests/redis/redis-get-zipfian.toml
 
 ## See Also
 
-- [Workload Configuration](./configuration/workload.md)
+- [Protocol Configuration](./configuration/workload.md)
 - [Transport Configuration](./configuration/transport.md)
-- [Protocol Configuration](./configuration/protocol.md)
+- [Protocol Selection](./configuration/protocol.md)
 - [Configuration Schema](../reference/schema.md)

@@ -86,19 +86,13 @@ xylem -P profiles/memcached-ramp.toml
 You can override configuration values using the `--set` flag with dot notation:
 
 ```bash
-# Change target address
+# Change target address for the first traffic group
 ./target/release/xylem -P tests/redis/redis-get-zipfian.toml \
-  --set target.address=192.168.1.100:6379
+  --set traffic_groups.0.target=192.168.1.100:6379
 
 # Change experiment duration
 ./target/release/xylem -P tests/redis/redis-get-zipfian.toml \
   --set experiment.duration=120s
-
-# Change multiple parameters
-./target/release/xylem -P tests/redis/redis-get-zipfian.toml \
-  --set experiment.duration=60s \
-  --set experiment.seed=42 \
-  --set workload.keys.n=1000000
 ```
 
 ## Creating a Custom Profile
@@ -113,29 +107,35 @@ duration = "30s"
 seed = 123
 
 [target]
-protocol = "redis"
 transport = "tcp"
-address = "localhost:6379"
 
-[workload]
-[workload.keys]
+[[traffic_groups]]
+name = "main"
+protocol = "redis"
+target = "localhost:6379"
+threads = [0, 1, 2, 3]
+connections_per_thread = 10
+max_pending_per_connection = 1
+
+[traffic_groups.protocol_config.keys]
 strategy = "zipfian"
 n = 10000
 theta = 0.99
 value_size = 100
 
-[[traffic_groups]]
-name = "main"
-protocol = "redis"
-threads = [0, 1, 2, 3]
-connections_per_thread = 10
-max_pending_per_connection = 1
+[traffic_groups.protocol_config.operations]
+strategy = "fixed"
+operation = "get"
 
 [traffic_groups.sampling_policy]
 type = "unlimited"
 
-[traffic_groups.policy]
+[traffic_groups.traffic_policy]
 type = "closed-loop"
+
+[output]
+format = "human"
+file = "results.json"
 ```
 
 Run with:
@@ -153,20 +153,31 @@ A typical profile file includes:
 duration = "60s"
 seed = 123
 
-# Target service configuration
+# Global target configuration (transport only)
 [target]
-protocol = "redis"
-address = "127.0.0.1:6379"
+transport = "tcp"
 
-# Workload configuration
-[workload]
-# ... workload parameters
-
-# Traffic groups (thread assignment and rate control)
+# Traffic groups (each with its own protocol, target, and rate control)
 [[traffic_groups]]
 name = "group-1"
+protocol = "redis"
+target = "127.0.0.1:6379"
 threads = [0, 1, 2, 3]
-# ... rate control parameters
+connections_per_thread = 10
+max_pending_per_connection = 1
+
+[traffic_groups.protocol_config.keys]
+strategy = "zipfian"
+n = 1000000
+theta = 0.99
+value_size = 64
+
+[traffic_groups.traffic_policy]
+type = "closed-loop"
+
+[output]
+format = "json"
+file = "results.json"
 ```
 
 ## Logging

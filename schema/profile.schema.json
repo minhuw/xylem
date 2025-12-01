@@ -19,15 +19,11 @@
       "items": {
         "$ref": "#/$defs/TrafficGroupConfig"
       }
-    },
-    "workload": {
-      "$ref": "#/$defs/WorkloadConfig"
     }
   },
   "required": [
     "experiment",
     "target",
-    "workload",
     "traffic_groups",
     "output"
   ],
@@ -68,283 +64,42 @@
         "duration"
       ]
     },
-    "KeysConfig": {
-      "description": "Key generation configuration (SPATIAL level)",
-      "oneOf": [
-        {
-          "type": "object",
-          "properties": {
-            "start": {
-              "type": "integer",
-              "format": "uint64",
-              "minimum": 0
-            },
-            "strategy": {
-              "type": "string",
-              "const": "sequential"
-            },
-            "value_size": {
-              "type": "integer",
-              "format": "uint",
-              "minimum": 0
-            }
-          },
-          "required": [
-            "strategy",
-            "start",
-            "value_size"
-          ]
+    "HtmlOutputConfig": {
+      "description": "HTML output configuration",
+      "type": "object",
+      "properties": {
+        "library": {
+          "description": "Chart library: chartjs or plotly",
+          "type": "string",
+          "default": "chartjs"
         },
-        {
-          "type": "object",
-          "properties": {
-            "max": {
-              "type": "integer",
-              "format": "uint64",
-              "minimum": 0
-            },
-            "strategy": {
-              "type": "string",
-              "const": "random"
-            },
-            "value_size": {
-              "type": "integer",
-              "format": "uint",
-              "minimum": 0
-            }
-          },
-          "required": [
-            "strategy",
-            "max",
-            "value_size"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "max": {
-              "type": "integer",
-              "format": "uint64",
-              "minimum": 0
-            },
-            "strategy": {
-              "type": "string",
-              "const": "round-robin"
-            },
-            "value_size": {
-              "type": "integer",
-              "format": "uint",
-              "minimum": 0
-            }
-          },
-          "required": [
-            "strategy",
-            "max",
-            "value_size"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "n": {
-              "description": "Number of keys in range [0, n-1]",
-              "type": "integer",
-              "format": "uint64",
-              "minimum": 0
-            },
-            "strategy": {
-              "type": "string",
-              "const": "zipfian"
-            },
-            "theta": {
-              "description": "Exponent (theta) controlling skewness",
-              "type": "number",
-              "format": "double"
-            },
-            "value_size": {
-              "type": "integer",
-              "format": "uint",
-              "minimum": 0
-            }
-          },
-          "required": [
-            "strategy",
-            "n",
-            "theta",
-            "value_size"
-          ]
+        "theme": {
+          "description": "Theme: light or dark",
+          "type": "string",
+          "default": "light"
         }
-      ]
-    },
-    "LoadPatternConfig": {
-      "description": "Load pattern configuration (MACRO level - time-varying traffic)",
-      "oneOf": [
-        {
-          "type": "object",
-          "properties": {
-            "rate": {
-              "description": "Requests per second",
-              "type": "number",
-              "format": "double"
-            },
-            "type": {
-              "type": "string",
-              "const": "constant"
-            }
-          },
-          "required": [
-            "type",
-            "rate"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "duration": {
-              "type": "string"
-            },
-            "end_rate": {
-              "type": "number",
-              "format": "double"
-            },
-            "start_rate": {
-              "type": "number",
-              "format": "double"
-            },
-            "type": {
-              "type": "string",
-              "const": "ramp"
-            }
-          },
-          "required": [
-            "type",
-            "start_rate",
-            "end_rate",
-            "duration"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "normal_rate": {
-              "type": "number",
-              "format": "double"
-            },
-            "spike_duration": {
-              "type": "string"
-            },
-            "spike_rate": {
-              "type": "number",
-              "format": "double"
-            },
-            "spike_start": {
-              "type": "string"
-            },
-            "type": {
-              "type": "string",
-              "const": "spike"
-            }
-          },
-          "required": [
-            "type",
-            "normal_rate",
-            "spike_rate",
-            "spike_start",
-            "spike_duration"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "amplitude": {
-              "type": "number",
-              "format": "double"
-            },
-            "base_rate": {
-              "type": "number",
-              "format": "double"
-            },
-            "period": {
-              "type": "string"
-            },
-            "phase_shift": {
-              "type": [
-                "string",
-                "null"
-              ],
-              "default": null
-            },
-            "type": {
-              "type": "string",
-              "const": "sinusoidal"
-            }
-          },
-          "required": [
-            "type",
-            "base_rate",
-            "amplitude",
-            "period"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "steps": {
-              "type": "array",
-              "items": {
-                "$ref": "#/$defs/StepConfig"
-              }
-            },
-            "type": {
-              "type": "string",
-              "const": "step"
-            }
-          },
-          "required": [
-            "type",
-            "steps"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "max_rate": {
-              "type": "number",
-              "format": "double"
-            },
-            "min_rate": {
-              "type": "number",
-              "format": "double"
-            },
-            "period": {
-              "type": "string"
-            },
-            "type": {
-              "type": "string",
-              "const": "sawtooth"
-            }
-          },
-          "required": [
-            "type",
-            "min_rate",
-            "max_rate",
-            "period"
-          ]
-        }
-      ]
+      }
     },
     "OutputConfig": {
       "description": "Output configuration",
       "type": "object",
       "properties": {
         "file": {
-          "description": "Output file path",
+          "description": "Output file path (for json/html, extensions will be added automatically)",
           "type": "string"
         },
         "format": {
-          "description": "Output format: json, csv",
-          "type": "string",
+          "description": "Output format: json, html, both, or detailed-json",
+          "$ref": "#/$defs/OutputFormat",
           "default": "json"
+        },
+        "html": {
+          "description": "HTML chart configuration",
+          "$ref": "#/$defs/HtmlOutputConfig",
+          "default": {
+            "library": "chartjs",
+            "theme": "light"
+          }
         },
         "real_time": {
           "description": "Print real-time updates",
@@ -354,6 +109,36 @@
       },
       "required": [
         "file"
+      ]
+    },
+    "OutputFormat": {
+      "description": "Output format options",
+      "oneOf": [
+        {
+          "description": "Simple JSON format (backward compatible)",
+          "type": "string",
+          "const": "json"
+        },
+        {
+          "description": "Detailed JSON with per-group breakdown",
+          "type": "string",
+          "const": "detailed-json"
+        },
+        {
+          "description": "HTML report with visualizations",
+          "type": "string",
+          "const": "html"
+        },
+        {
+          "description": "Both detailed JSON and HTML",
+          "type": "string",
+          "const": "both"
+        },
+        {
+          "description": "Human-readable console output only (no file)",
+          "type": "string",
+          "const": "human"
+        }
       ]
     },
     "PolicyConfig": {
@@ -447,7 +232,181 @@
             "initial_rate",
             "target_latency_us"
           ]
+        },
+        {
+          "description": "Sinusoidal pattern - varies rate following a sine wave (e.g., diurnal patterns)",
+          "type": "object",
+          "properties": {
+            "base_rate": {
+              "description": "Base rate (center of oscillation) in requests per second",
+              "type": "number",
+              "format": "double"
+            },
+            "amplitude": {
+              "description": "Amplitude - how much rate varies above/below base",
+              "type": "number",
+              "format": "double"
+            },
+            "period": {
+              "description": "Period duration (e.g., \"60s\", \"24h\")",
+              "type": "string"
+            },
+            "phase_shift": {
+              "description": "Optional phase shift duration",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "sinusoidal"
+            }
+          },
+          "required": [
+            "type",
+            "base_rate",
+            "amplitude",
+            "period"
+          ]
+        },
+        {
+          "description": "Ramp pattern - linearly increase/decrease rate over time",
+          "type": "object",
+          "properties": {
+            "start_rate": {
+              "description": "Starting rate in requests per second",
+              "type": "number",
+              "format": "double"
+            },
+            "end_rate": {
+              "description": "Ending rate in requests per second",
+              "type": "number",
+              "format": "double"
+            },
+            "duration": {
+              "description": "Ramp duration (e.g., \"60s\")",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "ramp"
+            }
+          },
+          "required": [
+            "type",
+            "start_rate",
+            "end_rate",
+            "duration"
+          ]
+        },
+        {
+          "description": "Spike pattern - sudden burst of traffic",
+          "type": "object",
+          "properties": {
+            "normal_rate": {
+              "description": "Normal baseline rate in requests per second",
+              "type": "number",
+              "format": "double"
+            },
+            "spike_rate": {
+              "description": "Peak rate during spike",
+              "type": "number",
+              "format": "double"
+            },
+            "spike_start": {
+              "description": "When the spike starts (e.g., \"10s\")",
+              "type": "string"
+            },
+            "spike_duration": {
+              "description": "How long the spike lasts (e.g., \"5s\")",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "spike"
+            }
+          },
+          "required": [
+            "type",
+            "normal_rate",
+            "spike_rate",
+            "spike_start",
+            "spike_duration"
+          ]
+        },
+        {
+          "description": "Sawtooth pattern - repeated ramps (ramp up, instant drop, repeat)",
+          "type": "object",
+          "properties": {
+            "min_rate": {
+              "description": "Minimum rate (start of ramp)",
+              "type": "number",
+              "format": "double"
+            },
+            "max_rate": {
+              "description": "Maximum rate (end of ramp)",
+              "type": "number",
+              "format": "double"
+            },
+            "period": {
+              "description": "Period for one complete cycle (e.g., \"30s\")",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "sawtooth"
+            }
+          },
+          "required": [
+            "type",
+            "min_rate",
+            "max_rate",
+            "period"
+          ]
         }
+      ]
+    },
+    "RedisClusterConfig": {
+      "description": "Redis Cluster configuration",
+      "type": "object",
+      "properties": {
+        "nodes": {
+          "description": "Cluster nodes with their slot assignments",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RedisClusterNodeConfig"
+          }
+        }
+      },
+      "required": [
+        "nodes"
+      ]
+    },
+    "RedisClusterNodeConfig": {
+      "description": "Redis Cluster node configuration",
+      "type": "object",
+      "properties": {
+        "address": {
+          "description": "Node address (e.g., \"127.0.0.1:7000\")",
+          "type": "string"
+        },
+        "slot_end": {
+          "description": "End of slot range (0-16383)",
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "slot_start": {
+          "description": "Start of slot range (0-16383)",
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "required": [
+        "address",
+        "slot_start",
+        "slot_end"
       ]
     },
     "SamplingPolicy": {
@@ -613,23 +572,6 @@
         }
       ]
     },
-    "StepConfig": {
-      "description": "Step configuration for StepPattern",
-      "type": "object",
-      "properties": {
-        "duration": {
-          "type": "string"
-        },
-        "rate": {
-          "type": "number",
-          "format": "double"
-        }
-      },
-      "required": [
-        "duration",
-        "rate"
-      ]
-    },
     "TargetConfig": {
       "description": "Target server configuration",
       "type": "object",
@@ -643,10 +585,22 @@
           "default": null
         },
         "protocol": {
-          "description": "Default protocol for traffic groups that don't specify their own\nValid: redis, memcached-binary, memcached-ascii, http",
+          "description": "Default protocol for traffic groups that don't specify their own\nValid: redis, redis-cluster, memcached-binary, memcached-ascii, http",
           "type": [
             "string",
             "null"
+          ],
+          "default": null
+        },
+        "redis_cluster": {
+          "description": "Redis Cluster configuration (only used when protocol = \"redis-cluster\")",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RedisClusterConfig"
+            },
+            {
+              "type": "null"
+            }
           ],
           "default": null
         },
@@ -678,16 +632,149 @@
           "description": "Group name for identification",
           "type": "string"
         },
-        "policy": {
-          "description": "Traffic policy configuration",
-          "$ref": "#/$defs/PolicyConfig"
-        },
         "protocol": {
           "description": "Protocol for this group (optional, falls back to target.protocol if not specified)",
           "type": [
             "string",
             "null"
           ],
+          "default": null
+        },
+        "protocol_config": {
+          "description": "Protocol-specific configuration. For Redis/Memcached: contains keys, operations, value_size. For HTTP: contains method, path, host.",
+          "type": "object",
+          "properties": {
+            "keys": {
+              "description": "Key generation strategy for key-value protocols",
+              "type": "object",
+              "properties": {
+                "strategy": {
+                  "description": "Key distribution: sequential, random, round-robin, zipfian, gaussian",
+                  "type": "string",
+                  "enum": ["sequential", "random", "round-robin", "zipfian", "gaussian"]
+                },
+                "n": {
+                  "description": "Number of keys for zipfian distribution",
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "theta": {
+                  "description": "Zipfian exponent (0.99 = typical, higher = more skew)",
+                  "type": "number"
+                },
+                "max": {
+                  "description": "Maximum key value for random/round-robin/gaussian",
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "start": {
+                  "description": "Starting key value for sequential",
+                  "type": "integer",
+                  "default": 0
+                },
+                "mean_pct": {
+                  "description": "Mean as percentage of keyspace (0.0-1.0) for gaussian",
+                  "type": "number",
+                  "minimum": 0.0,
+                  "maximum": 1.0
+                },
+                "std_dev_pct": {
+                  "description": "Standard deviation as percentage of keyspace for gaussian",
+                  "type": "number",
+                  "minimum": 0.0,
+                  "maximum": 1.0
+                },
+                "value_size": {
+                  "description": "Value size in bytes",
+                  "type": "integer",
+                  "minimum": 1
+                }
+              },
+              "required": ["strategy", "value_size"]
+            },
+            "operations": {
+              "description": "Redis command selection strategy",
+              "type": "object",
+              "properties": {
+                "strategy": {
+                  "description": "fixed (single command) or weighted (random selection)",
+                  "type": "string",
+                  "enum": ["fixed", "weighted"]
+                },
+                "operation": {
+                  "description": "Command name for fixed strategy (get, set, incr, etc.)",
+                  "type": "string"
+                },
+                "commands": {
+                  "description": "Array of weighted commands for weighted strategy",
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "name": {
+                        "description": "Command name: get, set, incr, mget, wait, setex, scan, etc.",
+                        "type": "string"
+                      },
+                      "weight": {
+                        "description": "Probability weight (0.0-1.0, weights are normalized)",
+                        "type": "number",
+                        "minimum": 0.0
+                      },
+                      "params": {
+                        "description": "Command-specific parameters",
+                        "type": "object",
+                        "properties": {
+                          "count": { "type": "integer", "description": "Key count for MGET" },
+                          "num_replicas": { "type": "integer", "description": "Replica count for WAIT" },
+                          "timeout_ms": { "type": "integer", "description": "Timeout for WAIT" }
+                        }
+                      }
+                    },
+                    "required": ["name", "weight"]
+                  }
+                }
+              },
+              "required": ["strategy"]
+            },
+            "value_size": {
+              "description": "Value size configuration (overrides keys.value_size)",
+              "type": "object",
+              "properties": {
+                "strategy": {
+                  "description": "fixed, uniform, or normal",
+                  "type": "string",
+                  "enum": ["fixed", "uniform", "normal"]
+                },
+                "size": { "type": "integer", "description": "Size for fixed strategy" },
+                "min": { "type": "integer", "description": "Minimum size for uniform/normal" },
+                "max": { "type": "integer", "description": "Maximum size for uniform/normal" },
+                "mean": { "type": "number", "description": "Mean for normal distribution" },
+                "std_dev": { "type": "number", "description": "Standard deviation for normal" }
+              },
+              "required": ["strategy"]
+            },
+            "data_import": {
+              "description": "Import test data from CSV file",
+              "type": "object",
+              "properties": {
+                "file": { "type": "string", "description": "Path to CSV file" },
+                "verification": {
+                  "type": "object",
+                  "properties": {
+                    "mode": { "type": "string", "enum": ["during", "after", "only"] },
+                    "sample_rate": { "type": "number", "minimum": 0.0, "maximum": 1.0 }
+                  }
+                }
+              },
+              "required": ["file"]
+            },
+            "method": { "type": "string", "description": "HTTP method (GET, POST, PUT)" },
+            "path": { "type": "string", "description": "HTTP request path" },
+            "host": { "type": "string", "description": "HTTP Host header" },
+            "body_size": { "type": "integer", "description": "HTTP request body size" },
+            "operation": { "type": "string", "description": "Memcached operation (GET, SET)" },
+            "message_size": { "type": "integer", "description": "Echo message size" }
+          },
           "default": null
         },
         "sampling_policy": {
@@ -715,31 +802,17 @@
             "format": "uint",
             "minimum": 0
           }
+        },
+        "traffic_policy": {
+          "description": "Traffic policy configuration (rate control)",
+          "$ref": "#/$defs/PolicyConfig"
         }
       },
       "required": [
         "name",
         "threads",
         "connections_per_thread",
-        "policy"
-      ]
-    },
-    "WorkloadConfig": {
-      "description": "Workload configuration",
-      "type": "object",
-      "properties": {
-        "keys": {
-          "description": "Key generation strategy",
-          "$ref": "#/$defs/KeysConfig"
-        },
-        "pattern": {
-          "description": "Load pattern (MACRO level - time-varying traffic)",
-          "$ref": "#/$defs/LoadPatternConfig"
-        }
-      },
-      "required": [
-        "keys",
-        "pattern"
+        "traffic_policy"
       ]
     }
   }

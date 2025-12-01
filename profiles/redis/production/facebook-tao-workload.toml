@@ -28,57 +28,49 @@ duration = "120s"  # Longer duration to capture diurnal patterns
 seed = 42
 
 [target]
-address = "127.0.0.1:6379"
-protocol = "redis"
 transport = "tcp"
 
-# Workload Configuration
-[workload]
+# Traffic Configuration
+# High connection count to simulate many concurrent users
+[[traffic_groups]]
+name = "social-graph-cache"
+protocol = "redis"
+target = "127.0.0.1:6379"
+threads = [0, 1, 2, 3, 4, 5, 6, 7]  # 8 threads for high concurrency
+connections_per_thread = 50          # 400 total connections
+max_pending_per_connection = 20      # High pipelining (TAO uses aggressive pipelining)
+
 # Social graph keyspace: 100M objects (representing users, posts, photos, etc.)
-[workload.keys]
+[traffic_groups.protocol_config.keys]
 strategy = "zipfian"
 n = 100000000        # 100M objects
 theta = 1.2          # Higher skew than YCSB (celebrities cause extreme hot keys)
 value_size = 100     # Median object size from TAO traces
 
 # Operation Mix: 99.8% reads, 0.2% writes
-[workload.operations]
+[traffic_groups.protocol_config.operations]
 strategy = "weighted"
 
-# GET: Single object fetch (most common)
-[[workload.operations.commands]]
+[[traffic_groups.protocol_config.operations.commands]]
 name = "get"
 weight = 0.898  # 89.8% - Single object reads
 
-# MGET: Fetch multiple related objects (friend lists, photo albums)
-[[workload.operations.commands]]
-name = "mget"
-weight = 0.100  # 10% - Multi-get operations (common pattern in social graphs)
-
-# SET: Update operations (post new content, update profile)
-[[workload.operations.commands]]
+[[traffic_groups.protocol_config.operations.commands]]
 name = "set"
 weight = 0.002  # 0.2% - Writes
 
+[[traffic_groups.protocol_config.operations.commands]]
+name = "mget"
+weight = 0.100  # 10% - Multi-get operations (batch fetches)
+params = { count = 5 }  # Fetch 5 keys at once (TAO typical batch size)
+
 # Load Pattern: Sinusoidal to simulate diurnal patterns
 # Peak during "daytime" hours, lower at "night"
-[workload.pattern]
+[traffic_groups.traffic_policy]
 type = "sinusoidal"
-min_rate = 20000.0   # Night traffic
-max_rate = 100000.0  # Peak daytime traffic
-period = "120s"      # One full cycle in benchmark duration
-phase_shift = 0.0
-
-# Traffic Configuration
-# High connection count to simulate many concurrent users
-[[traffic_groups]]
-name = "social-graph-cache"
-threads = [0, 1, 2, 3, 4, 5, 6, 7]  # 8 threads for high concurrency
-connections_per_thread = 50          # 400 total connections
-max_pending_per_connection = 20      # High pipelining (TAO uses aggressive pipelining)
-
-[traffic_groups.policy]
-type = "fixed-rate"
+base_rate = 60000.0   # Center rate (average traffic)
+amplitude = 40000.0   # Variation (+/- from base): 20K-100K range
+period = "120s"       # One full cycle in benchmark duration
 
 [traffic_groups.sampling_policy]
 type = "limited"

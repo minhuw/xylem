@@ -10,6 +10,7 @@ pub enum MultiProtocol {
     MemcachedAscii(xylem_protocols::memcached::MemcachedAsciiProtocol),
     Http(xylem_protocols::http::HttpProtocol),
     XylemEcho(xylem_protocols::xylem_echo::XylemEchoProtocol),
+    Masstree(xylem_protocols::MasstreeProtocol),
 }
 
 impl MultiProtocol {
@@ -24,6 +25,19 @@ impl MultiProtocol {
         match self {
             MultiProtocol::Redis(p) => p.generate_set_with_imported_data(conn_id, key, value),
             _ => panic!("generate_set_with_imported_data only supported for Redis protocol"),
+        }
+    }
+
+    /// Register cluster connections from actual pool mappings
+    ///
+    /// Only applicable for RedisCluster protocol. For other protocols, this is a no-op.
+    ///
+    /// # Arguments
+    ///
+    /// * `connections` - Slice of (connection_id, target_address) pairs
+    pub fn register_cluster_connections(&mut self, connections: &[(usize, std::net::SocketAddr)]) {
+        if let MultiProtocol::RedisCluster(p) = self {
+            p.register_connections(connections.iter().copied());
         }
     }
 }
@@ -49,6 +63,10 @@ impl Protocol for MultiProtocol {
             MultiProtocol::MemcachedAscii(p) => p.generate_request(conn_id, key, value_size),
             MultiProtocol::Http(p) => p.generate_request(conn_id, key, value_size),
             MultiProtocol::XylemEcho(p) => p.generate_request(conn_id, key, value_size),
+            MultiProtocol::Masstree(p) => {
+                let (data, (conn, seq)) = p.generate_request(conn_id, key, value_size);
+                (data, (conn, seq as u64))
+            }
         }
     }
 
@@ -70,6 +88,10 @@ impl Protocol for MultiProtocol {
             MultiProtocol::MemcachedAscii(p) => p.parse_response(conn_id, data),
             MultiProtocol::Http(p) => p.parse_response(conn_id, data),
             MultiProtocol::XylemEcho(p) => p.parse_response(conn_id, data),
+            MultiProtocol::Masstree(p) => {
+                let (consumed, req_id) = p.parse_response(conn_id, data)?;
+                Ok((consumed, req_id.map(|(conn, seq)| (conn, seq as u64))))
+            }
         }
     }
 
@@ -81,6 +103,7 @@ impl Protocol for MultiProtocol {
             MultiProtocol::MemcachedAscii(p) => p.name(),
             MultiProtocol::Http(p) => p.name(),
             MultiProtocol::XylemEcho(p) => p.name(),
+            MultiProtocol::Masstree(p) => p.name(),
         }
     }
 
@@ -92,6 +115,7 @@ impl Protocol for MultiProtocol {
             MultiProtocol::MemcachedAscii(p) => p.reset(),
             MultiProtocol::Http(p) => p.reset(),
             MultiProtocol::XylemEcho(p) => p.reset(),
+            MultiProtocol::Masstree(p) => p.reset(),
         }
     }
 }
@@ -119,9 +143,31 @@ pub fn create_http_protocol(path: &str, host: &str) -> Result<MultiProtocol> {
     )))
 }
 
+/// Create HTTP protocol with full configuration (method, path, host)
+pub fn create_http_protocol_full(
+    method: xylem_protocols::HttpMethod,
+    path: &str,
+    host: &str,
+) -> MultiProtocol {
+    MultiProtocol::Http(xylem_protocols::http::HttpProtocol::new(
+        method,
+        path.to_string(),
+        host.to_string(),
+    ))
+}
+
 pub fn create_memcached_binary_protocol() -> MultiProtocol {
     MultiProtocol::MemcachedBinary(xylem_protocols::memcached::MemcachedBinaryProtocol::new(
         xylem_protocols::memcached::MemcachedOp::Get,
+    ))
+}
+
+/// Create Memcached binary protocol with specified operation
+pub fn create_memcached_binary_protocol_with_op(
+    operation: xylem_protocols::memcached::MemcachedOp,
+) -> MultiProtocol {
+    MultiProtocol::MemcachedBinary(xylem_protocols::memcached::MemcachedBinaryProtocol::new(
+        operation,
     ))
 }
 
@@ -131,8 +177,22 @@ pub fn create_memcached_ascii_protocol() -> MultiProtocol {
     ))
 }
 
+/// Create Memcached ASCII protocol with specified operation
+pub fn create_memcached_ascii_protocol_with_op(
+    operation: xylem_protocols::memcached::ascii::MemcachedOp,
+) -> MultiProtocol {
+    MultiProtocol::MemcachedAscii(xylem_protocols::memcached::MemcachedAsciiProtocol::new(
+        operation,
+    ))
+}
+
 pub fn create_xylem_echo_protocol() -> MultiProtocol {
     MultiProtocol::XylemEcho(xylem_protocols::xylem_echo::XylemEchoProtocol::default())
+}
+
+/// Create Masstree protocol with specified operation
+pub fn create_masstree_protocol(operation: xylem_protocols::MasstreeOp) -> MultiProtocol {
+    MultiProtocol::Masstree(xylem_protocols::MasstreeProtocol::new(operation))
 }
 
 /// Configuration for Redis Cluster nodes

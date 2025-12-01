@@ -10,19 +10,30 @@ Xylem supports multiple transport layers for network communication.
 
 ## Transport Selection
 
-Specify the transport explicitly in your TOML profile configuration:
+Specify the transport in the `[target]` section of your TOML profile configuration. The transport applies to all traffic groups:
 
 ```toml
 [target]
-protocol = "redis"
 transport = "tcp"
-address = "localhost:6379"
 
-# or, for a Unix socket:
-[target]
+[[traffic_groups]]
+name = "main"
 protocol = "redis"
+target = "localhost:6379"
+# ...
+```
+
+For Unix sockets:
+
+```toml
+[target]
 transport = "unix"
-address = "/var/run/redis.sock"
+
+[[traffic_groups]]
+name = "main"
+protocol = "redis"
+target = "/var/run/redis.sock"
+# ...
 ```
 
 ## See Also
