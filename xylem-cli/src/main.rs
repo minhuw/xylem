@@ -484,6 +484,25 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
         }
     }
 
+    // Initialize evalsync if enabled and environment variables are set
+    #[cfg(feature = "evalsync")]
+    let evalsync_enabled = {
+        match evalsync::init_env() {
+            Ok(()) => {
+                tracing::info!("evalsync initialized, signaling ready...");
+                evalsync::ready().expect("Failed to signal evalsync ready");
+                tracing::info!("Waiting for evalsync start signal...");
+                evalsync::wait_for_start().expect("Failed to wait for evalsync start");
+                tracing::info!("Received evalsync start signal");
+                true
+            }
+            Err(e) => {
+                tracing::debug!("evalsync not enabled: {}", e);
+                false
+            }
+        }
+    };
+
     tracing::info!("Starting experiment...");
 
     // Clone config for use in worker closure
@@ -886,6 +905,16 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
             other => Err(xylem_core::Error::Config(format!("Unsupported transport: {}", other)))?,
         }
     })?;
+
+    // Signal evalsync end if it was enabled
+    #[cfg(feature = "evalsync")]
+    if evalsync_enabled {
+        if let Err(e) = evalsync::end() {
+            tracing::warn!("Failed to signal evalsync end: {}", e);
+        } else {
+            tracing::info!("Signaled evalsync end");
+        }
+    }
 
     tracing::info!("Experiment completed successfully");
     let stats = xylem_core::stats::GroupStatsCollector::merge(results);

@@ -34,6 +34,7 @@
 
         nativeBuildInputs = with pkgs; [
           pkg-config
+          protobuf # Required for evalsync's prost-build
         ];
 
       in
@@ -117,6 +118,9 @@
           cargoLock = {
             lockFile = ./Cargo.lock;
           };
+
+          # Enable evalsync feature for coordinated benchmarking
+          buildFeatures = [ "xylem-cli/evalsync" ];
 
           inherit buildInputs nativeBuildInputs;
 
