@@ -339,14 +339,12 @@ mod tests {
 
         // Should contain top-level sections
         assert!(paths.contains(&"experiment".to_string()));
-        assert!(paths.contains(&"target".to_string()));
         assert!(paths.contains(&"output".to_string()));
 
         // Should contain nested paths
         assert!(paths.contains(&"experiment.name".to_string()));
         assert!(paths.contains(&"experiment.duration".to_string()));
         assert!(paths.contains(&"experiment.seed".to_string()));
-        assert!(paths.contains(&"target.transport".to_string()));
 
         // Should contain array indexing for traffic_groups
         assert!(paths.contains(&"traffic_groups".to_string()));

@@ -14,7 +14,6 @@ use std::time::Duration;
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct ProfileConfig {
     pub experiment: ExperimentConfig,
-    pub target: TargetConfig,
     /// Traffic groups configuration
     pub traffic_groups: Vec<xylem_core::traffic_group::TrafficGroupConfig>,
     pub output: OutputConfig,
@@ -35,40 +34,6 @@ pub struct ExperimentConfig {
     #[serde(with = "humantime_serde")]
     #[schemars(with = "String")]
     pub duration: Duration,
-}
-
-/// Target server configuration
-/// Global target configuration (transport settings shared across all traffic groups)
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct TargetConfig {
-    /// Transport: tcp, udp (shared across all traffic groups)
-    #[serde(default = "default_transport")]
-    pub transport: String,
-    /// Redis Cluster configuration (only used when protocol = "redis-cluster")
-    #[serde(default)]
-    pub redis_cluster: Option<RedisClusterConfig>,
-}
-
-/// Redis Cluster configuration
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct RedisClusterConfig {
-    /// Cluster nodes with their slot assignments
-    pub nodes: Vec<RedisClusterNodeConfig>,
-}
-
-/// Redis Cluster node configuration
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct RedisClusterNodeConfig {
-    /// Node address (e.g., "127.0.0.1:7000")
-    pub address: String,
-    /// Start of slot range (0-16383)
-    pub slot_start: u16,
-    /// End of slot range (0-16383)
-    pub slot_end: u16,
-}
-
-fn default_transport() -> String {
-    "tcp".to_string()
 }
 
 /// Re-export KeysConfig from xylem-protocols for use in config files
@@ -293,23 +258,31 @@ impl ProfileConfig {
         ];
 
         let valid_transports = ["tcp", "udp", "unix"];
-        if !valid_transports.contains(&self.target.transport.as_str()) {
-            bail!(
-                "Invalid transport '{}'. Valid options: {}",
-                self.target.transport,
-                valid_transports.join(", ")
-            );
-        }
 
         // Traffic groups validation
         if self.traffic_groups.is_empty() {
             bail!("At least one traffic group must be defined");
         }
 
+        // Track transport per thread for validation
+        let mut thread_transports: std::collections::HashMap<usize, (&str, usize, &str)> =
+            std::collections::HashMap::new();
+
         for (i, group) in self.traffic_groups.iter().enumerate() {
             // Validate target address
             if group.target.is_empty() {
                 bail!("Traffic group {} '{}' must have a target address", i, group.name);
+            }
+
+            // Validate transport
+            if !valid_transports.contains(&group.transport.as_str()) {
+                bail!(
+                    "Invalid transport '{}' for traffic group {} '{}'. Valid options: {}",
+                    group.transport,
+                    i,
+                    group.name,
+                    valid_transports.join(", ")
+                );
             }
 
             // Validate protocol
@@ -337,6 +310,32 @@ impl ProfileConfig {
                 );
             }
 
+            // Validate all groups on the same thread use the same transport
+            for &thread_id in &group.threads {
+                match thread_transports.get(&thread_id) {
+                    Some((existing_transport, existing_group_idx, existing_group_name))
+                        if *existing_transport != group.transport.as_str() =>
+                    {
+                        bail!(
+                            "Thread {} has mixed transports: group {} '{}' uses '{}' but group {} '{}' uses '{}'. \
+                             All traffic groups on the same thread must use the same transport.",
+                            thread_id,
+                            existing_group_idx,
+                            existing_group_name,
+                            existing_transport,
+                            i,
+                            group.name,
+                            group.transport
+                        );
+                    }
+                    None => {
+                        thread_transports
+                            .insert(thread_id, (group.transport.as_str(), i, group.name.as_str()));
+                    }
+                    _ => {} // Same transport, nothing to do
+                }
+            }
+
             // Key-value protocols (Redis, Memcached) require protocol_config with keys
             // HTTP and XylemEcho have sensible defaults and don't require protocol_config
             let requires_protocol_config = matches!(
@@ -361,21 +360,31 @@ impl ProfileConfig {
                 validate_protocol_config(&group.protocol, pc, i, &group.name)?;
             }
 
-            // redis-cluster protocol requires target.redis_cluster configuration
+            // redis-cluster protocol requires redis_cluster configuration in protocol_config
             if group.protocol == "redis-cluster" {
-                let cluster = self.target.redis_cluster.as_ref().ok_or_else(|| {
+                let pc = group.protocol_config.as_ref().ok_or_else(|| {
                     anyhow::anyhow!(
-                        "Traffic group {} '{}' uses redis-cluster protocol but \
-                         [target.redis_cluster] configuration is missing. \
-                         Add a [[target.redis_cluster.nodes]] section with cluster node addresses.",
+                        "Traffic group {} '{}' uses redis-cluster protocol but has no protocol_config",
                         i,
                         group.name
                     )
                 })?;
-                if cluster.nodes.is_empty() {
+
+                let cluster = pc.get("redis_cluster").ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Traffic group {} '{}' uses redis-cluster protocol but \
+                         protocol_config.redis_cluster is missing. \
+                         Add a redis_cluster.nodes section with cluster node addresses.",
+                        i,
+                        group.name
+                    )
+                })?;
+
+                let nodes = cluster.get("nodes").and_then(|n| n.as_array());
+                if nodes.map_or(true, |n| n.is_empty()) {
                     bail!(
                         "Traffic group {} '{}' uses redis-cluster protocol but \
-                         target.redis_cluster.nodes is empty. Add at least one cluster node.",
+                         protocol_config.redis_cluster.nodes is empty or missing. Add at least one cluster node.",
                         i,
                         group.name
                     );
@@ -840,12 +849,11 @@ mod tests {
         assert_eq!(config.experiment.seed, Some(42));
         assert_eq!(config.experiment.duration, Duration::from_secs(30));
 
-        assert_eq!(config.target.transport, "tcp");
-
         assert_eq!(config.traffic_groups.len(), 1);
         assert_eq!(config.traffic_groups[0].name, "main");
         assert_eq!(config.traffic_groups[0].protocol, "redis");
         assert_eq!(config.traffic_groups[0].target, "127.0.0.1:6379");
+        assert_eq!(config.traffic_groups[0].transport, "tcp");
         assert_eq!(config.traffic_groups[0].threads, vec![0, 1, 2, 3]);
         assert_eq!(config.traffic_groups[0].connections_per_thread, 25);
     }
@@ -1006,10 +1014,6 @@ mod tests {
 name = "cli-target-test"
 duration = "10s"
 
-[target]
-transport = "tcp"
-
-
 [[traffic_groups]]
 name = "main"
 protocol = "redis"
@@ -1055,10 +1059,6 @@ file = "results/test.json"
 [experiment]
 name = "no-target-test"
 duration = "10s"
-
-[target]
-transport = "tcp"
-
 
 [[traffic_groups]]
 name = "main"
@@ -1160,10 +1160,6 @@ file = "results/test.json"
 name = "test"
 duration = "10s"
 
-[target]
-transport = "tcp"
-
-
 [[traffic_groups]]
 name = "main"
 protocol = "redis"
@@ -1258,10 +1254,6 @@ max = 5000"#,
 name = "test-{protocol}"
 duration = "10s"
 
-[target]
-transport = "tcp"
-
-
 [[traffic_groups]]
 name = "main"
 protocol = "{protocol}"
@@ -1302,10 +1294,6 @@ file = "test.json"
 [experiment]
 name = "test-invalid"
 duration = "10s"
-
-[target]
-transport = "tcp"
-
 
 [[traffic_groups]]
 name = "main"
@@ -1352,10 +1340,6 @@ file = "test.json"
 name = "test-duration"
 duration = "2m30s"
 
-[target]
-transport = "tcp"
-
-
 [[traffic_groups]]
 name = "main"
 protocol = "redis"
@@ -1393,10 +1377,6 @@ file = "test.json"
 [experiment]
 name = "no-seed"
 duration = "10s"
-
-[target]
-transport = "tcp"
-
 
 [[traffic_groups]]
 name = "main"
@@ -1618,8 +1598,8 @@ duration = "10s""#,
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("redis-cluster") && err.contains("target.redis_cluster"),
-            "Error should mention redis-cluster and target.redis_cluster: {}",
+            err.contains("redis-cluster") && err.contains("redis_cluster"),
+            "Error should mention redis-cluster and redis_cluster: {}",
             err
         );
     }
@@ -1632,14 +1612,6 @@ duration = "10s""#,
 name = "test"
 duration = "10s"
 
-[target]
-transport = "tcp"
-
-[[target.redis_cluster.nodes]]
-address = "127.0.0.1:7000"
-slot_start = 0
-slot_end = 16383
-
 [[traffic_groups]]
 name = "main"
 protocol = "redis-cluster"
@@ -1651,6 +1623,11 @@ connections_per_thread = 1
 strategy = "sequential"
 start = 0
 value_size = 64
+
+[[traffic_groups.protocol_config.redis_cluster.nodes]]
+address = "127.0.0.1:7000"
+slot_start = 0
+slot_end = 16383
 
 [traffic_groups.protocol_config.data_import]
 file = "/tmp/test.csv"

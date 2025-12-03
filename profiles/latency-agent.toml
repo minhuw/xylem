@@ -15,10 +15,6 @@ description = "Separate throughput and latency measurement agents"
 duration = "10s"
 seed = 42
 
-[target]
-transport = "tcp"
-
-
 # ============================================================================
 # LATENCY AGENT (like Lancet's latency agent)
 # ============================================================================
@@ -33,6 +29,7 @@ transport = "tcp"
 name = "latency-agent"
 protocol = "redis"
 target = "127.0.0.1:6379"
+transport = "tcp"
 threads = [0, 1]
 connections_per_thread = 10      # 20 total connections
 max_pending_per_connection = 1   # Closed-loop: one request at a time
@@ -64,6 +61,7 @@ rate = 100.0  # 100 req/s per connection × 20 connections = 2K QPS total
 name = "throughput-agent"
 protocol = "redis"
 target = "127.0.0.1:6379"
+transport = "tcp"
 threads = [2, 3, 4, 5, 6, 7]
 connections_per_thread = 25      # 150 total connections
 max_pending_per_connection = 32  # High pipelining for max throughput

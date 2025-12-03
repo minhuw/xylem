@@ -8,15 +8,12 @@ description = "Maximum throughput test using closed-loop execution (no rate limi
 seed = 1234567890
 duration = "30s"
 
-[target]
-transport = "tcp"
-
-
 # Single traffic group for maximum throughput
 [[traffic_groups]]
 name = "max-throughput"
 protocol = "memcached-binary"
 target = "127.0.0.1:11211"
+transport = "tcp"
 threads = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]  # 16 threads
 connections_per_thread = 1
 max_pending_per_connection = 1

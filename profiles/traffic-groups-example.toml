@@ -14,15 +14,12 @@ description = "Demonstrate traffic groups with separate latency and throughput a
 duration = "60s"
 seed = 42  # For reproducibility
 
-[target]
-transport = "tcp"
-
-
 # TRAFFIC GROUP 1: Latency Measurement (like Lancet's latency agent)
 [[traffic_groups]]
 name = "latency-measurement"
 protocol = "redis"
 target = "127.0.0.1:6379"
+transport = "tcp"
 threads = [0, 1]  # Explicit thread assignment
 connections_per_thread = 5
 max_pending_per_connection = 1  # Single outstanding request for accurate latency
@@ -45,6 +42,7 @@ rate = 2000.0  # Low rate: 2K req/s for latency measurement
 name = "throughput-generation"
 protocol = "redis"
 target = "127.0.0.1:6379"
+transport = "tcp"
 threads = [2, 3, 4, 5]  # More threads for high throughput
 connections_per_thread = 25
 max_pending_per_connection = 32  # High pipelining for max throughput

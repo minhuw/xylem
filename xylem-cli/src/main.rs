@@ -421,7 +421,6 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
         tracing::info!("Seed: {} (reproducible mode)", seed);
     }
     tracing::info!("Duration: {:?}", config.experiment.duration);
-    tracing::info!("Transport: {}", config.target.transport);
 
     // Display traffic groups information
     tracing::info!("Traffic groups: {}", config.traffic_groups.len());
@@ -589,11 +588,11 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                     let selector =
                         create_redis_selector(redis_config, config_for_worker.experiment.seed)?;
 
-                    // Get cluster config from target
+                    // Get cluster config from protocol_config.redis_cluster
                     let cluster_config =
-                        config_for_worker.target.redis_cluster.as_ref().ok_or_else(|| {
+                        redis_config.redis_cluster.as_ref().ok_or_else(|| {
                             anyhow::anyhow!(
-                                "redis-cluster protocol requires target.redis_cluster configuration"
+                                "redis-cluster protocol requires protocol_config.redis_cluster configuration"
                             )
                         })?;
 
@@ -710,7 +709,12 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
         let mut groups_config = Vec::new();
         // Track which groups are redis-cluster for post-creation wiring
         let mut redis_cluster_groups: Vec<usize> = Vec::new();
-        let is_unix_transport = config_for_worker.target.transport == "unix";
+        // Get transport from first group on this thread (validation ensures all groups use same transport)
+        let thread_transport = groups_for_thread
+            .first()
+            .map(|(group_id, _)| config_for_worker.traffic_groups[*group_id].transport.as_str())
+            .unwrap_or("tcp");
+        let is_unix_transport = thread_transport == "unix";
 
         for (group_id, group_meta) in groups_for_thread.iter() {
             let group_config = &config_for_worker.traffic_groups[*group_id];
@@ -750,10 +754,19 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
             // Redis-cluster: create connections to ALL cluster nodes
             redis_cluster_groups.push(*group_id);
 
+            // Parse protocol_config to get redis_cluster configuration
+            let redis_config: xylem_protocols::RedisConfig = group_config
+                .protocol_config
+                .as_ref()
+                .map(|pc| serde_json::from_value(pc.clone()))
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("Failed to parse redis-cluster protocol_config: {}", e))?
+                .unwrap_or_default();
+
             let cluster_config =
-                config_for_worker.target.redis_cluster.as_ref().ok_or_else(|| {
+                redis_config.redis_cluster.as_ref().ok_or_else(|| {
                     anyhow::anyhow!(
-                        "redis-cluster protocol requires target.redis_cluster configuration"
+                        "redis-cluster protocol requires protocol_config.redis_cluster configuration"
                     )
                 })?;
 
@@ -832,8 +845,8 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
             }
         }
 
-        // Select transport factory based on config
-        match config_for_worker.target.transport.as_str() {
+        // Select transport factory based on thread's transport
+        match thread_transport {
             "tcp" => {
                 let factory = TcpTransportFactory::default();
                 let mut worker = Worker::new_multi_group_with_generators(
@@ -956,6 +969,15 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
             tracing::debug!("Human format selected - output printed to console");
         }
         OutputFormat::DetailedJson | OutputFormat::Both | OutputFormat::Html => {
+            // Get transport summary from traffic groups
+            let unique_transports: std::collections::HashSet<_> =
+                config.traffic_groups.iter().map(|g| g.transport.as_str()).collect();
+            let output_transport = if unique_transports.len() == 1 {
+                config.traffic_groups[0].transport.clone()
+            } else {
+                format!("{} transports", unique_transports.len())
+            };
+
             // Detailed format with per-group statistics
             let detailed_results = output::DetailedExperimentResults::from_group_stats(
                 config.experiment.name.clone(),
@@ -963,7 +985,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                 config.experiment.seed,
                 target_address_string,
                 output_protocol,
-                config.target.transport.clone(),
+                output_transport,
                 duration,
                 &stats,
                 &config.traffic_groups,

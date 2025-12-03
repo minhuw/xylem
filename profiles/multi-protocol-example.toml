@@ -7,15 +7,12 @@ description = "Redis and Memcached running on the same worker threads"
 seed = 42
 duration = "30s"
 
-[target]
-transport = "tcp"
-
-
 # Redis workload on threads 0-1
 [[traffic_groups]]
 name = "redis-load"
 protocol = "redis"
 target = "127.0.0.1:6379"
+transport = "tcp"
 threads = [0, 1]
 connections_per_thread = 10
 max_pending_per_connection = 8
@@ -38,6 +35,7 @@ type = "closed-loop"
 name = "memcached-load"
 protocol = "memcached-binary"
 target = "127.0.0.1:11211"
+transport = "tcp"
 threads = [0, 1]  # Same threads as Redis!
 connections_per_thread = 10
 max_pending_per_connection = 8

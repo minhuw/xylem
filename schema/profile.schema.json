@@ -1,3 +1,5 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.14s
+     Running `target/debug/xylem schema`
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ProfileConfig",
@@ -10,9 +12,6 @@
     "output": {
       "$ref": "#/$defs/OutputConfig"
     },
-    "target": {
-      "$ref": "#/$defs/TargetConfig"
-    },
     "traffic_groups": {
       "description": "Traffic groups configuration",
       "type": "array",
@@ -23,7 +22,6 @@
   },
   "required": [
     "experiment",
-    "target",
     "traffic_groups",
     "output"
   ],
@@ -237,13 +235,13 @@
           "description": "Sinusoidal pattern - varies rate following a sine wave (e.g., diurnal patterns)",
           "type": "object",
           "properties": {
-            "base_rate": {
-              "description": "Base rate (center of oscillation) in requests per second",
+            "amplitude": {
+              "description": "Amplitude - how much rate varies above/below base",
               "type": "number",
               "format": "double"
             },
-            "amplitude": {
-              "description": "Amplitude - how much rate varies above/below base",
+            "base_rate": {
+              "description": "Base rate (center of oscillation) in requests per second",
               "type": "number",
               "format": "double"
             },
@@ -252,8 +250,12 @@
               "type": "string"
             },
             "phase_shift": {
-              "description": "Optional phase shift duration",
-              "type": "string"
+              "description": "Optional phase shift",
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
             },
             "type": {
               "type": "string",
@@ -271,19 +273,19 @@
           "description": "Ramp pattern - linearly increase/decrease rate over time",
           "type": "object",
           "properties": {
-            "start_rate": {
-              "description": "Starting rate in requests per second",
-              "type": "number",
-              "format": "double"
+            "duration": {
+              "description": "Ramp duration",
+              "type": "string"
             },
             "end_rate": {
               "description": "Ending rate in requests per second",
               "type": "number",
               "format": "double"
             },
-            "duration": {
-              "description": "Ramp duration (e.g., \"60s\")",
-              "type": "string"
+            "start_rate": {
+              "description": "Starting rate in requests per second",
+              "type": "number",
+              "format": "double"
             },
             "type": {
               "type": "string",
@@ -306,17 +308,17 @@
               "type": "number",
               "format": "double"
             },
+            "spike_duration": {
+              "description": "How long the spike lasts",
+              "type": "string"
+            },
             "spike_rate": {
               "description": "Peak rate during spike",
               "type": "number",
               "format": "double"
             },
             "spike_start": {
-              "description": "When the spike starts (e.g., \"10s\")",
-              "type": "string"
-            },
-            "spike_duration": {
-              "description": "How long the spike lasts (e.g., \"5s\")",
+              "description": "When the spike starts",
               "type": "string"
             },
             "type": {
@@ -336,18 +338,18 @@
           "description": "Sawtooth pattern - repeated ramps (ramp up, instant drop, repeat)",
           "type": "object",
           "properties": {
-            "min_rate": {
-              "description": "Minimum rate (start of ramp)",
-              "type": "number",
-              "format": "double"
-            },
             "max_rate": {
               "description": "Maximum rate (end of ramp)",
               "type": "number",
               "format": "double"
             },
+            "min_rate": {
+              "description": "Minimum rate (start of ramp)",
+              "type": "number",
+              "format": "double"
+            },
             "period": {
-              "description": "Period for one complete cycle (e.g., \"30s\")",
+              "description": "Period for one complete cycle",
               "type": "string"
             },
             "type": {
@@ -362,51 +364,6 @@
             "period"
           ]
         }
-      ]
-    },
-    "RedisClusterConfig": {
-      "description": "Redis Cluster configuration",
-      "type": "object",
-      "properties": {
-        "nodes": {
-          "description": "Cluster nodes with their slot assignments",
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/RedisClusterNodeConfig"
-          }
-        }
-      },
-      "required": [
-        "nodes"
-      ]
-    },
-    "RedisClusterNodeConfig": {
-      "description": "Redis Cluster node configuration",
-      "type": "object",
-      "properties": {
-        "address": {
-          "description": "Node address (e.g., \"127.0.0.1:7000\")",
-          "type": "string"
-        },
-        "slot_end": {
-          "description": "End of slot range (0-16383)",
-          "type": "integer",
-          "format": "uint16",
-          "maximum": 65535,
-          "minimum": 0
-        },
-        "slot_start": {
-          "description": "Start of slot range (0-16383)",
-          "type": "integer",
-          "format": "uint16",
-          "maximum": 65535,
-          "minimum": 0
-        }
-      },
-      "required": [
-        "address",
-        "slot_start",
-        "slot_end"
       ]
     },
     "SamplingPolicy": {
@@ -572,45 +529,6 @@
         }
       ]
     },
-    "TargetConfig": {
-      "description": "Target server configuration",
-      "type": "object",
-      "properties": {
-        "address": {
-          "description": "Server address (e.g., \"127.0.0.1:6379\") - can be overridden via CLI",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
-        },
-        "protocol": {
-          "description": "Default protocol for traffic groups that don't specify their own\nValid: redis, redis-cluster, memcached-binary, memcached-ascii, http",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
-        },
-        "redis_cluster": {
-          "description": "Redis Cluster configuration (only used when protocol = \"redis-cluster\")",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/RedisClusterConfig"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "transport": {
-          "description": "Transport: tcp, udp",
-          "type": "string",
-          "default": "tcp"
-        }
-      }
-    },
     "TrafficGroupConfig": {
       "description": "Traffic group configuration",
       "type": "object",
@@ -633,148 +551,11 @@
           "type": "string"
         },
         "protocol": {
-          "description": "Protocol for this group (optional, falls back to target.protocol if not specified)",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
+          "description": "Protocol for this group (redis, redis-cluster, memcached-binary, memcached-ascii, http, xylem-echo)",
+          "type": "string"
         },
         "protocol_config": {
-          "description": "Protocol-specific configuration. For Redis/Memcached: contains keys, operations, value_size. For HTTP: contains method, path, host.",
-          "type": "object",
-          "properties": {
-            "keys": {
-              "description": "Key generation strategy for key-value protocols",
-              "type": "object",
-              "properties": {
-                "strategy": {
-                  "description": "Key distribution: sequential, random, round-robin, zipfian, gaussian",
-                  "type": "string",
-                  "enum": ["sequential", "random", "round-robin", "zipfian", "gaussian"]
-                },
-                "n": {
-                  "description": "Number of keys for zipfian distribution",
-                  "type": "integer",
-                  "minimum": 1
-                },
-                "theta": {
-                  "description": "Zipfian exponent (0.99 = typical, higher = more skew)",
-                  "type": "number"
-                },
-                "max": {
-                  "description": "Maximum key value for random/round-robin/gaussian",
-                  "type": "integer",
-                  "minimum": 1
-                },
-                "start": {
-                  "description": "Starting key value for sequential",
-                  "type": "integer",
-                  "default": 0
-                },
-                "mean_pct": {
-                  "description": "Mean as percentage of keyspace (0.0-1.0) for gaussian",
-                  "type": "number",
-                  "minimum": 0.0,
-                  "maximum": 1.0
-                },
-                "std_dev_pct": {
-                  "description": "Standard deviation as percentage of keyspace for gaussian",
-                  "type": "number",
-                  "minimum": 0.0,
-                  "maximum": 1.0
-                },
-                "value_size": {
-                  "description": "Value size in bytes",
-                  "type": "integer",
-                  "minimum": 1
-                }
-              },
-              "required": ["strategy", "value_size"]
-            },
-            "operations": {
-              "description": "Redis command selection strategy",
-              "type": "object",
-              "properties": {
-                "strategy": {
-                  "description": "fixed (single command) or weighted (random selection)",
-                  "type": "string",
-                  "enum": ["fixed", "weighted"]
-                },
-                "operation": {
-                  "description": "Command name for fixed strategy (get, set, incr, etc.)",
-                  "type": "string"
-                },
-                "commands": {
-                  "description": "Array of weighted commands for weighted strategy",
-                  "type": "array",
-                  "items": {
-                    "type": "object",
-                    "properties": {
-                      "name": {
-                        "description": "Command name: get, set, incr, mget, wait, setex, scan, etc.",
-                        "type": "string"
-                      },
-                      "weight": {
-                        "description": "Probability weight (0.0-1.0, weights are normalized)",
-                        "type": "number",
-                        "minimum": 0.0
-                      },
-                      "params": {
-                        "description": "Command-specific parameters",
-                        "type": "object",
-                        "properties": {
-                          "count": { "type": "integer", "description": "Key count for MGET" },
-                          "num_replicas": { "type": "integer", "description": "Replica count for WAIT" },
-                          "timeout_ms": { "type": "integer", "description": "Timeout for WAIT" }
-                        }
-                      }
-                    },
-                    "required": ["name", "weight"]
-                  }
-                }
-              },
-              "required": ["strategy"]
-            },
-            "value_size": {
-              "description": "Value size configuration (overrides keys.value_size)",
-              "type": "object",
-              "properties": {
-                "strategy": {
-                  "description": "fixed, uniform, or normal",
-                  "type": "string",
-                  "enum": ["fixed", "uniform", "normal"]
-                },
-                "size": { "type": "integer", "description": "Size for fixed strategy" },
-                "min": { "type": "integer", "description": "Minimum size for uniform/normal" },
-                "max": { "type": "integer", "description": "Maximum size for uniform/normal" },
-                "mean": { "type": "number", "description": "Mean for normal distribution" },
-                "std_dev": { "type": "number", "description": "Standard deviation for normal" }
-              },
-              "required": ["strategy"]
-            },
-            "data_import": {
-              "description": "Import test data from CSV file",
-              "type": "object",
-              "properties": {
-                "file": { "type": "string", "description": "Path to CSV file" },
-                "verification": {
-                  "type": "object",
-                  "properties": {
-                    "mode": { "type": "string", "enum": ["during", "after", "only"] },
-                    "sample_rate": { "type": "number", "minimum": 0.0, "maximum": 1.0 }
-                  }
-                }
-              },
-              "required": ["file"]
-            },
-            "method": { "type": "string", "description": "HTTP method (GET, POST, PUT)" },
-            "path": { "type": "string", "description": "HTTP request path" },
-            "host": { "type": "string", "description": "HTTP Host header" },
-            "body_size": { "type": "integer", "description": "HTTP request body size" },
-            "operation": { "type": "string", "description": "Memcached operation (GET, SET)" },
-            "message_size": { "type": "integer", "description": "Echo message size" }
-          },
+          "description": "Protocol-specific configuration as a JSON value.\nEach protocol factory interprets this according to its own schema.\nFor Redis/Memcached: contains keys configuration (strategy, max, value_size, etc.)\nFor HTTP: contains path, host, method configuration\nFor redis-cluster: contains keys, operations, and redis_cluster node configuration\nFor custom protocols: defined by the protocol factory",
           "default": null
         },
         "sampling_policy": {
@@ -787,12 +568,8 @@
           }
         },
         "target": {
-          "description": "Target address for this group (optional, falls back to global target if not specified)",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
+          "description": "Target address for this group (e.g., \"127.0.0.1:6379\" or \"/var/run/redis.sock\")",
+          "type": "string"
         },
         "threads": {
           "description": "Thread IDs this group runs on",
@@ -806,10 +583,17 @@
         "traffic_policy": {
           "description": "Traffic policy configuration (rate control)",
           "$ref": "#/$defs/PolicyConfig"
+        },
+        "transport": {
+          "description": "Transport layer: tcp, udp, unix (defaults to \"tcp\")",
+          "type": "string",
+          "default": "tcp"
         }
       },
       "required": [
         "name",
+        "protocol",
+        "target",
         "threads",
         "connections_per_thread",
         "traffic_policy"

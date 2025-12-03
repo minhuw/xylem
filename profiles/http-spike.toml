@@ -7,15 +7,12 @@ description = "HTTP load test with 10x traffic spike to measure tail latencies u
 seed = 99999
 duration = "120s"
 
-[target]
-transport = "tcp"
-
-
 # Single traffic group with Poisson arrival
 [[traffic_groups]]
 name = "poisson-spike"
 protocol = "http"
 target = "127.0.0.1:8080"
+transport = "tcp"
 threads = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]  # 16 threads
 connections_per_thread = 1
 max_pending_per_connection = 1

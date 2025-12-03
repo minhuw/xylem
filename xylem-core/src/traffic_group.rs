@@ -23,8 +23,11 @@ pub struct TrafficGroupConfig {
     pub name: String,
     /// Protocol for this group (redis, redis-cluster, memcached-binary, memcached-ascii, http, xylem-echo)
     pub protocol: String,
-    /// Target address for this group (e.g., "127.0.0.1:6379")
+    /// Target address for this group (e.g., "127.0.0.1:6379" or "/var/run/redis.sock")
     pub target: String,
+    /// Transport layer: tcp, udp, unix (defaults to "tcp")
+    #[serde(default = "default_transport")]
+    pub transport: String,
     /// Thread IDs this group runs on
     pub threads: Vec<usize>,
     /// Number of connections per thread
@@ -41,9 +44,14 @@ pub struct TrafficGroupConfig {
     /// Each protocol factory interprets this according to its own schema.
     /// For Redis/Memcached: contains keys configuration (strategy, max, value_size, etc.)
     /// For HTTP: contains path, host, method configuration
+    /// For redis-cluster: contains keys, operations, and redis_cluster node configuration
     /// For custom protocols: defined by the protocol factory
     #[serde(default)]
     pub protocol_config: Option<serde_json::Value>,
+}
+
+fn default_transport() -> String {
+    "tcp".to_string()
 }
 
 fn default_max_pending() -> usize {
@@ -221,6 +229,8 @@ pub struct TrafficGroup {
     pub protocol: String,
     /// Target address for this group
     pub target: String,
+    /// Transport layer for this group
+    pub transport: String,
     /// Threads this group runs on
     pub threads: Vec<usize>,
     /// Connections per thread
@@ -241,6 +251,7 @@ impl TrafficGroup {
             name: config.name.clone(),
             protocol: config.protocol.clone(),
             target: config.target.clone(),
+            transport: config.transport.clone(),
             threads: config.threads.clone(),
             connections_per_thread: config.connections_per_thread,
             max_pending_per_connection: config.max_pending_per_connection,
@@ -322,6 +333,7 @@ mod tests {
             name: "test-group".to_string(),
             protocol: "redis".to_string(),
             target: "127.0.0.1:6379".to_string(),
+            transport: "tcp".to_string(),
             threads: vec![0, 1, 2],
             connections_per_thread: 10,
             max_pending_per_connection: 5,
@@ -333,6 +345,7 @@ mod tests {
         let group = TrafficGroup::from_config(0, &config);
         assert_eq!(group.id, 0);
         assert_eq!(group.name, "test-group");
+        assert_eq!(group.transport, "tcp");
         assert_eq!(group.threads, vec![0, 1, 2]);
         assert_eq!(group.total_connections(), 30); // 3 threads * 10 conns
     }
@@ -344,6 +357,7 @@ mod tests {
                 name: "latency".to_string(),
                 protocol: "redis".to_string(),
                 target: "127.0.0.1:6379".to_string(),
+                transport: "tcp".to_string(),
                 threads: vec![0, 1],
                 connections_per_thread: 5,
                 max_pending_per_connection: 1,
@@ -357,6 +371,7 @@ mod tests {
                 name: "throughput".to_string(),
                 protocol: "redis".to_string(),
                 target: "127.0.0.1:6380".to_string(),
+                transport: "tcp".to_string(),
                 threads: vec![2, 3, 4],
                 connections_per_thread: 20,
                 max_pending_per_connection: 32,
@@ -391,6 +406,7 @@ mod tests {
                 name: "g1".to_string(),
                 protocol: "redis".to_string(),
                 target: "127.0.0.1:6379".to_string(),
+                transport: "tcp".to_string(),
                 threads: vec![0, 1],
                 connections_per_thread: 5,
                 max_pending_per_connection: 1,
@@ -402,6 +418,7 @@ mod tests {
                 name: "g2".to_string(),
                 protocol: "redis".to_string(),
                 target: "127.0.0.1:6380".to_string(),
+                transport: "tcp".to_string(),
                 threads: vec![2],
                 connections_per_thread: 10,
                 max_pending_per_connection: 1,
@@ -423,6 +440,7 @@ mod tests {
                 name: "g1".to_string(),
                 protocol: "redis".to_string(),
                 target: "127.0.0.1:6379".to_string(),
+                transport: "tcp".to_string(),
                 threads: vec![2, 3], // Pin to cores 2, 3
                 connections_per_thread: 5,
                 max_pending_per_connection: 1,
@@ -434,6 +452,7 @@ mod tests {
                 name: "g2".to_string(),
                 protocol: "redis".to_string(),
                 target: "127.0.0.1:6380".to_string(),
+                transport: "tcp".to_string(),
                 threads: vec![5], // Pin to core 5
                 connections_per_thread: 10,
                 max_pending_per_connection: 1,
