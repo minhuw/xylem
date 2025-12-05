@@ -19,6 +19,7 @@
 
 use crate::Protocol;
 use anyhow::Result;
+use std::collections::HashMap;
 use zeropool::BufferPool;
 
 const MESSAGE_SIZE: usize = 16; // 8 bytes request_id + 8 bytes delay_us
@@ -28,6 +29,8 @@ pub struct XylemEchoProtocol {
     default_delay_us: u64,
     /// Buffer pool for request generation
     pool: BufferPool,
+    /// Per-connection sequence counter for generating unique request IDs
+    conn_seq: HashMap<usize, u64>,
 }
 
 impl XylemEchoProtocol {
@@ -35,7 +38,16 @@ impl XylemEchoProtocol {
         Self {
             default_delay_us,
             pool: BufferPool::new(),
+            conn_seq: HashMap::new(),
         }
+    }
+
+    /// Get next sequence number for a connection
+    fn next_seq(&mut self, conn_id: usize) -> u64 {
+        let seq = self.conn_seq.entry(conn_id).or_insert(0);
+        let result = *seq;
+        *seq = seq.wrapping_add(1);
+        result
     }
 }
 
@@ -47,6 +59,11 @@ impl Default for XylemEchoProtocol {
 
 impl Protocol for XylemEchoProtocol {
     type RequestId = (usize, u64);
+
+    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId) {
+        let seq = self.next_seq(conn_id);
+        self.generate_request(conn_id, seq, 0)
+    }
 
     fn generate_request(
         &mut self,
@@ -103,7 +120,7 @@ impl Protocol for XylemEchoProtocol {
     }
 
     fn reset(&mut self) {
-        // No state to reset
+        self.conn_seq.clear();
     }
 }
 

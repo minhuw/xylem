@@ -169,11 +169,9 @@ mod tests {
     fn test_end_to_end_reproducibility() {
         // Test that using the same master seed produces identical results across all components
         use crate::scheduler::policy::{PoissonPolicy, Policy};
-        use crate::workload::distributions::{
-            Distribution, ExponentialDistribution, ZipfianDistribution,
-        };
         use crate::workload::generator::KeyGeneration;
         use components::*;
+        use xylem_common::{Distribution, ExponentialDistribution, ZipfianDistribution};
 
         let master_seed = 12345;
 

@@ -53,7 +53,33 @@ pub trait Protocol: Send {
     /// Type of request ID used by this protocol
     type RequestId: Eq + Hash + Clone + Copy + Debug;
 
-    /// Generate a request with an ID
+    /// Generate the next request for a connection
+    ///
+    /// This is the primary method protocols should implement. The protocol decides
+    /// what to send based on its internal workload generator state.
+    ///
+    /// # Arguments
+    /// * `conn_id` - Connection identifier (for protocols that need per-connection state)
+    ///
+    /// # Returns
+    /// (request_data, request_id) tuple
+    ///
+    /// # Default Implementation
+    /// Panics - protocols should implement this method.
+    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId) {
+        let _ = conn_id;
+        unimplemented!(
+            "Protocol {} does not implement next_request(). \
+             Either implement next_request() or use generate_request() with external workload generator.",
+            self.name()
+        )
+    }
+
+    /// Generate a request with an ID (legacy API)
+    ///
+    /// # Deprecation Notice
+    /// This method is being phased out. Protocols should implement `next_request()` instead,
+    /// which allows the protocol to manage its own workload generation internally.
     ///
     /// # Arguments
     /// * `conn_id` - Connection identifier (for protocols that need per-connection state)
@@ -138,6 +164,7 @@ pub mod masstree;
 pub mod memcached;
 pub mod protocol;
 pub mod redis;
+pub mod workload;
 pub mod xylem_echo;
 
 // Re-export commonly used types

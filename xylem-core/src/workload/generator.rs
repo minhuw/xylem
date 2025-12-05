@@ -1,11 +1,11 @@
 //! Request generation
 
-use super::distributions::{Distribution, NormalDistribution, ZipfianDistribution};
 use super::value_size::ValueSizeGenerator;
 use crate::timing::time_ns;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use std::time::Duration;
+use xylem_common::{Distribution, NormalDistribution, ZipfianDistribution};
 
 /// Trait for key generation (to enable per-command key generators)
 pub trait KeyGeneratorTrait: Send {

@@ -147,7 +147,13 @@ pub trait DynProtocolFactory: Send + Sync {
 
 /// Type-erased protocol trait for runtime dispatch.
 pub trait DynProtocol: Send {
-    /// Generate a request
+    /// Generate the next request for a connection
+    ///
+    /// This is the primary method that should be called by the worker.
+    /// The protocol decides what to send based on its internal state.
+    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, (usize, u64));
+
+    /// Generate a request (legacy API)
     fn generate_request(
         &mut self,
         conn_id: usize,
@@ -185,6 +191,10 @@ impl<P> DynProtocol for P
 where
     P: Protocol<RequestId = (usize, u64)> + Send,
 {
+    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, (usize, u64)) {
+        Protocol::next_request(self, conn_id)
+    }
+
     fn generate_request(
         &mut self,
         conn_id: usize,

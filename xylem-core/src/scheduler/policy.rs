@@ -10,8 +10,8 @@
 //! - Simpler API: `next_send_time()` instead of complex `delay_until_next()`
 //! - Uses shared distributions from `workload::distributions`
 
-use crate::workload::ExponentialDistribution;
 use std::time::Duration;
+use xylem_common::ExponentialDistribution;
 
 /// Policy trait for per-connection traffic models
 ///

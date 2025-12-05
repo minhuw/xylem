@@ -11,6 +11,7 @@ repository = "https://github.com/minhuw/xylem"
 workspace = true
 
 [dependencies]
+xylem-common = { path = "../xylem-common" }
 xylem-transport = { path = "../xylem-transport" }
 anyhow = { workspace = true }
 serde = { workspace = true }

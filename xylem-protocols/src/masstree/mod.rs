@@ -89,6 +89,10 @@ pub struct MasstreeProtocol {
     conn_handshake_done: HashMap<usize, bool>,
     /// Buffer pool for request generation
     pool: BufferPool,
+    /// Key generator for next_request()
+    key_gen: Option<crate::workload::KeyGeneration>,
+    /// Value size for next_request()
+    value_size: usize,
 }
 
 impl MasstreeProtocol {
@@ -98,6 +102,24 @@ impl MasstreeProtocol {
             conn_send_seq: HashMap::new(),
             conn_handshake_done: HashMap::new(),
             pool: BufferPool::new(),
+            key_gen: None,
+            value_size: 64,
+        }
+    }
+
+    /// Create with embedded workload generator
+    pub fn with_workload(
+        operation: MasstreeOp,
+        key_gen: crate::workload::KeyGeneration,
+        value_size: usize,
+    ) -> Self {
+        Self {
+            operation,
+            conn_send_seq: HashMap::new(),
+            conn_handshake_done: HashMap::new(),
+            pool: BufferPool::new(),
+            key_gen: Some(key_gen),
+            value_size,
         }
     }
 
@@ -305,6 +327,11 @@ impl Default for MasstreeProtocol {
 impl Protocol for MasstreeProtocol {
     type RequestId = (usize, u16);
 
+    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId) {
+        let key = self.key_gen.as_mut().map(|g| g.next_key()).unwrap_or(0);
+        self.generate_request(conn_id, key, self.value_size)
+    }
+
     fn generate_request(
         &mut self,
         conn_id: usize,
@@ -459,6 +486,9 @@ impl Protocol for MasstreeProtocol {
     fn reset(&mut self) {
         self.conn_send_seq.clear();
         self.conn_handshake_done.clear();
+        if let Some(ref mut key_gen) = self.key_gen {
+            key_gen.reset();
+        }
     }
 }
 

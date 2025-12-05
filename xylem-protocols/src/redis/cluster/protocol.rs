@@ -345,6 +345,13 @@ impl RedisClusterProtocol {
 impl Protocol for RedisClusterProtocol {
     type RequestId = ClusterRequestId;
 
+    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId) {
+        // Delegate to base protocol's key generation then route
+        let key = self.base_protocol.key_gen_mut().map(|g| g.next_key()).unwrap_or(0);
+        let value_size = self.base_protocol.value_size();
+        self.generate_request(conn_id, key, value_size)
+    }
+
     fn generate_request(
         &mut self,
         conn_id: usize,

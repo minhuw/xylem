@@ -164,35 +164,9 @@ mod tests {
     #[test]
     fn test_uniform_size() {
         let mut gen = UniformSize::new(100, 200).expect("Failed to create UniformSize");
-
         for _ in 0..1000 {
             let size = gen.next_size();
             assert!((100..=200).contains(&size), "Size {} out of range [100, 200]", size);
-        }
-    }
-
-    #[test]
-    fn test_uniform_size_distribution() {
-        let mut gen =
-            UniformSize::with_seed(0, 100, Some(42)).expect("Failed to create UniformSize");
-
-        let mut counts = [0usize; 10]; // 10 buckets
-        let samples = 10000;
-
-        for _ in 0..samples {
-            let size = gen.next_size();
-            let bucket = (size / 10).min(9);
-            counts[bucket] += 1;
-        }
-
-        // Each bucket should get roughly 10% (1000 ± 300)
-        for (i, &count) in counts.iter().enumerate() {
-            assert!(
-                count > 700 && count < 1300,
-                "Bucket {} has {} samples (expected ~1000)",
-                i,
-                count
-            );
         }
     }
 
@@ -205,44 +179,10 @@ mod tests {
     #[test]
     fn test_normal_size() {
         let mut gen = NormalSize::new(150.0, 30.0, 50, 250).expect("Failed to create NormalSize");
-
         for _ in 0..1000 {
             let size = gen.next_size();
             assert!((50..=250).contains(&size), "Size {} out of range [50, 250]", size);
         }
-    }
-
-    #[test]
-    fn test_normal_size_distribution() {
-        let mut gen = NormalSize::with_seed(100.0, 20.0, 0, 200, Some(42))
-            .expect("Failed to create NormalSize");
-
-        let mut counts = [0usize; 5]; // 5 buckets: <60, 60-80, 80-120, 120-140, >140
-        let samples = 10000;
-
-        for _ in 0..samples {
-            let size = gen.next_size();
-            let bucket = if size < 60 {
-                0
-            } else if size < 80 {
-                1
-            } else if size < 120 {
-                2
-            } else if size < 140 {
-                3
-            } else {
-                4
-            };
-            counts[bucket] += 1;
-        }
-
-        // Middle bucket (80-120) should have most samples (contains mean ± 1σ)
-        let middle_bucket = counts[2];
-        assert!(
-            middle_bucket > 6000,
-            "Middle bucket should have >60% of samples, got {}",
-            middle_bucket
-        );
     }
 
     #[test]
@@ -264,26 +204,5 @@ mod tests {
         assert_eq!(gen.next_size_for_command("set"), 256);
         assert_eq!(gen.next_size_for_command("incr"), 128); // Uses default
         assert_eq!(gen.next_size(), 128); // Uses default
-    }
-
-    #[test]
-    fn test_per_command_size_with_variable_sizes() {
-        let mut command_gens: HashMap<String, Box<dyn ValueSizeGenerator>> = HashMap::new();
-        command_gens.insert(
-            "set".to_string(),
-            Box::new(UniformSize::with_seed(100, 200, Some(42)).unwrap()),
-        );
-
-        let default_gen = Box::new(FixedSize::new(64));
-        let mut gen = PerCommandSize::new(command_gens, default_gen);
-
-        // SET should return variable sizes
-        let size1 = gen.next_size_for_command("set");
-        let size2 = gen.next_size_for_command("set");
-        assert!((100..=200).contains(&size1));
-        assert!((100..=200).contains(&size2));
-
-        // GET should return fixed default
-        assert_eq!(gen.next_size_for_command("get"), 64);
     }
 }

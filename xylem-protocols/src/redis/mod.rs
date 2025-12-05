@@ -89,6 +89,10 @@ pub struct RedisProtocol {
     pool: BufferPool,
     /// Command execution statistics
     command_stats: std::collections::HashMap<String, u64>,
+    /// Key generator for next_request() - None means use command_selector's per-command keys
+    key_gen: Option<crate::workload::KeyGeneration>,
+    /// Value size for next_request()
+    value_size: usize,
 }
 
 impl RedisProtocol {
@@ -104,6 +108,29 @@ impl RedisProtocol {
             conn_in_transaction: std::collections::HashMap::new(),
             pool: BufferPool::new(),
             command_stats: std::collections::HashMap::new(),
+            key_gen: None,
+            value_size: 64,
+        }
+    }
+
+    /// Create with embedded workload generator
+    pub fn with_workload(
+        command_selector: Box<dyn CommandSelector<RedisOp>>,
+        key_gen: crate::workload::KeyGeneration,
+        value_size: usize,
+    ) -> Self {
+        Self {
+            command_selector,
+            conn_send_seq: std::collections::HashMap::new(),
+            conn_recv_seq: std::collections::HashMap::new(),
+            moved_redirects: 0,
+            ask_redirects: 0,
+            resp_version: 2,
+            conn_in_transaction: std::collections::HashMap::new(),
+            pool: BufferPool::new(),
+            command_stats: std::collections::HashMap::new(),
+            key_gen: Some(key_gen),
+            value_size,
         }
     }
 
@@ -161,6 +188,16 @@ impl RedisProtocol {
     pub fn reset_redirect_stats(&mut self) {
         self.moved_redirects = 0;
         self.ask_redirects = 0;
+    }
+
+    /// Get mutable access to key generator (for cluster protocol delegation)
+    pub fn key_gen_mut(&mut self) -> Option<&mut crate::workload::KeyGeneration> {
+        self.key_gen.as_mut()
+    }
+
+    /// Get configured value size
+    pub fn value_size(&self) -> usize {
+        self.value_size
     }
 
     /// Check if a connection is in a transaction
@@ -396,6 +433,17 @@ impl RedisProtocol {
 impl Protocol for RedisProtocol {
     type RequestId = (usize, u64); // (conn_id, sequence)
 
+    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId) {
+        // Check if command selector has per-command keys
+        if self.command_selector.has_per_command_keys() {
+            self.generate_request_with_command_keys(conn_id, self.value_size)
+        } else {
+            // Use embedded key generator or default to 0
+            let key = self.key_gen.as_mut().map(|g| g.next_key()).unwrap_or(0);
+            self.generate_request(conn_id, key, self.value_size)
+        }
+    }
+
     fn generate_request(
         &mut self,
         conn_id: usize,
@@ -489,6 +537,9 @@ impl Protocol for RedisProtocol {
         self.conn_in_transaction.clear();
         self.command_selector.reset();
         self.command_stats.clear();
+        if let Some(ref mut key_gen) = self.key_gen {
+            key_gen.reset();
+        }
     }
 }
 

@@ -31,6 +31,8 @@ pub struct HttpProtocol {
     method: HttpMethod,
     path: String,
     host: String,
+    /// Body size for POST/PUT requests
+    body_size: usize,
     /// Per-connection sequence numbers for request tracking (TX side)
     conn_seq: HashMap<usize, u64>,
     /// Per-connection expected response sequence (RX side - responses are FIFO)
@@ -41,10 +43,20 @@ pub struct HttpProtocol {
 
 impl HttpProtocol {
     pub fn new(method: HttpMethod, path: String, host: String) -> Self {
+        Self::with_body_size(method, path, host, 64)
+    }
+
+    pub fn with_body_size(
+        method: HttpMethod,
+        path: String,
+        host: String,
+        body_size: usize,
+    ) -> Self {
         Self {
             method,
             path,
             host,
+            body_size,
             conn_seq: HashMap::new(),
             conn_response_seq: HashMap::new(),
             pool: BufferPool::new(),
@@ -92,6 +104,12 @@ impl Default for HttpProtocol {
 
 impl Protocol for HttpProtocol {
     type RequestId = (usize, u64);
+
+    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId) {
+        // HTTP protocol doesn't use key/value semantics
+        // For POST/PUT, we use the configured body_size
+        self.generate_request(conn_id, 0, self.body_size)
+    }
 
     fn generate_request(
         &mut self,

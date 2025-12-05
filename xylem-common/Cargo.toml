@@ -1,0 +1,18 @@
+[package]
+name = "xylem-common"
+version = "0.1.0"
+edition = "2021"
+authors = ["xylem contributors"]
+description = "Common utilities for Xylem latency measurement tool"
+license = "MIT"
+repository = "https://github.com/minhuw/xylem"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+rand = { workspace = true }
+rand_distr = { workspace = true }
+
+[dev-dependencies]

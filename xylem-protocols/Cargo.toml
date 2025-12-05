@@ -14,6 +14,7 @@ workspace = true
 schema = ["schemars"]
 
 [dependencies]
+xylem-common = { path = "../xylem-common" }
 xylem-core = { path = "../xylem-core" }
 anyhow = { workspace = true }
 serde = { workspace = true }
@@ -26,3 +27,4 @@ rand_distr = { workspace = true }
 rmp = "0.8.14"
 rmp-serde.workspace = true
 zeropool = "0.2"
+csv = { workspace = true }

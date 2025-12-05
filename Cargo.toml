@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "xylem-cli",
+    "xylem-common",
     "xylem-core", "xylem-echo-server",
     "xylem-protocols", "xylem-transport",
 ]

@@ -1942,6 +1942,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "xylem-common"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rand 0.9.2",
+ "rand_distr 0.5.1",
+]
+
+[[package]]
 name = "xylem-core"
 version = "0.1.0"
 dependencies = [
@@ -1961,6 +1970,7 @@ dependencies = [
  "tdigest",
  "tokio",
  "tracing",
+ "xylem-common",
  "xylem-protocols",
  "xylem-transport",
  "zeropool",
@@ -1981,6 +1991,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "csv",
  "httparse",
  "rand 0.9.2",
  "rand_distr 0.5.1",
@@ -1989,6 +2000,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "xylem-common",
  "xylem-core",
  "zeropool",
 ]

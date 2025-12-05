@@ -21,6 +21,10 @@ pub struct MemcachedAsciiProtocol {
     conn_recv_seq: HashMap<usize, u64>,
     /// Buffer pool for request generation
     pool: BufferPool,
+    /// Key generator for next_request()
+    key_gen: Option<crate::workload::KeyGeneration>,
+    /// Value size for next_request()
+    value_size: usize,
 }
 
 impl MemcachedAsciiProtocol {
@@ -30,6 +34,24 @@ impl MemcachedAsciiProtocol {
             conn_send_seq: HashMap::new(),
             conn_recv_seq: HashMap::new(),
             pool: BufferPool::new(),
+            key_gen: None,
+            value_size: 64,
+        }
+    }
+
+    /// Create with embedded workload generator
+    pub fn with_workload(
+        operation: MemcachedOp,
+        key_gen: crate::workload::KeyGeneration,
+        value_size: usize,
+    ) -> Self {
+        Self {
+            operation,
+            conn_send_seq: HashMap::new(),
+            conn_recv_seq: HashMap::new(),
+            pool: BufferPool::new(),
+            key_gen: Some(key_gen),
+            value_size,
         }
     }
 
@@ -56,6 +78,11 @@ impl Default for MemcachedAsciiProtocol {
 
 impl Protocol for MemcachedAsciiProtocol {
     type RequestId = (usize, u64);
+
+    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId) {
+        let key = self.key_gen.as_mut().map(|g| g.next_key()).unwrap_or(0);
+        self.generate_request(conn_id, key, self.value_size)
+    }
 
     fn generate_request(
         &mut self,
@@ -144,5 +171,8 @@ impl Protocol for MemcachedAsciiProtocol {
     fn reset(&mut self) {
         self.conn_send_seq.clear();
         self.conn_recv_seq.clear();
+        if let Some(ref mut key_gen) = self.key_gen {
+            key_gen.reset();
+        }
     }
 }
