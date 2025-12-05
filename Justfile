@@ -255,6 +255,71 @@ flamegraph-echo-unix:
     echo "✅ Flamegraph generated: flamegraph-unix.svg"
     echo "   Open it in a browser to analyze performance"
 
+# Demo: Request dump feature - records all requests to CSV files
+# Runs a 10-second Redis benchmark with Poisson arrivals and Zipfian keys
+demo-request-dump:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    DUMP_DIR="/tmp/xylem_request_dump"
+
+    echo "📝 Request Dump Demo"
+    echo "===================="
+    echo ""
+    echo "This demo shows how to record all requests to CSV files."
+    echo "Configuration: 1 thread, Poisson 1000 req/s, Zipfian keys, 10 seconds"
+    echo ""
+
+    # Clean up old dump files
+    rm -rf "$DUMP_DIR"
+    mkdir -p "$DUMP_DIR"
+
+    # Start Redis
+    echo "🚀 Starting Redis server..."
+    just redis-start
+    echo ""
+
+    # Ensure Redis is cleaned up on exit
+    cleanup() {
+        echo ""
+        echo "🧹 Stopping Redis server..."
+        just redis-stop
+    }
+    trap cleanup EXIT
+
+    # Run the benchmark
+    echo "🔥 Running benchmark with request dump enabled..."
+    echo ""
+    cargo run --release --bin xylem -- -P profiles/request-dump-demo.toml
+
+    echo ""
+    echo "📊 Request dump files:"
+    ls -la "$DUMP_DIR"
+    echo ""
+
+    # Show sample of the dump
+    DUMP_FILE=$(ls "$DUMP_DIR"/*.csv 2>/dev/null | head -1)
+    if [ -n "$DUMP_FILE" ]; then
+        echo "📄 Sample from $DUMP_FILE (first 20 lines):"
+        echo "-------------------------------------------"
+        head -20 "$DUMP_FILE"
+        echo "..."
+        echo ""
+        echo "📈 Total records: $(wc -l < "$DUMP_FILE") lines"
+        echo ""
+        echo "💡 CSV columns:"
+        echo "   - timestamp_ns: Request timestamp in nanoseconds"
+        echo "   - thread_id: Worker thread ID"
+        echo "   - group_id: Traffic group ID"
+        echo "   - conn_id: Connection ID"
+        echo "   - request_id: Unique request identifier"
+        echo "   - data_len: Request data length in bytes"
+        echo "   - data_utf8: Request data (UTF-8 encoded)"
+    fi
+
+    echo ""
+    echo "✅ Demo complete! Dump files are in: $DUMP_DIR"
+
 # Run a quick benchmark (Redis, 10k requests, single connection)
 bench-quick:
     @echo "⚡ Running quick benchmark..."
@@ -386,6 +451,9 @@ help:
     @echo "  just flamegraph-echo     - Generate flamegraph with echo benchmark (30s)"
     @echo "  just bench-quick         - Quick benchmark"
     @echo "  just bench-full          - Full benchmark"
+    @echo ""
+    @echo "📝 Demos:"
+    @echo "  just demo-request-dump   - Demo request dump feature (records to CSV)"
     @echo ""
     @echo "🎯 Server Management:"
     @echo "  just servers-start     - Start Redis & Memcached"

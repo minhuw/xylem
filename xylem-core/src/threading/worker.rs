@@ -8,11 +8,13 @@
 //! - Multiple connections with pipelining: High-throughput load testing
 
 use crate::connection::{ConnectionPool, TrafficGroupConfig};
+use crate::request_dump::RequestDumper;
 use crate::stats::GroupStatsCollector;
 use crate::timing;
 use crate::Result;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use xylem_transport::{ConnectionGroup, TransportFactory};
 
@@ -149,6 +151,10 @@ pub struct Worker<G: ConnectionGroup, P: Protocol> {
     protocols: HashMap<usize, P>,
     stats: GroupStatsCollector,
     config: WorkerConfig,
+    /// Optional request dumper for recording all requests
+    request_dumper: Option<Arc<RequestDumper>>,
+    /// Thread ID for request dumping
+    thread_id: usize,
 }
 
 impl<G: ConnectionGroup, P: Protocol> Worker<G, P> {
@@ -172,7 +178,14 @@ impl<G: ConnectionGroup, P: Protocol> Worker<G, P> {
         let mut protocols = HashMap::new();
         protocols.insert(0, protocol);
 
-        Ok(Self { pool, protocols, stats, config })
+        Ok(Self {
+            pool,
+            protocols,
+            stats,
+            config,
+            request_dumper: None,
+            thread_id: 0,
+        })
     }
 
     /// Create a new pipelined worker with closed-loop policy (max throughput)
@@ -196,7 +209,14 @@ impl<G: ConnectionGroup, P: Protocol> Worker<G, P> {
     ) -> Result<Self> {
         let pool = ConnectionPool::new_multi_group(factory, config.target, groups)?;
 
-        Ok(Self { pool, protocols, stats, config })
+        Ok(Self {
+            pool,
+            protocols,
+            stats,
+            config,
+            request_dumper: None,
+            thread_id: 0,
+        })
     }
 
     /// Create a new pipelined worker with multiple traffic groups, each with its own target
@@ -209,7 +229,14 @@ impl<G: ConnectionGroup, P: Protocol> Worker<G, P> {
     ) -> Result<Self> {
         let pool = ConnectionPool::new_multi_group_with_targets(factory, groups)?;
 
-        Ok(Self { pool, protocols, stats, config })
+        Ok(Self {
+            pool,
+            protocols,
+            stats,
+            config,
+            request_dumper: None,
+            thread_id: 0,
+        })
     }
 
     /// Get mapping of connection ID to target address
@@ -233,6 +260,30 @@ impl<G: ConnectionGroup, P: Protocol> Worker<G, P> {
     /// Useful for post-construction wiring (e.g., registering cluster connections).
     pub fn protocols_mut(&mut self) -> &mut HashMap<usize, P> {
         &mut self.protocols
+    }
+
+    /// Set the request dumper for recording all requests
+    ///
+    /// # Arguments
+    /// * `dumper` - The request dumper instance (shared across threads)
+    /// * `thread_id` - The thread ID for this worker (used in dump records)
+    pub fn set_request_dumper(&mut self, dumper: Arc<RequestDumper>, thread_id: usize) {
+        self.request_dumper = Some(dumper);
+        self.thread_id = thread_id;
+    }
+
+    /// Record a request to the dump file (helper to reduce nesting)
+    fn record_request(
+        &self,
+        dumper: &RequestDumper,
+        group_id: usize,
+        conn_id: usize,
+        data: &[u8],
+        req_id_str: &str,
+    ) {
+        if let Err(e) = dumper.record(self.thread_id, group_id, conn_id, data, req_id_str) {
+            tracing::warn!("Failed to record request to dump: {}", e);
+        }
     }
 
     /// Run the pipelined measurement loop (Lancet symmetric_tcp_main style)
@@ -260,6 +311,18 @@ impl<G: ConnectionGroup, P: Protocol> Worker<G, P> {
 
                 // Generate request using protocol's embedded generator
                 let (request_data, req_id) = protocol.next_request(connection_id);
+
+                // Record request to dump file if enabled
+                if let Some(ref dumper) = self.request_dumper {
+                    let req_id_str = format!("{:?}", req_id);
+                    self.record_request(
+                        dumper,
+                        group_id,
+                        connection_id,
+                        &request_data,
+                        &req_id_str,
+                    );
+                }
 
                 // Send request
                 let sent_time_ns = timing::time_ns();
@@ -428,6 +491,12 @@ impl<G: ConnectionGroup, P: Protocol> Worker<G, P> {
         let (retry_data, retry_req_id) =
             protocol.regenerate_request(target_connection_id, retry_req.original_request_id);
 
+        // Record retry request to dump file if enabled
+        if let Some(ref dumper) = self.request_dumper {
+            let req_id_str = format!("{:?}_retry{}", retry_req_id, retry_req.attempt);
+            self.record_request(dumper, group_id, target_connection_id, &retry_data, &req_id_str);
+        }
+
         // Send the retry request
         // Note: We intentionally do NOT call state.on_request_sent() or generator.mark_request_sent()
         // because retries are already counted as in-flight from the original request. Double-counting
@@ -529,7 +598,14 @@ impl<P: Protocol> Worker<xylem_transport::UnixConnectionGroup, P> {
     ) -> Result<Self> {
         let pool = ConnectionPool::new_multi_group_unix(factory, groups)?;
 
-        Ok(Self { pool, protocols, stats, config })
+        Ok(Self {
+            pool,
+            protocols,
+            stats,
+            config,
+            request_dumper: None,
+            thread_id: 0,
+        })
     }
 }
 

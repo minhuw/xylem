@@ -17,6 +17,9 @@ pub struct ProfileConfig {
     /// Traffic groups configuration
     pub traffic_groups: Vec<xylem_core::traffic_group::TrafficGroupConfig>,
     pub output: OutputConfig,
+    /// Optional request dump configuration for recording all requests
+    #[serde(default)]
+    pub request_dump: Option<xylem_core::request_dump::DumpConfig>,
 }
 
 /// Experiment metadata
@@ -1544,5 +1547,126 @@ file = "/tmp/test.json"
             "Error should mention data_import not supported for redis-cluster: {}",
             err
         );
+    }
+
+    #[test]
+    fn test_request_dump_config_parsing() {
+        let toml_str = r#"
+[experiment]
+name = "test-request-dump"
+duration = "10s"
+
+[[traffic_groups]]
+name = "main"
+protocol = "redis"
+target = "127.0.0.1:6379"
+threads = [0]
+connections_per_thread = 1
+
+[traffic_groups.protocol_config.keys]
+strategy = "sequential"
+start = 0
+value_size = 64
+
+[traffic_groups.traffic_policy]
+type = "closed-loop"
+
+[output]
+format = "json"
+file = "/tmp/test.json"
+
+[request_dump]
+directory = "/tmp/xylem_dumps"
+prefix = "redis_requests"
+encoding = "utf8"
+rotation = "hourly"
+max_files = 24
+"#;
+        let config: ProfileConfig = toml::from_str(toml_str).expect("TOML should parse");
+        assert!(config.request_dump.is_some());
+
+        let dump_config = config.request_dump.unwrap();
+        assert_eq!(dump_config.directory.to_str().unwrap(), "/tmp/xylem_dumps");
+        assert_eq!(dump_config.prefix, "redis_requests");
+        assert_eq!(dump_config.encoding, xylem_core::request_dump::DataEncoding::Utf8Lossy);
+        assert_eq!(dump_config.rotation, xylem_core::request_dump::RotationPolicy::Hourly);
+        assert_eq!(dump_config.max_files, Some(24));
+    }
+
+    #[test]
+    fn test_request_dump_size_rotation() {
+        let toml_str = r#"
+[experiment]
+name = "test"
+duration = "10s"
+
+[[traffic_groups]]
+name = "main"
+protocol = "redis"
+target = "127.0.0.1:6379"
+threads = [0]
+connections_per_thread = 1
+
+[traffic_groups.protocol_config.keys]
+strategy = "sequential"
+start = 0
+value_size = 64
+
+[traffic_groups.traffic_policy]
+type = "closed-loop"
+
+[output]
+format = "json"
+file = "/tmp/test.json"
+
+[request_dump]
+directory = "/tmp/dumps"
+rotation = { size = 10485760 }
+"#;
+        let config: ProfileConfig = toml::from_str(toml_str).expect("TOML should parse");
+        assert!(config.request_dump.is_some());
+
+        let dump_config = config.request_dump.unwrap();
+        assert_eq!(dump_config.rotation, xylem_core::request_dump::RotationPolicy::Size(10485760));
+    }
+
+    #[test]
+    fn test_request_dump_defaults() {
+        let toml_str = r#"
+[experiment]
+name = "test"
+duration = "10s"
+
+[[traffic_groups]]
+name = "main"
+protocol = "redis"
+target = "127.0.0.1:6379"
+threads = [0]
+connections_per_thread = 1
+
+[traffic_groups.protocol_config.keys]
+strategy = "sequential"
+start = 0
+value_size = 64
+
+[traffic_groups.traffic_policy]
+type = "closed-loop"
+
+[output]
+format = "json"
+file = "/tmp/test.json"
+
+[request_dump]
+directory = "/tmp/dumps"
+"#;
+        let config: ProfileConfig = toml::from_str(toml_str).expect("TOML should parse");
+        assert!(config.request_dump.is_some());
+
+        let dump_config = config.request_dump.unwrap();
+        // Check defaults
+        assert_eq!(dump_config.prefix, "xylem_requests");
+        assert_eq!(dump_config.encoding, xylem_core::request_dump::DataEncoding::Hex);
+        assert_eq!(dump_config.rotation, xylem_core::request_dump::RotationPolicy::Never);
+        assert_eq!(dump_config.max_files, None);
     }
 }

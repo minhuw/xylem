@@ -1,0 +1,66 @@
+# Request Dump Demo Profile
+#
+# This profile demonstrates the request dump feature which records all
+# requests sent during the benchmark to CSV files for analysis.
+#
+# Run with: just demo-request-dump
+#
+# Output will be written to /tmp/xylem_request_dump/
+
+[experiment]
+name = "request-dump-demo"
+description = "Demo of request dump feature - records all requests to CSV"
+duration = "10s"
+seed = 42
+
+[[traffic_groups]]
+name = "redis-workload"
+protocol = "redis"
+target = "127.0.0.1:6379"
+transport = "tcp"
+threads = [0]                    # Single thread for clear demonstration
+connections_per_thread = 10
+max_pending_per_connection = 1   # No pipelining for easier analysis
+
+# Zipfian key distribution - creates "hot key" pattern
+[traffic_groups.protocol_config.keys]
+strategy = "zipfian"
+n = 10000                        # 10k key space
+theta = 0.99                     # Highly skewed (YCSB default)
+value_size = 64
+
+# Mix of GET and SET operations
+[traffic_groups.protocol_config.operations]
+strategy = "weighted"
+
+[[traffic_groups.protocol_config.operations.commands]]
+name = "get"
+weight = 0.8                     # 80% reads
+
+[[traffic_groups.protocol_config.operations.commands]]
+name = "set"
+weight = 0.2                     # 20% writes
+
+# Poisson arrival pattern at 1000 req/s
+[traffic_groups.traffic_policy]
+type = "poisson"
+rate = 1000.0                    # 1000 requests per second
+
+[traffic_groups.sampling_policy]
+type = "unlimited"               # Sample all for latency
+
+[output]
+format = "json"
+file = "/tmp/request-dump-demo-results.json"
+real_time = true
+
+# Request dump configuration
+# All requests will be recorded to CSV files in the specified directory
+[request_dump]
+directory = "/tmp/xylem_request_dump"
+prefix = "redis_demo"
+encoding = "utf8"                # Human-readable (Redis is text-based)
+rotation = "never"               # Single file for short demo
+# For longer runs, use:
+# rotation = "hourly"
+# max_files = 24                 # Keep last 24 hours

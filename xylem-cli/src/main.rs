@@ -4,6 +4,7 @@ use clap_complete::{generate, Shell};
 use schemars::schema_for;
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use xylem_core::threading::{CpuPinning, ThreadingRuntime, Worker, WorkerConfig};
 use xylem_transport::{TcpTransportFactory, UdpTransportFactory};
@@ -441,6 +442,22 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
 
     tracing::info!("Starting experiment...");
 
+    // Create request dumper if configured
+    let request_dumper = if let Some(ref dump_config) = config.request_dump {
+        let dumper = xylem_core::request_dump::RequestDumper::new(dump_config.clone())
+            .context("Failed to create request dumper")?;
+        tracing::info!(
+            "Request dumping enabled: directory={:?}, prefix={}, encoding={:?}, rotation={:?}",
+            dump_config.directory,
+            dump_config.prefix,
+            dump_config.encoding,
+            dump_config.rotation
+        );
+        Some(dumper)
+    } else {
+        None
+    };
+
     // Clone config for use in worker closure
     let config_for_worker = config.clone();
 
@@ -478,6 +495,8 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
 
     // Support multiple traffic groups per thread with per-group protocols
     let results = runtime.run_workers_generic(move |thread_idx| {
+        // Clone the request dumper for this worker thread
+        let request_dumper_for_worker = request_dumper.clone();
         // Find which traffic groups this thread belongs to
         let groups_for_thread = thread_assignment
             .get_groups_for_thread(thread_idx)
@@ -755,6 +774,11 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                 // Wire redis-cluster connections
                 wire_cluster_connections(&mut worker, &redis_cluster_groups);
 
+                // Wire request dumper if enabled
+                if let Some(ref dumper) = request_dumper_for_worker {
+                    worker.set_request_dumper(Arc::clone(dumper), thread_idx);
+                }
+
                 worker.run()?;
                 Ok(worker.into_stats())
             }
@@ -770,6 +794,11 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
 
                 // Wire redis-cluster connections
                 wire_cluster_connections(&mut worker, &redis_cluster_groups);
+
+                // Wire request dumper if enabled
+                if let Some(ref dumper) = request_dumper_for_worker {
+                    worker.set_request_dumper(Arc::clone(dumper), thread_idx);
+                }
 
                 worker.run()?;
                 Ok(worker.into_stats())
@@ -803,6 +832,11 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
 
                 // Wire redis-cluster connections (unlikely for Unix but for consistency)
                 wire_cluster_connections(&mut worker, &redis_cluster_groups);
+
+                // Wire request dumper if enabled
+                if let Some(ref dumper) = request_dumper_for_worker {
+                    worker.set_request_dumper(Arc::clone(dumper), thread_idx);
+                }
 
                 worker.run()?;
                 Ok(worker.into_stats())
