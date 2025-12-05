@@ -6,7 +6,7 @@
 use std::time::Duration;
 use xylem_core::stats::GroupStatsCollector;
 use xylem_core::threading::{ThreadingRuntime, Worker, WorkerConfig};
-use xylem_core::workload::{KeyGeneration, RateControl, RequestGenerator};
+
 use xylem_transport::TcpTransportFactory;
 
 mod common;
@@ -25,13 +25,16 @@ impl<P: xylem_protocols::Protocol> ProtocolAdapter<P> {
 impl<P: xylem_protocols::Protocol> xylem_core::threading::worker::Protocol for ProtocolAdapter<P> {
     type RequestId = P::RequestId;
 
-    fn generate_request(
+    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId) {
+        self.inner.next_request(conn_id)
+    }
+
+    fn regenerate_request(
         &mut self,
         conn_id: usize,
-        key: u64,
-        value_size: usize,
+        original_request_id: Self::RequestId,
     ) -> (Vec<u8>, Self::RequestId) {
-        self.inner.generate_request(conn_id, key, value_size)
+        self.inner.regenerate_request(conn_id, original_request_id)
     }
 
     fn parse_response(
@@ -68,28 +71,17 @@ fn test_masstree_get_single_thread() {
     let protocol = ProtocolAdapter::new(protocol);
 
     // Create worker components
-    let generator = RequestGenerator::new(
-        KeyGeneration::sequential(0),
-        RateControl::ClosedLoop,
-        Box::new(xylem_core::workload::FixedSize::new(64)),
-    );
     let stats = common::create_test_stats();
     let worker_config = WorkerConfig {
         target: target_addr,
         duration,
-        value_size: 64,
         conn_count: 1,
         max_pending_per_conn: 1,
     };
 
-    let mut worker = Worker::with_closed_loop(
-        &TcpTransportFactory::default(),
-        protocol,
-        generator,
-        stats,
-        worker_config,
-    )
-    .expect("Failed to create worker");
+    let mut worker =
+        Worker::with_closed_loop(&TcpTransportFactory::default(), protocol, stats, worker_config)
+            .expect("Failed to create worker");
 
     // Run the worker
     println!("Starting single-threaded Masstree GET test...");
@@ -143,28 +135,17 @@ fn test_masstree_set_single_thread() {
     let protocol = ProtocolAdapter::new(protocol);
 
     // Create worker components
-    let generator = RequestGenerator::new(
-        KeyGeneration::sequential(0),
-        RateControl::ClosedLoop,
-        Box::new(xylem_core::workload::FixedSize::new(128)),
-    );
     let stats = common::create_test_stats();
     let worker_config = WorkerConfig {
         target: target_addr,
         duration,
-        value_size: 128,
         conn_count: 1,
         max_pending_per_conn: 1,
     };
 
-    let mut worker = Worker::with_closed_loop(
-        &TcpTransportFactory::default(),
-        protocol,
-        generator,
-        stats,
-        worker_config,
-    )
-    .expect("Failed to create worker");
+    let mut worker =
+        Worker::with_closed_loop(&TcpTransportFactory::default(), protocol, stats, worker_config)
+            .expect("Failed to create worker");
 
     // Run the worker
     println!("Starting single-threaded Masstree SET test...");
@@ -208,28 +189,21 @@ fn test_masstree_multi_thread() {
 
     println!("Starting {num_threads}-threaded Masstree test...");
 
-    let results = runtime.run_workers_generic(move |thread_id| {
+    let results = runtime.run_workers_generic(move |_thread_id| {
         let protocol = xylem_protocols::masstree::MasstreeProtocol::new(
             xylem_protocols::masstree::MasstreeOp::Get,
         );
         let protocol = ProtocolAdapter::new(protocol);
-        let generator = RequestGenerator::new(
-            KeyGeneration::sequential(thread_id as u64 * 10000),
-            RateControl::ClosedLoop,
-            Box::new(xylem_core::workload::FixedSize::new(64)),
-        );
         let stats = common::create_test_stats();
         let worker_config = WorkerConfig {
             target: target_addr,
             duration,
-            value_size: 64,
             conn_count: 1,
             max_pending_per_conn: 1,
         };
         let mut worker = Worker::with_closed_loop(
             &TcpTransportFactory::default(),
             protocol,
-            generator,
             stats,
             worker_config,
         )
@@ -292,28 +266,17 @@ fn test_masstree_remove_operation() {
     let protocol = ProtocolAdapter::new(protocol);
 
     // Create worker components
-    let generator = RequestGenerator::new(
-        KeyGeneration::sequential(0),
-        RateControl::ClosedLoop,
-        Box::new(xylem_core::workload::FixedSize::new(64)),
-    );
     let stats = common::create_test_stats();
     let worker_config = WorkerConfig {
         target: target_addr,
         duration,
-        value_size: 64,
         conn_count: 1,
         max_pending_per_conn: 1,
     };
 
-    let mut worker = Worker::with_closed_loop(
-        &TcpTransportFactory::default(),
-        protocol,
-        generator,
-        stats,
-        worker_config,
-    )
-    .expect("Failed to create worker");
+    let mut worker =
+        Worker::with_closed_loop(&TcpTransportFactory::default(), protocol, stats, worker_config)
+            .expect("Failed to create worker");
 
     // Run the worker
     println!("Starting single-threaded Masstree REMOVE test...");
@@ -353,26 +316,24 @@ fn test_masstree_rate_limited() {
         xylem_protocols::masstree::MasstreeOp::Get,
     );
     let protocol = ProtocolAdapter::new(protocol);
-    let generator = RequestGenerator::new(
-        KeyGeneration::sequential(0),
-        RateControl::Fixed { rate: target_rate },
-        Box::new(xylem_core::workload::FixedSize::new(64)),
-    );
     let stats = common::create_test_stats();
     let worker_config = WorkerConfig {
         target: target_addr,
         duration,
-        value_size: 64,
         conn_count: 1,
         max_pending_per_conn: 1,
     };
 
-    let mut worker = Worker::with_closed_loop(
+    // Use fixed-rate policy for rate limiting
+    let policy_scheduler =
+        Box::new(xylem_core::scheduler::UniformPolicyScheduler::fixed_rate(target_rate));
+
+    let mut worker = Worker::new(
         &TcpTransportFactory::default(),
         protocol,
-        generator,
         stats,
         worker_config,
+        policy_scheduler,
     )
     .expect("Failed to create worker");
 

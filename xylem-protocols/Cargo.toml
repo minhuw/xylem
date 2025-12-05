@@ -28,3 +28,6 @@ rmp = "0.8.14"
 rmp-serde.workspace = true
 zeropool = "0.2"
 csv = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

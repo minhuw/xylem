@@ -39,50 +39,6 @@ pub struct ExperimentConfig {
 /// Re-export KeysConfig from xylem-protocols for use in config files
 pub use xylem_protocols::KeysConfig;
 
-/// Value size configuration
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-#[serde(tag = "strategy", rename_all = "lowercase")]
-pub enum ValueSizeConfig {
-    /// Fixed size for all requests
-    Fixed { size: usize },
-    /// Uniform random size in range [min, max]
-    Uniform { min: usize, max: usize },
-    /// Normal (Gaussian) distribution
-    Normal {
-        mean: f64,
-        std_dev: f64,
-        min: usize,
-        max: usize,
-    },
-    /// Per-command size configuration
-    #[serde(rename = "per_command")]
-    PerCommand {
-        /// Size strategies for specific commands
-        commands: std::collections::HashMap<String, CommandValueSizeConfig>,
-        /// Default strategy for unspecified commands
-        default: Box<ValueSizeConfig>,
-    },
-}
-
-/// Value size configuration for a specific command
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-#[serde(tag = "distribution", rename_all = "lowercase")]
-pub enum CommandValueSizeConfig {
-    Fixed {
-        size: usize,
-    },
-    Uniform {
-        min: usize,
-        max: usize,
-    },
-    Normal {
-        mean: f64,
-        std_dev: f64,
-        min: usize,
-        max: usize,
-    },
-}
-
 /// Operations configuration (command selection)
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(tag = "strategy", rename_all = "lowercase")]
@@ -641,67 +597,6 @@ fn parse_value(value_str: &str) -> Result<toml::Value> {
     Ok(toml::Value::String(string_val.to_string()))
 }
 
-// Helper methods to convert config types to runtime types
-// Note: These may appear unused but are kept for potential future use
-// when migrating more features to per-traffic-group configuration.
-
-#[allow(dead_code)]
-impl ValueSizeConfig {
-    /// Convert to a ValueSizeGenerator
-    pub fn to_generator(
-        &self,
-        master_seed: Option<u64>,
-    ) -> anyhow::Result<Box<dyn xylem_core::workload::ValueSizeGenerator>> {
-        use xylem_core::seed::derive_seed;
-        use xylem_core::workload::{FixedSize, NormalSize, PerCommandSize, UniformSize};
-
-        match self {
-            Self::Fixed { size } => Ok(Box::new(FixedSize::new(*size))),
-            Self::Uniform { min, max } => {
-                let seed = master_seed.map(|s| derive_seed(s, "uniform_value_size"));
-                Ok(Box::new(UniformSize::with_seed(*min, *max, seed)?))
-            }
-            Self::Normal { mean, std_dev, min, max } => {
-                let seed = master_seed.map(|s| derive_seed(s, "normal_value_size"));
-                Ok(Box::new(NormalSize::with_seed(*mean, *std_dev, *min, *max, seed)?))
-            }
-            Self::PerCommand { commands, default } => {
-                let mut command_generators = std::collections::HashMap::new();
-                for (cmd, cfg) in commands {
-                    let gen = cfg.to_generator(master_seed)?;
-                    command_generators.insert(cmd.clone(), gen);
-                }
-                let default_gen = default.to_generator(master_seed)?;
-                Ok(Box::new(PerCommandSize::new(command_generators, default_gen)))
-            }
-        }
-    }
-}
-
-#[allow(dead_code)]
-impl CommandValueSizeConfig {
-    /// Convert to a ValueSizeGenerator
-    pub fn to_generator(
-        &self,
-        master_seed: Option<u64>,
-    ) -> anyhow::Result<Box<dyn xylem_core::workload::ValueSizeGenerator>> {
-        use xylem_core::seed::derive_seed;
-        use xylem_core::workload::{FixedSize, NormalSize, UniformSize};
-
-        match self {
-            Self::Fixed { size } => Ok(Box::new(FixedSize::new(*size))),
-            Self::Uniform { min, max } => {
-                let seed = master_seed.map(|s| derive_seed(s, "uniform_cmd_size"));
-                Ok(Box::new(UniformSize::with_seed(*min, *max, seed)?))
-            }
-            Self::Normal { mean, std_dev, min, max } => {
-                let seed = master_seed.map(|s| derive_seed(s, "normal_cmd_size"));
-                Ok(Box::new(NormalSize::with_seed(*mean, *std_dev, *min, *max, seed)?))
-            }
-        }
-    }
-}
-
 #[allow(dead_code)]
 impl OperationsConfig {
     /// Helper: Process a command with per-command keys
@@ -712,7 +607,7 @@ impl OperationsConfig {
         let op = Self::parse_redis_op(&cmd_cfg.name, cmd_cfg.params.as_ref())?;
 
         if let Some(ref keys_config) = cmd_cfg.keys {
-            let key_gen = keys_config.to_key_generation(master_seed)?;
+            let key_gen = keys_config.to_key_gen(master_seed)?;
             Ok((op, Box::new(key_gen) as Box<dyn xylem_protocols::KeyGenerator>))
         } else {
             anyhow::bail!(
@@ -828,7 +723,7 @@ impl OperationsConfig {
 mod tests {
     use super::*;
     use xylem_core::stats::collector::SamplingPolicy;
-    use xylem_core::workload::KeyGeneration;
+    use xylem_protocols::workload::KeyGeneration;
 
     /// Helper to extract KeysConfig from protocol_config
     fn get_keys_config(
@@ -1111,7 +1006,7 @@ file = "results/test.json"
             .expect("Expected keys config in protocol_config");
 
         let key_gen = keys_config
-            .to_key_generation(config.experiment.seed)
+            .to_key_gen(config.experiment.seed)
             .expect("Failed to convert to KeyGeneration");
 
         match key_gen {
@@ -1142,10 +1037,8 @@ file = "results/test.json"
         let keys = get_keys_config(&config.traffic_groups[0])
             .expect("Expected keys config in protocol_config");
 
-        let key_gen1 =
-            keys.to_key_generation(master_seed).expect("Failed to create key generation 1");
-        let key_gen2 =
-            keys.to_key_generation(master_seed).expect("Failed to create key generation 2");
+        let key_gen1 = keys.to_key_gen(master_seed).expect("Failed to create key generation 1");
+        let key_gen2 = keys.to_key_gen(master_seed).expect("Failed to create key generation 2");
 
         match (&key_gen1, &key_gen2) {
             (KeyGeneration::Zipfian(_), KeyGeneration::Zipfian(_)) => {}
@@ -1189,7 +1082,7 @@ file = "test.json"
 
         let config = ProfileConfig::from_file(tmpfile.path()).unwrap();
         let keys_config = get_keys_config(&config.traffic_groups[0]).unwrap();
-        let key_gen = keys_config.to_key_generation(None).unwrap();
+        let key_gen = keys_config.to_key_gen(None).unwrap();
 
         match key_gen {
             KeyGeneration::Sequential { start, .. } => {
@@ -1211,7 +1104,7 @@ max = 10000"#,
 
         let config = ProfileConfig::from_file(tmpfile.path()).unwrap();
         let keys_config = get_keys_config(&config.traffic_groups[0]).unwrap();
-        let key_gen = keys_config.to_key_generation(Some(12345)).unwrap();
+        let key_gen = keys_config.to_key_gen(Some(12345)).unwrap();
 
         match key_gen {
             KeyGeneration::Random { max, .. } => {
@@ -1233,7 +1126,7 @@ max = 5000"#,
 
         let config = ProfileConfig::from_file(tmpfile.path()).unwrap();
         let keys_config = get_keys_config(&config.traffic_groups[0]).unwrap();
-        let key_gen = keys_config.to_key_generation(None).unwrap();
+        let key_gen = keys_config.to_key_gen(None).unwrap();
 
         match key_gen {
             KeyGeneration::RoundRobin { max, .. } => {

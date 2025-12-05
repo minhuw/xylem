@@ -77,6 +77,7 @@ pub mod components {
     pub const UNIFORM_DIST: &str = "uniform_distribution";
     pub const NORMAL_DIST: &str = "normal_distribution";
     pub const GAUSSIAN_DIST: &str = "gaussian_distribution";
+    /// Seed component for protocol-specific random generation (e.g., key generation)
     pub const RANDOM_KEYS: &str = "random_key_generation";
     pub const POISSON_POLICY: &str = "poisson_policy";
 }
@@ -169,9 +170,10 @@ mod tests {
     fn test_end_to_end_reproducibility() {
         // Test that using the same master seed produces identical results across all components
         use crate::scheduler::policy::{PoissonPolicy, Policy};
-        use crate::workload::generator::KeyGeneration;
         use components::*;
-        use xylem_common::{Distribution, ExponentialDistribution, ZipfianDistribution};
+        use xylem_common::{
+            Distribution, ExponentialDistribution, UniformDistribution, ZipfianDistribution,
+        };
 
         let master_seed = 12345;
 
@@ -187,8 +189,12 @@ mod tests {
             Some(derive_seed(master_seed, EXPONENTIAL_DIST)),
         )
         .unwrap();
-        let mut rand_keys1 =
-            KeyGeneration::random_with_seed(10000, Some(derive_seed(master_seed, RANDOM_KEYS)));
+        let mut uniform1 = UniformDistribution::with_seed(
+            0.0,
+            10000.0,
+            Some(derive_seed(master_seed, RANDOM_KEYS)),
+        )
+        .unwrap();
         let mut poisson1 =
             PoissonPolicy::with_seed(1000.0, Some(derive_seed(master_seed, POISSON_POLICY)))
                 .unwrap();
@@ -196,7 +202,7 @@ mod tests {
         // Generate samples from run 1
         let zipf_samples1: Vec<u64> = (0..10).map(|_| zipf1.sample_key()).collect();
         let exp_samples1: Vec<f64> = (0..10).map(|_| exp1.sample()).collect();
-        let key_samples1: Vec<u64> = (0..10).map(|_| rand_keys1.next_key()).collect();
+        let uniform_samples1: Vec<f64> = (0..10).map(|_| uniform1.sample()).collect();
 
         // Poisson policy needs send times
         poisson1.on_request_sent(1000);
@@ -214,8 +220,12 @@ mod tests {
             Some(derive_seed(master_seed, EXPONENTIAL_DIST)),
         )
         .unwrap();
-        let mut rand_keys2 =
-            KeyGeneration::random_with_seed(10000, Some(derive_seed(master_seed, RANDOM_KEYS)));
+        let mut uniform2 = UniformDistribution::with_seed(
+            0.0,
+            10000.0,
+            Some(derive_seed(master_seed, RANDOM_KEYS)),
+        )
+        .unwrap();
         let mut poisson2 =
             PoissonPolicy::with_seed(1000.0, Some(derive_seed(master_seed, POISSON_POLICY)))
                 .unwrap();
@@ -223,7 +233,7 @@ mod tests {
         // Generate samples from run 2
         let zipf_samples2: Vec<u64> = (0..10).map(|_| zipf2.sample_key()).collect();
         let exp_samples2: Vec<f64> = (0..10).map(|_| exp2.sample()).collect();
-        let key_samples2: Vec<u64> = (0..10).map(|_| rand_keys2.next_key()).collect();
+        let uniform_samples2: Vec<f64> = (0..10).map(|_| uniform2.sample()).collect();
 
         poisson2.on_request_sent(1000);
         let poisson_time2 = poisson2.next_send_time(1000);
@@ -231,13 +241,13 @@ mod tests {
         // Verify all sequences are identical
         assert_eq!(zipf_samples1, zipf_samples2, "Zipfian samples should be identical");
         assert_eq!(exp_samples1, exp_samples2, "Exponential samples should be identical");
-        assert_eq!(key_samples1, key_samples2, "Random key samples should be identical");
+        assert_eq!(uniform_samples1, uniform_samples2, "Uniform samples should be identical");
         assert_eq!(poisson_time1, poisson_time2, "Poisson timing should be identical");
 
         println!("✓ Reproducibility verified across all components:");
         println!("  Zipfian: {:?}", &zipf_samples1[..3]);
         println!("  Exponential: {:?}", &exp_samples1[..3]);
-        println!("  Random keys: {:?}", &key_samples1[..3]);
+        println!("  Uniform: {:?}", &uniform_samples1[..3]);
         println!("  Poisson next time: {:?}", poisson_time1);
     }
 }

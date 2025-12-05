@@ -22,7 +22,7 @@ fn send_command_and_read_response(
     key: u64,
     value_size: usize,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let (request, _) = protocol.generate_request(conn_id, key, value_size);
+    let (request, _) = protocol.generate_request_with_key(conn_id, key, value_size);
 
     let mut stream = TcpStream::connect(addr)?;
     stream.write_all(&request)?;
@@ -44,7 +44,7 @@ fn test_auth_simple_password() {
     // Try without AUTH - should fail
     let mut get_protocol = RedisProtocol::new(Box::new(FixedCommandSelector::new(RedisOp::Get)));
     let mut stream = TcpStream::connect("127.0.0.1:6380").unwrap();
-    let (request, _) = get_protocol.generate_request(0, 1, 64);
+    let (request, _) = get_protocol.generate_request_with_key(0, 1, 64);
     stream.write_all(&request).unwrap();
 
     let mut buffer = vec![0u8; 1024];
@@ -65,7 +65,7 @@ fn test_auth_simple_password() {
         })));
 
     let mut stream = TcpStream::connect("127.0.0.1:6380").unwrap();
-    let (auth_request, _) = auth_protocol.generate_request(0, 1, 64);
+    let (auth_request, _) = auth_protocol.generate_request_with_key(0, 1, 64);
     stream.write_all(&auth_request).unwrap();
 
     let mut buffer = vec![0u8; 1024];
@@ -76,7 +76,7 @@ fn test_auth_simple_password() {
     println!("✓ Simple password authentication successful");
 
     // Now GET should work
-    let (get_request, _) = get_protocol.generate_request(0, 1, 64);
+    let (get_request, _) = get_protocol.generate_request_with_key(0, 1, 64);
     stream.write_all(&get_request).unwrap();
 
     let mut buffer = vec![0u8; 1024];
@@ -104,7 +104,7 @@ fn test_auth_acl_username_password() {
         })));
 
     let mut stream = TcpStream::connect("127.0.0.1:6381").unwrap();
-    let (auth_request, _) = auth_protocol.generate_request(0, 1, 64);
+    let (auth_request, _) = auth_protocol.generate_request_with_key(0, 1, 64);
     stream.write_all(&auth_request).unwrap();
 
     let mut buffer = vec![0u8; 1024];
@@ -119,7 +119,7 @@ fn test_auth_acl_username_password() {
 
     // Verify we can execute commands
     let mut get_protocol = RedisProtocol::new(Box::new(FixedCommandSelector::new(RedisOp::Get)));
-    let (get_request, _) = get_protocol.generate_request(0, 1, 64);
+    let (get_request, _) = get_protocol.generate_request_with_key(0, 1, 64);
     stream.write_all(&get_request).unwrap();
 
     let mut buffer = vec![0u8; 1024];
@@ -154,13 +154,13 @@ fn test_select_database() {
     let mut stream = TcpStream::connect("127.0.0.1:6379").unwrap();
 
     // SELECT 5 again
-    let (select_req, _) = select_protocol.generate_request(0, 1, 64);
+    let (select_req, _) = select_protocol.generate_request_with_key(0, 1, 64);
     stream.write_all(&select_req).unwrap();
     let _ = stream.read(&mut vec![0u8; 1024]).unwrap();
 
     // SET key in DB 5
     let mut set_protocol = RedisProtocol::new(Box::new(FixedCommandSelector::new(RedisOp::Set)));
-    let (set_req, _) = set_protocol.generate_request(0, 999, 10);
+    let (set_req, _) = set_protocol.generate_request_with_key(0, 999, 10);
     stream.write_all(&set_req).unwrap();
     let _ = stream.read(&mut vec![0u8; 1024]).unwrap();
 
@@ -169,13 +169,13 @@ fn test_select_database() {
     // SELECT 0 (default)
     let mut select0_protocol =
         RedisProtocol::new(Box::new(FixedCommandSelector::new(RedisOp::SelectDb { db: 0 })));
-    let (select0_req, _) = select0_protocol.generate_request(0, 1, 64);
+    let (select0_req, _) = select0_protocol.generate_request_with_key(0, 1, 64);
     stream.write_all(&select0_req).unwrap();
     let _ = stream.read(&mut vec![0u8; 1024]).unwrap();
 
     // GET key:999 in DB 0 should return nil
     let mut get_protocol = RedisProtocol::new(Box::new(FixedCommandSelector::new(RedisOp::Get)));
-    let (get_req, _) = get_protocol.generate_request(0, 999, 64);
+    let (get_req, _) = get_protocol.generate_request_with_key(0, 999, 64);
     stream.write_all(&get_req).unwrap();
 
     let mut buffer = vec![0u8; 1024];
@@ -243,7 +243,7 @@ fn test_setex_with_expiry() {
         RedisProtocol::new(Box::new(FixedCommandSelector::new(RedisOp::SetEx { ttl_seconds: 1 })));
 
     let mut stream = TcpStream::connect("127.0.0.1:6379").unwrap();
-    let (setex_req, _) = setex_protocol.generate_request(0, 888, 20);
+    let (setex_req, _) = setex_protocol.generate_request_with_key(0, 888, 20);
     stream.write_all(&setex_req).unwrap();
 
     let mut buffer = vec![0u8; 1024];
@@ -255,7 +255,7 @@ fn test_setex_with_expiry() {
 
     // Immediately GET - should exist
     let mut get_protocol = RedisProtocol::new(Box::new(FixedCommandSelector::new(RedisOp::Get)));
-    let (get_req, _) = get_protocol.generate_request(0, 888, 64);
+    let (get_req, _) = get_protocol.generate_request_with_key(0, 888, 64);
     stream.write_all(&get_req).unwrap();
 
     let mut buffer = vec![0u8; 1024];
@@ -270,7 +270,7 @@ fn test_setex_with_expiry() {
     std::thread::sleep(std::time::Duration::from_secs(2));
 
     // GET again on same stream - should be expired
-    let (get_req, _) = get_protocol.generate_request(0, 888, 64);
+    let (get_req, _) = get_protocol.generate_request_with_key(0, 888, 64);
     stream.write_all(&get_req).expect("Failed to write GET request");
 
     let mut buffer = vec![0u8; 1024];
@@ -297,7 +297,7 @@ fn test_setrange_getrange() {
 
     // First SET a base value
     let mut set_protocol = RedisProtocol::new(Box::new(FixedCommandSelector::new(RedisOp::Set)));
-    let (set_req, _) = set_protocol.generate_request(0, 777, 20);
+    let (set_req, _) = set_protocol.generate_request_with_key(0, 777, 20);
     stream.write_all(&set_req).unwrap();
     let _ = stream.read(&mut vec![0u8; 1024]).unwrap();
 
@@ -306,7 +306,7 @@ fn test_setrange_getrange() {
     // SETRANGE at offset 5
     let mut setrange_protocol =
         RedisProtocol::new(Box::new(FixedCommandSelector::new(RedisOp::SetRange { offset: 5 })));
-    let (setrange_req, _) = setrange_protocol.generate_request(0, 777, 8);
+    let (setrange_req, _) = setrange_protocol.generate_request_with_key(0, 777, 8);
     stream.write_all(&setrange_req).unwrap();
 
     let mut buffer = vec![0u8; 1024];
@@ -322,7 +322,7 @@ fn test_setrange_getrange() {
             offset: 5,
             end: 12,
         })));
-    let (getrange_req, _) = getrange_protocol.generate_request(0, 777, 64);
+    let (getrange_req, _) = getrange_protocol.generate_request_with_key(0, 777, 64);
     stream.write_all(&getrange_req).unwrap();
 
     let mut buffer = vec![0u8; 1024];
@@ -366,7 +366,7 @@ fn test_resp3_parsing_integration() {
 
     let mut hello_protocol =
         RedisProtocol::new(Box::new(FixedCommandSelector::new(RedisOp::Hello { version: 3 })));
-    let (hello_req, _) = hello_protocol.generate_request(0, 1, 64);
+    let (hello_req, _) = hello_protocol.generate_request_with_key(0, 1, 64);
     stream.write_all(&hello_req).unwrap();
     let _ = stream.read(&mut vec![0u8; 8192]).unwrap();
 
@@ -375,7 +375,7 @@ fn test_resp3_parsing_integration() {
     // Now responses should be in RESP3 format
     // Test GET with null response (RESP3 null is _\r\n)
     let mut get_protocol = RedisProtocol::new(Box::new(FixedCommandSelector::new(RedisOp::Get)));
-    let (get_req, _) = get_protocol.generate_request(0, 99999, 64);
+    let (get_req, _) = get_protocol.generate_request_with_key(0, 99999, 64);
     stream.write_all(&get_req).unwrap();
 
     let mut buffer = vec![0u8; 1024];

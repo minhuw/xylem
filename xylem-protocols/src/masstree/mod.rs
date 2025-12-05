@@ -324,20 +324,14 @@ impl Default for MasstreeProtocol {
     }
 }
 
-impl Protocol for MasstreeProtocol {
-    type RequestId = (usize, u16);
-
-    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId) {
-        let key = self.key_gen.as_mut().map(|g| g.next_key()).unwrap_or(0);
-        self.generate_request(conn_id, key, self.value_size)
-    }
-
-    fn generate_request(
+impl MasstreeProtocol {
+    /// Internal method to generate a request with specific key and value size
+    fn generate_request_internal(
         &mut self,
         conn_id: usize,
         key: u64,
         value_size: usize,
-    ) -> (Vec<u8>, Self::RequestId) {
+    ) -> (Vec<u8>, (usize, u16)) {
         // Check if handshake is done for this connection
         if !self.is_handshake_done(conn_id) {
             let handshake = self.build_handshake().expect("Failed to build handshake request");
@@ -373,6 +367,15 @@ impl Protocol for MasstreeProtocol {
         };
 
         (request, (conn_id, seq))
+    }
+}
+
+impl Protocol for MasstreeProtocol {
+    type RequestId = (usize, u16);
+
+    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId) {
+        let key = self.key_gen.as_mut().map(|g| g.next_key()).unwrap_or(0);
+        self.generate_request_internal(conn_id, key, self.value_size)
     }
 
     fn parse_response(
@@ -662,7 +665,7 @@ mod tests {
     #[test]
     fn test_handshake_request() {
         let mut proto = MasstreeProtocol::new(MasstreeOp::Get);
-        let (req, (conn_id, seq)) = proto.generate_request(0, 1, 64);
+        let (req, (conn_id, seq)) = proto.next_request(0);
 
         assert_eq!(conn_id, 0);
         assert_eq!(seq, 0); // Handshake uses seq 0
@@ -679,7 +682,7 @@ mod tests {
         // Mark handshake as done
         proto.mark_handshake_done(0);
 
-        let (req, (conn_id, seq)) = proto.generate_request(0, 123, 64);
+        let (req, (conn_id, seq)) = proto.next_request(0);
 
         assert_eq!(conn_id, 0);
         assert_eq!(seq, 0); // First request after handshake
@@ -695,13 +698,14 @@ mod tests {
         // Mark handshake as done
         proto.mark_handshake_done(0);
 
-        let (req, (conn_id, seq)) = proto.generate_request(0, 456, 128);
+        let (req, (conn_id, seq)) = proto.next_request(0);
 
         assert_eq!(conn_id, 0);
         assert_eq!(seq, 0);
 
         // SET requests should be larger (include value)
-        assert!(req.len() > 100);
+        // Default value_size is 64, plus overhead for key, seq, cmd
+        assert!(req.len() > 64, "SET request too small: {} bytes", req.len());
     }
 
     #[test]
@@ -709,9 +713,10 @@ mod tests {
         let mut proto = MasstreeProtocol::new(MasstreeOp::Get);
         proto.mark_handshake_done(0);
 
-        let (_, (_, seq1)) = proto.generate_request(0, 1, 64);
-        let (_, (_, seq2)) = proto.generate_request(0, 2, 64);
-        let (_, (_, seq3)) = proto.generate_request(0, 3, 64);
+        // Same conn_id, sequence increments
+        let (_, (_, seq1)) = proto.next_request(0);
+        let (_, (_, seq2)) = proto.next_request(0);
+        let (_, (_, seq3)) = proto.next_request(0);
 
         assert_eq!(seq1, 0);
         assert_eq!(seq2, 1);
@@ -724,10 +729,12 @@ mod tests {
         proto.mark_handshake_done(0);
         proto.mark_handshake_done(1);
 
-        let (_, (_, seq_conn0_1)) = proto.generate_request(0, 1, 64);
-        let (_, (_, seq_conn1_1)) = proto.generate_request(1, 1, 64);
-        let (_, (_, seq_conn0_2)) = proto.generate_request(0, 2, 64);
+        let (_, (conn0, seq_conn0_1)) = proto.next_request(0);
+        let (_, (conn1, seq_conn1_1)) = proto.next_request(1);
+        let (_, (_, seq_conn0_2)) = proto.next_request(0);
 
+        assert_eq!(conn0, 0);
+        assert_eq!(conn1, 1);
         assert_eq!(seq_conn0_1, 0);
         assert_eq!(seq_conn1_1, 0); // Each connection has independent sequence
         assert_eq!(seq_conn0_2, 1);
@@ -738,7 +745,7 @@ mod tests {
         let mut proto = MasstreeProtocol::new(MasstreeOp::Remove);
         proto.mark_handshake_done(0);
 
-        let (req, (conn_id, seq)) = proto.generate_request(0, 789, 64);
+        let (req, (conn_id, seq)) = proto.next_request(0);
 
         assert_eq!(conn_id, 0);
         assert_eq!(seq, 0);
@@ -755,7 +762,7 @@ mod tests {
         let mut proto = MasstreeProtocol::new(MasstreeOp::Put { columns });
         proto.mark_handshake_done(0);
 
-        let (req, (conn_id, seq)) = proto.generate_request(0, 100, 64);
+        let (req, (conn_id, seq)) = proto.next_request(0);
 
         assert_eq!(conn_id, 0);
         assert_eq!(seq, 0);
@@ -775,7 +782,7 @@ mod tests {
         let mut proto = MasstreeProtocol::new(scan_op);
         proto.mark_handshake_done(0);
 
-        let (req, (conn_id, seq)) = proto.generate_request(0, 1, 64);
+        let (req, (conn_id, seq)) = proto.next_request(0);
 
         assert_eq!(conn_id, 0);
         assert_eq!(seq, 0);
@@ -791,7 +798,7 @@ mod tests {
         let mut proto = MasstreeProtocol::new(MasstreeOp::Checkpoint);
         proto.mark_handshake_done(0);
 
-        let (req, (conn_id, seq)) = proto.generate_request(0, 1, 64);
+        let (req, (conn_id, seq)) = proto.next_request(0);
 
         assert_eq!(conn_id, 0);
         assert_eq!(seq, 0);
@@ -818,11 +825,11 @@ mod tests {
         // Test that different operations work on same protocol instance
         let mut proto1 = MasstreeProtocol::new(MasstreeOp::Get);
         proto1.mark_handshake_done(0);
-        let (req1, _) = proto1.generate_request(0, 1, 64);
+        let (req1, _) = proto1.next_request(0);
 
         let mut proto2 = MasstreeProtocol::new(MasstreeOp::Remove);
         proto2.mark_handshake_done(0);
-        let (req2, _) = proto2.generate_request(0, 1, 64);
+        let (req2, _) = proto2.next_request(0);
 
         // Requests should be different
         assert_ne!(req1, req2);

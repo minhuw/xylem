@@ -11,7 +11,7 @@ use std::time::Duration;
 use xylem_cli::multi_protocol;
 use xylem_core::stats::{GroupStatsCollector, SamplingPolicy};
 use xylem_core::threading::{ThreadingRuntime, Worker, WorkerConfig};
-use xylem_core::workload::{KeyGeneration, RateControl, RequestGenerator};
+
 use xylem_transport::TcpTransportFactory;
 
 mod common;
@@ -30,13 +30,16 @@ impl<P: xylem_protocols::Protocol> ProtocolAdapter<P> {
 impl<P: xylem_protocols::Protocol> xylem_core::threading::worker::Protocol for ProtocolAdapter<P> {
     type RequestId = P::RequestId;
 
-    fn generate_request(
+    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId) {
+        self.inner.next_request(conn_id)
+    }
+
+    fn regenerate_request(
         &mut self,
         conn_id: usize,
-        key: u64,
-        value_size: usize,
+        original_request_id: Self::RequestId,
     ) -> (Vec<u8>, Self::RequestId) {
-        self.inner.generate_request(conn_id, key, value_size)
+        self.inner.regenerate_request(conn_id, original_request_id)
     }
 
     fn parse_response(
@@ -71,8 +74,6 @@ fn run_multi_protocol_test() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Running multi-protocol integration test...");
 
     let duration = Duration::from_secs(2);
-    let key_gen = KeyGeneration::sequential(0);
-    let value_size = 64;
 
     // Create threading runtime with 2 threads
     let runtime = ThreadingRuntime::new(2);
@@ -95,12 +96,6 @@ fn run_multi_protocol_test() -> Result<(), Box<dyn std::error::Error>> {
         let http_protocol =
             multi_protocol::create_protocol("http", Some(("/", "127.0.0.1:8080")), None)?;
         protocols.insert(2, ProtocolAdapter::new(http_protocol));
-
-        let generator = RequestGenerator::new(
-            key_gen.clone(),
-            RateControl::ClosedLoop,
-            Box::new(xylem_core::workload::FixedSize::new(value_size)),
-        );
 
         let mut stats = GroupStatsCollector::new();
         stats.register_group(0, &SamplingPolicy::Unlimited);
@@ -149,7 +144,6 @@ fn run_multi_protocol_test() -> Result<(), Box<dyn std::error::Error>> {
         let worker_config = WorkerConfig {
             target: redis_addr, // Default (unused by new_multi_group_with_targets)
             duration,
-            value_size,
             conn_count: 10,
             max_pending_per_conn: 1,
         };
@@ -163,7 +157,6 @@ fn run_multi_protocol_test() -> Result<(), Box<dyn std::error::Error>> {
         let mut worker = Worker::new_multi_group_with_targets(
             &TcpTransportFactory::default(),
             thread_protocols,
-            generator,
             stats,
             worker_config,
             groups_config,
@@ -210,8 +203,6 @@ fn run_redis_memcached_test() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("(Using Redis for both groups to work around single-target limitation)");
 
     let duration = Duration::from_secs(1);
-    let key_gen = KeyGeneration::sequential(0);
-    let value_size = 64;
 
     let runtime = ThreadingRuntime::new(1);
 
@@ -231,12 +222,6 @@ fn run_redis_memcached_test() -> Result<(), Box<dyn std::error::Error>> {
         let redis_protocol2 =
             multi_protocol::create_protocol("redis", None, Some(redis_selector2))?;
         protocols.insert(1, ProtocolAdapter::new(redis_protocol2));
-
-        let generator = RequestGenerator::new(
-            key_gen.clone(),
-            RateControl::ClosedLoop,
-            Box::new(xylem_core::workload::FixedSize::new(value_size)),
-        );
 
         let mut stats = GroupStatsCollector::new();
         stats.register_group(0, &SamplingPolicy::Unlimited);
@@ -263,7 +248,6 @@ fn run_redis_memcached_test() -> Result<(), Box<dyn std::error::Error>> {
         let worker_config = WorkerConfig {
             target: "127.0.0.1:6379".parse().unwrap(),
             duration,
-            value_size,
             conn_count: 10,
             max_pending_per_conn: 1,
         };
@@ -271,7 +255,6 @@ fn run_redis_memcached_test() -> Result<(), Box<dyn std::error::Error>> {
         let mut worker = Worker::new_multi_group(
             &TcpTransportFactory::default(),
             protocols,
-            generator,
             stats,
             worker_config,
             groups_config,

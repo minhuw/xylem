@@ -18,7 +18,7 @@
 use std::time::Duration;
 use xylem_core::stats::GroupStatsCollector;
 use xylem_core::threading::{ThreadingRuntime, Worker, WorkerConfig};
-use xylem_core::workload::{KeyGeneration, RateControl, RequestGenerator};
+
 use xylem_transport::TcpTransportFactory;
 
 mod common;
@@ -37,13 +37,16 @@ impl<P: xylem_protocols::Protocol> ProtocolAdapter<P> {
 impl<P: xylem_protocols::Protocol> xylem_core::threading::worker::Protocol for ProtocolAdapter<P> {
     type RequestId = P::RequestId;
 
-    fn generate_request(
+    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId) {
+        self.inner.next_request(conn_id)
+    }
+
+    fn regenerate_request(
         &mut self,
         conn_id: usize,
-        key: u64,
-        value_size: usize,
+        original_request_id: Self::RequestId,
     ) -> (Vec<u8>, Self::RequestId) {
-        self.inner.generate_request(conn_id, key, value_size)
+        self.inner.regenerate_request(conn_id, original_request_id)
     }
 
     fn parse_response(
@@ -78,28 +81,17 @@ fn test_http_get_single_thread() {
         "localhost".to_string(),
     );
     let protocol = ProtocolAdapter::new(protocol);
-    let generator = RequestGenerator::new(
-        KeyGeneration::sequential(0),
-        RateControl::ClosedLoop,
-        Box::new(xylem_core::workload::FixedSize::new(64)),
-    );
     let stats = common::create_test_stats();
     let worker_config = WorkerConfig {
         target: target_addr,
         duration,
-        value_size: 64,
         conn_count: 1,
         max_pending_per_conn: 1,
     };
 
-    let mut worker = Worker::with_closed_loop(
-        &TcpTransportFactory::default(),
-        protocol,
-        generator,
-        stats,
-        worker_config,
-    )
-    .expect("Failed to create worker");
+    let mut worker =
+        Worker::with_closed_loop(&TcpTransportFactory::default(), protocol, stats, worker_config)
+            .expect("Failed to create worker");
 
     println!("Starting HTTP GET test...");
     let result = worker.run();
@@ -147,28 +139,17 @@ fn test_http_post_single_thread() {
         "localhost".to_string(),
     );
     let protocol = ProtocolAdapter::new(protocol);
-    let generator = RequestGenerator::new(
-        KeyGeneration::sequential(0),
-        RateControl::ClosedLoop,
-        Box::new(xylem_core::workload::FixedSize::new(128)),
-    );
     let stats = common::create_test_stats();
     let worker_config = WorkerConfig {
         target: target_addr,
         duration,
-        value_size: 128,
         conn_count: 1,
         max_pending_per_conn: 1,
     };
 
-    let mut worker = Worker::with_closed_loop(
-        &TcpTransportFactory::default(),
-        protocol,
-        generator,
-        stats,
-        worker_config,
-    )
-    .expect("Failed to create worker");
+    let mut worker =
+        Worker::with_closed_loop(&TcpTransportFactory::default(), protocol, stats, worker_config)
+            .expect("Failed to create worker");
 
     println!("Starting HTTP POST test...");
     let result = worker.run();
@@ -204,30 +185,23 @@ fn test_http_multi_thread() {
 
     println!("Starting {num_threads}-threaded HTTP test...");
 
-    let results = runtime.run_workers_generic(move |thread_id| {
+    let results = runtime.run_workers_generic(move |_thread_id| {
         let protocol = xylem_protocols::http::HttpProtocol::new(
             xylem_protocols::HttpMethod::Get,
             "/".to_string(),
             "localhost".to_string(),
         );
         let protocol = ProtocolAdapter::new(protocol);
-        let generator = RequestGenerator::new(
-            KeyGeneration::sequential(thread_id as u64 * 10000),
-            RateControl::ClosedLoop,
-            Box::new(xylem_core::workload::FixedSize::new(64)),
-        );
         let stats = common::create_test_stats();
         let worker_config = WorkerConfig {
             target: target_addr,
             duration,
-            value_size: 64,
             conn_count: 1,
             max_pending_per_conn: 1,
         };
         let mut worker = Worker::with_closed_loop(
             &TcpTransportFactory::default(),
             protocol,
-            generator,
             stats,
             worker_config,
         )
@@ -287,28 +261,17 @@ fn test_http_rate_limited() {
         "localhost".to_string(),
     );
     let protocol = ProtocolAdapter::new(protocol);
-    let generator = RequestGenerator::new(
-        KeyGeneration::sequential(0),
-        RateControl::Fixed { rate: target_rate },
-        Box::new(xylem_core::workload::FixedSize::new(64)),
-    );
     let stats = common::create_test_stats();
     let worker_config = WorkerConfig {
         target: target_addr,
         duration,
-        value_size: 64,
         conn_count: 1,
         max_pending_per_conn: 1,
     };
 
-    let mut worker = Worker::with_closed_loop(
-        &TcpTransportFactory::default(),
-        protocol,
-        generator,
-        stats,
-        worker_config,
-    )
-    .expect("Failed to create worker");
+    let mut worker =
+        Worker::with_closed_loop(&TcpTransportFactory::default(), protocol, stats, worker_config)
+            .expect("Failed to create worker");
 
     println!("Starting rate-limited test (target: {target_rate} req/s)...");
     let result = worker.run();
@@ -346,28 +309,17 @@ fn test_http_put_request() {
         "localhost".to_string(),
     );
     let protocol = ProtocolAdapter::new(protocol);
-    let generator = RequestGenerator::new(
-        KeyGeneration::sequential(0),
-        RateControl::ClosedLoop,
-        Box::new(xylem_core::workload::FixedSize::new(256)),
-    );
     let stats = common::create_test_stats();
     let worker_config = WorkerConfig {
         target: target_addr,
         duration,
-        value_size: 256,
         conn_count: 1,
         max_pending_per_conn: 1,
     };
 
-    let mut worker = Worker::with_closed_loop(
-        &TcpTransportFactory::default(),
-        protocol,
-        generator,
-        stats,
-        worker_config,
-    )
-    .expect("Failed to create worker");
+    let mut worker =
+        Worker::with_closed_loop(&TcpTransportFactory::default(), protocol, stats, worker_config)
+            .expect("Failed to create worker");
 
     println!("Starting HTTP PUT test...");
     let result = worker.run();
@@ -399,28 +351,17 @@ fn test_http_pipelined() {
         "localhost".to_string(),
     );
     let protocol = ProtocolAdapter::new(protocol);
-    let generator = RequestGenerator::new(
-        KeyGeneration::sequential(0),
-        RateControl::ClosedLoop,
-        Box::new(xylem_core::workload::FixedSize::new(64)),
-    );
     let stats = common::create_test_stats();
     let worker_config = WorkerConfig {
         target: target_addr,
         duration,
-        value_size: 64,
         conn_count: 2,
         max_pending_per_conn: 16, // Allow HTTP pipelining
     };
 
-    let mut worker = Worker::with_closed_loop(
-        &TcpTransportFactory::default(),
-        protocol,
-        generator,
-        stats,
-        worker_config,
-    )
-    .expect("Failed to create worker");
+    let mut worker =
+        Worker::with_closed_loop(&TcpTransportFactory::default(), protocol, stats, worker_config)
+            .expect("Failed to create worker");
 
     println!("Starting HTTP pipelined test (2 conns, 16 max pending each)...");
     let result = worker.run();

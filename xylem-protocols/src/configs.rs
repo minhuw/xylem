@@ -68,13 +68,13 @@ impl KeysConfig {
         }
     }
 
-    /// Convert to a KeyGeneration instance from xylem-core
-    pub fn to_key_generation(
+    /// Convert to a KeyGeneration instance for protocol-embedded workload
+    pub fn to_key_gen(
         &self,
         master_seed: Option<u64>,
-    ) -> anyhow::Result<xylem_core::workload::KeyGeneration> {
+    ) -> anyhow::Result<crate::workload::KeyGeneration> {
+        use crate::workload::KeyGeneration;
         use xylem_core::seed::{components, derive_seed};
-        use xylem_core::workload::KeyGeneration;
 
         match self {
             Self::Sequential { start, .. } => Ok(KeyGeneration::sequential(*start)),
@@ -211,6 +211,89 @@ pub enum ValueSizeConfig {
         min: usize,
         max: usize,
     },
+    /// Per-command size configuration
+    #[serde(rename = "per_command")]
+    PerCommand {
+        /// Size strategies for specific commands
+        commands: std::collections::HashMap<String, CommandValueSizeConfig>,
+        /// Default strategy for unspecified commands
+        default: Box<ValueSizeConfig>,
+    },
+}
+
+/// Value size configuration for a specific command
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "distribution", rename_all = "lowercase")]
+pub enum CommandValueSizeConfig {
+    Fixed {
+        size: usize,
+    },
+    Uniform {
+        min: usize,
+        max: usize,
+    },
+    Normal {
+        mean: f64,
+        std_dev: f64,
+        min: usize,
+        max: usize,
+    },
+}
+
+impl CommandValueSizeConfig {
+    /// Convert to a ValueSizeGenerator
+    pub fn to_generator(
+        &self,
+        master_seed: Option<u64>,
+    ) -> anyhow::Result<Box<dyn crate::workload::ValueSizeGenerator>> {
+        use crate::workload::{FixedSize, NormalSize, UniformSize};
+        use xylem_core::seed::derive_seed;
+
+        match self {
+            Self::Fixed { size } => Ok(Box::new(FixedSize::new(*size))),
+            Self::Uniform { min, max } => {
+                let seed = master_seed.map(|s| derive_seed(s, "uniform_cmd_size"));
+                Ok(Box::new(UniformSize::with_seed(*min, *max, seed)?))
+            }
+            Self::Normal { mean, std_dev, min, max } => {
+                let seed = master_seed.map(|s| derive_seed(s, "normal_cmd_size"));
+                Ok(Box::new(NormalSize::with_seed(*mean, *std_dev, *min, *max, seed)?))
+            }
+        }
+    }
+}
+
+impl ValueSizeConfig {
+    /// Convert to a ValueSizeGenerator
+    pub fn to_generator(
+        &self,
+        master_seed: Option<u64>,
+    ) -> anyhow::Result<Box<dyn crate::workload::ValueSizeGenerator>> {
+        use crate::workload::{FixedSize, NormalSize, PerCommandSize, UniformSize};
+        use xylem_core::seed::derive_seed;
+
+        match self {
+            Self::Fixed { size } => Ok(Box::new(FixedSize::new(*size))),
+            Self::Uniform { min, max } => {
+                let seed = master_seed.map(|s| derive_seed(s, "uniform_value_size"));
+                Ok(Box::new(UniformSize::with_seed(*min, *max, seed)?))
+            }
+            Self::Normal { mean, std_dev, min, max } => {
+                let seed = master_seed.map(|s| derive_seed(s, "normal_value_size"));
+                Ok(Box::new(NormalSize::with_seed(*mean, *std_dev, *min, *max, seed)?))
+            }
+            Self::PerCommand { commands, default } => {
+                let mut command_generators = std::collections::HashMap::new();
+                for (cmd, cfg) in commands {
+                    let gen = cfg.to_generator(master_seed)?;
+                    command_generators.insert(cmd.clone(), gen);
+                }
+                let default_gen = default.to_generator(master_seed)?;
+                Ok(Box::new(PerCommandSize::new(command_generators, default_gen)))
+            }
+        }
+    }
 }
 
 /// Operations configuration for Redis (command selection)

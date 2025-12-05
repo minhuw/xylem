@@ -6,7 +6,7 @@
 use std::time::Duration;
 use xylem_core::stats::GroupStatsCollector;
 use xylem_core::threading::{ThreadingRuntime, Worker, WorkerConfig};
-use xylem_core::workload::{KeyGeneration, RateControl, RequestGenerator};
+
 use xylem_transport::TcpTransportFactory;
 
 mod common;
@@ -25,13 +25,16 @@ impl<P: xylem_protocols::Protocol> ProtocolAdapter<P> {
 impl<P: xylem_protocols::Protocol> xylem_core::threading::worker::Protocol for ProtocolAdapter<P> {
     type RequestId = P::RequestId;
 
-    fn generate_request(
+    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId) {
+        self.inner.next_request(conn_id)
+    }
+
+    fn regenerate_request(
         &mut self,
         conn_id: usize,
-        key: u64,
-        value_size: usize,
+        original_request_id: Self::RequestId,
     ) -> (Vec<u8>, Self::RequestId) {
-        self.inner.generate_request(conn_id, key, value_size)
+        self.inner.regenerate_request(conn_id, original_request_id)
     }
 
     fn parse_response(
@@ -67,27 +70,16 @@ fn test_memcached_binary_single_thread() {
                 ),
             );
             let _transport = TcpTransportFactory::default();
-            let generator = RequestGenerator::new(
-                KeyGeneration::sequential(0),
-                RateControl::ClosedLoop,
-                Box::new(xylem_core::workload::FixedSize::new(64)),
-            );
             let stats = common::create_test_stats();
             let config = WorkerConfig {
                 target: target_addr,
                 duration: Duration::from_secs(1),
-                value_size: 64,
                 conn_count: 1,
                 max_pending_per_conn: 1,
             };
 
-            let mut worker = Worker::with_closed_loop(
-                &TcpTransportFactory::default(),
-                protocol,
-                generator,
-                stats,
-                config,
-            )?;
+            let mut worker =
+                Worker::with_closed_loop(&TcpTransportFactory::default(), protocol, stats, config)?;
             worker.run()?;
             Ok(worker.into_stats())
         })
@@ -124,27 +116,16 @@ fn test_memcached_ascii_single_thread() {
                 ),
             );
             let _transport = TcpTransportFactory::default();
-            let generator = RequestGenerator::new(
-                KeyGeneration::sequential(0),
-                RateControl::ClosedLoop,
-                Box::new(xylem_core::workload::FixedSize::new(64)),
-            );
             let stats = common::create_test_stats();
             let config = WorkerConfig {
                 target: target_addr,
                 duration: Duration::from_secs(1),
-                value_size: 64,
                 conn_count: 1,
                 max_pending_per_conn: 1,
             };
 
-            let mut worker = Worker::with_closed_loop(
-                &TcpTransportFactory::default(),
-                protocol,
-                generator,
-                stats,
-                config,
-            )?;
+            let mut worker =
+                Worker::with_closed_loop(&TcpTransportFactory::default(), protocol, stats, config)?;
             worker.run()?;
             Ok(worker.into_stats())
         })
@@ -181,27 +162,16 @@ fn test_memcached_binary_multi_thread() {
                 ),
             );
             let _transport = TcpTransportFactory::default();
-            let generator = RequestGenerator::new(
-                KeyGeneration::random(10000),
-                RateControl::ClosedLoop,
-                Box::new(xylem_core::workload::FixedSize::new(64)),
-            );
             let stats = common::create_test_stats();
             let config = WorkerConfig {
                 target: target_addr,
                 duration: Duration::from_secs(2),
-                value_size: 64,
                 conn_count: 1,
                 max_pending_per_conn: 1,
             };
 
-            let mut worker = Worker::with_closed_loop(
-                &TcpTransportFactory::default(),
-                protocol,
-                generator,
-                stats,
-                config,
-            )?;
+            let mut worker =
+                Worker::with_closed_loop(&TcpTransportFactory::default(), protocol, stats, config)?;
             worker.run()?;
             Ok(worker.into_stats())
         })
@@ -242,26 +212,24 @@ fn test_memcached_ascii_rate_limited() {
                 ),
             );
             let _transport = TcpTransportFactory::default();
-            let generator = RequestGenerator::new(
-                KeyGeneration::sequential(0),
-                RateControl::Fixed { rate: target_rate },
-                Box::new(xylem_core::workload::FixedSize::new(64)),
-            );
             let stats = common::create_test_stats();
             let config = WorkerConfig {
                 target: target_addr,
                 duration: Duration::from_secs(2),
-                value_size: 64,
                 conn_count: 1,
                 max_pending_per_conn: 1,
             };
 
-            let mut worker = Worker::with_closed_loop(
+            // Use fixed-rate policy for rate limiting
+            let policy_scheduler =
+                Box::new(xylem_core::scheduler::UniformPolicyScheduler::fixed_rate(target_rate));
+
+            let mut worker = Worker::new(
                 &TcpTransportFactory::default(),
                 protocol,
-                generator,
                 stats,
                 config,
+                policy_scheduler,
             )?;
             worker.run()?;
             Ok(worker.into_stats())

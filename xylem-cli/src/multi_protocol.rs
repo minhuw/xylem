@@ -45,26 +45,19 @@ impl MultiProtocol {
 impl Protocol for MultiProtocol {
     type RequestId = (usize, u64);
 
-    fn generate_request(
-        &mut self,
-        conn_id: usize,
-        key: u64,
-        value_size: usize,
-    ) -> (Vec<u8>, Self::RequestId) {
+    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId) {
         match self {
-            MultiProtocol::Redis(p) => p.generate_request(conn_id, key, value_size),
+            MultiProtocol::Redis(p) => p.next_request(conn_id),
             MultiProtocol::RedisCluster(p) => {
-                let (data, (_orig_conn, _slot, (_target_conn, seq))) =
-                    p.generate_request(conn_id, key, value_size);
-                // Map cluster request ID to simple request ID
+                let (data, (_orig_conn, _slot, (_target_conn, seq))) = p.next_request(conn_id);
                 (data, (conn_id, seq))
             }
-            MultiProtocol::MemcachedBinary(p) => p.generate_request(conn_id, key, value_size),
-            MultiProtocol::MemcachedAscii(p) => p.generate_request(conn_id, key, value_size),
-            MultiProtocol::Http(p) => p.generate_request(conn_id, key, value_size),
-            MultiProtocol::XylemEcho(p) => p.generate_request(conn_id, key, value_size),
+            MultiProtocol::MemcachedBinary(p) => p.next_request(conn_id),
+            MultiProtocol::MemcachedAscii(p) => p.next_request(conn_id),
+            MultiProtocol::Http(p) => p.next_request(conn_id),
+            MultiProtocol::XylemEcho(p) => p.next_request(conn_id),
             MultiProtocol::Masstree(p) => {
-                let (data, (conn, seq)) = p.generate_request(conn_id, key, value_size);
+                let (data, (conn, seq)) = p.next_request(conn_id);
                 (data, (conn, seq as u64))
             }
         }
@@ -133,6 +126,19 @@ pub fn create_redis_protocol(
     redis_selector: Box<dyn xylem_protocols::CommandSelector<xylem_protocols::RedisOp>>,
 ) -> MultiProtocol {
     MultiProtocol::Redis(xylem_protocols::redis::RedisProtocol::new(redis_selector))
+}
+
+/// Create a Redis protocol with embedded workload generators
+pub fn create_redis_protocol_with_workload(
+    redis_selector: Box<dyn xylem_protocols::CommandSelector<xylem_protocols::RedisOp>>,
+    key_gen: xylem_protocols::workload::KeyGeneration,
+    value_size: usize,
+) -> MultiProtocol {
+    MultiProtocol::Redis(xylem_protocols::redis::RedisProtocol::with_workload(
+        redis_selector,
+        key_gen,
+        value_size,
+    ))
 }
 
 pub fn create_http_protocol(path: &str, host: &str) -> Result<MultiProtocol> {
@@ -216,9 +222,23 @@ pub fn create_redis_cluster_protocol(
     redis_selector: Box<dyn xylem_protocols::CommandSelector<xylem_protocols::RedisOp>>,
     cluster_config: RedisClusterConfig,
 ) -> Result<MultiProtocol> {
+    create_redis_cluster_protocol_with_workload(redis_selector, cluster_config, None, 64)
+}
+
+/// Create Redis cluster protocol with embedded workload
+pub fn create_redis_cluster_protocol_with_workload(
+    redis_selector: Box<dyn xylem_protocols::CommandSelector<xylem_protocols::RedisOp>>,
+    cluster_config: RedisClusterConfig,
+    key_gen: Option<xylem_protocols::workload::KeyGeneration>,
+    value_size: usize,
+) -> Result<MultiProtocol> {
     use xylem_protocols::{ClusterTopology, SlotRange};
 
-    let mut protocol = xylem_protocols::RedisClusterProtocol::new(redis_selector);
+    let mut protocol = if let Some(kg) = key_gen {
+        xylem_protocols::RedisClusterProtocol::with_workload(redis_selector, kg, value_size)
+    } else {
+        xylem_protocols::RedisClusterProtocol::new(redis_selector)
+    };
 
     // Register connections and build topology
     let mut ranges = Vec::new();

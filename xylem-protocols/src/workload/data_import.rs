@@ -242,7 +242,9 @@ pub struct VerificationStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::io::Write;
+    use tempfile::{NamedTempFile, TempDir};
 
     fn create_test_csv(path: &Path, entries: &[(&str, &str, u64)]) -> Result<()> {
         let mut file = std::fs::File::create(path)?;
@@ -295,5 +297,126 @@ mod tests {
         assert!(verifier.has_mismatches());
 
         std::fs::remove_file(csv_path).ok();
+    }
+
+    #[test]
+    fn test_data_import_end_to_end() {
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = temp_dir.path().join("test_data.csv");
+
+        let mut csv_file = std::fs::File::create(&csv_path).unwrap();
+        writeln!(csv_file, "key,value,expiry").unwrap();
+        writeln!(csv_file, "test:1,value1,0").unwrap();
+        writeln!(csv_file, "test:2,value2,0").unwrap();
+        writeln!(csv_file, "test:3,value3,0").unwrap();
+        csv_file.flush().unwrap();
+
+        let importer = DataImporter::from_csv(&csv_path).unwrap();
+        assert_eq!(importer.len(), 3);
+
+        let entry1 = importer.get_by_key("test:1").expect("Key test:1 should exist");
+        assert_eq!(entry1.key, "test:1");
+        assert_eq!(entry1.value_bytes(), b"value1");
+        assert_eq!(entry1.expiry, 0);
+
+        let entry2 = importer.get_by_key("test:2").expect("Key test:2 should exist");
+        assert_eq!(entry2.value_bytes(), b"value2");
+    }
+
+    #[test]
+    fn test_data_import_csv_parsing() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        writeln!(temp_file, "key,value,expiry").unwrap();
+        writeln!(temp_file, "user:100,alice,0").unwrap();
+        writeln!(temp_file, "user:101,bob,3600").unwrap();
+        writeln!(temp_file, "session:abc,tokendata,1800").unwrap();
+        temp_file.flush().unwrap();
+
+        let importer = DataImporter::from_csv(temp_file.path()).unwrap();
+        assert_eq!(importer.len(), 3);
+
+        let alice = importer.get_by_key("user:100").unwrap();
+        assert_eq!(alice.value_bytes(), b"alice");
+        assert_eq!(alice.expiry, 0);
+
+        let bob = importer.get_by_key("user:101").unwrap();
+        assert_eq!(bob.value_bytes(), b"bob");
+        assert_eq!(bob.expiry, 3600);
+
+        let session = importer.get_by_key("session:abc").unwrap();
+        assert_eq!(session.value_bytes(), b"tokendata");
+        assert_eq!(session.expiry, 1800);
+    }
+
+    #[test]
+    fn test_data_import_random_access() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        writeln!(temp_file, "key,value,expiry").unwrap();
+        for i in 0..10 {
+            writeln!(temp_file, "key:{},value{},0", i, i).unwrap();
+        }
+        temp_file.flush().unwrap();
+
+        let mut importer = DataImporter::from_csv_with_seed(temp_file.path(), Some(42)).unwrap();
+
+        let mut seen_keys = HashSet::new();
+        for _ in 0..20 {
+            let entry = importer.next_random();
+            seen_keys.insert(entry.key.clone());
+        }
+
+        assert!(seen_keys.len() > 1, "Random access should return different keys");
+    }
+
+    #[test]
+    fn test_data_import_sequential_access() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        writeln!(temp_file, "key,value,expiry").unwrap();
+        writeln!(temp_file, "key:0,val0,0").unwrap();
+        writeln!(temp_file, "key:1,val1,0").unwrap();
+        writeln!(temp_file, "key:2,val2,0").unwrap();
+        temp_file.flush().unwrap();
+
+        let mut importer = DataImporter::from_csv(temp_file.path()).unwrap();
+
+        let entry0 = importer.next_sequential();
+        assert_eq!(entry0.key, "key:0");
+
+        let entry1 = importer.next_sequential();
+        assert_eq!(entry1.key, "key:1");
+
+        let entry2 = importer.next_sequential();
+        assert_eq!(entry2.key, "key:2");
+
+        // Should wrap around
+        let entry3 = importer.next_sequential();
+        assert_eq!(entry3.key, "key:0");
+    }
+
+    #[test]
+    fn test_data_verifier_comprehensive() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        writeln!(temp_file, "key,value,expiry").unwrap();
+        writeln!(temp_file, "key1,value1,0").unwrap();
+        writeln!(temp_file, "key2,value2,0").unwrap();
+        temp_file.flush().unwrap();
+
+        let importer = DataImporter::from_csv(temp_file.path()).unwrap();
+        let mut verifier = DataVerifier::new(&importer);
+
+        // Verify correct values
+        assert!(verifier.verify("key1", b"value1"));
+        assert!(verifier.verify("key2", b"value2"));
+
+        // Verify incorrect values
+        assert!(!verifier.verify("key1", b"wrong_value"));
+
+        // Non-existent keys are treated as success (for write testing scenarios)
+        assert!(verifier.verify("key3", b"value3"));
+
+        let stats = verifier.stats();
+        assert_eq!(stats.successful, 3);
+        assert_eq!(stats.failed, 1);
+        assert!(stats.mismatch_rate > 0.0);
     }
 }

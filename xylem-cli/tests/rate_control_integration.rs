@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 use xylem_core::threading::{Worker, WorkerConfig};
-use xylem_core::workload::{KeyGeneration, RateControl, RequestGenerator};
+
 use xylem_transport::TcpTransportFactory;
 
 mod common;
@@ -24,13 +24,16 @@ impl<P: xylem_protocols::Protocol> ProtocolAdapter<P> {
 impl<P: xylem_protocols::Protocol> xylem_core::threading::worker::Protocol for ProtocolAdapter<P> {
     type RequestId = P::RequestId;
 
-    fn generate_request(
+    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId) {
+        self.inner.next_request(conn_id)
+    }
+
+    fn regenerate_request(
         &mut self,
         conn_id: usize,
-        key: u64,
-        value_size: usize,
+        original_request_id: Self::RequestId,
     ) -> (Vec<u8>, Self::RequestId) {
-        self.inner.generate_request(conn_id, key, value_size)
+        self.inner.regenerate_request(conn_id, original_request_id)
     }
 
     fn parse_response(
@@ -59,28 +62,16 @@ fn run_rate_experiment(target_rate: f64, duration_secs: u64, conn_count: usize) 
         xylem_protocols::FixedCommandSelector::new(xylem_protocols::redis::RedisOp::Get),
     ));
     let protocol = ProtocolAdapter::new(protocol);
-    let generator = RequestGenerator::new(
-        KeyGeneration::sequential(0),
-        RateControl::Fixed { rate: target_rate },
-        Box::new(xylem_core::workload::FixedSize::new(64)),
-    );
     let stats = common::create_test_stats();
     let config = WorkerConfig {
         target: target_addr,
         duration,
-        value_size: 64,
         conn_count,
         max_pending_per_conn: 8,
     };
 
-    let mut worker = Worker::with_closed_loop(
-        &TcpTransportFactory::default(),
-        protocol,
-        generator,
-        stats,
-        config,
-    )
-    .unwrap();
+    let mut worker =
+        Worker::with_closed_loop(&TcpTransportFactory::default(), protocol, stats, config).unwrap();
 
     let result = worker.run();
     assert!(result.is_ok(), "Worker failed: {:?}", result.err());
@@ -145,28 +136,16 @@ fn test_rate_vs_throughput_saturation() {
         xylem_protocols::FixedCommandSelector::new(xylem_protocols::redis::RedisOp::Get),
     ));
     let protocol = ProtocolAdapter::new(protocol);
-    let generator = RequestGenerator::new(
-        KeyGeneration::sequential(0),
-        RateControl::ClosedLoop,
-        Box::new(xylem_core::workload::FixedSize::new(64)),
-    );
     let stats = common::create_test_stats();
     let config = WorkerConfig {
         target: target_addr,
         duration,
-        value_size: 64,
         conn_count: 4,
         max_pending_per_conn: 16,
     };
 
-    let mut worker = Worker::with_closed_loop(
-        &TcpTransportFactory::default(),
-        protocol,
-        generator,
-        stats,
-        config,
-    )
-    .unwrap();
+    let mut worker =
+        Worker::with_closed_loop(&TcpTransportFactory::default(), protocol, stats, config).unwrap();
 
     worker.run().unwrap();
     let max_throughput = worker.stats().global().tx_requests() as f64 / duration.as_secs_f64();

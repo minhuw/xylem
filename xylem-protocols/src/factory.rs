@@ -153,12 +153,11 @@ pub trait DynProtocol: Send {
     /// The protocol decides what to send based on its internal state.
     fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, (usize, u64));
 
-    /// Generate a request (legacy API)
-    fn generate_request(
+    /// Regenerate a request for retry using the original request ID
+    fn regenerate_request(
         &mut self,
         conn_id: usize,
-        key: u64,
-        value_size: usize,
+        original_request_id: (usize, u64),
     ) -> (Vec<u8>, (usize, u64));
 
     /// Parse a response
@@ -173,17 +172,6 @@ pub trait DynProtocol: Send {
 
     /// Reset state
     fn reset(&mut self);
-
-    /// Generate a SET request with imported data (for data import support)
-    /// Default implementation panics - only Redis supports this.
-    fn generate_set_with_imported_data(
-        &mut self,
-        _conn_id: usize,
-        _key: &str,
-        _value: &[u8],
-    ) -> (Vec<u8>, (usize, u64)) {
-        panic!("generate_set_with_imported_data not supported for protocol: {}", self.name());
-    }
 }
 
 /// Blanket implementation of DynProtocol for any Protocol implementation
@@ -195,13 +183,12 @@ where
         Protocol::next_request(self, conn_id)
     }
 
-    fn generate_request(
+    fn regenerate_request(
         &mut self,
         conn_id: usize,
-        key: u64,
-        value_size: usize,
+        original_request_id: (usize, u64),
     ) -> (Vec<u8>, (usize, u64)) {
-        Protocol::generate_request(self, conn_id, key, value_size)
+        Protocol::regenerate_request(self, conn_id, original_request_id)
     }
 
     fn parse_response(
@@ -284,12 +271,7 @@ mod tests {
     impl Protocol for TestProtocol {
         type RequestId = (usize, u64);
 
-        fn generate_request(
-            &mut self,
-            conn_id: usize,
-            _key: u64,
-            _value_size: usize,
-        ) -> (Vec<u8>, Self::RequestId) {
+        fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId) {
             (vec![self.value as u8], (conn_id, 0))
         }
 
@@ -337,7 +319,7 @@ mod tests {
         let config = TestConfig { value: 100 };
         let mut protocol = factory.create(config, None).unwrap();
 
-        let (data, _id) = Protocol::generate_request(&mut protocol, 0, 0, 0);
+        let (data, _id) = Protocol::next_request(&mut protocol, 0);
         assert_eq!(data, vec![100]);
     }
 
@@ -350,7 +332,7 @@ mod tests {
         let config = serde_json::json!({"value": 50});
         let mut protocol = factory.create_from_value(config, None).unwrap();
 
-        let (data, _id) = DynProtocol::generate_request(protocol.as_mut(), 0, 0, 0);
+        let (data, _id) = DynProtocol::next_request(protocol.as_mut(), 0);
         assert_eq!(data, vec![50]);
     }
 
@@ -359,7 +341,7 @@ mod tests {
         let factory: &dyn DynProtocolFactory = &TestFactory;
 
         let mut protocol = factory.create_from_value(serde_json::Value::Null, None).unwrap();
-        let (data, _id) = DynProtocol::generate_request(protocol.as_mut(), 0, 0, 0);
+        let (data, _id) = DynProtocol::next_request(protocol.as_mut(), 0);
         assert_eq!(data, vec![42]); // default value
     }
 }

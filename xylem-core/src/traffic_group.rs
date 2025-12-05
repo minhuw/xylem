@@ -42,10 +42,7 @@ pub struct TrafficGroupConfig {
     pub sampling_policy: SamplingPolicy,
     /// Protocol-specific configuration as a JSON value.
     /// Each protocol factory interprets this according to its own schema.
-    /// For Redis/Memcached: contains keys configuration (strategy, max, value_size, etc.)
-    /// For HTTP: contains path, host, method configuration
-    /// For redis-cluster: contains keys, operations, and redis_cluster node configuration
-    /// For custom protocols: defined by the protocol factory
+    /// The core is protocol-agnostic - this value is passed directly to the protocol factory.
     #[serde(default)]
     pub protocol_config: Option<serde_json::Value>,
 }

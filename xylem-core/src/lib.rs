@@ -6,7 +6,6 @@
 
 pub mod connection;
 pub mod error;
-pub mod request;
 pub mod scheduler;
 pub mod seed;
 pub mod stats;

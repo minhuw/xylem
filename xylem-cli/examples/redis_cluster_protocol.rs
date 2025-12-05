@@ -92,7 +92,7 @@ fn main() {
         };
 
         // Generate request
-        let (request_data, req_id) = protocol.generate_request(0, *key, 100);
+        let (request_data, req_id) = protocol.generate_request_with_key(0, *key, 100);
         let (_orig_conn, req_slot, (target_conn, _seq)) = req_id;
 
         // Verify routing

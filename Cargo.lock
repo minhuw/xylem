@@ -2000,6 +2000,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "tempfile",
  "xylem-common",
  "xylem-core",
  "zeropool",

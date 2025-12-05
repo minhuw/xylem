@@ -11,7 +11,6 @@ use std::thread;
 use std::time::Duration;
 use xylem_core::stats::GroupStatsCollector;
 use xylem_core::threading::{Worker, WorkerConfig};
-use xylem_core::workload::{FixedSize, KeyGeneration, RateControl, RequestGenerator};
 use xylem_transport::TcpTransportFactory;
 
 const MESSAGE_SIZE: usize = 16;
@@ -40,12 +39,7 @@ impl EchoProtocol {
 impl xylem_core::threading::worker::Protocol for EchoProtocol {
     type RequestId = u64;
 
-    fn generate_request(
-        &mut self,
-        _conn_id: usize,
-        _key: u64,
-        _value_size: usize,
-    ) -> (Vec<u8>, Self::RequestId) {
+    fn next_request(&mut self, _conn_id: usize) -> (Vec<u8>, Self::RequestId) {
         let req_id = self.next_req_id;
         self.next_req_id += 1;
 
@@ -101,12 +95,6 @@ fn run_worker(
 
     let protocol = EchoProtocol::new();
 
-    let generator = RequestGenerator::new(
-        KeyGeneration::sequential(0),
-        RateControl::ClosedLoop,
-        Box::new(FixedSize::new(MESSAGE_SIZE)),
-    );
-
     let mut stats = GroupStatsCollector::new();
     stats.register_group(
         0,
@@ -119,19 +107,13 @@ fn run_worker(
     let config = WorkerConfig {
         target,
         duration,
-        value_size: MESSAGE_SIZE,
         conn_count: num_connections,
         max_pending_per_conn: max_pending,
     };
 
-    let mut worker = Worker::with_closed_loop(
-        &TcpTransportFactory::default(),
-        protocol,
-        generator,
-        stats,
-        config,
-    )
-    .expect("Failed to create worker");
+    let mut worker =
+        Worker::with_closed_loop(&TcpTransportFactory::default(), protocol, stats, config)
+            .expect("Failed to create worker");
 
     // Run the actual xylem worker loop
     worker.run().expect("Worker failed");

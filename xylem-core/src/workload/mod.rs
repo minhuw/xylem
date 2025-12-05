@@ -1,9 +1,10 @@
-//! Workload generation
+//! Workload patterns and statistical distributions
+//!
+//! This module provides:
+//! - Load patterns for adaptive rate control (constant, ramp, spike, etc.)
+//! - Statistical distributions re-exported from `xylem-common` for use by protocols
 
-pub mod data_import;
-pub mod generator;
 pub mod patterns;
-pub mod value_size;
 
 // Re-export distributions from xylem-common
 pub use xylem_common::distributions;
@@ -14,13 +15,8 @@ pub use xylem_common::{
     ParetoDistribution, UniformDistribution, ZipfianDistribution,
 };
 
-// Re-export main types
-pub use data_import::{
-    DataImporter, DataVerifier, ImportedEntry, VerificationMismatch, VerificationStats,
-};
-pub use generator::{KeyGeneration, KeyGeneratorTrait, RateControl, RequestGenerator};
+// Re-export load patterns
 pub use patterns::{
     ConstantPattern, LoadPattern, RampPattern, SawtoothPattern, SinusoidalPattern, SpikePattern,
     StepPattern,
 };
-pub use value_size::{FixedSize, NormalSize, PerCommandSize, UniformSize, ValueSizeGenerator};

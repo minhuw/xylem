@@ -6,7 +6,6 @@ use std::io;
 use std::path::PathBuf;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use xylem_core::threading::{CpuPinning, ThreadingRuntime, Worker, WorkerConfig};
-use xylem_core::workload::{RateControl, RequestGenerator};
 use xylem_transport::{TcpTransportFactory, UdpTransportFactory};
 
 mod completions;
@@ -91,46 +90,6 @@ impl ParsedProtocolConfig {
             Self::Masstree(c) => Some(c.keys.clone()),
             // HTTP and XylemEcho don't use key-based workloads
             Self::Http(_) | Self::XylemEcho(_) => None,
-        }
-    }
-
-    /// Get the value/body size for this protocol
-    /// For key-value protocols, returns the value_size from keys config or value_size override
-    /// For HTTP, returns body_size
-    /// For XylemEcho, returns message_size
-    fn get_value_size(&self) -> usize {
-        match self {
-            Self::Redis(c) => c.value_size.as_ref().map_or_else(
-                || c.keys.value_size(),
-                |vs| match vs {
-                    xylem_protocols::ValueSizeConfig::Fixed { size } => *size,
-                    // For variable sizes, use the midpoint as default
-                    xylem_protocols::ValueSizeConfig::Uniform { min, max } => (min + max) / 2,
-                    xylem_protocols::ValueSizeConfig::Normal { mean, .. } => *mean as usize,
-                },
-            ),
-            Self::Memcached(c) => c.keys.value_size(),
-            Self::Masstree(c) => c.keys.value_size(),
-            Self::Http(c) => c.body_size,
-            Self::XylemEcho(c) => c.message_size,
-        }
-    }
-
-    /// Get the value size configuration (for protocols that support variable sizes)
-    fn value_size_config(&self) -> Option<&xylem_protocols::ValueSizeConfig> {
-        match self {
-            Self::Redis(c) => c.value_size.as_ref(),
-            // Other protocols don't have separate value_size config
-            _ => None,
-        }
-    }
-
-    /// Get the data import configuration (for protocols that support it)
-    fn data_import_config(&self) -> Option<&xylem_protocols::DataImportConfig> {
-        match self {
-            Self::Redis(c) => c.data_import.as_ref(),
-            // Only Redis supports data import currently
-            _ => None,
         }
     }
 }
@@ -218,36 +177,16 @@ impl<P: xylem_protocols::Protocol<RequestId = (usize, u64)> + 'static>
 {
     type RequestId = (usize, u64);
 
-    fn generate_request(
-        &mut self,
-        conn_id: usize,
-        key: u64,
-        value_size: usize,
-    ) -> (Vec<u8>, Self::RequestId) {
-        self.inner.generate_request(conn_id, key, value_size)
+    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId) {
+        self.inner.next_request(conn_id)
     }
 
-    fn generate_set_with_imported_data(
+    fn regenerate_request(
         &mut self,
         conn_id: usize,
-        key: &str,
-        value: &[u8],
+        original_request_id: Self::RequestId,
     ) -> (Vec<u8>, Self::RequestId) {
-        // Check if P is MultiProtocol (which can dispatch to Redis)
-        use std::any::TypeId;
-        let p_type = TypeId::of::<P>();
-        let multi_type = TypeId::of::<xylem_cli::multi_protocol::MultiProtocol>();
-
-        if p_type == multi_type {
-            // SAFETY: We just checked that P is MultiProtocol
-            let multi = unsafe {
-                &mut *(&mut self.inner as *mut P as *mut xylem_cli::multi_protocol::MultiProtocol)
-            };
-            multi.generate_set_with_imported_data(conn_id, key, value)
-        } else {
-            // If not MultiProtocol, it's not supported
-            panic!("generate_set_with_imported_data only supported for MultiProtocol (Redis), got type: {:?}", std::any::type_name::<P>())
-        }
+        self.inner.regenerate_request(conn_id, original_request_id)
     }
 
     fn parse_response(
@@ -277,8 +216,6 @@ impl<P: xylem_protocols::Protocol<RequestId = (usize, u64)> + 'static>
                 Ok(xylem_core::threading::ParseResult::Retry(xylem_core::threading::RetryRequest {
                     bytes_consumed: retry.bytes_consumed,
                     original_request_id: retry.original_request_id,
-                    key: retry.key,
-                    value_size: retry.value_size,
                     target_conn_id: retry.target_conn_id,
                     prepare_commands: retry.prepare_commands,
                     attempt: retry.attempt,
@@ -546,9 +483,8 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
             .get_groups_for_thread(thread_idx)
             .ok_or_else(|| anyhow::anyhow!("No groups assigned to thread {}", thread_idx))?;
 
-        // Build protocol map and generator map: one per group_id
+        // Build protocol map: one per group_id
         let mut protocols = std::collections::HashMap::new();
-        let mut generators = std::collections::HashMap::new();
 
         for (group_id, _group_meta) in groups_for_thread.iter() {
             let group_config = &config_for_worker.traffic_groups[*group_id];
@@ -581,7 +517,15 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                 (ParsedProtocolConfig::Redis(redis_config), "redis") => {
                     let selector =
                         create_redis_selector(redis_config, config_for_worker.experiment.seed)?;
-                    let p = xylem_cli::multi_protocol::create_redis_protocol(selector);
+                    // Get key generator and value size for embedded workload
+                    let keys_config = parsed_config.keys_config().ok_or_else(|| {
+                        anyhow::anyhow!("Redis protocol requires keys configuration")
+                    })?;
+                    let key_gen = keys_config.to_key_gen(config_for_worker.experiment.seed)?;
+                    let value_size = keys_config.value_size();
+                    let p = xylem_cli::multi_protocol::create_redis_protocol_with_workload(
+                        selector, key_gen, value_size,
+                    );
                     ProtocolAdapter::new(p)
                 }
                 (ParsedProtocolConfig::Redis(redis_config), "redis-cluster") => {
@@ -609,9 +553,18 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                             .collect(),
                     };
 
-                    let p = xylem_cli::multi_protocol::create_redis_cluster_protocol(
+                    // Get key generator and value size for embedded workload
+                    let keys_config = parsed_config.keys_config().ok_or_else(|| {
+                        anyhow::anyhow!("Redis-cluster protocol requires keys configuration")
+                    })?;
+                    let key_gen = keys_config.to_key_gen(config_for_worker.experiment.seed)?;
+                    let value_size = keys_config.value_size();
+
+                    let p = xylem_cli::multi_protocol::create_redis_cluster_protocol_with_workload(
                         selector,
                         cluster_proto_config,
+                        Some(key_gen),
+                        value_size,
                     )?;
                     ProtocolAdapter::new(p)
                 }
@@ -643,63 +596,6 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
             };
 
             protocols.insert(*group_id, protocol_adapted);
-
-            // Create key generator and value size generator based on protocol type
-            // Key-value protocols (Redis, Memcached) use keys config
-            // HTTP uses body_size, XylemEcho uses message_size
-            let (group_key_gen, group_value_size_gen) = if let Some(keys_config) =
-                parsed_config.keys_config()
-            {
-                // Key-value protocol: use keys config for key generation
-                let key_gen = keys_config.to_key_generation(config_for_worker.experiment.seed)?;
-                let value_gen = create_value_size_generator(
-                    parsed_config.value_size_config(),
-                    keys_config.value_size(),
-                    config_for_worker.experiment.seed,
-                )?;
-                (key_gen, value_gen)
-            } else {
-                // Non-key-value protocol (HTTP, XylemEcho): use sequential keys and fixed body/message size
-                let key_gen = xylem_core::workload::KeyGeneration::sequential(0);
-                let body_size = parsed_config.get_value_size();
-                let value_gen: Box<dyn xylem_core::workload::ValueSizeGenerator> =
-                    Box::new(xylem_core::workload::FixedSize::new(body_size));
-                (key_gen, value_gen)
-            };
-
-            // Get data_import config from typed parsed config
-            let group_data_import = parsed_config.data_import_config();
-
-            let group_generator = if let Some(import_config) = group_data_import {
-                tracing::info!(
-                    "Thread {}, Group {}: Loading imported data from {}",
-                    thread_idx,
-                    group_config.name,
-                    import_config.file.display()
-                );
-
-                let data_importer = xylem_core::workload::DataImporter::from_csv_with_seed(
-                    &import_config.file,
-                    config_for_worker.experiment.seed,
-                )?;
-
-                tracing::info!(
-                    "Thread {}, Group {}: Loaded {} entries from CSV",
-                    thread_idx,
-                    group_config.name,
-                    data_importer.len()
-                );
-
-                RequestGenerator::with_imported_data(
-                    data_importer,
-                    RateControl::ClosedLoop,
-                    group_value_size_gen,
-                )
-            } else {
-                RequestGenerator::new(group_key_gen, RateControl::ClosedLoop, group_value_size_gen)
-            };
-
-            generators.insert(*group_id, group_generator);
         }
 
         // Initialize group stats collector and register all groups
@@ -825,7 +721,6 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
         let worker_config = WorkerConfig {
             target: default_target,
             duration,
-            value_size: 64, // Unused: per-group RequestGenerator provides value_size
             conn_count: total_conn_count,
             max_pending_per_conn: 1, // This will be overridden per-group
         };
@@ -849,10 +744,9 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
         match thread_transport {
             "tcp" => {
                 let factory = TcpTransportFactory::default();
-                let mut worker = Worker::new_multi_group_with_generators(
+                let mut worker = Worker::new_multi_group_with_targets(
                     &factory,
                     protocols,
-                    generators,
                     stats,
                     worker_config,
                     groups_config,
@@ -866,10 +760,9 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
             }
             "udp" => {
                 let factory = UdpTransportFactory::default();
-                let mut worker = Worker::new_multi_group_with_generators(
+                let mut worker = Worker::new_multi_group_with_targets(
                     &factory,
                     protocols,
-                    generators,
                     stats,
                     worker_config,
                     groups_config,
@@ -903,7 +796,6 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                 let mut worker = Worker::new_multi_group_unix(
                     &factory,
                     protocols,
-                    generators,
                     stats,
                     worker_config,
                     unix_groups_config,
@@ -1056,7 +948,7 @@ fn create_redis_selector(
 
                     // Check if this command has per-command key distribution
                     if let Some(ref keys_config) = cmd.keys {
-                        let key_gen = keys_config.to_key_generation(seed)?;
+                        let key_gen = keys_config.to_key_gen(seed)?;
                         per_command_keys.push(Some(
                             Box::new(key_gen) as Box<dyn xylem_protocols::KeyGenerator>
                         ));
@@ -1075,7 +967,7 @@ fn create_redis_selector(
                         .map(|opt| match opt {
                             Some(kg) => kg,
                             None => {
-                                let kg = default_keys.to_key_generation(seed).unwrap();
+                                let kg = default_keys.to_key_gen(seed).unwrap();
                                 Box::new(kg) as Box<dyn xylem_protocols::KeyGenerator>
                             }
                         })
@@ -1193,26 +1085,6 @@ fn parse_redis_op(
              SETEX, SETRANGE, GETRANGE, SCAN, MULTI, EXEC, DISCARD, CUSTOM",
             cmd
         ),
-    }
-}
-
-/// Create a value size generator from a ValueSizeConfig or use a default fixed size
-fn create_value_size_generator(
-    config: Option<&xylem_protocols::ValueSizeConfig>,
-    default_size: usize,
-    seed: Option<u64>,
-) -> anyhow::Result<Box<dyn xylem_core::workload::ValueSizeGenerator>> {
-    match config {
-        Some(xylem_protocols::ValueSizeConfig::Fixed { size }) => {
-            Ok(Box::new(xylem_core::workload::FixedSize::new(*size)))
-        }
-        Some(xylem_protocols::ValueSizeConfig::Uniform { min, max }) => {
-            Ok(Box::new(xylem_core::workload::UniformSize::with_seed(*min, *max, seed)?))
-        }
-        Some(xylem_protocols::ValueSizeConfig::Normal { mean, std_dev, min, max }) => Ok(Box::new(
-            xylem_core::workload::NormalSize::with_seed(*mean, *std_dev, *min, *max, seed)?,
-        )),
-        None => Ok(Box::new(xylem_core::workload::FixedSize::new(default_size))),
     }
 }
 

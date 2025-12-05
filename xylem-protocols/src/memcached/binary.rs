@@ -137,15 +137,6 @@ impl Protocol for MemcachedBinaryProtocol {
 
     fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId) {
         let key = self.key_gen.as_mut().map(|g| g.next_key()).unwrap_or(0);
-        self.generate_request(conn_id, key, self.value_size)
-    }
-
-    fn generate_request(
-        &mut self,
-        conn_id: usize,
-        key: u64,
-        value_size: usize,
-    ) -> (Vec<u8>, Self::RequestId) {
         let seq = self.next_send_seq(conn_id);
         let key_str = format!("key:{key}");
         let key_bytes = key_str.as_bytes();
@@ -166,12 +157,12 @@ impl Protocol for MemcachedBinaryProtocol {
             MemcachedOp::Set => {
                 // SET: header + extras (8 bytes: flags + expiration) + key + value
                 let extras_len = 8u8;
-                let body_len = extras_len as u32 + key_len as u32 + value_size as u32;
+                let body_len = extras_len as u32 + key_len as u32 + self.value_size as u32;
                 let header = BmcHeader::new_request(CMD_SET, key_len, extras_len, body_len);
 
-                let mut buf = self
-                    .pool
-                    .get(BmcHeader::SIZE + extras_len as usize + key_len as usize + value_size);
+                let mut buf = self.pool.get(
+                    BmcHeader::SIZE + extras_len as usize + key_len as usize + self.value_size,
+                );
                 buf.clear();
                 buf.extend_from_slice(&header.as_bytes());
 
@@ -182,7 +173,7 @@ impl Protocol for MemcachedBinaryProtocol {
                 buf.extend_from_slice(key_bytes);
 
                 // Value
-                buf.resize(buf.len() + value_size, b'x');
+                buf.resize(buf.len() + self.value_size, b'x');
 
                 buf.to_vec()
             }

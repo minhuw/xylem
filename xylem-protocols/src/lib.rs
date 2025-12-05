@@ -15,12 +15,8 @@ use std::hash::Hash;
 pub struct RetryRequest<ReqId> {
     /// Number of bytes consumed from the response buffer
     pub bytes_consumed: usize,
-    /// Original request ID that triggered this retry
+    /// Original request ID that triggered this retry (protocol uses this to look up request data)
     pub original_request_id: ReqId,
-    /// Key to use for the retry request
-    pub key: u64,
-    /// Value size for the retry request
-    pub value_size: usize,
     /// Target connection ID for the retry (None = use routing logic)
     pub target_conn_id: Option<usize>,
     /// Preparation commands to send before the retry (e.g., ASKING for Redis Cluster)
@@ -55,44 +51,37 @@ pub trait Protocol: Send {
 
     /// Generate the next request for a connection
     ///
-    /// This is the primary method protocols should implement. The protocol decides
-    /// what to send based on its internal workload generator state.
+    /// The protocol generates the request based on its internal state
+    /// (command selector, key generator, value size, etc.)
     ///
     /// # Arguments
     /// * `conn_id` - Connection identifier (for protocols that need per-connection state)
     ///
     /// # Returns
     /// (request_data, request_id) tuple
-    ///
-    /// # Default Implementation
-    /// Panics - protocols should implement this method.
-    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId) {
-        let _ = conn_id;
-        unimplemented!(
-            "Protocol {} does not implement next_request(). \
-             Either implement next_request() or use generate_request() with external workload generator.",
-            self.name()
-        )
-    }
+    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId);
 
-    /// Generate a request with an ID (legacy API)
+    /// Regenerate a request for retry using the original request ID
     ///
-    /// # Deprecation Notice
-    /// This method is being phased out. Protocols should implement `next_request()` instead,
-    /// which allows the protocol to manage its own workload generation internally.
+    /// The protocol looks up any stored metadata for the original request
+    /// and generates a new request with the same parameters.
+    /// This is used for retry scenarios (e.g., cluster redirects).
     ///
     /// # Arguments
-    /// * `conn_id` - Connection identifier (for protocols that need per-connection state)
-    /// * `key` - Request key
-    /// * `value_size` - Value size for the request
+    /// * `conn_id` - Target connection ID for the retry
+    /// * `original_request_id` - The request ID from the original request
     ///
-    /// Returns (request_data, request_id)
-    fn generate_request(
+    /// # Returns
+    /// (request_data, new_request_id) tuple
+    ///
+    /// Default implementation just generates a new request (ignores original).
+    fn regenerate_request(
         &mut self,
         conn_id: usize,
-        key: u64,
-        value_size: usize,
-    ) -> (Vec<u8>, Self::RequestId);
+        _original_request_id: Self::RequestId,
+    ) -> (Vec<u8>, Self::RequestId) {
+        self.next_request(conn_id)
+    }
 
     /// Parse a response and return the request ID it corresponds to
     ///
@@ -169,9 +158,9 @@ pub mod xylem_echo;
 
 // Re-export commonly used types
 pub use configs::{
-    DataImportConfig, HttpConfig, KeysConfig, MasstreeConfig, MasstreeScanConfig, MemcachedConfig,
-    RedisCommandParams, RedisCommandWeight, RedisConfig, RedisOperationsConfig, ValueSizeConfig,
-    VerificationConfig, XylemEchoConfig,
+    CommandValueSizeConfig, DataImportConfig, HttpConfig, KeysConfig, MasstreeConfig,
+    MasstreeScanConfig, MemcachedConfig, RedisCommandParams, RedisCommandWeight, RedisConfig,
+    RedisOperationsConfig, ValueSizeConfig, VerificationConfig, XylemEchoConfig,
 };
 pub use factories::{
     HttpFactory, MemcachedAsciiFactory, MemcachedBinaryFactory, ProtocolRegistry, RedisFactory,

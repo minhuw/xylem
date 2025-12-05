@@ -62,20 +62,12 @@ impl Protocol for XylemEchoProtocol {
 
     fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId) {
         let seq = self.next_seq(conn_id);
-        self.generate_request(conn_id, seq, 0)
-    }
 
-    fn generate_request(
-        &mut self,
-        conn_id: usize,
-        key: u64,
-        _value_size: usize,
-    ) -> (Vec<u8>, Self::RequestId) {
-        // Create request ID tuple (conn_id, key)
-        let request_id = (conn_id, key);
+        // Create request ID tuple (conn_id, seq)
+        let request_id = (conn_id, seq);
 
-        // Encode conn_id and key into 8 bytes: high 32 bits = conn_id, low 32 bits = key
-        let encoded_id = ((conn_id as u64) << 32) | (key & 0xFFFFFFFF);
+        // Encode conn_id and seq into 8 bytes: high 32 bits = conn_id, low 32 bits = seq
+        let encoded_id = ((conn_id as u64) << 32) | (seq & 0xFFFFFFFF);
 
         let mut buf = self.pool.get(MESSAGE_SIZE);
         buf.clear();
@@ -133,18 +125,18 @@ mod tests {
         let mut protocol = XylemEchoProtocol::new(100);
 
         // Generate a request
-        let (request, req_id) = protocol.generate_request(0, 42, 0);
+        let (request, req_id) = protocol.next_request(0);
 
         assert_eq!(request.len(), MESSAGE_SIZE);
-        assert_eq!(req_id, (0, 42)); // (conn_id, key)
+        assert_eq!(req_id, (0, 0)); // (conn_id, seq) - first request is seq 0
 
-        // Check encoded request_id (high 32 bits = conn_id=0, low 32 bits = key=42)
+        // Check encoded request_id (high 32 bits = conn_id=0, low 32 bits = seq=0)
         let encoded_id = u64::from_le_bytes([
             request[0], request[1], request[2], request[3], request[4], request[5], request[6],
             request[7],
         ]);
         assert_eq!(encoded_id >> 32, 0); // conn_id
-        assert_eq!(encoded_id & 0xFFFFFFFF, 42); // key
+        assert_eq!(encoded_id & 0xFFFFFFFF, 0); // seq
 
         // Check delay_us encoding
         let delay_us = u64::from_le_bytes([
@@ -198,17 +190,17 @@ mod tests {
     fn test_multiple_connections() {
         let mut protocol = XylemEchoProtocol::new(50);
 
-        // Connection 0, key 1
-        let (_, id0) = protocol.generate_request(0, 1, 0);
+        // Connection 0, first request
+        let (_, id0) = protocol.next_request(0);
 
-        // Connection 1, key 1 (same key, different connection)
-        let (_, id1) = protocol.generate_request(1, 1, 0);
+        // Connection 1, first request (different connection)
+        let (_, id1) = protocol.next_request(1);
 
         // IDs should be different because conn_id differs
         assert_ne!(id0, id1);
 
-        // Check request IDs
-        assert_eq!(id0, (0, 1)); // (conn_id=0, key=1)
-        assert_eq!(id1, (1, 1)); // (conn_id=1, key=1)
+        // Check request IDs - each connection starts at seq 0
+        assert_eq!(id0, (0, 0)); // (conn_id=0, seq=0)
+        assert_eq!(id1, (1, 0)); // (conn_id=1, seq=0)
     }
 }

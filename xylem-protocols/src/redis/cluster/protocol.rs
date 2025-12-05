@@ -59,7 +59,7 @@ struct RequestMetadata {
 /// protocol.register_connection("127.0.0.1:7002".parse()?, 2);
 ///
 /// // Requests automatically route to correct node
-/// let (request, id) = protocol.generate_request(0, 1000, 100);
+/// let (request, id) = protocol.generate_request_with_key(0, 1000, 100);
 /// ```
 pub struct RedisClusterProtocol {
     /// Underlying single-node Redis protocol
@@ -112,6 +112,25 @@ impl RedisClusterProtocol {
     pub fn new(command_selector: Box<dyn CommandSelector<RedisOp>>) -> Self {
         Self {
             base_protocol: RedisProtocol::new(command_selector),
+            topology: ClusterTopology::new(),
+            max_redirects: 5,
+            redirect_stats: RedirectStats::default(),
+            conn_to_node: HashMap::new(),
+            node_to_conn: HashMap::new(),
+            default_node: None,
+            request_metadata: HashMap::new(),
+            retry_counts: HashMap::new(),
+        }
+    }
+
+    /// Create with embedded workload generator
+    pub fn with_workload(
+        command_selector: Box<dyn CommandSelector<RedisOp>>,
+        key_gen: crate::workload::KeyGeneration,
+        value_size: usize,
+    ) -> Self {
+        Self {
+            base_protocol: RedisProtocol::with_workload(command_selector, key_gen, value_size),
             topology: ClusterTopology::new(),
             max_redirects: 5,
             redirect_stats: RedirectStats::default(),
@@ -288,8 +307,6 @@ impl RedisClusterProtocol {
                 Ok(crate::RetryRequest {
                     bytes_consumed: consumed,
                     original_request_id: cluster_req_id,
-                    key: metadata.key,
-                    value_size: metadata.value_size,
                     target_conn_id,
                     prepare_commands: vec![],
                     attempt: retry_count,
@@ -304,8 +321,6 @@ impl RedisClusterProtocol {
                 Ok(crate::RetryRequest {
                     bytes_consumed: consumed,
                     original_request_id: cluster_req_id,
-                    key: metadata.key,
-                    value_size: metadata.value_size,
                     target_conn_id,
                     prepare_commands: vec![asking_cmd],
                     attempt: retry_count,
@@ -349,15 +364,66 @@ impl Protocol for RedisClusterProtocol {
         // Delegate to base protocol's key generation then route
         let key = self.base_protocol.key_gen_mut().map(|g| g.next_key()).unwrap_or(0);
         let value_size = self.base_protocol.value_size();
-        self.generate_request(conn_id, key, value_size)
+        self.generate_request_with_key(conn_id, key, value_size)
     }
 
-    fn generate_request(
+    fn regenerate_request(
+        &mut self,
+        conn_id: usize,
+        original_request_id: Self::RequestId,
+    ) -> (Vec<u8>, Self::RequestId) {
+        // Extract base request ID from cluster request ID
+        let (_orig_conn, _slot, base_req_id) = original_request_id;
+
+        // Look up original request metadata
+        if let Some(metadata) = self.request_metadata.get(&base_req_id).copied() {
+            self.generate_request_with_key(conn_id, metadata.key, metadata.value_size)
+        } else {
+            // Fallback: generate new request if metadata not found
+            self.next_request(conn_id)
+        }
+    }
+
+    fn parse_response(
+        &mut self,
+        conn_id: usize,
+        data: &[u8],
+    ) -> Result<(usize, Option<Self::RequestId>)> {
+        // Delegate to internal implementation
+        self.parse_response_impl(conn_id, data)
+    }
+
+    fn parse_response_extended(
+        &mut self,
+        conn_id: usize,
+        data: &[u8],
+    ) -> Result<crate::ParseResult<Self::RequestId>> {
+        // Delegate to internal implementation
+        self.parse_response_extended_impl(conn_id, data)
+    }
+
+    fn name(&self) -> &'static str {
+        "redis-cluster"
+    }
+
+    fn reset(&mut self) {
+        self.base_protocol.reset();
+        self.redirect_stats = RedirectStats::default();
+        self.request_metadata.clear();
+        self.retry_counts.clear();
+    }
+}
+
+impl RedisClusterProtocol {
+    /// Generate a request with specific key and value size
+    ///
+    /// This is used for testing and for routing requests with known keys.
+    pub fn generate_request_with_key(
         &mut self,
         conn_id: usize,
         key: u64,
         value_size: usize,
-    ) -> (Vec<u8>, Self::RequestId) {
+    ) -> (Vec<u8>, ClusterRequestId) {
         // Format key as "key:{n}"
         let key_str = format!("key:{}", key);
         let key_bytes = key_str.as_bytes();
@@ -398,7 +464,7 @@ impl Protocol for RedisClusterProtocol {
 
         // Generate request using base protocol
         let (request_data, base_req_id) =
-            self.base_protocol.generate_request(target_conn_id, key, value_size);
+            self.base_protocol.generate_request_with_key(target_conn_id, key, value_size);
 
         // Store request metadata for potential retry (Phase 7)
         let metadata = RequestMetadata {
@@ -415,11 +481,11 @@ impl Protocol for RedisClusterProtocol {
         (request_data, cluster_req_id)
     }
 
-    fn parse_response(
+    fn parse_response_impl(
         &mut self,
         conn_id: usize,
         data: &[u8],
-    ) -> Result<(usize, Option<Self::RequestId>)> {
+    ) -> Result<(usize, Option<ClusterRequestId>)> {
         // Parse using base protocol
         let result = self.base_protocol.parse_response(conn_id, data);
 
@@ -455,11 +521,11 @@ impl Protocol for RedisClusterProtocol {
         }
     }
 
-    fn parse_response_extended(
+    fn parse_response_extended_impl(
         &mut self,
         conn_id: usize,
         data: &[u8],
-    ) -> Result<crate::ParseResult<Self::RequestId>> {
+    ) -> Result<crate::ParseResult<ClusterRequestId>> {
         // Parse using base protocol
         let result = self.base_protocol.parse_response(conn_id, data);
 
@@ -543,17 +609,6 @@ impl Protocol for RedisClusterProtocol {
             }
         }
     }
-
-    fn name(&self) -> &'static str {
-        "redis-cluster"
-    }
-
-    fn reset(&mut self) {
-        self.base_protocol.reset();
-        self.redirect_stats = RedirectStats::default();
-        self.request_metadata.clear();
-        self.retry_counts.clear();
-    }
 }
 
 #[cfg(test)]
@@ -634,7 +689,7 @@ mod tests {
         protocol.register_connection("127.0.0.1:7000".parse().unwrap(), 0);
 
         // Generate request
-        let (request_data, req_id) = protocol.generate_request(0, 1000, 100);
+        let (request_data, req_id) = protocol.generate_request_with_key(0, 1000, 100);
 
         // Verify request data is not empty
         assert!(!request_data.is_empty());
@@ -658,7 +713,7 @@ mod tests {
         protocol.register_connection("127.0.0.1:7002".parse().unwrap(), 2);
 
         // Generate request and verify slot calculation
-        let (_, req_id1) = protocol.generate_request(99, 1000, 100);
+        let (_, req_id1) = protocol.generate_request_with_key(99, 1000, 100);
         let (_, slot1, (target_conn1, _)) = req_id1;
         assert_eq!(slot1, calculate_slot(b"key:1000"));
 
@@ -673,7 +728,7 @@ mod tests {
         }
 
         // Different key should potentially route to different node
-        let (_, req_id2) = protocol.generate_request(99, 9999, 100);
+        let (_, req_id2) = protocol.generate_request_with_key(99, 9999, 100);
         let (_, slot2, _) = req_id2;
         assert_eq!(slot2, calculate_slot(b"key:9999"));
 
@@ -697,7 +752,7 @@ mod tests {
 
         // Generate a request to change state
         protocol.register_connection("127.0.0.1:7000".parse().unwrap(), 0);
-        protocol.generate_request(0, 1000, 100);
+        protocol.generate_request_with_key(0, 1000, 100);
 
         // Reset
         protocol.reset();
@@ -715,7 +770,7 @@ mod tests {
         protocol.register_connection(node, 0);
 
         // Don't set topology - should use default node
-        let (request, req_id) = protocol.generate_request(0, 1000, 100);
+        let (request, req_id) = protocol.generate_request_with_key(0, 1000, 100);
 
         // Should still generate valid request
         assert!(!request.is_empty());

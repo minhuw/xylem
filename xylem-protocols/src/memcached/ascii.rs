@@ -81,15 +81,6 @@ impl Protocol for MemcachedAsciiProtocol {
 
     fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId) {
         let key = self.key_gen.as_mut().map(|g| g.next_key()).unwrap_or(0);
-        self.generate_request(conn_id, key, self.value_size)
-    }
-
-    fn generate_request(
-        &mut self,
-        conn_id: usize,
-        key: u64,
-        value_size: usize,
-    ) -> (Vec<u8>, Self::RequestId) {
         let seq = self.next_send_seq(conn_id);
         let request_data = match self.operation {
             MemcachedOp::Get => {
@@ -103,14 +94,14 @@ impl Protocol for MemcachedAsciiProtocol {
             }
             MemcachedOp::Set => {
                 // Format: set key:N 0 0 <value_len>\r\n<value>\r\n
-                let mut buf = self.pool.get(256 + value_size);
+                let mut buf = self.pool.get(256 + self.value_size);
                 buf.clear();
                 buf.extend_from_slice(b"set key:");
                 buf.extend_from_slice(key.to_string().as_bytes());
                 buf.extend_from_slice(b" 0 0 ");
-                buf.extend_from_slice(value_size.to_string().as_bytes());
+                buf.extend_from_slice(self.value_size.to_string().as_bytes());
                 buf.extend_from_slice(b"\r\n");
-                buf.resize(buf.len() + value_size, b'x');
+                buf.resize(buf.len() + self.value_size, b'x');
                 buf.extend_from_slice(b"\r\n");
                 buf.to_vec()
             }
