@@ -286,16 +286,16 @@ fn test_redis_multi_thread() {
     );
 }
 
+/// Test closed-loop throughput with minimal pipelining (single outstanding request)
 #[test]
-fn test_redis_rate_limited() {
+fn test_redis_closed_loop_minimal() {
     // Start Redis server (will auto-cleanup on drop)
     let _redis = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
-    println!("Running rate-limited test...");
+    println!("Running closed-loop minimal pipelining test...");
 
     let target_addr = "127.0.0.1:6379".parse().unwrap();
     let duration = Duration::from_secs(2);
-    let target_rate = 500.0; // 500 req/s (adjusted for closed-loop latency)
 
     let protocol = xylem_protocols::redis::RedisProtocol::new(Box::new(
         xylem_protocols::FixedCommandSelector::new(xylem_protocols::redis::RedisOp::Get),
@@ -306,14 +306,14 @@ fn test_redis_rate_limited() {
         target: target_addr,
         duration,
         conn_count: 1,
-        max_pending_per_conn: 1,
+        max_pending_per_conn: 1, // Minimal pipelining - one request at a time
     };
 
     let mut worker =
         Worker::with_closed_loop(&TcpTransportFactory::default(), protocol, stats, worker_config)
             .expect("Failed to create worker");
 
-    println!("Starting rate-limited test (target: {target_rate} req/s)...");
+    println!("Starting closed-loop test with minimal pipelining...");
     let result = worker.run();
 
     assert!(result.is_ok(), "Worker should complete successfully");
@@ -322,15 +322,12 @@ fn test_redis_rate_limited() {
     let actual_rate = stats.global().tx_requests() as f64 / duration.as_secs_f64();
 
     println!("Results:");
-    println!("  Target rate: {target_rate:.2} req/s");
     println!("  Actual rate: {actual_rate:.2} req/s");
     println!("  Total requests: {}", stats.global().tx_requests());
 
-    // Verify we're close to target rate (within 40% tolerance)
-    // Note: Rate limiting is affected by network latency, so we need a generous tolerance
-    let rate_ratio = actual_rate / target_rate;
+    // With minimal pipelining (1 outstanding request), we should still achieve some throughput
     assert!(
-        rate_ratio > 0.6 && rate_ratio < 1.4,
-        "Actual rate should be within 40% of target rate, got {rate_ratio:.2}x"
+        actual_rate > 100.0,
+        "Even minimal pipelining should achieve at least 100 req/s, got {actual_rate:.2}"
     );
 }

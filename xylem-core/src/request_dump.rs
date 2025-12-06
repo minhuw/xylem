@@ -33,11 +33,12 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// Rotation policy for request dump files
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum RotationPolicy {
     /// Never rotate - single file
+    #[default]
     Never,
     /// Rotate every minute
     Minutely,
@@ -47,12 +48,6 @@ pub enum RotationPolicy {
     Daily,
     /// Rotate when file exceeds size (in bytes)
     Size(u64),
-}
-
-impl Default for RotationPolicy {
-    fn default() -> Self {
-        Self::Never
-    }
 }
 
 /// Encoding method for request data in dump files

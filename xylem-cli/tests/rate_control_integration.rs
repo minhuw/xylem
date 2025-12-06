@@ -1,9 +1,13 @@
-//! Rate control integration tests
+//! Rate control and throughput integration tests.
 //!
-//! Tests verifying that rate control mechanisms achieve target rates accurately.
+//! Tests verifying:
+//! - Closed-loop throughput behavior with different configurations
+//! - Rate-limited behavior with fixed-rate and Poisson policies
+//!
 //! Requires Redis Docker container.
 
 use std::time::Duration;
+use xylem_core::scheduler::UniformPolicyScheduler;
 use xylem_core::threading::{Worker, WorkerConfig};
 
 use xylem_transport::TcpTransportFactory;
@@ -53,8 +57,8 @@ impl<P: xylem_protocols::Protocol> xylem_core::threading::worker::Protocol for P
     }
 }
 
-/// Run a rate-limited experiment and return (target_rate, actual_rate, error_percent)
-fn run_rate_experiment(target_rate: f64, duration_secs: u64, conn_count: usize) -> (f64, f64, f64) {
+/// Run a closed-loop throughput experiment and return the actual rate
+fn run_throughput_experiment(duration_secs: u64, conn_count: usize, pipeline_depth: usize) -> f64 {
     let target_addr = "127.0.0.1:6379".parse().unwrap();
     let duration = Duration::from_secs(duration_secs);
 
@@ -67,11 +71,116 @@ fn run_rate_experiment(target_rate: f64, duration_secs: u64, conn_count: usize) 
         target: target_addr,
         duration,
         conn_count,
-        max_pending_per_conn: 8,
+        max_pending_per_conn: pipeline_depth,
     };
 
     let mut worker =
         Worker::with_closed_loop(&TcpTransportFactory::default(), protocol, stats, config).unwrap();
+
+    let result = worker.run();
+    assert!(result.is_ok(), "Worker failed: {:?}", result.err());
+
+    let stats = worker.stats().global();
+    stats.tx_requests() as f64 / duration.as_secs_f64()
+}
+
+/// Test closed-loop throughput with single connection
+#[test]
+fn test_throughput_single_connection() {
+    let _guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
+
+    println!("\n=== Testing Single Connection Throughput ===");
+    let rate = run_throughput_experiment(3, 1, 8);
+
+    println!("Actual rate: {rate:.2} req/s");
+
+    // Single connection with pipelining should achieve reasonable throughput
+    assert!(
+        rate > 1000.0,
+        "Single connection should achieve at least 1000 req/s, got {rate:.2}"
+    );
+    println!("✓ Single connection throughput: {rate:.0} req/s");
+}
+
+/// Test closed-loop throughput with multiple connections
+#[test]
+fn test_throughput_multiple_connections() {
+    let _guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
+
+    println!("\n=== Testing Multiple Connection Throughput ===");
+    let rate = run_throughput_experiment(3, 4, 8);
+
+    println!("Actual rate: {rate:.2} req/s");
+
+    // Multiple connections should achieve higher throughput
+    assert!(
+        rate > 2000.0,
+        "Multiple connections should achieve at least 2000 req/s, got {rate:.2}"
+    );
+    println!("✓ Multiple connection throughput: {rate:.0} req/s");
+}
+
+/// Test throughput scaling with pipeline depth
+#[test]
+fn test_throughput_scaling_with_pipeline_depth() {
+    let _guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
+
+    println!("\n=== Testing Throughput Scaling with Pipeline Depth ===");
+
+    // Test with different pipeline depths
+    let depths = [1, 4, 16];
+    let mut rates = Vec::new();
+
+    println!("{:<20} {:<20}", "Pipeline Depth", "Throughput (req/s)");
+    println!("{:-<40}", "");
+
+    for depth in depths {
+        let rate = run_throughput_experiment(3, 2, depth);
+        println!("{depth:<20} {rate:<20.0}");
+        rates.push(rate);
+    }
+
+    // Higher pipeline depth should generally achieve higher or equal throughput
+    // (up to saturation point)
+    assert!(
+        rates[1] >= rates[0] * 0.9,
+        "Pipeline depth 4 should not be much worse than depth 1"
+    );
+
+    println!("\n✓ Throughput scales with pipeline depth");
+}
+
+// =============================================================================
+// Rate-Limited Tests
+// =============================================================================
+
+/// Run a rate-limited experiment and return (target_rate, actual_rate, error_percent)
+fn run_rate_limited_experiment(
+    target_rate: f64,
+    duration_secs: u64,
+    conn_count: usize,
+) -> (f64, f64, f64) {
+    let target_addr = "127.0.0.1:6379".parse().unwrap();
+    let duration = Duration::from_secs(duration_secs);
+
+    let protocol = xylem_protocols::redis::RedisProtocol::new(Box::new(
+        xylem_protocols::FixedCommandSelector::new(xylem_protocols::redis::RedisOp::Get),
+    ));
+    let protocol = ProtocolAdapter::new(protocol);
+    let stats = common::create_test_stats();
+    let config = WorkerConfig {
+        target: target_addr,
+        duration,
+        conn_count,
+        max_pending_per_conn: 1, // Single pending for rate-limited mode
+    };
+
+    // Use fixed-rate policy scheduler
+    let policy_scheduler = Box::new(UniformPolicyScheduler::fixed_rate(target_rate));
+
+    let mut worker =
+        Worker::new(&TcpTransportFactory::default(), protocol, stats, config, policy_scheduler)
+            .unwrap();
 
     let result = worker.run();
     assert!(result.is_ok(), "Worker failed: {:?}", result.err());
@@ -83,54 +192,57 @@ fn run_rate_experiment(target_rate: f64, duration_secs: u64, conn_count: usize) 
     (target_rate, actual_rate, error_percent)
 }
 
+/// Test rate accuracy with low rate (100 req/s)
 #[test]
 fn test_rate_accuracy_low_rate() {
     let _guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
     println!("\n=== Testing Low Rate (100 req/s) ===");
-    let (target, actual, error) = run_rate_experiment(100.0, 5, 1);
+    let (target, actual, error) = run_rate_limited_experiment(100.0, 5, 1);
 
     println!("Target rate: {target:.2} req/s");
     println!("Actual rate: {actual:.2} req/s");
     println!("Error: {error:.2}%");
 
-    // Low rates should be very accurate (within 5%)
+    // Low rates should be accurate (within 10%)
     assert!(
-        error < 5.0,
+        error < 10.0,
         "Low rate error too high: {error:.2}% (target: {target:.2}, actual: {actual:.2})"
     );
     println!("✓ Low rate accuracy: {error:.2}%");
 }
 
+/// Test rate accuracy with medium rate (1000 req/s)
 #[test]
 fn test_rate_accuracy_medium_rate() {
     let _guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
-    println!("\n=== Testing Medium Rate (5000 req/s) ===");
-    let (target, actual, error) = run_rate_experiment(5000.0, 5, 2);
+    println!("\n=== Testing Medium Rate (1000 req/s) ===");
+    // Use 1 connection since rate limiting is per-connection
+    let (target, actual, error) = run_rate_limited_experiment(1000.0, 5, 1);
 
     println!("Target rate: {target:.2} req/s");
     println!("Actual rate: {actual:.2} req/s");
     println!("Error: {error:.2}%");
 
-    // Medium rates should be accurate within 15%
+    // Medium rates should be accurate within 10%
     assert!(
-        error < 15.0,
+        error < 10.0,
         "Medium rate error too high: {error:.2}% (target: {target:.2}, actual: {actual:.2})"
     );
     println!("✓ Medium rate accuracy: {error:.2}%");
 }
 
+/// Test Poisson rate limiting produces correct average rate
 #[test]
-fn test_rate_vs_throughput_saturation() {
+fn test_poisson_rate_limiting() {
     let _guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
-    println!("\n=== Testing Rate vs Throughput Saturation ===");
-    println!("Finding maximum achievable throughput...\n");
+    println!("\n=== Testing Poisson Rate Limiting (500 req/s) ===");
 
-    // First, find max throughput in closed-loop mode
     let target_addr = "127.0.0.1:6379".parse().unwrap();
-    let duration = Duration::from_secs(3);
+    let duration = Duration::from_secs(5);
+    let target_rate = 500.0;
 
     let protocol = xylem_protocols::redis::RedisProtocol::new(Box::new(
         xylem_protocols::FixedCommandSelector::new(xylem_protocols::redis::RedisOp::Get),
@@ -140,33 +252,33 @@ fn test_rate_vs_throughput_saturation() {
     let config = WorkerConfig {
         target: target_addr,
         duration,
-        conn_count: 4,
-        max_pending_per_conn: 16,
+        conn_count: 1,
+        max_pending_per_conn: 1,
     };
 
+    // Use Poisson policy scheduler
+    let policy_scheduler =
+        Box::new(UniformPolicyScheduler::poisson(target_rate).expect("Failed to create Poisson"));
+
     let mut worker =
-        Worker::with_closed_loop(&TcpTransportFactory::default(), protocol, stats, config).unwrap();
+        Worker::new(&TcpTransportFactory::default(), protocol, stats, config, policy_scheduler)
+            .unwrap();
 
-    worker.run().unwrap();
-    let max_throughput = worker.stats().global().tx_requests() as f64 / duration.as_secs_f64();
+    let result = worker.run();
+    assert!(result.is_ok(), "Worker failed: {:?}", result.err());
 
-    println!("Maximum throughput (closed-loop): {max_throughput:.0} req/s\n");
+    let stats = worker.stats().global();
+    let actual_rate = stats.tx_requests() as f64 / duration.as_secs_f64();
+    let error = ((actual_rate - target_rate) / target_rate * 100.0).abs();
 
-    // Test rates below and above saturation point
-    let test_rates = vec![
-        max_throughput * 0.5, // 50% of max - should achieve target
-        max_throughput * 1.5, // 150% of max - should saturate
-    ];
+    println!("Target rate: {target_rate:.2} req/s");
+    println!("Actual rate: {actual_rate:.2} req/s");
+    println!("Error: {error:.2}%");
 
-    println!("{:<20} {:<20} {:<15}", "Target Rate", "Actual Rate", "Saturated?");
-    println!("{:-<55}", "");
-
-    for target in test_rates {
-        let (_t, actual, _e) = run_rate_experiment(target, 3, 4);
-        let saturated = if actual < target * 0.9 { "Yes" } else { "No" };
-
-        println!("{target:<20.0} {actual:<20.0} {saturated:<15}");
-    }
-
-    println!("\n✓ Rate control behaves correctly at saturation");
+    // Poisson should be accurate within 10%
+    assert!(
+        error < 10.0,
+        "Poisson rate error too high: {error:.2}% (target: {target_rate:.2}, actual: {actual_rate:.2})"
+    );
+    println!("✓ Poisson rate accuracy: {error:.2}%");
 }

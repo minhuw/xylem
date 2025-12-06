@@ -146,15 +146,19 @@ fn test_redis_pipelined_multiple_connections() {
     println!("✓ Multi-connection pipelined throughput: {throughput:.0} req/s");
 }
 
+/// Test closed-loop pipelined performance with multiple connections
+///
+/// Note: This is a closed-loop test (maximum throughput), not rate-limited.
+/// The worker will send requests as fast as possible with the configured
+/// pipelining depth.
 #[test]
-fn test_redis_pipelined_rate_limited() {
+fn test_redis_pipelined_closed_loop() {
     let _guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
-    println!("Running pipelined rate-limited test...");
+    println!("Running pipelined closed-loop test...");
 
     let target_addr = "127.0.0.1:6379".parse().unwrap();
     let duration = Duration::from_secs(2);
-    let target_rate = 1000.0; // 1000 req/s
 
     let protocol = xylem_protocols::redis::RedisProtocol::new(Box::new(
         xylem_protocols::FixedCommandSelector::new(xylem_protocols::redis::RedisOp::Get),
@@ -171,7 +175,7 @@ fn test_redis_pipelined_rate_limited() {
     let mut worker =
         Worker::with_closed_loop(&TcpTransportFactory::default(), protocol, stats, config).unwrap();
 
-    println!("Starting rate-limited test (target: {target_rate} req/s)...");
+    println!("Starting closed-loop test...");
     let result = worker.run();
 
     assert!(result.is_ok(), "Worker should complete: {:?}", result.err());
@@ -180,16 +184,14 @@ fn test_redis_pipelined_rate_limited() {
     let actual_rate = stats.tx_requests() as f64 / duration.as_secs_f64();
 
     println!("Results:");
-    println!("  Target rate: {target_rate:.2} req/s");
     println!("  Actual rate: {actual_rate:.2} req/s");
     println!("  Total requests: {}", stats.tx_requests());
 
-    // Verify rate is close to target (within 20%)
-    let rate_ratio = actual_rate / target_rate;
+    // Closed-loop should achieve reasonable throughput (at least 1000 req/s with pipelining)
     assert!(
-        rate_ratio > 0.8 && rate_ratio < 1.2,
-        "Actual rate should be within 20% of target, got {rate_ratio:.2}x"
+        actual_rate > 1000.0,
+        "Closed-loop pipelined should achieve at least 1000 req/s, got {actual_rate:.2}"
     );
 
-    println!("✓ Rate control working ({}% of target)", (rate_ratio * 100.0) as i32);
+    println!("✓ Closed-loop pipelining working ({actual_rate:.0} req/s)");
 }
