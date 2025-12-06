@@ -93,6 +93,12 @@ pub struct MasstreeProtocol {
     key_gen: Option<crate::workload::KeyGeneration>,
     /// Value size for next_request()
     value_size: usize,
+    /// Key prefix for generated keys (default: "key:")
+    key_prefix: String,
+    /// Whether to use random data for values instead of repeated 'x'
+    random_data: bool,
+    /// RNG for random data generation (only used when random_data is true)
+    rng: Option<rand::rngs::SmallRng>,
 }
 
 impl MasstreeProtocol {
@@ -104,6 +110,9 @@ impl MasstreeProtocol {
             pool: BufferPool::new(),
             key_gen: None,
             value_size: 64,
+            key_prefix: "key:".to_string(),
+            random_data: false,
+            rng: None,
         }
     }
 
@@ -113,6 +122,36 @@ impl MasstreeProtocol {
         key_gen: crate::workload::KeyGeneration,
         value_size: usize,
     ) -> Self {
+        Self::with_workload_and_options(
+            operation,
+            key_gen,
+            value_size,
+            "key:".to_string(),
+            false,
+            None,
+        )
+    }
+
+    /// Create with embedded workload generator and custom options
+    pub fn with_workload_and_options(
+        operation: MasstreeOp,
+        key_gen: crate::workload::KeyGeneration,
+        value_size: usize,
+        key_prefix: String,
+        random_data: bool,
+        seed: Option<u64>,
+    ) -> Self {
+        use rand::SeedableRng;
+
+        let rng = if random_data {
+            Some(match seed {
+                Some(s) => rand::rngs::SmallRng::seed_from_u64(s),
+                None => rand::rngs::SmallRng::seed_from_u64(rand::random()),
+            })
+        } else {
+            None
+        };
+
         Self {
             operation,
             conn_send_seq: HashMap::new(),
@@ -120,6 +159,9 @@ impl MasstreeProtocol {
             pool: BufferPool::new(),
             key_gen: Some(key_gen),
             value_size,
+            key_prefix,
+            random_data,
+            rng,
         }
     }
 
@@ -134,8 +176,41 @@ impl MasstreeProtocol {
         *self.conn_handshake_done.get(&conn_id).unwrap_or(&false)
     }
 
-    fn mark_handshake_done(&mut self, conn_id: usize) {
+    /// Mark a connection's handshake as complete
+    /// This is useful for testing to skip the handshake phase
+    pub fn mark_handshake_done(&mut self, conn_id: usize) {
         self.conn_handshake_done.insert(conn_id, true);
+    }
+
+    /// Get the key prefix
+    pub fn key_prefix(&self) -> &str {
+        &self.key_prefix
+    }
+
+    /// Check if random data is enabled
+    pub fn random_data(&self) -> bool {
+        self.random_data
+    }
+
+    /// Format a key with the configured prefix
+    fn format_key(&self, key: u64) -> String {
+        format!("{}{}", self.key_prefix, key)
+    }
+
+    /// Generate value data of the specified size
+    fn generate_value(&mut self, size: usize) -> Vec<u8> {
+        if self.random_data {
+            if let Some(ref mut rng) = self.rng {
+                use rand::Rng;
+                // Generate printable ASCII characters (33-126)
+                (0..size).map(|_| rng.random_range(33u8..127u8)).collect()
+            } else {
+                // Fallback to 'x' if RNG not available
+                vec![b'x'; size]
+            }
+        } else {
+            vec![b'x'; size]
+        }
     }
 
     /// Build a handshake request: [0, 14, {"core": -1, "maxkeylen": 255}]
@@ -339,16 +414,16 @@ impl MasstreeProtocol {
         }
 
         let seq = self.next_send_seq(conn_id);
-        // Key format matching lancet: just use the key as string (or format as desired)
-        let key_str = format!("key:{}", key);
+        // Format key with configurable prefix
+        let key_str = self.format_key(key);
 
         let request = match &self.operation {
             MasstreeOp::Get => {
                 self.build_get_request(seq, &key_str).expect("Failed to build GET request")
             }
             MasstreeOp::Set => {
-                // Generate value filled with 'x' characters to match lancet
-                let value = vec![b'x'; value_size];
+                // Generate value using configurable data generation
+                let value = self.generate_value(value_size);
                 self.build_set_request(seq, &key_str, &value)
                     .expect("Failed to build SET request")
             }
@@ -833,5 +908,152 @@ mod tests {
 
         // Requests should be different
         assert_ne!(req1, req2);
+    }
+
+    #[test]
+    fn test_custom_key_prefix() {
+        use crate::workload::KeyGeneration;
+
+        let key_gen = KeyGeneration::sequential(0);
+        let mut proto = MasstreeProtocol::with_workload_and_options(
+            MasstreeOp::Get,
+            key_gen,
+            64,
+            "memtier-".to_string(),
+            false,
+            None,
+        );
+        proto.mark_handshake_done(0);
+
+        let (req, _) = proto.next_request(0);
+        let req_str = String::from_utf8_lossy(&req);
+
+        assert!(req_str.contains("memtier-"), "Expected custom key prefix 'memtier-'");
+        assert!(!req_str.contains("key:"), "Should not contain default prefix 'key:'");
+    }
+
+    #[test]
+    fn test_custom_key_prefix_set() {
+        use crate::workload::KeyGeneration;
+
+        let key_gen = KeyGeneration::sequential(100);
+        let mut proto = MasstreeProtocol::with_workload_and_options(
+            MasstreeOp::Set,
+            key_gen,
+            10,
+            "test:".to_string(),
+            false,
+            None,
+        );
+        proto.mark_handshake_done(0);
+
+        let (req, _) = proto.next_request(0);
+        let req_str = String::from_utf8_lossy(&req);
+
+        assert!(req_str.contains("test:100"), "Expected custom key prefix 'test:'");
+    }
+
+    #[test]
+    fn test_random_data_generation() {
+        use crate::workload::KeyGeneration;
+
+        let key_gen = KeyGeneration::sequential(0);
+        let mut proto = MasstreeProtocol::with_workload_and_options(
+            MasstreeOp::Set,
+            key_gen,
+            100,
+            "key:".to_string(),
+            true,     // Enable random data
+            Some(42), // Use fixed seed for reproducibility
+        );
+        proto.mark_handshake_done(0);
+
+        let (req, _) = proto.next_request(0);
+
+        // Count occurrences of 'x' - random data should have fewer consecutive x's
+        let x_count = req.iter().filter(|&&b| b == b'x').count();
+        // With random data of size 100, we shouldn't have 100 consecutive x's
+        // (statistically very unlikely with random ASCII 33-126)
+        assert!(
+            x_count < 50,
+            "Random data should not contain many 'x' characters, found {}",
+            x_count
+        );
+    }
+
+    #[test]
+    fn test_random_data_reproducibility() {
+        use crate::workload::KeyGeneration;
+
+        // Create two protocols with the same seed
+        let key_gen1 = KeyGeneration::sequential(0);
+        let mut proto1 = MasstreeProtocol::with_workload_and_options(
+            MasstreeOp::Set,
+            key_gen1,
+            50,
+            "key:".to_string(),
+            true,
+            Some(12345),
+        );
+        proto1.mark_handshake_done(0);
+
+        let key_gen2 = KeyGeneration::sequential(0);
+        let mut proto2 = MasstreeProtocol::with_workload_and_options(
+            MasstreeOp::Set,
+            key_gen2,
+            50,
+            "key:".to_string(),
+            true,
+            Some(12345),
+        );
+        proto2.mark_handshake_done(0);
+
+        // Generate requests - they should be identical with the same seed
+        let (req1, _) = proto1.next_request(0);
+        let (req2, _) = proto2.next_request(0);
+
+        assert_eq!(req1, req2, "Same seed should produce same random data");
+    }
+
+    #[test]
+    fn test_key_prefix_accessor() {
+        use crate::workload::KeyGeneration;
+
+        let key_gen = KeyGeneration::sequential(0);
+        let proto = MasstreeProtocol::with_workload_and_options(
+            MasstreeOp::Get,
+            key_gen,
+            64,
+            "custom:".to_string(),
+            false,
+            None,
+        );
+
+        assert_eq!(proto.key_prefix(), "custom:");
+        assert!(!proto.random_data());
+    }
+
+    #[test]
+    fn test_random_data_accessor() {
+        use crate::workload::KeyGeneration;
+
+        let key_gen = KeyGeneration::sequential(0);
+        let proto = MasstreeProtocol::with_workload_and_options(
+            MasstreeOp::Set,
+            key_gen,
+            64,
+            "key:".to_string(),
+            true,
+            Some(42),
+        );
+
+        assert!(proto.random_data());
+    }
+
+    #[test]
+    fn test_default_key_prefix() {
+        let proto = MasstreeProtocol::new(MasstreeOp::Get);
+        assert_eq!(proto.key_prefix(), "key:");
+        assert!(!proto.random_data());
     }
 }

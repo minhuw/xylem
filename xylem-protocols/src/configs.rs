@@ -510,6 +510,12 @@ pub struct MasstreeConfig {
     /// Scan configuration
     #[serde(default)]
     pub scan: Option<MasstreeScanConfig>,
+    /// Value size configuration (overrides keys.value_size for variable sizes)
+    #[serde(default)]
+    pub value_size: Option<ValueSizeConfig>,
+    /// Use random data for values instead of repeated 'x' characters
+    #[serde(default)]
+    pub random_data: bool,
 }
 
 /// Masstree scan configuration
@@ -539,6 +545,8 @@ impl Default for MasstreeConfig {
             operation: default_masstree_operation(),
             put_columns: None,
             scan: None,
+            value_size: None,
+            random_data: false,
         }
     }
 }
