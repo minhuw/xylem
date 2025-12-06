@@ -6,6 +6,11 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Default key prefix for key-value protocols
+fn default_key_prefix() -> String {
+    "key:".to_string()
+}
+
 /// Key generation strategy configuration for key-value protocols (Redis, Memcached)
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -18,6 +23,9 @@ pub enum KeysConfig {
         start: u64,
         /// Value size in bytes
         value_size: usize,
+        /// Key prefix (default: "key:")
+        #[serde(default = "default_key_prefix")]
+        prefix: String,
     },
     /// Random keys within a range
     Random {
@@ -25,6 +33,9 @@ pub enum KeysConfig {
         max: u64,
         /// Value size in bytes
         value_size: usize,
+        /// Key prefix (default: "key:")
+        #[serde(default = "default_key_prefix")]
+        prefix: String,
     },
     /// Round-robin through keys
     #[serde(rename = "round-robin")]
@@ -33,6 +44,9 @@ pub enum KeysConfig {
         max: u64,
         /// Value size in bytes
         value_size: usize,
+        /// Key prefix (default: "key:")
+        #[serde(default = "default_key_prefix")]
+        prefix: String,
     },
     /// Zipfian distribution (power-law)
     Zipfian {
@@ -42,6 +56,9 @@ pub enum KeysConfig {
         theta: f64,
         /// Value size in bytes
         value_size: usize,
+        /// Key prefix (default: "key:")
+        #[serde(default = "default_key_prefix")]
+        prefix: String,
     },
     /// Gaussian (normal) distribution
     Gaussian {
@@ -53,6 +70,9 @@ pub enum KeysConfig {
         max: u64,
         /// Value size in bytes
         value_size: usize,
+        /// Key prefix (default: "key:")
+        #[serde(default = "default_key_prefix")]
+        prefix: String,
     },
 }
 
@@ -65,6 +85,17 @@ impl KeysConfig {
             Self::RoundRobin { value_size, .. } => *value_size,
             Self::Zipfian { value_size, .. } => *value_size,
             Self::Gaussian { value_size, .. } => *value_size,
+        }
+    }
+
+    /// Get the key prefix from this key configuration
+    pub fn prefix(&self) -> &str {
+        match self {
+            Self::Sequential { prefix, .. } => prefix,
+            Self::Random { prefix, .. } => prefix,
+            Self::RoundRobin { prefix, .. } => prefix,
+            Self::Zipfian { prefix, .. } => prefix,
+            Self::Gaussian { prefix, .. } => prefix,
         }
     }
 
@@ -102,7 +133,7 @@ impl KeysConfig {
                     anyhow::bail!("value_size must be > 0");
                 }
             }
-            Self::Random { max, value_size } => {
+            Self::Random { max, value_size, .. } => {
                 if *max == 0 {
                     anyhow::bail!("Random max must be > 0");
                 }
@@ -110,7 +141,7 @@ impl KeysConfig {
                     anyhow::bail!("value_size must be > 0");
                 }
             }
-            Self::RoundRobin { max, value_size } => {
+            Self::RoundRobin { max, value_size, .. } => {
                 if *max == 0 {
                     anyhow::bail!("RoundRobin max must be > 0");
                 }
@@ -118,7 +149,7 @@ impl KeysConfig {
                     anyhow::bail!("value_size must be > 0");
                 }
             }
-            Self::Zipfian { n, theta, value_size } => {
+            Self::Zipfian { n, theta, value_size, .. } => {
                 if *n == 0 {
                     anyhow::bail!("Zipfian n must be > 0");
                 }
@@ -129,7 +160,9 @@ impl KeysConfig {
                     anyhow::bail!("value_size must be > 0");
                 }
             }
-            Self::Gaussian { mean_pct, std_dev_pct, max, value_size } => {
+            Self::Gaussian {
+                mean_pct, std_dev_pct, max, value_size, ..
+            } => {
                 if *max == 0 {
                     anyhow::bail!("Gaussian max must be > 0");
                 }
@@ -150,7 +183,11 @@ impl KeysConfig {
 
 impl Default for KeysConfig {
     fn default() -> Self {
-        Self::Sequential { start: 0, value_size: 64 }
+        Self::Sequential {
+            start: 0,
+            value_size: 64,
+            prefix: default_key_prefix(),
+        }
     }
 }
 
@@ -167,6 +204,10 @@ pub struct RedisConfig {
     /// Value size configuration (overrides keys.value_size for variable sizes)
     #[serde(default)]
     pub value_size: Option<ValueSizeConfig>,
+    /// Use random data for values instead of repeated 'x' characters
+    /// When true, generates pseudo-random bytes for each request
+    #[serde(default)]
+    pub random_data: bool,
     /// Data import configuration (use real data from CSV)
     #[serde(default)]
     pub data_import: Option<DataImportConfig>,
@@ -576,5 +617,55 @@ mod tests {
         )
         .unwrap();
         assert_eq!(zipfian.value_size(), 128);
+    }
+
+    #[test]
+    fn test_gaussian_keys_config() {
+        let gaussian: KeysConfig = serde_json::from_str(
+            r#"{"strategy": "gaussian", "mean_pct": 0.5, "std_dev_pct": 0.1, "max": 1000000, "value_size": 256}"#,
+        )
+        .unwrap();
+        assert_eq!(gaussian.value_size(), 256);
+
+        // Validate it
+        gaussian.validate().expect("Gaussian config should be valid");
+
+        // Convert to key generator
+        let mut keygen = gaussian.to_key_gen(Some(42)).expect("Failed to create key generator");
+        for _ in 0..100 {
+            let key = keygen.next_key();
+            assert!(key < 1000000, "Key {} out of range", key);
+        }
+    }
+
+    #[test]
+    fn test_gaussian_keys_config_validation() {
+        // Invalid mean_pct (> 1.0)
+        let invalid: KeysConfig = serde_json::from_str(
+            r#"{"strategy": "gaussian", "mean_pct": 1.5, "std_dev_pct": 0.1, "max": 1000, "value_size": 64}"#,
+        )
+        .unwrap();
+        assert!(invalid.validate().is_err());
+
+        // Invalid std_dev_pct (< 0.0)
+        let invalid: KeysConfig = serde_json::from_str(
+            r#"{"strategy": "gaussian", "mean_pct": 0.5, "std_dev_pct": -0.1, "max": 1000, "value_size": 64}"#,
+        )
+        .unwrap();
+        assert!(invalid.validate().is_err());
+
+        // Invalid max (= 0)
+        let invalid: KeysConfig = serde_json::from_str(
+            r#"{"strategy": "gaussian", "mean_pct": 0.5, "std_dev_pct": 0.1, "max": 0, "value_size": 64}"#,
+        )
+        .unwrap();
+        assert!(invalid.validate().is_err());
+
+        // Invalid value_size (= 0)
+        let invalid: KeysConfig = serde_json::from_str(
+            r#"{"strategy": "gaussian", "mean_pct": 0.5, "std_dev_pct": 0.1, "max": 1000, "value_size": 0}"#,
+        )
+        .unwrap();
+        assert!(invalid.validate().is_err());
     }
 }

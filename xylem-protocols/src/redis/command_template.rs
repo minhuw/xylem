@@ -119,9 +119,19 @@ impl CommandTemplate {
 
     /// Generate a RESP request from this template
     pub fn generate_request(&self, key: u64, value_size: usize) -> Vec<u8> {
+        self.generate_request_with_options(key, value_size, "key:", &"x".repeat(value_size))
+    }
+
+    /// Generate a RESP request from this template with custom key prefix and value data
+    pub fn generate_request_with_options(
+        &self,
+        key: u64,
+        value_size: usize,
+        key_prefix: &str,
+        value_data: &str,
+    ) -> Vec<u8> {
         // First pass: substitute variables to get command parts
         let mut command_parts = Vec::new();
-        let value_data = "x".repeat(value_size);
 
         for part in &self.parts {
             match part {
@@ -132,8 +142,8 @@ impl CommandTemplate {
                 }
                 TemplatePart::Variable(var) => {
                     let value = match var {
-                        Variable::Key => format!("key:{}", key),
-                        Variable::Data => value_data.clone(),
+                        Variable::Key => format!("{}{}", key_prefix, key),
+                        Variable::Data => value_data.to_string(),
                         Variable::ValueSize => value_size.to_string(),
                     };
                     command_parts.push(value);

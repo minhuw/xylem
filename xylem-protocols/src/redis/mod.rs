@@ -18,8 +18,14 @@ pub enum RedisOp {
     Get,
     Set,
     Incr,
+    /// DEL - Delete one or more keys
+    Del,
     /// Multi-get - fetch multiple keys at once
     MGet {
+        count: usize,
+    },
+    /// MSET - Set multiple keys at once
+    MSet {
         count: usize,
     },
     /// WAIT for replication
@@ -67,6 +73,83 @@ pub enum RedisOp {
     Exec,
     /// DISCARD - Discard all commands in transaction
     Discard,
+    // List operations
+    /// LPUSH - Push element(s) to the head of a list
+    LPush,
+    /// RPUSH - Push element(s) to the tail of a list
+    RPush,
+    /// LPOP - Remove and return element from the head of a list
+    LPop,
+    /// RPOP - Remove and return element from the tail of a list
+    RPop,
+    /// LRANGE - Get a range of elements from a list
+    LRange {
+        start: i64,
+        stop: i64,
+    },
+    /// LLEN - Get the length of a list
+    LLen,
+    // Set operations
+    /// SADD - Add member(s) to a set
+    SAdd,
+    /// SREM - Remove member(s) from a set
+    SRem,
+    /// SMEMBERS - Get all members of a set
+    SMembers,
+    /// SISMEMBER - Check if member exists in a set
+    SIsMember,
+    /// SPOP - Remove and return random member(s) from a set
+    SPop {
+        count: Option<usize>,
+    },
+    /// SCARD - Get the number of members in a set
+    SCard,
+    // Sorted set operations
+    /// ZADD - Add member with score to sorted set
+    ZAdd {
+        score: f64,
+    },
+    /// ZREM - Remove member(s) from sorted set
+    ZRem,
+    /// ZRANGE - Get range of members from sorted set by index
+    ZRange {
+        start: i64,
+        stop: i64,
+        with_scores: bool,
+    },
+    /// ZRANGEBYSCORE - Get range of members by score
+    ZRangeByScore {
+        min: f64,
+        max: f64,
+        with_scores: bool,
+    },
+    /// ZSCORE - Get score of member in sorted set
+    ZScore,
+    /// ZCARD - Get number of members in sorted set
+    ZCard,
+    // Hash operations
+    /// HSET - Set field in hash
+    HSet {
+        field: String,
+    },
+    /// HGET - Get field from hash
+    HGet {
+        field: String,
+    },
+    /// HMSET - Set multiple fields in hash
+    HMSet {
+        fields: Vec<String>,
+    },
+    /// HMGET - Get multiple fields from hash
+    HMGet {
+        fields: Vec<String>,
+    },
+    /// HGETALL - Get all fields and values from hash
+    HGetAll,
+    /// HDEL - Delete field(s) from hash
+    HDel {
+        field: String,
+    },
     /// Custom command from template
     Custom(CommandTemplate),
 }
@@ -93,6 +176,12 @@ pub struct RedisProtocol {
     key_gen: Option<crate::workload::KeyGeneration>,
     /// Value size for next_request()
     value_size: usize,
+    /// Key prefix for generated keys (default: "key:")
+    key_prefix: String,
+    /// Whether to use random data for values instead of repeated 'x'
+    random_data: bool,
+    /// RNG for random data generation (only used when random_data is true)
+    rng: Option<rand::rngs::SmallRng>,
 }
 
 impl RedisProtocol {
@@ -110,6 +199,9 @@ impl RedisProtocol {
             command_stats: std::collections::HashMap::new(),
             key_gen: None,
             value_size: 64,
+            key_prefix: "key:".to_string(),
+            random_data: false,
+            rng: None,
         }
     }
 
@@ -119,6 +211,36 @@ impl RedisProtocol {
         key_gen: crate::workload::KeyGeneration,
         value_size: usize,
     ) -> Self {
+        Self::with_workload_and_options(
+            command_selector,
+            key_gen,
+            value_size,
+            "key:".to_string(),
+            false,
+            None,
+        )
+    }
+
+    /// Create with embedded workload generator and custom options
+    pub fn with_workload_and_options(
+        command_selector: Box<dyn CommandSelector<RedisOp>>,
+        key_gen: crate::workload::KeyGeneration,
+        value_size: usize,
+        key_prefix: String,
+        random_data: bool,
+        seed: Option<u64>,
+    ) -> Self {
+        use rand::SeedableRng;
+
+        let rng = if random_data {
+            Some(match seed {
+                Some(s) => rand::rngs::SmallRng::seed_from_u64(s),
+                None => rand::rngs::SmallRng::seed_from_u64(rand::random()),
+            })
+        } else {
+            None
+        };
+
         Self {
             command_selector,
             conn_send_seq: std::collections::HashMap::new(),
@@ -131,6 +253,9 @@ impl RedisProtocol {
             command_stats: std::collections::HashMap::new(),
             key_gen: Some(key_gen),
             value_size,
+            key_prefix,
+            random_data,
+            rng,
         }
     }
 
@@ -140,7 +265,9 @@ impl RedisProtocol {
             RedisOp::Get => "GET",
             RedisOp::Set => "SET",
             RedisOp::Incr => "INCR",
+            RedisOp::Del => "DEL",
             RedisOp::MGet { .. } => "MGET",
+            RedisOp::MSet { .. } => "MSET",
             RedisOp::Wait { .. } => "WAIT",
             RedisOp::Auth { .. } => "AUTH",
             RedisOp::SelectDb { .. } => "SELECT",
@@ -153,6 +280,34 @@ impl RedisProtocol {
             RedisOp::Multi => "MULTI",
             RedisOp::Exec => "EXEC",
             RedisOp::Discard => "DISCARD",
+            // List operations
+            RedisOp::LPush => "LPUSH",
+            RedisOp::RPush => "RPUSH",
+            RedisOp::LPop => "LPOP",
+            RedisOp::RPop => "RPOP",
+            RedisOp::LRange { .. } => "LRANGE",
+            RedisOp::LLen => "LLEN",
+            // Set operations
+            RedisOp::SAdd => "SADD",
+            RedisOp::SRem => "SREM",
+            RedisOp::SMembers => "SMEMBERS",
+            RedisOp::SIsMember => "SISMEMBER",
+            RedisOp::SPop { .. } => "SPOP",
+            RedisOp::SCard => "SCARD",
+            // Sorted set operations
+            RedisOp::ZAdd { .. } => "ZADD",
+            RedisOp::ZRem => "ZREM",
+            RedisOp::ZRange { .. } => "ZRANGE",
+            RedisOp::ZRangeByScore { .. } => "ZRANGEBYSCORE",
+            RedisOp::ZScore => "ZSCORE",
+            RedisOp::ZCard => "ZCARD",
+            // Hash operations
+            RedisOp::HSet { .. } => "HSET",
+            RedisOp::HGet { .. } => "HGET",
+            RedisOp::HMSet { .. } => "HMSET",
+            RedisOp::HMGet { .. } => "HMGET",
+            RedisOp::HGetAll => "HGETALL",
+            RedisOp::HDel { .. } => "HDEL",
             RedisOp::Custom(_template) => "CUSTOM",
         };
         *self.command_stats.entry(cmd_name.to_string()).or_insert(0) += 1;
@@ -198,6 +353,42 @@ impl RedisProtocol {
     /// Get configured value size
     pub fn value_size(&self) -> usize {
         self.value_size
+    }
+
+    /// Get the key prefix
+    pub fn key_prefix(&self) -> &str {
+        &self.key_prefix
+    }
+
+    /// Check if random data is enabled
+    pub fn random_data(&self) -> bool {
+        self.random_data
+    }
+
+    /// Format a key with the configured prefix
+    fn format_key(&self, key: u64) -> String {
+        format!("{}{}", self.key_prefix, key)
+    }
+
+    /// Generate value data of the specified size
+    fn generate_value(&mut self, size: usize) -> String {
+        if self.random_data {
+            if let Some(ref mut rng) = self.rng {
+                use rand::Rng;
+                // Generate printable ASCII characters (33-126) for safe RESP encoding
+                (0..size)
+                    .map(|_| {
+                        let c: u8 = rng.random_range(33..127);
+                        c as char
+                    })
+                    .collect()
+            } else {
+                // Fallback to 'x' if RNG not available
+                "x".repeat(size)
+            }
+        } else {
+            "x".repeat(size)
+        }
     }
 
     /// Check if a connection is in a transaction
@@ -315,32 +506,33 @@ impl RedisProtocol {
     }
 
     /// Format a Redis command into RESP bytes
-    fn format_command(&self, operation: &RedisOp, key: u64, value_size: usize) -> Vec<u8> {
+    fn format_command(&mut self, operation: &RedisOp, key: u64, value_size: usize) -> Vec<u8> {
         match operation {
             RedisOp::Get => {
-                format!("*2\r\n$3\r\nGET\r\n${}\r\nkey:{}\r\n", key.to_string().len() + 4, key)
-                    .into_bytes()
+                let key_str = self.format_key(key);
+                format!("*2\r\n$3\r\nGET\r\n${}\r\n{}\r\n", key_str.len(), key_str).into_bytes()
             }
             RedisOp::Set => {
-                let value = "x".repeat(value_size);
+                let key_str = self.format_key(key);
+                let value = self.generate_value(value_size);
                 format!(
-                    "*3\r\n$3\r\nSET\r\n${}\r\nkey:{}\r\n${}\r\n{}\r\n",
-                    key.to_string().len() + 4,
-                    key,
+                    "*3\r\n$3\r\nSET\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                    key_str.len(),
+                    key_str,
                     value_size,
                     value
                 )
                 .into_bytes()
             }
             RedisOp::Incr => {
-                format!("*2\r\n$4\r\nINCR\r\n${}\r\nkey:{}\r\n", key.to_string().len() + 4, key)
-                    .into_bytes()
+                let key_str = self.format_key(key);
+                format!("*2\r\n$4\r\nINCR\r\n${}\r\n{}\r\n", key_str.len(), key_str).into_bytes()
             }
             RedisOp::MGet { count } => {
                 let mut request = format!("*{}\r\n$4\r\nMGET\r\n", count + 1);
                 for i in 0..*count {
                     let curr_key = key.wrapping_add(i as u64);
-                    let key_str = format!("key:{}", curr_key);
+                    let key_str = self.format_key(curr_key);
                     request.push_str(&format!("${}\r\n{}\r\n", key_str.len(), key_str));
                 }
                 request.into_bytes()
@@ -380,12 +572,13 @@ impl RedisProtocol {
                 format!("*2\r\n$5\r\nHELLO\r\n$1\r\n{}\r\n", version).into_bytes()
             }
             RedisOp::SetEx { ttl_seconds } => {
-                let value = "x".repeat(value_size);
+                let key_str = self.format_key(key);
+                let value = self.generate_value(value_size);
                 let ttl_str = ttl_seconds.to_string();
                 format!(
-                    "*4\r\n$5\r\nSETEX\r\n${}\r\nkey:{}\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
-                    key.to_string().len() + 4,
-                    key,
+                    "*4\r\n$5\r\nSETEX\r\n${}\r\n{}\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                    key_str.len(),
+                    key_str,
                     ttl_str.len(),
                     ttl_str,
                     value_size,
@@ -394,12 +587,13 @@ impl RedisProtocol {
                 .into_bytes()
             }
             RedisOp::SetRange { offset } => {
-                let value = "x".repeat(value_size);
+                let key_str = self.format_key(key);
+                let value = self.generate_value(value_size);
                 let offset_str = offset.to_string();
                 format!(
-                    "*4\r\n$8\r\nSETRANGE\r\n${}\r\nkey:{}\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
-                    key.to_string().len() + 4,
-                    key,
+                    "*4\r\n$8\r\nSETRANGE\r\n${}\r\n{}\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                    key_str.len(),
+                    key_str,
                     offset_str.len(),
                     offset_str,
                     value_size,
@@ -408,12 +602,13 @@ impl RedisProtocol {
                 .into_bytes()
             }
             RedisOp::GetRange { offset, end } => {
+                let key_str = self.format_key(key);
                 let offset_str = offset.to_string();
                 let end_str = end.to_string();
                 format!(
-                    "*4\r\n$8\r\nGETRANGE\r\n${}\r\nkey:{}\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
-                    key.to_string().len() + 4,
-                    key,
+                    "*4\r\n$8\r\nGETRANGE\r\n${}\r\n{}\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                    key_str.len(),
+                    key_str,
                     offset_str.len(),
                     offset_str,
                     end_str.len(),
@@ -453,7 +648,326 @@ impl RedisProtocol {
             RedisOp::Multi => b"*1\r\n$5\r\nMULTI\r\n".to_vec(),
             RedisOp::Exec => b"*1\r\n$4\r\nEXEC\r\n".to_vec(),
             RedisOp::Discard => b"*1\r\n$7\r\nDISCARD\r\n".to_vec(),
-            RedisOp::Custom(template) => template.generate_request(key, value_size),
+            // DEL command
+            RedisOp::Del => {
+                let key_str = self.format_key(key);
+                format!("*2\r\n$3\r\nDEL\r\n${}\r\n{}\r\n", key_str.len(), key_str).into_bytes()
+            }
+            // MSET command
+            RedisOp::MSet { count } => {
+                let value = self.generate_value(value_size);
+                let mut request = format!("*{}\r\n$4\r\nMSET\r\n", count * 2 + 1);
+                for i in 0..*count {
+                    let curr_key = key.wrapping_add(i as u64);
+                    let key_str = self.format_key(curr_key);
+                    request.push_str(&format!(
+                        "${}\r\n{}\r\n${}\r\n{}\r\n",
+                        key_str.len(),
+                        key_str,
+                        value_size,
+                        value
+                    ));
+                }
+                request.into_bytes()
+            }
+            // List operations
+            RedisOp::LPush => {
+                let key_str = format!("{}list:{}", self.key_prefix, key);
+                let value = self.generate_value(value_size);
+                format!(
+                    "*3\r\n$5\r\nLPUSH\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                    key_str.len(),
+                    key_str,
+                    value_size,
+                    value
+                )
+                .into_bytes()
+            }
+            RedisOp::RPush => {
+                let key_str = format!("{}list:{}", self.key_prefix, key);
+                let value = self.generate_value(value_size);
+                format!(
+                    "*3\r\n$5\r\nRPUSH\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                    key_str.len(),
+                    key_str,
+                    value_size,
+                    value
+                )
+                .into_bytes()
+            }
+            RedisOp::LPop => {
+                let key_str = format!("{}list:{}", self.key_prefix, key);
+                format!("*2\r\n$4\r\nLPOP\r\n${}\r\n{}\r\n", key_str.len(), key_str).into_bytes()
+            }
+            RedisOp::RPop => {
+                let key_str = format!("{}list:{}", self.key_prefix, key);
+                format!("*2\r\n$4\r\nRPOP\r\n${}\r\n{}\r\n", key_str.len(), key_str).into_bytes()
+            }
+            RedisOp::LRange { start, stop } => {
+                let key_str = format!("{}list:{}", self.key_prefix, key);
+                let start_str = start.to_string();
+                let stop_str = stop.to_string();
+                format!(
+                    "*4\r\n$6\r\nLRANGE\r\n${}\r\n{}\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                    key_str.len(),
+                    key_str,
+                    start_str.len(),
+                    start_str,
+                    stop_str.len(),
+                    stop_str
+                )
+                .into_bytes()
+            }
+            RedisOp::LLen => {
+                let key_str = format!("{}list:{}", self.key_prefix, key);
+                format!("*2\r\n$4\r\nLLEN\r\n${}\r\n{}\r\n", key_str.len(), key_str).into_bytes()
+            }
+            // Set operations
+            RedisOp::SAdd => {
+                let key_str = format!("{}set:{}", self.key_prefix, key);
+                let member = format!("member:{}", key);
+                format!(
+                    "*3\r\n$4\r\nSADD\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                    key_str.len(),
+                    key_str,
+                    member.len(),
+                    member
+                )
+                .into_bytes()
+            }
+            RedisOp::SRem => {
+                let key_str = format!("{}set:{}", self.key_prefix, key);
+                let member = format!("member:{}", key);
+                format!(
+                    "*3\r\n$4\r\nSREM\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                    key_str.len(),
+                    key_str,
+                    member.len(),
+                    member
+                )
+                .into_bytes()
+            }
+            RedisOp::SMembers => {
+                let key_str = format!("{}set:{}", self.key_prefix, key);
+                format!("*2\r\n$8\r\nSMEMBERS\r\n${}\r\n{}\r\n", key_str.len(), key_str)
+                    .into_bytes()
+            }
+            RedisOp::SIsMember => {
+                let key_str = format!("{}set:{}", self.key_prefix, key);
+                let member = format!("member:{}", key);
+                format!(
+                    "*3\r\n$9\r\nSISMEMBER\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                    key_str.len(),
+                    key_str,
+                    member.len(),
+                    member
+                )
+                .into_bytes()
+            }
+            RedisOp::SPop { count } => {
+                let key_str = format!("{}set:{}", self.key_prefix, key);
+                if let Some(c) = count {
+                    let count_str = c.to_string();
+                    format!(
+                        "*3\r\n$4\r\nSPOP\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                        key_str.len(),
+                        key_str,
+                        count_str.len(),
+                        count_str
+                    )
+                    .into_bytes()
+                } else {
+                    format!("*2\r\n$4\r\nSPOP\r\n${}\r\n{}\r\n", key_str.len(), key_str)
+                        .into_bytes()
+                }
+            }
+            RedisOp::SCard => {
+                let key_str = format!("{}set:{}", self.key_prefix, key);
+                format!("*2\r\n$5\r\nSCARD\r\n${}\r\n{}\r\n", key_str.len(), key_str).into_bytes()
+            }
+            // Sorted set operations
+            RedisOp::ZAdd { score } => {
+                let key_str = format!("{}zset:{}", self.key_prefix, key);
+                let member = format!("member:{}", key);
+                let score_str = score.to_string();
+                format!(
+                    "*4\r\n$4\r\nZADD\r\n${}\r\n{}\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                    key_str.len(),
+                    key_str,
+                    score_str.len(),
+                    score_str,
+                    member.len(),
+                    member
+                )
+                .into_bytes()
+            }
+            RedisOp::ZRem => {
+                let key_str = format!("{}zset:{}", self.key_prefix, key);
+                let member = format!("member:{}", key);
+                format!(
+                    "*3\r\n$4\r\nZREM\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                    key_str.len(),
+                    key_str,
+                    member.len(),
+                    member
+                )
+                .into_bytes()
+            }
+            RedisOp::ZRange { start, stop, with_scores } => {
+                let key_str = format!("{}zset:{}", self.key_prefix, key);
+                let start_str = start.to_string();
+                let stop_str = stop.to_string();
+                if *with_scores {
+                    format!(
+                        "*5\r\n$6\r\nZRANGE\r\n${}\r\n{}\r\n${}\r\n{}\r\n${}\r\n{}\r\n$10\r\nWITHSCORES\r\n",
+                        key_str.len(),
+                        key_str,
+                        start_str.len(),
+                        start_str,
+                        stop_str.len(),
+                        stop_str
+                    )
+                    .into_bytes()
+                } else {
+                    format!(
+                        "*4\r\n$6\r\nZRANGE\r\n${}\r\n{}\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                        key_str.len(),
+                        key_str,
+                        start_str.len(),
+                        start_str,
+                        stop_str.len(),
+                        stop_str
+                    )
+                    .into_bytes()
+                }
+            }
+            RedisOp::ZRangeByScore { min, max, with_scores } => {
+                let key_str = format!("{}zset:{}", self.key_prefix, key);
+                let min_str = min.to_string();
+                let max_str = max.to_string();
+                if *with_scores {
+                    format!(
+                        "*5\r\n$13\r\nZRANGEBYSCORE\r\n${}\r\n{}\r\n${}\r\n{}\r\n${}\r\n{}\r\n$10\r\nWITHSCORES\r\n",
+                        key_str.len(),
+                        key_str,
+                        min_str.len(),
+                        min_str,
+                        max_str.len(),
+                        max_str
+                    )
+                    .into_bytes()
+                } else {
+                    format!(
+                        "*4\r\n$13\r\nZRANGEBYSCORE\r\n${}\r\n{}\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                        key_str.len(),
+                        key_str,
+                        min_str.len(),
+                        min_str,
+                        max_str.len(),
+                        max_str
+                    )
+                    .into_bytes()
+                }
+            }
+            RedisOp::ZScore => {
+                let key_str = format!("{}zset:{}", self.key_prefix, key);
+                let member = format!("member:{}", key);
+                format!(
+                    "*3\r\n$6\r\nZSCORE\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                    key_str.len(),
+                    key_str,
+                    member.len(),
+                    member
+                )
+                .into_bytes()
+            }
+            RedisOp::ZCard => {
+                let key_str = format!("{}zset:{}", self.key_prefix, key);
+                format!("*2\r\n$5\r\nZCARD\r\n${}\r\n{}\r\n", key_str.len(), key_str).into_bytes()
+            }
+            // Hash operations
+            RedisOp::HSet { field } => {
+                let key_str = format!("{}hash:{}", self.key_prefix, key);
+                let value = self.generate_value(value_size);
+                format!(
+                    "*4\r\n$4\r\nHSET\r\n${}\r\n{}\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                    key_str.len(),
+                    key_str,
+                    field.len(),
+                    field,
+                    value_size,
+                    value
+                )
+                .into_bytes()
+            }
+            RedisOp::HGet { field } => {
+                let key_str = format!("{}hash:{}", self.key_prefix, key);
+                format!(
+                    "*3\r\n$4\r\nHGET\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                    key_str.len(),
+                    key_str,
+                    field.len(),
+                    field
+                )
+                .into_bytes()
+            }
+            RedisOp::HMSet { fields } => {
+                let key_str = format!("{}hash:{}", self.key_prefix, key);
+                let value = self.generate_value(value_size);
+                // *<num_args>\r\n$5\r\nHMSET\r\n$<keylen>\r\n<key>\r\n[<field><value>...]
+                let num_args = 2 + fields.len() * 2; // HMSET + key + (field + value) * count
+                let mut request = format!(
+                    "*{}\r\n$5\r\nHMSET\r\n${}\r\n{}\r\n",
+                    num_args,
+                    key_str.len(),
+                    key_str
+                );
+                for field in fields {
+                    request.push_str(&format!(
+                        "${}\r\n{}\r\n${}\r\n{}\r\n",
+                        field.len(),
+                        field,
+                        value_size,
+                        value
+                    ));
+                }
+                request.into_bytes()
+            }
+            RedisOp::HMGet { fields } => {
+                let key_str = format!("{}hash:{}", self.key_prefix, key);
+                // *<num_args>\r\n$5\r\nHMGET\r\n$<keylen>\r\n<key>\r\n[<field>...]
+                let num_args = 2 + fields.len(); // HMGET + key + fields
+                let mut request = format!(
+                    "*{}\r\n$5\r\nHMGET\r\n${}\r\n{}\r\n",
+                    num_args,
+                    key_str.len(),
+                    key_str
+                );
+                for field in fields {
+                    request.push_str(&format!("${}\r\n{}\r\n", field.len(), field));
+                }
+                request.into_bytes()
+            }
+            RedisOp::HGetAll => {
+                let key_str = format!("{}hash:{}", self.key_prefix, key);
+                format!("*2\r\n$7\r\nHGETALL\r\n${}\r\n{}\r\n", key_str.len(), key_str).into_bytes()
+            }
+            RedisOp::HDel { field } => {
+                let key_str = format!("{}hash:{}", self.key_prefix, key);
+                format!(
+                    "*3\r\n$4\r\nHDEL\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                    key_str.len(),
+                    key_str,
+                    field.len(),
+                    field
+                )
+                .into_bytes()
+            }
+            RedisOp::Custom(template) => {
+                // For custom templates, generate value for __data__ substitution
+                let value = self.generate_value(value_size);
+                template.generate_request_with_options(key, value_size, &self.key_prefix, &value)
+            }
         }
     }
 }
@@ -1828,5 +2342,580 @@ mod tests {
         let mut protocol = RedisProtocol::new(Box::new(FixedCommandSelector::new(RedisOp::Incr)));
         protocol.generate_request_with_key(0, 123, 100);
         assert_eq!(protocol.get_command_stats().get("INCR"), Some(&1));
+    }
+
+    // Tests for new commands
+
+    #[test]
+    fn test_generate_del_request() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Del));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*2\r\n"));
+        assert!(request_str.contains("DEL"));
+        assert!(request_str.contains("key:42"));
+    }
+
+    #[test]
+    fn test_generate_mset_request() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::MSet { count: 3 }));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request_with_key(0, 10, 5);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*7\r\n")); // MSET + 3 * (key + value)
+        assert!(request_str.contains("MSET"));
+        assert!(request_str.contains("key:10"));
+        assert!(request_str.contains("key:11"));
+        assert!(request_str.contains("key:12"));
+        assert!(request_str.contains("xxxxx")); // 5 bytes of value
+    }
+
+    #[test]
+    fn test_generate_lpush_request() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::LPush));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request_with_key(0, 42, 10);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*3\r\n"));
+        assert!(request_str.contains("LPUSH"));
+        assert!(request_str.contains("list:42"));
+        assert!(request_str.contains("xxxxxxxxxx")); // 10 bytes of value
+    }
+
+    #[test]
+    fn test_generate_rpush_request() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::RPush));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request_with_key(0, 42, 10);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*3\r\n"));
+        assert!(request_str.contains("RPUSH"));
+        assert!(request_str.contains("list:42"));
+    }
+
+    #[test]
+    fn test_generate_lpop_request() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::LPop));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*2\r\n"));
+        assert!(request_str.contains("LPOP"));
+        assert!(request_str.contains("list:42"));
+    }
+
+    #[test]
+    fn test_generate_rpop_request() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::RPop));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*2\r\n"));
+        assert!(request_str.contains("RPOP"));
+        assert!(request_str.contains("list:42"));
+    }
+
+    #[test]
+    fn test_generate_lrange_request() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::LRange { start: 0, stop: 10 }));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*4\r\n"));
+        assert!(request_str.contains("LRANGE"));
+        assert!(request_str.contains("list:42"));
+        assert!(request_str.contains("0")); // start
+        assert!(request_str.contains("10")); // stop
+    }
+
+    #[test]
+    fn test_generate_llen_request() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::LLen));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*2\r\n"));
+        assert!(request_str.contains("LLEN"));
+        assert!(request_str.contains("list:42"));
+    }
+
+    #[test]
+    fn test_generate_sadd_request() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::SAdd));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*3\r\n"));
+        assert!(request_str.contains("SADD"));
+        assert!(request_str.contains("set:42"));
+        assert!(request_str.contains("member:42"));
+    }
+
+    #[test]
+    fn test_generate_srem_request() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::SRem));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*3\r\n"));
+        assert!(request_str.contains("SREM"));
+        assert!(request_str.contains("set:42"));
+        assert!(request_str.contains("member:42"));
+    }
+
+    #[test]
+    fn test_generate_smembers_request() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::SMembers));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*2\r\n"));
+        assert!(request_str.contains("SMEMBERS"));
+        assert!(request_str.contains("set:42"));
+    }
+
+    #[test]
+    fn test_generate_sismember_request() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::SIsMember));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*3\r\n"));
+        assert!(request_str.contains("SISMEMBER"));
+        assert!(request_str.contains("set:42"));
+        assert!(request_str.contains("member:42"));
+    }
+
+    #[test]
+    fn test_generate_spop_request() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::SPop { count: None }));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*2\r\n"));
+        assert!(request_str.contains("SPOP"));
+        assert!(request_str.contains("set:42"));
+    }
+
+    #[test]
+    fn test_generate_spop_with_count_request() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::SPop { count: Some(5) }));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*3\r\n"));
+        assert!(request_str.contains("SPOP"));
+        assert!(request_str.contains("set:42"));
+        assert!(request_str.contains("5"));
+    }
+
+    #[test]
+    fn test_generate_scard_request() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::SCard));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*2\r\n"));
+        assert!(request_str.contains("SCARD"));
+        assert!(request_str.contains("set:42"));
+    }
+
+    #[test]
+    fn test_generate_zadd_request() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::ZAdd { score: 1.5 }));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*4\r\n"));
+        assert!(request_str.contains("ZADD"));
+        assert!(request_str.contains("zset:42"));
+        assert!(request_str.contains("1.5"));
+        assert!(request_str.contains("member:42"));
+    }
+
+    #[test]
+    fn test_generate_zrem_request() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::ZRem));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*3\r\n"));
+        assert!(request_str.contains("ZREM"));
+        assert!(request_str.contains("zset:42"));
+        assert!(request_str.contains("member:42"));
+    }
+
+    #[test]
+    fn test_generate_zrange_request() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::ZRange {
+            start: 0,
+            stop: 10,
+            with_scores: false,
+        }));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*4\r\n"));
+        assert!(request_str.contains("ZRANGE"));
+        assert!(request_str.contains("zset:42"));
+        assert!(!request_str.contains("WITHSCORES"));
+    }
+
+    #[test]
+    fn test_generate_zrange_with_scores_request() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::ZRange {
+            start: 0,
+            stop: -1,
+            with_scores: true,
+        }));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*5\r\n"));
+        assert!(request_str.contains("ZRANGE"));
+        assert!(request_str.contains("zset:42"));
+        assert!(request_str.contains("WITHSCORES"));
+    }
+
+    #[test]
+    fn test_generate_zrangebyscore_request() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::ZRangeByScore {
+            min: 0.0,
+            max: 100.0,
+            with_scores: false,
+        }));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*4\r\n"));
+        assert!(request_str.contains("ZRANGEBYSCORE"));
+        assert!(request_str.contains("zset:42"));
+    }
+
+    #[test]
+    fn test_generate_zscore_request() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::ZScore));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*3\r\n"));
+        assert!(request_str.contains("ZSCORE"));
+        assert!(request_str.contains("zset:42"));
+        assert!(request_str.contains("member:42"));
+    }
+
+    #[test]
+    fn test_generate_zcard_request() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::ZCard));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*2\r\n"));
+        assert!(request_str.contains("ZCARD"));
+        assert!(request_str.contains("zset:42"));
+    }
+
+    #[test]
+    fn test_generate_hset_request() {
+        let selector =
+            Box::new(FixedCommandSelector::new(RedisOp::HSet { field: "field1".to_string() }));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request_with_key(0, 42, 10);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*4\r\n"));
+        assert!(request_str.contains("HSET"));
+        assert!(request_str.contains("hash:42"));
+        assert!(request_str.contains("field1"));
+        assert!(request_str.contains("xxxxxxxxxx")); // 10 bytes of value
+    }
+
+    #[test]
+    fn test_generate_hget_request() {
+        let selector =
+            Box::new(FixedCommandSelector::new(RedisOp::HGet { field: "field1".to_string() }));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*3\r\n"));
+        assert!(request_str.contains("HGET"));
+        assert!(request_str.contains("hash:42"));
+        assert!(request_str.contains("field1"));
+    }
+
+    #[test]
+    fn test_generate_hmset_request() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::HMSet {
+            fields: vec!["f1".to_string(), "f2".to_string(), "f3".to_string()],
+        }));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request_with_key(0, 42, 5);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*8\r\n")); // HMSET + key + 3 * (field + value)
+        assert!(request_str.contains("HMSET"));
+        assert!(request_str.contains("hash:42"));
+        assert!(request_str.contains("f1"));
+        assert!(request_str.contains("f2"));
+        assert!(request_str.contains("f3"));
+    }
+
+    #[test]
+    fn test_generate_hmget_request() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::HMGet {
+            fields: vec!["f1".to_string(), "f2".to_string()],
+        }));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*4\r\n")); // HMGET + key + 2 fields
+        assert!(request_str.contains("HMGET"));
+        assert!(request_str.contains("hash:42"));
+        assert!(request_str.contains("f1"));
+        assert!(request_str.contains("f2"));
+    }
+
+    #[test]
+    fn test_generate_hgetall_request() {
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::HGetAll));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*2\r\n"));
+        assert!(request_str.contains("HGETALL"));
+        assert!(request_str.contains("hash:42"));
+    }
+
+    #[test]
+    fn test_generate_hdel_request() {
+        let selector =
+            Box::new(FixedCommandSelector::new(RedisOp::HDel { field: "field1".to_string() }));
+        let mut protocol = RedisProtocol::new(selector);
+
+        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.starts_with("*3\r\n"));
+        assert!(request_str.contains("HDEL"));
+        assert!(request_str.contains("hash:42"));
+        assert!(request_str.contains("field1"));
+    }
+
+    #[test]
+    fn test_custom_key_prefix() {
+        use crate::workload::KeyGeneration;
+
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
+        let key_gen = KeyGeneration::sequential(0);
+        let mut protocol = RedisProtocol::with_workload_and_options(
+            selector,
+            key_gen,
+            64,
+            "memtier-".to_string(),
+            false,
+            None,
+        );
+
+        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.contains("memtier-42"), "Expected custom key prefix 'memtier-'");
+        assert!(!request_str.contains("key:"), "Should not contain default prefix 'key:'");
+    }
+
+    #[test]
+    fn test_custom_key_prefix_set() {
+        use crate::workload::KeyGeneration;
+
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Set));
+        let key_gen = KeyGeneration::sequential(0);
+        let mut protocol = RedisProtocol::with_workload_and_options(
+            selector,
+            key_gen,
+            10,
+            "test:".to_string(),
+            false,
+            None,
+        );
+
+        let (request, _) = protocol.generate_request_with_key(0, 100, 10);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.contains("test:100"), "Expected custom key prefix 'test:'");
+        assert!(request_str.contains("xxxxxxxxxx"), "Expected 10 x's for value");
+    }
+
+    #[test]
+    fn test_random_data_generation() {
+        use crate::workload::KeyGeneration;
+
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Set));
+        let key_gen = KeyGeneration::sequential(0);
+        let mut protocol = RedisProtocol::with_workload_and_options(
+            selector,
+            key_gen,
+            100,
+            "key:".to_string(),
+            true,     // Enable random data
+            Some(42), // Use fixed seed for reproducibility
+        );
+
+        let (request1, _) = protocol.generate_request_with_key(0, 1, 100);
+        let request_str1 = String::from_utf8_lossy(&request1);
+
+        // Random data should NOT contain all 'x's
+        assert!(
+            !request_str1.contains("xxxxxxxxxxxxxxxxxxxx"),
+            "Random data should not be all x's"
+        );
+
+        // Should still contain the key
+        assert!(request_str1.contains("key:1"));
+    }
+
+    #[test]
+    fn test_random_data_reproducibility() {
+        use crate::workload::KeyGeneration;
+
+        // Create two protocols with the same seed
+        let selector1 = Box::new(FixedCommandSelector::new(RedisOp::Set));
+        let key_gen1 = KeyGeneration::sequential(0);
+        let mut protocol1 = RedisProtocol::with_workload_and_options(
+            selector1,
+            key_gen1,
+            50,
+            "key:".to_string(),
+            true,
+            Some(12345),
+        );
+
+        let selector2 = Box::new(FixedCommandSelector::new(RedisOp::Set));
+        let key_gen2 = KeyGeneration::sequential(0);
+        let mut protocol2 = RedisProtocol::with_workload_and_options(
+            selector2,
+            key_gen2,
+            50,
+            "key:".to_string(),
+            true,
+            Some(12345),
+        );
+
+        // Generate requests - they should be identical with the same seed
+        let (request1, _) = protocol1.generate_request_with_key(0, 1, 50);
+        let (request2, _) = protocol2.generate_request_with_key(0, 1, 50);
+
+        assert_eq!(request1, request2, "Same seed should produce same random data");
+    }
+
+    #[test]
+    fn test_key_prefix_with_data_structures() {
+        use crate::workload::KeyGeneration;
+
+        // Test that key prefix applies to list operations
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::LPush));
+        let key_gen = KeyGeneration::sequential(0);
+        let mut protocol = RedisProtocol::with_workload_and_options(
+            selector,
+            key_gen,
+            10,
+            "myapp:".to_string(),
+            false,
+            None,
+        );
+
+        let (request, _) = protocol.generate_request_with_key(0, 42, 10);
+        let request_str = String::from_utf8_lossy(&request);
+
+        assert!(request_str.contains("myapp:list:42"), "List key should have custom prefix");
+    }
+
+    #[test]
+    fn test_key_prefix_accessor() {
+        use crate::workload::KeyGeneration;
+
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
+        let key_gen = KeyGeneration::sequential(0);
+        let protocol = RedisProtocol::with_workload_and_options(
+            selector,
+            key_gen,
+            64,
+            "custom:".to_string(),
+            false,
+            None,
+        );
+
+        assert_eq!(protocol.key_prefix(), "custom:");
+        assert!(!protocol.random_data());
+    }
+
+    #[test]
+    fn test_random_data_accessor() {
+        use crate::workload::KeyGeneration;
+
+        let selector = Box::new(FixedCommandSelector::new(RedisOp::Set));
+        let key_gen = KeyGeneration::sequential(0);
+        let protocol = RedisProtocol::with_workload_and_options(
+            selector,
+            key_gen,
+            64,
+            "key:".to_string(),
+            true,
+            Some(42),
+        );
+
+        assert!(protocol.random_data());
     }
 }

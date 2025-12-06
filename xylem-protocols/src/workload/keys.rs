@@ -239,4 +239,121 @@ mod tests {
         let result = KeyGeneration::zipfian(100, 0.99);
         assert!(result.is_ok());
     }
+
+    #[test]
+    fn test_gaussian_basic() {
+        // Mean at 50% of keyspace, std_dev at 10% of keyspace, max 1000
+        let mut keygen =
+            KeyGeneration::gaussian(0.5, 0.1, 1000).expect("Failed to create Gaussian");
+        for _ in 0..1000 {
+            let key = keygen.next_key();
+            assert!(key < 1000, "Key {} out of range [0, 1000)", key);
+        }
+    }
+
+    #[test]
+    fn test_gaussian_distribution_centered() {
+        // Mean at 50% of keyspace (500), std_dev at 10% (100)
+        let mut keygen =
+            KeyGeneration::gaussian_with_seed(0.5, 0.1, 1000, Some(42)).expect("Failed to create");
+        let mut sum = 0u64;
+        let samples = 10000;
+        for _ in 0..samples {
+            sum += keygen.next_key();
+        }
+        let avg = sum as f64 / samples as f64;
+        // Average should be close to 500 (the mean)
+        assert!((avg - 500.0).abs() < 50.0, "Average {} should be close to 500", avg);
+    }
+
+    #[test]
+    fn test_gaussian_parameter_validation() {
+        // max = 0 should fail
+        let result = KeyGeneration::gaussian(0.5, 0.1, 0);
+        assert!(result.is_err());
+
+        // mean_pct out of range should fail
+        let result = KeyGeneration::gaussian(1.5, 0.1, 1000);
+        assert!(result.is_err());
+
+        let result = KeyGeneration::gaussian(-0.1, 0.1, 1000);
+        assert!(result.is_err());
+
+        // std_dev_pct out of range should fail
+        let result = KeyGeneration::gaussian(0.5, 1.5, 1000);
+        assert!(result.is_err());
+
+        let result = KeyGeneration::gaussian(0.5, -0.1, 1000);
+        assert!(result.is_err());
+
+        // Valid parameters should succeed
+        let result = KeyGeneration::gaussian(0.5, 0.1, 1000);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_gaussian_reset() {
+        let mut keygen =
+            KeyGeneration::gaussian_with_seed(0.5, 0.1, 1000, Some(42)).expect("Failed to create");
+        // Generate some keys
+        for _ in 0..100 {
+            keygen.next_key();
+        }
+        // Reset should not panic and keygen should still produce valid keys
+        keygen.reset();
+        for _ in 0..100 {
+            let key = keygen.next_key();
+            assert!(key < 1000, "Key {} out of range after reset", key);
+        }
+    }
+
+    #[test]
+    fn test_gaussian_clone() {
+        let keygen =
+            KeyGeneration::gaussian_with_seed(0.5, 0.1, 1000, Some(42)).expect("Failed to create");
+        let mut clone1 = keygen.clone();
+        let mut clone2 = keygen.clone();
+
+        // Both clones should be usable and produce valid keys
+        for _ in 0..100 {
+            let k1 = clone1.next_key();
+            let k2 = clone2.next_key();
+            assert!(k1 < 1000);
+            assert!(k2 < 1000);
+        }
+    }
+
+    #[test]
+    fn test_gaussian_edge_at_mean_zero() {
+        // Mean at 0% - keys should cluster near 0
+        let mut keygen =
+            KeyGeneration::gaussian_with_seed(0.0, 0.1, 1000, Some(42)).expect("Failed to create");
+        let mut low_count = 0;
+        let samples = 1000;
+        for _ in 0..samples {
+            let key = keygen.next_key();
+            if key < 200 {
+                low_count += 1;
+            }
+        }
+        // Most keys should be in the lower range
+        assert!(low_count > samples / 2, "Expected most keys near 0");
+    }
+
+    #[test]
+    fn test_gaussian_edge_at_mean_one() {
+        // Mean at 100% - keys should cluster near max
+        let mut keygen =
+            KeyGeneration::gaussian_with_seed(1.0, 0.1, 1000, Some(42)).expect("Failed to create");
+        let mut high_count = 0;
+        let samples = 1000;
+        for _ in 0..samples {
+            let key = keygen.next_key();
+            if key > 800 {
+                high_count += 1;
+            }
+        }
+        // Most keys should be in the upper range
+        assert!(high_count > samples / 2, "Expected most keys near max");
+    }
 }

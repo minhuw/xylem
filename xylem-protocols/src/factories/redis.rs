@@ -98,7 +98,7 @@ fn validate_keys_config(keys: &KeysConfig) -> Result<()> {
                 anyhow::bail!("value_size must be > 0");
             }
         }
-        KeysConfig::Random { max, value_size } => {
+        KeysConfig::Random { max, value_size, .. } => {
             if *max == 0 {
                 anyhow::bail!("Random max must be > 0");
             }
@@ -106,7 +106,7 @@ fn validate_keys_config(keys: &KeysConfig) -> Result<()> {
                 anyhow::bail!("value_size must be > 0");
             }
         }
-        KeysConfig::RoundRobin { max, value_size } => {
+        KeysConfig::RoundRobin { max, value_size, .. } => {
             if *max == 0 {
                 anyhow::bail!("RoundRobin max must be > 0");
             }
@@ -114,7 +114,7 @@ fn validate_keys_config(keys: &KeysConfig) -> Result<()> {
                 anyhow::bail!("value_size must be > 0");
             }
         }
-        KeysConfig::Zipfian { n, theta, value_size } => {
+        KeysConfig::Zipfian { n, theta, value_size, .. } => {
             if *n == 0 {
                 anyhow::bail!("Zipfian n must be > 0");
             }
@@ -125,7 +125,9 @@ fn validate_keys_config(keys: &KeysConfig) -> Result<()> {
                 anyhow::bail!("value_size must be > 0");
             }
         }
-        KeysConfig::Gaussian { mean_pct, std_dev_pct, max, value_size } => {
+        KeysConfig::Gaussian {
+            mean_pct, std_dev_pct, max, value_size, ..
+        } => {
             if *max == 0 {
                 anyhow::bail!("Gaussian max must be > 0");
             }
@@ -206,15 +208,27 @@ mod tests {
     #[test]
     fn test_validate_keys_config() {
         // Valid random
-        let keys = KeysConfig::Random { max: 1000, value_size: 64 };
+        let keys = KeysConfig::Random {
+            max: 1000,
+            value_size: 64,
+            prefix: "key:".to_string(),
+        };
         assert!(validate_keys_config(&keys).is_ok());
 
         // Invalid: zero max
-        let keys = KeysConfig::Random { max: 0, value_size: 64 };
+        let keys = KeysConfig::Random {
+            max: 0,
+            value_size: 64,
+            prefix: "key:".to_string(),
+        };
         assert!(validate_keys_config(&keys).is_err());
 
         // Invalid: zero value_size
-        let keys = KeysConfig::Random { max: 1000, value_size: 0 };
+        let keys = KeysConfig::Random {
+            max: 1000,
+            value_size: 0,
+            prefix: "key:".to_string(),
+        };
         assert!(validate_keys_config(&keys).is_err());
     }
 }
