@@ -126,7 +126,7 @@ fn run_worker(
         for _ in 0..max_pending {
             let (data, req_id) = state.generate_request();
             if let Some(conn) = group.get_mut(conn_id) {
-                if let Ok(send_ts) = conn.send(&data) {
+                if let Ok((send_ts, ..)) = conn.send(&data) {
                     state.pending.insert(req_id, PendingRequest { send_ts });
                     total_tx += 1;
                 }
@@ -166,7 +166,7 @@ fn run_worker(
 
                 // Send next request (closed loop)
                 let (data, new_req_id) = state.generate_request();
-                let Ok(send_ts) = conn.send(&data) else {
+                let Ok((send_ts, ..)) = conn.send(&data) else {
                     continue;
                 };
                 state.pending.insert(new_req_id, PendingRequest { send_ts });

@@ -3,6 +3,13 @@
 //! This module provides two APIs:
 //! - `TcpTransport`: Single-connection API (one multiplexer per connection)
 //! - `TcpConnectionGroup`: Multi-connection API (one multiplexer per group)
+//!
+//! ## Hardware Timestamping (Linux only)
+//!
+//! On Linux, this transport can use kernel timestamps (SO_TIMESTAMPING) for
+//! more accurate latency measurement. Hardware timestamps are used when the
+//! NIC supports them, with automatic fallback to software timestamps.
+//! Configure via `TcpTimestampConfig`.
 
 use crate::mux::{Interest, Multiplexer, MultiplexerType};
 use crate::{
@@ -14,7 +21,60 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
+use crate::hw_timestamp;
+#[cfg(target_os = "linux")]
+use std::os::unix::io::AsRawFd;
+
 const DEFAULT_RECV_BUFFER_SIZE: usize = 8192;
+
+/// Configuration for TCP timestamping (Linux only)
+///
+/// On Linux, this configures kernel-level timestamping for more accurate
+/// latency measurement. Falls back to software timestamps if HW not available.
+///
+/// By default, kernel timestamps are enabled on Linux.
+#[derive(Debug, Clone)]
+pub struct TcpTimestampConfig {
+    /// Network interface to bind to for hardware timestamping (e.g., "eth0")
+    /// If None, no interface binding is performed.
+    #[cfg(target_os = "linux")]
+    pub interface: Option<String>,
+
+    /// Whether to enable kernel timestamping on sockets
+    /// When true, uses SO_TIMESTAMPING for RX timestamps
+    /// Default: true on Linux
+    #[cfg(target_os = "linux")]
+    pub enable_timestamps: bool,
+}
+
+impl Default for TcpTimestampConfig {
+    fn default() -> Self {
+        Self {
+            #[cfg(target_os = "linux")]
+            interface: None,
+            #[cfg(target_os = "linux")]
+            enable_timestamps: true, // Enable by default on Linux
+        }
+    }
+}
+
+impl TcpTimestampConfig {
+    /// Create config with timestamping enabled (no interface binding)
+    #[cfg(target_os = "linux")]
+    pub fn with_timestamps() -> Self {
+        Self { interface: None, enable_timestamps: true }
+    }
+
+    /// Create config with timestamping and interface binding
+    #[cfg(target_os = "linux")]
+    pub fn with_interface(interface: impl Into<String>) -> Self {
+        Self {
+            interface: Some(interface.into()),
+            enable_timestamps: true,
+        }
+    }
+}
 
 pub struct TcpTransport {
     stream: Option<TcpStream>,
@@ -154,23 +214,59 @@ pub struct TcpConn {
     stream: TcpStream,
     recv_buffer: Vec<u8>,
     connected: bool,
+    /// TX byte counter for correlating TX timestamps (wrapping)
+    tx_byte_counter: u32,
+    /// Whether kernel timestamping is enabled for this connection
+    #[cfg(target_os = "linux")]
+    timestamps_enabled: bool,
 }
 
 impl TcpConn {
+    #[allow(dead_code)] // Used on non-Linux or when timestamps not configured
     fn new(stream: TcpStream) -> Self {
         Self {
             stream,
             recv_buffer: vec![0u8; DEFAULT_RECV_BUFFER_SIZE],
             connected: true,
+            tx_byte_counter: 0,
+            #[cfg(target_os = "linux")]
+            timestamps_enabled: false,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn with_timestamps(stream: TcpStream, timestamps_enabled: bool) -> Self {
+        Self {
+            stream,
+            recv_buffer: vec![0u8; DEFAULT_RECV_BUFFER_SIZE],
+            connected: true,
+            tx_byte_counter: 0,
+            timestamps_enabled,
+        }
+    }
+
+    /// Get the raw file descriptor (for polling TX timestamps)
+    #[cfg(target_os = "linux")]
+    pub(crate) fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+        self.stream.as_raw_fd()
+    }
+
+    /// Check if timestamps are enabled
+    #[cfg(target_os = "linux")]
+    pub(crate) fn timestamps_enabled(&self) -> bool {
+        self.timestamps_enabled
     }
 }
 
 impl GroupConnection for TcpConn {
-    fn send(&mut self, data: &[u8]) -> Result<Timestamp> {
+    fn send(&mut self, data: &[u8]) -> Result<(Timestamp, u32, u32)> {
         if !self.connected {
             return Err(Error::Connection("Connection closed".to_string()));
         }
+
+        // Record TX byte range [tx_start, tx_end)
+        let tx_start = self.tx_byte_counter;
+        let tx_end = tx_start.wrapping_add(data.len() as u32);
 
         let mut total_written = 0;
         while total_written < data.len() {
@@ -184,7 +280,12 @@ impl GroupConnection for TcpConn {
             }
         }
 
-        Ok(Timestamp::now())
+        // Update byte counter after successful send
+        self.tx_byte_counter = tx_end;
+
+        // Return software timestamp and TX byte range for correlation
+        // The actual HW TX timestamp will arrive via error queue with offset >= tx_end
+        Ok((Timestamp::now(), tx_start, tx_end))
     }
 
     fn recv(&mut self) -> Result<(Vec<u8>, Timestamp)> {
@@ -192,6 +293,24 @@ impl GroupConnection for TcpConn {
             return Err(Error::Connection("Connection closed".to_string()));
         }
 
+        // Use kernel timestamps when available
+        #[cfg(target_os = "linux")]
+        if self.timestamps_enabled {
+            return self.recv_with_timestamp();
+        }
+
+        // Standard recv without kernel timestamps
+        self.recv_standard()
+    }
+
+    fn is_connected(&self) -> bool {
+        self.connected
+    }
+}
+
+impl TcpConn {
+    /// Standard receive using read() - no kernel timestamps
+    fn recv_standard(&mut self) -> Result<(Vec<u8>, Timestamp)> {
         match self.stream.read(&mut self.recv_buffer) {
             Ok(0) => {
                 self.connected = false;
@@ -207,8 +326,25 @@ impl GroupConnection for TcpConn {
         }
     }
 
-    fn is_connected(&self) -> bool {
-        self.connected
+    /// Receive using recvmsg() with kernel timestamps
+    #[cfg(target_os = "linux")]
+    fn recv_with_timestamp(&mut self) -> Result<(Vec<u8>, Timestamp)> {
+        let fd = self.stream.as_raw_fd();
+
+        match hw_timestamp::recvmsg_with_timestamp(fd, &mut self.recv_buffer, 0) {
+            Ok((0, _)) => {
+                self.connected = false;
+                Err(Error::Connection("Connection closed by peer".to_string()))
+            }
+            Ok((n, ts_opt)) => {
+                let data = self.recv_buffer[..n].to_vec();
+                // Use hardware timestamp if available, otherwise software
+                let timestamp = ts_opt.unwrap_or_else(Timestamp::now);
+                Ok((data, timestamp))
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok((Vec::new(), Timestamp::now())),
+            Err(e) => Err(e.into()),
+        }
     }
 }
 
@@ -217,6 +353,9 @@ pub struct TcpConnectionGroup {
     mux: Multiplexer,
     connections: HashMap<usize, TcpConn>,
     next_id: usize,
+    /// Timestamp configuration for new connections
+    #[cfg(target_os = "linux")]
+    timestamp_config: TcpTimestampConfig,
 }
 
 impl TcpConnectionGroup {
@@ -229,7 +368,56 @@ impl TcpConnectionGroup {
             mux: Multiplexer::new(mux_type)?,
             connections: HashMap::new(),
             next_id: 0,
+            #[cfg(target_os = "linux")]
+            timestamp_config: TcpTimestampConfig::default(),
         })
+    }
+
+    /// Create with timestamp configuration (Linux only)
+    #[cfg(target_os = "linux")]
+    pub fn with_timestamp_config(
+        mux_type: MultiplexerType,
+        timestamp_config: TcpTimestampConfig,
+    ) -> Result<Self> {
+        Ok(Self {
+            mux: Multiplexer::new(mux_type)?,
+            connections: HashMap::new(),
+            next_id: 0,
+            timestamp_config,
+        })
+    }
+
+    /// Configure kernel timestamping on a socket (Linux only)
+    ///
+    /// Tries hardware timestamping first, falls back to software if unavailable.
+    /// Returns true if any form of kernel timestamping was enabled.
+    #[cfg(target_os = "linux")]
+    fn configure_timestamping(&self, fd: i32, conn_id: usize) -> bool {
+        // Bind to interface if specified
+        if let Some(ref interface) = self.timestamp_config.interface {
+            if let Err(e) = hw_timestamp::bind_to_device(fd, interface) {
+                tracing::warn!("Could not bind to device '{}': {}", interface, e);
+            }
+        }
+
+        // Try hardware timestamping first
+        if hw_timestamp::enable_socket_timestamping(fd).is_ok() {
+            tracing::debug!("Hardware timestamping enabled for connection {}", conn_id);
+            return true;
+        }
+
+        // Fallback to software timestamps
+        tracing::debug!("Hardware timestamping not available, trying software");
+        match hw_timestamp::enable_software_timestamping(fd) {
+            Ok(()) => {
+                tracing::debug!("Software timestamping enabled for connection {}", conn_id);
+                true
+            }
+            Err(e) => {
+                tracing::warn!("Could not enable kernel timestamping: {}", e);
+                false
+            }
+        }
     }
 
     fn connect_with_timeout(&mut self, target: &SocketAddr, conn_id: usize) -> Result<TcpStream> {
@@ -292,7 +480,22 @@ impl ConnectionGroup for TcpConnectionGroup {
         self.next_id += 1;
 
         let stream = self.connect_with_timeout(target, conn_id)?;
+
+        // Configure timestamping if enabled
+        #[cfg(target_os = "linux")]
+        let conn = {
+            let timestamps_enabled = if self.timestamp_config.enable_timestamps {
+                self.configure_timestamping(stream.as_raw_fd(), conn_id)
+            } else {
+                false
+            };
+
+            TcpConn::with_timestamps(stream, timestamps_enabled)
+        };
+
+        #[cfg(not(target_os = "linux"))]
         let conn = TcpConn::new(stream);
+
         self.connections.insert(conn_id, conn);
 
         Ok(conn_id)
@@ -317,6 +520,40 @@ impl ConnectionGroup for TcpConnectionGroup {
         Ok(ready)
     }
 
+    #[cfg(target_os = "linux")]
+    fn poll_tx_timestamps(&mut self) -> Result<Vec<crate::TxTimestampInfo>> {
+        let mut results = Vec::new();
+
+        for (&conn_id, conn) in &self.connections {
+            if !conn.timestamps_enabled() {
+                continue;
+            }
+
+            let fd = conn.as_raw_fd();
+
+            // Poll error queue for TX timestamps (non-blocking)
+            loop {
+                match hw_timestamp::recv_tx_timestamp(fd) {
+                    Ok(Some((timestamp, opt_id))) => {
+                        results.push(crate::TxTimestampInfo {
+                            conn_id,
+                            tx_offset: opt_id,
+                            timestamp,
+                        });
+                    }
+                    Ok(None) => break, // No more timestamps available
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => {
+                        tracing::trace!("Error polling TX timestamp for conn {}: {}", conn_id, e);
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
     fn len(&self) -> usize {
         self.connections.len()
     }
@@ -339,14 +576,35 @@ impl ConnectionGroup for TcpConnectionGroup {
 }
 
 /// Factory for creating TCP connection groups
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub struct TcpTransportFactory {
     mux_type: MultiplexerType,
+    #[cfg(target_os = "linux")]
+    timestamp_config: TcpTimestampConfig,
 }
 
 impl TcpTransportFactory {
     pub fn new(mux_type: MultiplexerType) -> Self {
-        Self { mux_type }
+        Self {
+            mux_type,
+            #[cfg(target_os = "linux")]
+            timestamp_config: TcpTimestampConfig::default(),
+        }
+    }
+
+    /// Create factory with timestamp configuration (Linux only)
+    #[cfg(target_os = "linux")]
+    pub fn with_timestamp_config(
+        mux_type: MultiplexerType,
+        timestamp_config: TcpTimestampConfig,
+    ) -> Self {
+        Self { mux_type, timestamp_config }
+    }
+
+    /// Create factory with timestamping enabled (uses default interface binding)
+    #[cfg(target_os = "linux")]
+    pub fn with_timestamps(mux_type: MultiplexerType) -> Self {
+        Self::with_timestamp_config(mux_type, TcpTimestampConfig::with_timestamps())
     }
 }
 
@@ -354,7 +612,15 @@ impl TransportFactory for TcpTransportFactory {
     type Group = TcpConnectionGroup;
 
     fn create_group(&self) -> Result<Self::Group> {
-        TcpConnectionGroup::with_multiplexer(self.mux_type)
+        #[cfg(target_os = "linux")]
+        {
+            TcpConnectionGroup::with_timestamp_config(self.mux_type, self.timestamp_config.clone())
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            TcpConnectionGroup::with_multiplexer(self.mux_type)
+        }
     }
 }
 
@@ -556,7 +822,8 @@ mod tests {
         let conn_id = group.add_connection(&addr).unwrap();
 
         let test_data = b"Hello, Group!";
-        let send_ts = group.get_mut(conn_id).unwrap().send(test_data).unwrap();
+        let (send_ts, _tx_start, _tx_end) =
+            group.get_mut(conn_id).unwrap().send(test_data).unwrap();
 
         thread::sleep(Duration::from_millis(10));
 

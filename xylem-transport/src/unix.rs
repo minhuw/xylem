@@ -148,6 +148,8 @@ pub struct UnixConn {
     stream: UnixStream,
     recv_buffer: Vec<u8>,
     connected: bool,
+    /// TX byte counter for timestamp correlation (monotonically increasing)
+    tx_byte_counter: u32,
 }
 
 impl UnixConn {
@@ -156,15 +158,20 @@ impl UnixConn {
             stream,
             recv_buffer: vec![0u8; DEFAULT_RECV_BUFFER_SIZE],
             connected: true,
+            tx_byte_counter: 0,
         }
     }
 }
 
 impl GroupConnection for UnixConn {
-    fn send(&mut self, data: &[u8]) -> Result<Timestamp> {
+    fn send(&mut self, data: &[u8]) -> Result<(Timestamp, u32, u32)> {
         if !self.connected {
             return Err(Error::Connection("Connection closed".to_string()));
         }
+
+        // Record TX byte range before send
+        let tx_start = self.tx_byte_counter;
+        let tx_end = tx_start.wrapping_add(data.len() as u32);
 
         let mut total_written = 0;
         while total_written < data.len() {
@@ -178,7 +185,9 @@ impl GroupConnection for UnixConn {
             }
         }
 
-        Ok(Timestamp::now())
+        // Update byte counter and capture software timestamp
+        self.tx_byte_counter = tx_end;
+        Ok((Timestamp::now(), tx_start, tx_end))
     }
 
     fn recv(&mut self) -> Result<(Vec<u8>, Timestamp)> {
@@ -571,7 +580,8 @@ mod tests {
         let conn_id = group.add_connection_path(&socket_path).unwrap();
 
         let test_data = b"Hello, Unix Group!";
-        let send_ts = group.get_mut(conn_id).unwrap().send(test_data).unwrap();
+        let (send_ts, _tx_start, _tx_end) =
+            group.get_mut(conn_id).unwrap().send(test_data).unwrap();
 
         thread::sleep(Duration::from_millis(10));
 

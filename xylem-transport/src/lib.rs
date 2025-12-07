@@ -10,6 +10,15 @@
 //! - **UDP**: Non-blocking UDP sockets
 //! - **Unix**: Unix domain sockets (Unix only)
 //!
+//! ## Hardware Timestamping (Linux only)
+//!
+//! On Linux, transports can use kernel timestamps (SO_TIMESTAMPING) for more
+//! accurate latency measurement. Hardware timestamps are used when available,
+//! with automatic fallback to software timestamps. This requires:
+//! - Linux kernel >= 4.19.4 for best results
+//! - NIC with hardware timestamping support for HW timestamps (e.g., Mellanox ConnectX, Intel i210)
+//! - Root or CAP_NET_ADMIN capability for NIC-level timestamping
+//!
 //! ## I/O Multiplexer Selection
 //!
 //! The multiplexer backend can be selected at runtime:
@@ -75,7 +84,7 @@
 
 use std::fmt;
 use std::net::SocketAddr;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Result type for transport operations
 pub type Result<T> = std::result::Result<T, Error>;
@@ -118,95 +127,6 @@ impl std::error::Error for Error {}
 impl From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Self {
         Error::Io(err)
-    }
-}
-
-/// Timestamp for request/response tracking
-///
-/// Uses RDTSC (Read Time-Stamp Counter) on x86_64 for minimal overhead.
-/// Falls back to `Instant` on other architectures.
-#[derive(Debug, Clone, Copy)]
-pub struct Timestamp {
-    cycles: u64,
-}
-
-/// Calibration data for converting RDTSC cycles to nanoseconds
-struct TscCalibration {
-    cycles_per_ns: f64,
-}
-
-impl TscCalibration {
-    fn calibrate() -> Self {
-        // Calibrate by measuring cycles over a known duration
-        let start_cycles = rdtsc();
-        let start_instant = Instant::now();
-
-        // Sleep for a short calibration period
-        std::thread::sleep(Duration::from_millis(10));
-
-        let end_cycles = rdtsc();
-        let elapsed_ns = start_instant.elapsed().as_nanos() as f64;
-
-        let cycles = (end_cycles - start_cycles) as f64;
-        let cycles_per_ns = cycles / elapsed_ns;
-
-        Self { cycles_per_ns }
-    }
-
-    fn cycles_to_nanos(&self, cycles: u64) -> u64 {
-        (cycles as f64 / self.cycles_per_ns) as u64
-    }
-}
-
-/// Get calibration data (initialized once)
-fn get_calibration() -> &'static TscCalibration {
-    static CALIBRATION: std::sync::OnceLock<TscCalibration> = std::sync::OnceLock::new();
-    CALIBRATION.get_or_init(TscCalibration::calibrate)
-}
-
-/// Read the CPU timestamp counter with serialization
-///
-/// Uses RDTSCP which includes a memory barrier to ensure the timestamp
-/// is taken after all previous instructions complete.
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-fn rdtsc() -> u64 {
-    unsafe {
-        let mut _aux: u32 = 0;
-        core::arch::x86_64::__rdtscp(&mut _aux)
-    }
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-#[inline(always)]
-fn rdtsc() -> u64 {
-    // Fallback for non-x86_64: use Instant
-    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-    let start = START.get_or_init(Instant::now);
-    start.elapsed().as_nanos() as u64
-}
-
-impl Timestamp {
-    /// Create a new timestamp from current time
-    ///
-    /// Uses RDTSC for minimal overhead (~20 cycles vs ~200+ for clock_gettime).
-    #[inline(always)]
-    pub fn now() -> Self {
-        Self { cycles: rdtsc() }
-    }
-
-    /// Calculate duration since another timestamp
-    #[inline]
-    pub fn duration_since(&self, earlier: &Timestamp) -> Duration {
-        let delta_cycles = self.cycles.saturating_sub(earlier.cycles);
-        let nanos = get_calibration().cycles_to_nanos(delta_cycles);
-        Duration::from_nanos(nanos)
-    }
-
-    /// Get the raw cycle count (for comparisons)
-    #[inline]
-    pub fn cycles(&self) -> u64 {
-        self.cycles
     }
 }
 
@@ -263,16 +183,44 @@ pub trait Transport: Send {
 // Connection Group API (ConnectionGroup trait)
 // =============================================================================
 
+/// Information about a TX timestamp received from the kernel
+///
+/// TX timestamps arrive asynchronously via the socket's error queue.
+/// This struct contains the timestamp and the byte offset (opt_id) needed
+/// to correlate it back to the original send operation.
+#[derive(Debug, Clone, Copy)]
+pub struct TxTimestampInfo {
+    /// Connection ID that sent the data
+    pub conn_id: usize,
+    /// Byte offset (opt_id) for correlating with the send operation
+    pub tx_offset: u32,
+    /// The kernel-provided TX timestamp
+    pub timestamp: Timestamp,
+}
+
 /// A connection within a group
 ///
 /// Represents a single connection managed by a `ConnectionGroup`. Provides
 /// send/recv operations with timestamp tracking.
 pub trait GroupConnection: Send {
-    /// Send data and return timestamp
+    /// Send data and return software timestamp and TX byte/packet range
     ///
-    /// Sends the provided data and captures a nanosecond-precision timestamp
-    /// immediately after the send operation completes.
-    fn send(&mut self, data: &[u8]) -> Result<Timestamp>;
+    /// Sends the provided data and returns a tuple of:
+    /// - `Timestamp`: Software timestamp captured immediately after the send
+    /// - `u32`: TX range start (byte offset for TCP, packet ID for UDP)
+    /// - `u32`: TX range end (byte offset for TCP, packet ID for UDP)
+    ///
+    /// The range semantics differ by transport:
+    /// - **TCP**: Byte offsets where end = start + data.len() (wrapping u32 counter)
+    /// - **UDP**: Packet IDs where start == end (single packet per send)
+    ///
+    /// The actual hardware TX timestamp will arrive later via the error queue
+    /// and can be retrieved using `ConnectionGroup::poll_tx_timestamps()`.
+    /// A TX timestamp with offset >= end indicates the data has been transmitted.
+    ///
+    /// Note: The counters wrap at u32::MAX. Callers should use wrapping comparison
+    /// when correlating TX timestamps with send operations.
+    fn send(&mut self, data: &[u8]) -> Result<(Timestamp, u32, u32)>;
 
     /// Receive data and return timestamp
     ///
@@ -317,6 +265,23 @@ pub trait ConnectionGroup: Send {
     /// * `timeout` - Maximum time to wait. `None` means return immediately.
     fn poll(&mut self, timeout: Option<Duration>) -> Result<Vec<usize>>;
 
+    /// Poll for TX timestamps from all connections (Linux only)
+    ///
+    /// TX timestamps arrive asynchronously via the socket's error queue after
+    /// the data has been transmitted. This method checks all connections and
+    /// returns any available TX timestamps.
+    ///
+    /// Returns a vector of `TxTimestampInfo` containing:
+    /// - `conn_id`: The connection that sent the data
+    /// - `tx_offset`: Byte offset for correlating with the original send
+    /// - `timestamp`: The kernel-provided TX timestamp
+    ///
+    /// On non-Linux platforms, this returns an empty vector.
+    fn poll_tx_timestamps(&mut self) -> Result<Vec<TxTimestampInfo>> {
+        // Default implementation returns empty (no TX timestamp support)
+        Ok(Vec::new())
+    }
+
     /// Number of connections in the group
     fn len(&self) -> usize;
 
@@ -355,10 +320,16 @@ pub trait TransportFactory: Send + Sync {
 pub mod buffer_pool;
 pub mod mux;
 pub mod tcp;
+mod timestamp;
 pub mod udp;
 
 #[cfg(unix)]
 pub mod unix;
+
+// Hardware timestamping helpers (Linux only)
+// Used internally by tcp/udp modules for kernel timestamp support
+#[cfg(target_os = "linux")]
+pub mod hw_timestamp;
 
 // =============================================================================
 // Re-exports
@@ -366,6 +337,7 @@ pub mod unix;
 
 pub use buffer_pool::{BufferPool, MaybePooledBuffer, PooledBuffer};
 pub use mux::{Multiplexer, MultiplexerType};
+pub use timestamp::Timestamp;
 
 pub use tcp::TcpTransport;
 pub use udp::UdpTransport;
@@ -376,3 +348,13 @@ pub use tcp::{TcpConnectionGroup, TcpTransportFactory};
 pub use udp::{UdpConnectionGroup, UdpTransportFactory};
 #[cfg(unix)]
 pub use unix::{UnixConnectionGroup, UnixTransportFactory};
+
+// Timestamp configuration (Linux only)
+#[cfg(target_os = "linux")]
+pub use tcp::TcpTimestampConfig;
+#[cfg(target_os = "linux")]
+pub use udp::UdpTimestampConfig;
+
+// Hardware timestamping utilities (Linux only)
+#[cfg(target_os = "linux")]
+pub use hw_timestamp::{disable_nic_timestamping, enable_nic_timestamping};

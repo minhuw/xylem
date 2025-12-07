@@ -8,11 +8,31 @@
 
 use crate::scheduler::{Policy, ReadyHeap};
 use crate::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
 use std::net::SocketAddr;
 use std::time::Duration;
 use xylem_transport::{ConnectionGroup, GroupConnection, Timestamp, TransportFactory};
+
+/// Wrapping less-than-or-equal comparison for u32 counters
+///
+/// Returns true if `a <= b` accounting for wrapping.
+/// Uses signed arithmetic: if (a - b) as i32 <= 0, then a <= b in wrapping sense.
+/// This works correctly when the difference is less than 2^31 (~2 billion).
+///
+/// # Assumptions
+///
+/// The outstanding data between oldest pending request and newest TX timestamp
+/// must be less than the wrap threshold. This is safe in practice:
+/// - **TCP**: Counter tracks bytes. With typical max_pending of 64-256 requests
+///   and 64KB max request size, that's at most 16MB outstanding per connection.
+///   Would need ~32,000 connections each with 64KB max pipeline to hit 2GB.
+/// - **UDP**: Counter tracks packets. With typical max_pending of 64-256,
+///   we're far below the ~2 billion packet threshold.
+#[inline]
+fn wrapping_le(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) <= 0
+}
 
 /// Maximum receive buffer size per connection
 /// Increased to support large values (e.g., YCSB workloads with 10KB+ values)
@@ -28,14 +48,40 @@ pub type TrafficGroupConfig =
 pub type UnixTrafficGroupConfig =
     (usize, String, usize, usize, Box<dyn crate::scheduler::PolicyScheduler>);
 
+/// Timeout for stale TX queue entries (1 minute in nanoseconds)
+/// Entries older than this are cleaned up to prevent memory leaks from lost packets
+const TX_QUEUE_STALE_TIMEOUT_NS: u64 = 60_000_000_000;
+
 /// Pending request tracking
 #[derive(Debug)]
 struct PendingRequest {
-    /// Timestamp when request was sent
+    /// Software timestamp when request was sent
     send_ts: Timestamp,
+    /// Hardware TX timestamp (filled in later when received from error queue)
+    tx_hw_ts: Option<Timestamp>,
 }
 
 /// Per-connection application state (no transport - I/O goes through ConnectionGroup)
+///
+/// # Pending Request Tracking
+///
+/// Uses two data structures for efficient request tracking:
+///
+/// 1. `pending_map: HashMap<ReqId, PendingRequest>` - Primary storage, O(1) lookup by request ID
+///    Used when responses arrive (protocol provides req_id)
+///
+/// 2. `tx_pending_queue: VecDeque<(u32, ReqId, u64)>` - Queue for TX timestamp correlation
+///    Requests are pushed to back (tx_end is monotonically increasing),
+///    TX timestamps are matched from front (kernel delivers in order).
+///    The u64 is a monotonic timestamp (nanoseconds) for stale entry cleanup.
+///
+/// Flow:
+/// - send() -> push_back to tx_pending_queue, insert into pending_map
+/// - poll_tx_timestamps() -> pop from front while tx_end <= offset, set pending_map[req_id].tx_hw_ts
+/// - recv() -> lookup pending_map by req_id, clean up queue if needed, compute latency
+///
+/// Queue cleanup: When a response arrives before its TX timestamp (or for transports without
+/// HW timestamps like Unix sockets), the queue entry is cleaned up by popping from front.
 pub struct ConnectionState<ReqId: Eq + Hash + Clone> {
     /// Connection ID in the ConnectionGroup
     connection_id: usize,
@@ -43,8 +89,11 @@ pub struct ConnectionState<ReqId: Eq + Hash + Clone> {
     target: SocketAddr,
     /// Maximum pending requests allowed
     max_pending_requests: usize,
-    /// Map of request ID to pending request timestamps
+    /// Primary storage: ReqId -> PendingRequest for O(1) response lookup
     pending_map: HashMap<ReqId, PendingRequest>,
+    /// Queue of (tx_end, ReqId, enqueue_time_ns) for TX timestamp correlation - push back, pop front
+    /// The enqueue_time_ns is used for stale entry cleanup (entries older than 1 minute are removed)
+    tx_pending_queue: VecDeque<(u32, ReqId, u64)>,
     /// Receive buffer for partial responses
     recv_buffer: Vec<u8>,
     /// Current position in receive buffer
@@ -73,6 +122,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
             target,
             max_pending_requests,
             pending_map: HashMap::with_capacity(max_pending_requests),
+            tx_pending_queue: VecDeque::with_capacity(max_pending_requests),
             recv_buffer: vec![0u8; MAX_PAYLOAD],
             buffer_pos: 0,
             closed: false,
@@ -132,9 +182,98 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         self.policy.name()
     }
 
-    /// Record a sent request
-    fn record_send(&mut self, req_id: ReqId, send_ts: Timestamp) {
-        self.pending_map.insert(req_id, PendingRequest { send_ts });
+    /// Record a sent request with TX byte range for hardware timestamp correlation
+    ///
+    /// `tx_start` is accepted for API symmetry with `GroupConnection::send()` but unused;
+    /// only `tx_end` is needed to determine when a TX timestamp covers this request.
+    fn record_send(&mut self, req_id: ReqId, send_ts: Timestamp, _tx_start: u32, tx_end: u32) {
+        let now_ns = crate::timing::time_ns();
+        // Push to queue for TX timestamp correlation (tx_end increases monotonically)
+        self.tx_pending_queue.push_back((tx_end, req_id.clone(), now_ns));
+        self.pending_map.insert(req_id, PendingRequest { send_ts, tx_hw_ts: None });
+    }
+
+    /// Clean up queue entry for a completed request that didn't receive its TX timestamp
+    ///
+    /// Uses linear search to find and remove the entry, handling out-of-order responses.
+    /// Also cleans up any stale entries for already-completed requests along the way.
+    fn cleanup_tx_queue_entry(&mut self, req_id: &ReqId) {
+        // First, try to pop stale entries from the front (common case optimization)
+        while let Some((_, front_id, _)) = self.tx_pending_queue.front() {
+            if front_id == req_id {
+                self.tx_pending_queue.pop_front();
+                return;
+            }
+            if !self.pending_map.contains_key(front_id) {
+                // Stale entry, remove it
+                self.tx_pending_queue.pop_front();
+            } else {
+                // Found a still-pending request, stop front cleanup
+                break;
+            }
+        }
+
+        // If not found at front, search and remove from middle of queue (out-of-order case)
+        if let Some(pos) = self.tx_pending_queue.iter().position(|(_, id, _)| id == req_id) {
+            self.tx_pending_queue.remove(pos);
+        }
+    }
+
+    /// Clean up stale entries from the TX pending queue
+    ///
+    /// Removes entries that are older than `TX_QUEUE_STALE_TIMEOUT_NS` (1 minute).
+    /// This prevents memory growth when TX timestamps are never received (e.g., packet loss,
+    /// NIC doesn't support HW timestamps, or kernel drops error queue messages).
+    ///
+    /// Returns the number of stale entries removed.
+    pub fn cleanup_stale_tx_queue_entries(&mut self) -> usize {
+        let now_ns = crate::timing::time_ns();
+        let mut removed = 0;
+
+        // Pop stale entries from front
+        // Queue is ordered by tx_end, and since sends are sequential, enqueue_time
+        // increases monotonically. Thus if front is not stale, none are.
+        while let Some(&(_, _, enqueue_time)) = self.tx_pending_queue.front() {
+            if now_ns.saturating_sub(enqueue_time) > TX_QUEUE_STALE_TIMEOUT_NS {
+                self.tx_pending_queue.pop_front();
+                removed += 1;
+            } else {
+                break;
+            }
+        }
+
+        removed
+    }
+
+    /// Update pending requests with hardware TX timestamp
+    ///
+    /// A TX timestamp with `offset` indicates all bytes/packets up to `offset` have been transmitted.
+    /// We pop from front of queue all requests with `tx_end <= offset` and set their TX timestamp.
+    ///
+    /// Uses wrapping comparison to handle u32 counter overflow correctly.
+    ///
+    /// Returns the number of pending requests that were updated with the TX timestamp.
+    /// A single TX timestamp may cover multiple small requests.
+    pub fn set_tx_timestamp(&mut self, offset: u32, tx_ts: Timestamp) -> usize {
+        let mut updated_count = 0;
+
+        // Pop from front while tx_end <= offset (queue is ordered by tx_end)
+        // Use wrapping comparison to handle counter overflow after ~4GB (TCP) or ~4B packets (UDP)
+        while let Some(&(tx_end, ref req_id, _)) = self.tx_pending_queue.front() {
+            if wrapping_le(tx_end, offset) {
+                // Update pending_map if request still exists (might have been completed already
+                // if response arrived before TX timestamp)
+                if let Some(pending) = self.pending_map.get_mut(req_id) {
+                    pending.tx_hw_ts = Some(tx_ts);
+                    updated_count += 1;
+                }
+                self.tx_pending_queue.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        updated_count
     }
 
     /// Process received data and extract latencies
@@ -176,7 +315,15 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
             })?;
 
             if let Some(pending) = self.pending_map.remove(&req_id) {
-                let latency = recv_ts.duration_since(&pending.send_ts);
+                // If TX timestamp wasn't received yet, clean up queue entry to prevent leak
+                // This happens when response arrives before TX timestamp (fast network/loopback)
+                // or when HW timestamps are not supported (Unix sockets)
+                if pending.tx_hw_ts.is_none() {
+                    self.cleanup_tx_queue_entry(&req_id);
+                }
+                // Use hardware TX timestamp if available, otherwise software timestamp
+                let send_ts = pending.tx_hw_ts.unwrap_or(pending.send_ts);
+                let latency = recv_ts.duration_since(&send_ts);
                 latencies.push((req_id, latency));
             } else {
                 return Err(crate::Error::Protocol(format!(
@@ -365,8 +512,8 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
             .get_mut(connection_id)
             .ok_or_else(|| crate::Error::Connection("Connection not found in group".to_string()))?;
 
-        let send_ts = connection.send(data)?;
-        state.record_send(req_id, send_ts);
+        let (send_ts, tx_start, tx_end) = connection.send(data)?;
+        state.record_send(req_id, send_ts, tx_start, tx_end);
 
         Ok(())
     }
@@ -413,6 +560,43 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
             .ok_or_else(|| crate::Error::Connection("Connection state not found".to_string()))?;
 
         state.process_recv(&data, recv_ts, process_fn)
+    }
+
+    /// Poll for and process TX timestamps from the transport layer
+    ///
+    /// TX timestamps arrive asynchronously from the kernel's error queue.
+    /// This method retrieves them and updates the corresponding pending requests
+    /// so that latency calculations can use hardware TX timestamps.
+    ///
+    /// Returns the number of pending requests updated with TX timestamps.
+    /// Note: A single TX timestamp may update multiple requests if they were
+    /// batched together in a single kernel acknowledgment.
+    pub fn poll_tx_timestamps(&mut self) -> Result<usize> {
+        let tx_timestamps = self.group.poll_tx_timestamps()?;
+        let mut count = 0;
+
+        for tx_info in tx_timestamps {
+            if let Some(state) = self.connection_states.get_mut(&tx_info.conn_id) {
+                count += state.set_tx_timestamp(tx_info.tx_offset, tx_info.timestamp);
+            }
+        }
+
+        Ok(count)
+    }
+
+    /// Clean up stale TX queue entries across all connections
+    ///
+    /// Removes TX queue entries older than 1 minute to prevent memory leaks
+    /// when TX timestamps are never received (packet loss, unsupported NIC, etc.).
+    ///
+    /// This should be called periodically (e.g., once per second or per poll cycle).
+    /// Returns the total number of stale entries removed across all connections.
+    pub fn cleanup_stale_tx_queues(&mut self) -> usize {
+        let mut total_removed = 0;
+        for state in self.connection_states.values_mut() {
+            total_removed += state.cleanup_stale_tx_queue_entries();
+        }
+        total_removed
     }
 
     /// Pick the next ready connection (O(log N) via min-heap)
@@ -594,5 +778,39 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug>
             connection_ids,
             ready_heap,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_wrapping_le() {
+        // Normal cases
+        assert!(wrapping_le(0, 0));
+        assert!(wrapping_le(0, 1));
+        assert!(wrapping_le(100, 200));
+        assert!(!wrapping_le(200, 100));
+
+        // Near max value
+        assert!(wrapping_le(u32::MAX - 1, u32::MAX));
+        assert!(wrapping_le(u32::MAX, u32::MAX));
+        assert!(!wrapping_le(u32::MAX, u32::MAX - 1));
+
+        // Wrap-around cases (critical for byte/packet counter overflow)
+        // After wrapping: 0xFFFFFFFF -> 0x00000000 -> 0x00000001
+        assert!(wrapping_le(u32::MAX, 0)); // MAX is "before" 0 after wrap
+        assert!(wrapping_le(u32::MAX, 1)); // MAX is "before" 1 after wrap
+        assert!(wrapping_le(u32::MAX - 10, 5)); // Near-MAX is "before" small values after wrap
+
+        // Realistic scenario: tx_end wraps around, kernel reports wrapped offset
+        let tx_end = u32::MAX - 100; // Request sent just before wrap
+        let offset = 50u32; // Kernel reports offset after wrap
+        assert!(wrapping_le(tx_end, offset)); // Should match
+
+        // Large gap within valid range (< 2^31)
+        assert!(wrapping_le(0, i32::MAX as u32));
+        assert!(wrapping_le(1000, 1000 + (i32::MAX as u32 - 1)));
     }
 }

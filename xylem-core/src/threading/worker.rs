@@ -383,6 +383,17 @@ impl<G: ConnectionGroup, P: Protocol> Worker<G, P> {
         // Poll all connections with one syscall
         let ready_ids = self.pool.poll(timeout)?;
 
+        // Poll for TX timestamps from error queue (non-blocking)
+        // Must be called AFTER poll() because TX timestamps arrive asynchronously
+        // and may not be available until after the NIC has transmitted the data
+        if let Err(e) = self.pool.poll_tx_timestamps() {
+            tracing::trace!("Error polling TX timestamps: {}", e);
+        }
+
+        // Clean up stale TX queue entries (entries older than 1 minute)
+        // This prevents memory leaks when TX timestamps are never received
+        self.pool.cleanup_stale_tx_queues();
+
         // Collect retries to process after response handling
         let mut retries: Vec<(usize, RetryRequest<_>)> = Vec::new();
 

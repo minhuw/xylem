@@ -3,6 +3,13 @@
 //! This module provides two APIs:
 //! - `UdpTransport`: Single-connection API (one multiplexer per connection)
 //! - `UdpConnectionGroup`: Multi-connection API (one multiplexer per group)
+//!
+//! ## Hardware Timestamping (Linux only)
+//!
+//! On Linux, this transport can use kernel timestamps (SO_TIMESTAMPING) for
+//! more accurate latency measurement. Hardware timestamps are used when the
+//! NIC supports them, with automatic fallback to software timestamps.
+//! Configure via `UdpTimestampConfig`.
 
 use crate::mux::{Interest, Multiplexer, MultiplexerType};
 use crate::{
@@ -13,7 +20,60 @@ use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
+use crate::hw_timestamp;
+#[cfg(target_os = "linux")]
+use std::os::unix::io::AsRawFd;
+
 const DEFAULT_UDP_BUFFER_SIZE: usize = 65535;
+
+/// Configuration for UDP timestamping (Linux only)
+///
+/// On Linux, this configures kernel-level timestamping for more accurate
+/// latency measurement. Falls back to software timestamps if HW not available.
+///
+/// By default, kernel timestamps are enabled on Linux.
+#[derive(Debug, Clone)]
+pub struct UdpTimestampConfig {
+    /// Network interface to bind to for hardware timestamping (e.g., "eth0")
+    /// If None, no interface binding is performed.
+    #[cfg(target_os = "linux")]
+    pub interface: Option<String>,
+
+    /// Whether to enable kernel timestamping on sockets
+    /// When true, uses SO_TIMESTAMPING for RX timestamps
+    /// Default: true on Linux
+    #[cfg(target_os = "linux")]
+    pub enable_timestamps: bool,
+}
+
+impl Default for UdpTimestampConfig {
+    fn default() -> Self {
+        Self {
+            #[cfg(target_os = "linux")]
+            interface: None,
+            #[cfg(target_os = "linux")]
+            enable_timestamps: true, // Enable by default on Linux
+        }
+    }
+}
+
+impl UdpTimestampConfig {
+    /// Create config with timestamping enabled (no interface binding)
+    #[cfg(target_os = "linux")]
+    pub fn with_timestamps() -> Self {
+        Self { interface: None, enable_timestamps: true }
+    }
+
+    /// Create config with timestamping and interface binding
+    #[cfg(target_os = "linux")]
+    pub fn with_interface(interface: impl Into<String>) -> Self {
+        Self {
+            interface: Some(interface.into()),
+            enable_timestamps: true,
+        }
+    }
+}
 
 pub struct UdpTransport {
     socket: Option<UdpSocket>,
@@ -126,20 +186,63 @@ pub struct UdpConn {
     socket: UdpSocket,
     target: SocketAddr,
     recv_buffer: Vec<u8>,
+    /// TX packet counter for correlating TX timestamps (wrapping)
+    /// For UDP, each datagram gets its own timestamp, so we use a simple counter
+    tx_packet_counter: u32,
+    /// Whether kernel timestamping is enabled for this connection
+    #[cfg(target_os = "linux")]
+    timestamps_enabled: bool,
 }
 
 impl UdpConn {
+    #[allow(dead_code)] // Used on non-Linux or when timestamps not configured
     fn new(socket: UdpSocket, target: SocketAddr) -> Self {
         Self {
             socket,
             target,
             recv_buffer: vec![0u8; DEFAULT_UDP_BUFFER_SIZE],
+            tx_packet_counter: 0,
+            #[cfg(target_os = "linux")]
+            timestamps_enabled: false,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn with_timestamps(socket: UdpSocket, target: SocketAddr, timestamps_enabled: bool) -> Self {
+        Self {
+            socket,
+            target,
+            recv_buffer: vec![0u8; DEFAULT_UDP_BUFFER_SIZE],
+            tx_packet_counter: 0,
+            timestamps_enabled,
+        }
+    }
+
+    /// Get the raw file descriptor (for polling TX timestamps)
+    #[cfg(target_os = "linux")]
+    pub(crate) fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+        self.socket.as_raw_fd()
+    }
+
+    /// Check if timestamps are enabled
+    #[cfg(target_os = "linux")]
+    pub(crate) fn timestamps_enabled(&self) -> bool {
+        self.timestamps_enabled
     }
 }
 
 impl GroupConnection for UdpConn {
-    fn send(&mut self, data: &[u8]) -> Result<Timestamp> {
+    fn send(&mut self, data: &[u8]) -> Result<(Timestamp, u32, u32)> {
+        // For UDP, kernel's SOF_TIMESTAMPING_OPT_ID returns a packet counter (not byte offset).
+        // The kernel reports packet ID N after the Nth sendmsg (0-indexed).
+        // Unlike TCP where opt_id = cumulative bytes sent, UDP opt_id = packet sequence number.
+        //
+        // We store tx_end = packet_id so that when kernel reports opt_id = N, the comparison
+        // `tx_end <= offset` (i.e., `N <= N`) is true and we match correctly.
+        let packet_id = self.tx_packet_counter;
+        let tx_start = packet_id;
+        let tx_end = packet_id;
+
         loop {
             match self.socket.send_to(data, self.target) {
                 Ok(_) => break,
@@ -151,10 +254,33 @@ impl GroupConnection for UdpConn {
             }
         }
 
-        Ok(Timestamp::now())
+        // Increment packet counter for next send
+        self.tx_packet_counter = packet_id.wrapping_add(1);
+
+        // Return software timestamp and packet ID for correlation
+        Ok((Timestamp::now(), tx_start, tx_end))
     }
 
     fn recv(&mut self) -> Result<(Vec<u8>, Timestamp)> {
+        // On Linux with timestamps enabled, use recvmsg to get kernel timestamp
+        #[cfg(target_os = "linux")]
+        if self.timestamps_enabled {
+            let fd = self.socket.as_raw_fd();
+            match hw_timestamp::recvmsg_with_timestamp(fd, &mut self.recv_buffer, 0) {
+                Ok((n, ts_opt)) => {
+                    let data = self.recv_buffer[..n].to_vec();
+                    // Use hardware timestamp if available, otherwise software
+                    let timestamp = ts_opt.unwrap_or_else(Timestamp::now);
+                    return Ok((data, timestamp));
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    return Ok((Vec::new(), Timestamp::now()));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        // Standard recv path (non-Linux or timestamps disabled)
         match self.socket.recv_from(&mut self.recv_buffer) {
             Ok((n, _src_addr)) => {
                 let timestamp = Timestamp::now();
@@ -176,6 +302,9 @@ pub struct UdpConnectionGroup {
     mux: Multiplexer,
     connections: HashMap<usize, UdpConn>,
     next_id: usize,
+    /// Timestamp configuration for new connections
+    #[cfg(target_os = "linux")]
+    timestamp_config: UdpTimestampConfig,
 }
 
 impl UdpConnectionGroup {
@@ -188,7 +317,56 @@ impl UdpConnectionGroup {
             mux: Multiplexer::new(mux_type)?,
             connections: HashMap::new(),
             next_id: 0,
+            #[cfg(target_os = "linux")]
+            timestamp_config: UdpTimestampConfig::default(),
         })
+    }
+
+    /// Create with timestamp configuration (Linux only)
+    #[cfg(target_os = "linux")]
+    pub fn with_timestamp_config(
+        mux_type: MultiplexerType,
+        timestamp_config: UdpTimestampConfig,
+    ) -> Result<Self> {
+        Ok(Self {
+            mux: Multiplexer::new(mux_type)?,
+            connections: HashMap::new(),
+            next_id: 0,
+            timestamp_config,
+        })
+    }
+
+    /// Configure kernel timestamping on a socket (Linux only)
+    ///
+    /// Tries hardware timestamping first, falls back to software if unavailable.
+    /// Returns true if any form of kernel timestamping was enabled.
+    #[cfg(target_os = "linux")]
+    fn configure_timestamping(&self, fd: i32, conn_id: usize) -> bool {
+        // Bind to interface if specified
+        if let Some(ref interface) = self.timestamp_config.interface {
+            if let Err(e) = hw_timestamp::bind_to_device(fd, interface) {
+                tracing::warn!("Could not bind to device '{}': {}", interface, e);
+            }
+        }
+
+        // Try hardware timestamping first
+        if hw_timestamp::enable_socket_timestamping(fd).is_ok() {
+            tracing::debug!("Hardware timestamping enabled for UDP connection {}", conn_id);
+            return true;
+        }
+
+        // Fallback to software timestamps
+        tracing::debug!("Hardware timestamping not available, trying software");
+        match hw_timestamp::enable_software_timestamping(fd) {
+            Ok(()) => {
+                tracing::debug!("Software timestamping enabled for UDP connection {}", conn_id);
+                true
+            }
+            Err(e) => {
+                tracing::warn!("Could not enable kernel timestamping: {}", e);
+                false
+            }
+        }
     }
 }
 
@@ -215,7 +393,21 @@ impl ConnectionGroup for UdpConnectionGroup {
         socket.set_nonblocking(true)?;
         self.mux.register_fd(&socket, conn_id, Interest::READABLE)?;
 
+        // On Linux, configure timestamping
+        #[cfg(target_os = "linux")]
+        let conn = {
+            let timestamps_enabled = if self.timestamp_config.enable_timestamps {
+                self.configure_timestamping(socket.as_raw_fd(), conn_id)
+            } else {
+                false
+            };
+
+            UdpConn::with_timestamps(socket, *target, timestamps_enabled)
+        };
+
+        #[cfg(not(target_os = "linux"))]
         let conn = UdpConn::new(socket, *target);
+
         self.connections.insert(conn_id, conn);
 
         Ok(conn_id)
@@ -240,6 +432,44 @@ impl ConnectionGroup for UdpConnectionGroup {
         Ok(ready)
     }
 
+    #[cfg(target_os = "linux")]
+    fn poll_tx_timestamps(&mut self) -> Result<Vec<crate::TxTimestampInfo>> {
+        let mut results = Vec::new();
+
+        for (&conn_id, conn) in &self.connections {
+            if !conn.timestamps_enabled() {
+                continue;
+            }
+
+            let fd = conn.as_raw_fd();
+
+            // Poll error queue for TX timestamps (non-blocking)
+            loop {
+                match hw_timestamp::recv_tx_timestamp(fd) {
+                    Ok(Some((timestamp, opt_id))) => {
+                        results.push(crate::TxTimestampInfo {
+                            conn_id,
+                            tx_offset: opt_id,
+                            timestamp,
+                        });
+                    }
+                    Ok(None) => break, // No more timestamps available
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => {
+                        tracing::trace!(
+                            "Error polling TX timestamp for UDP conn {}: {}",
+                            conn_id,
+                            e
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
     fn len(&self) -> usize {
         self.connections.len()
     }
@@ -261,14 +491,35 @@ impl ConnectionGroup for UdpConnectionGroup {
 }
 
 /// Factory for creating UDP connection groups
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub struct UdpTransportFactory {
     mux_type: MultiplexerType,
+    #[cfg(target_os = "linux")]
+    timestamp_config: UdpTimestampConfig,
 }
 
 impl UdpTransportFactory {
     pub fn new(mux_type: MultiplexerType) -> Self {
-        Self { mux_type }
+        Self {
+            mux_type,
+            #[cfg(target_os = "linux")]
+            timestamp_config: UdpTimestampConfig::default(),
+        }
+    }
+
+    /// Create factory with timestamp configuration (Linux only)
+    #[cfg(target_os = "linux")]
+    pub fn with_timestamp_config(
+        mux_type: MultiplexerType,
+        timestamp_config: UdpTimestampConfig,
+    ) -> Self {
+        Self { mux_type, timestamp_config }
+    }
+
+    /// Create factory with timestamping enabled (uses default interface binding)
+    #[cfg(target_os = "linux")]
+    pub fn with_timestamps(mux_type: MultiplexerType) -> Self {
+        Self::with_timestamp_config(mux_type, UdpTimestampConfig::with_timestamps())
     }
 }
 
@@ -276,6 +527,13 @@ impl TransportFactory for UdpTransportFactory {
     type Group = UdpConnectionGroup;
 
     fn create_group(&self) -> Result<Self::Group> {
+        #[cfg(target_os = "linux")]
+        return UdpConnectionGroup::with_timestamp_config(
+            self.mux_type,
+            self.timestamp_config.clone(),
+        );
+
+        #[cfg(not(target_os = "linux"))]
         UdpConnectionGroup::with_multiplexer(self.mux_type)
     }
 }
@@ -449,7 +707,8 @@ mod tests {
         let conn_id = group.add_connection(&addr).unwrap();
 
         let test_data = b"Hello, UDP Group!";
-        let send_ts = group.get_mut(conn_id).unwrap().send(test_data).unwrap();
+        let (send_ts, _tx_start, _tx_end) =
+            group.get_mut(conn_id).unwrap().send(test_data).unwrap();
 
         thread::sleep(Duration::from_millis(10));
 
