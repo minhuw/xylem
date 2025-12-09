@@ -18,6 +18,35 @@ use std::sync::Arc;
 use std::time::Duration;
 use xylem_transport::{ConnectionGroup, TransportFactory};
 
+/// Request metadata returned alongside request data
+///
+/// This struct provides additional information about a request that the
+/// protocol generates, allowing the worker to make decisions about how to
+/// handle the request (e.g., whether to collect stats).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RequestMeta {
+    /// True if this is a warm-up request (stats should not be collected).
+    /// Warm-up requests are used for:
+    /// - Protocol handshakes
+    /// - Data population/insertion phases
+    /// - Cache warming
+    pub is_warmup: bool,
+}
+
+impl RequestMeta {
+    /// Create metadata for a normal measurement request
+    #[inline]
+    pub fn measurement() -> Self {
+        Self { is_warmup: false }
+    }
+
+    /// Create metadata for a warm-up request (stats not collected)
+    #[inline]
+    pub fn warmup() -> Self {
+        Self { is_warmup: true }
+    }
+}
+
 /// Retry request information for protocol-level retries
 #[derive(Debug, Clone)]
 pub struct RetryRequest<ReqId> {
@@ -25,6 +54,8 @@ pub struct RetryRequest<ReqId> {
     pub bytes_consumed: usize,
     /// Original request ID that triggered this retry (protocol uses this to look up request data)
     pub original_request_id: ReqId,
+    /// Whether the original request was a warmup request
+    pub is_warmup: bool,
     /// Target connection ID for the retry (None = use routing logic)
     pub target_conn_id: Option<usize>,
     /// Preparation commands to send before the retry (e.g., ASKING for Redis Cluster)
@@ -63,8 +94,9 @@ pub trait Protocol: Send {
     /// * `conn_id` - Connection identifier
     ///
     /// # Returns
-    /// (request_data, request_id) tuple
-    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId);
+    /// (request_data, request_id, metadata) tuple where metadata indicates
+    /// whether this is a warm-up request (stats should not be collected)
+    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId, RequestMeta);
 
     /// Regenerate a request for retry using the original request ID
     ///
@@ -77,15 +109,18 @@ pub trait Protocol: Send {
     /// * `original_request_id` - The request ID from the original request
     ///
     /// # Returns
-    /// (request_data, new_request_id) tuple
+    /// (request_data, new_request_id, metadata) tuple
     ///
     /// Default implementation just generates a new request (ignores original).
+    /// Retries are always measurement requests (not warmup).
     fn regenerate_request(
         &mut self,
         conn_id: usize,
         _original_request_id: Self::RequestId,
-    ) -> (Vec<u8>, Self::RequestId) {
-        self.next_request(conn_id)
+    ) -> (Vec<u8>, Self::RequestId, RequestMeta) {
+        let (data, req_id, _) = self.next_request(conn_id);
+        // Retries are always measurement requests
+        (data, req_id, RequestMeta::measurement())
     }
 
     /// Parse a response and return the request ID it corresponds to
@@ -315,7 +350,7 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
                     self.protocols.get_mut(&group_id).expect("Protocol not found for group_id");
 
                 // Generate request using protocol's embedded generator
-                let (request_data, req_id) = protocol.next_request(connection_id);
+                let (request_data, req_id, meta) = protocol.next_request(connection_id);
 
                 // Record request to dump file if enabled
                 if let Some(ref dumper) = self.request_dumper {
@@ -329,15 +364,17 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
                     );
                 }
 
-                // Send request
+                // Send request (track warmup status for response handling)
                 let sent_time_ns = timing::time_ns();
-                self.pool.send(connection_id, &request_data, req_id)?;
+                self.pool.send(connection_id, &request_data, req_id, meta.is_warmup)?;
 
-                // Notify policy and record stats
+                // Notify policy and record stats (skip stats for warmup requests)
                 if let Some(state) = self.pool.get_state_mut(connection_id) {
                     state.on_request_sent(sent_time_ns);
                 }
-                self.stats.record_tx_bytes(group_id, connection_id, request_data.len());
+                if !meta.is_warmup {
+                    self.stats.record_tx_bytes(group_id, connection_id, request_data.len());
+                }
             }
 
             // RECEIVE PHASE: Poll all connections for responses (single syscall)
@@ -419,36 +456,24 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             let protocol =
                 self.protocols.get_mut(&group_id).expect("Protocol not found for group_id");
 
-            let stats = &mut self.stats;
             let mut connection_retries = Vec::new();
-            let conn_id_for_stats = connection_id; // Capture for closure
+            let mut response_warmup: HashMap<P::RequestId, bool> = HashMap::new();
 
             #[allow(clippy::excessive_nesting)]
-            let latencies = match self.pool.recv_responses(connection_id, |data| {
-                let result = protocol.parse_response_extended(connection_id, data);
-                match result {
+            let responses = match self.pool.recv_responses(connection_id, |data| {
+                match protocol.parse_response_extended(connection_id, data) {
                     Ok(ParseResult::Complete { bytes_consumed, request_id }) => {
-                        if bytes_consumed > 0 {
-                            stats.record_rx_bytes(group_id, conn_id_for_stats, bytes_consumed);
-                        }
                         Ok((bytes_consumed, Some(request_id)))
                     }
                     Ok(ParseResult::Incomplete) => Ok((0, None)),
                     Ok(ParseResult::Retry(retry_req)) => {
                         connection_retries.push(retry_req.clone());
-                        if retry_req.bytes_consumed > 0 {
-                            stats.record_rx_bytes(
-                                group_id,
-                                conn_id_for_stats,
-                                retry_req.bytes_consumed,
-                            );
-                        }
                         Ok((retry_req.bytes_consumed, Some(retry_req.original_request_id)))
                     }
                     Err(e) => Err(e.into()),
                 }
             }) {
-                Ok(latencies) => latencies,
+                Ok(responses) => responses,
                 Err(e) => {
                     if let crate::Error::Connection(_) = e {
                         let _ = self.pool.close(connection_id);
@@ -458,8 +483,16 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
                 }
             };
 
-            // Record all latencies with group_id and connection_id
-            for (_req_id, latency) in latencies {
+            // Record latencies and RX bytes with group_id and connection_id (skip warmup requests)
+            for (req_id, latency, is_warmup, bytes_consumed) in responses {
+                if is_warmup {
+                    response_warmup.insert(req_id, true);
+                    continue;
+                }
+                response_warmup.insert(req_id, false);
+                if bytes_consumed > 0 {
+                    self.stats.record_rx_bytes(group_id, connection_id, bytes_consumed);
+                }
                 self.stats.record_latency(group_id, connection_id, latency);
             }
 
@@ -467,7 +500,10 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             self.pool.reschedule_connection(connection_id);
 
             // Collect retries for this connection
-            for retry in connection_retries {
+            for mut retry in connection_retries {
+                if let Some(is_warmup) = response_warmup.get(&retry.original_request_id) {
+                    retry.is_warmup = *is_warmup;
+                }
                 retries.push((group_id, retry));
             }
         }
@@ -509,8 +545,11 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         // Generate and send retry request using the original request ID
         let protocol = self.protocols.get_mut(&group_id).expect("Protocol not found for group_id");
 
-        let (retry_data, retry_req_id) =
+        let (retry_data, retry_req_id, mut meta) =
             protocol.regenerate_request(target_connection_id, retry_req.original_request_id);
+        if retry_req.is_warmup {
+            meta.is_warmup = true;
+        }
 
         // Record retry request to dump file if enabled
         if let Some(ref dumper) = self.request_dumper {
@@ -522,8 +561,11 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         // Note: We intentionally do NOT call state.on_request_sent() or generator.mark_request_sent()
         // because retries are already counted as in-flight from the original request. Double-counting
         // would skew rate limiting and statistics (especially for Redis Cluster MOVED/ASK redirects).
-        self.pool.send(target_connection_id, &retry_data, retry_req_id)?;
-        self.stats.record_tx_bytes(group_id, target_connection_id, retry_data.len());
+        self.pool
+            .send(target_connection_id, &retry_data, retry_req_id, meta.is_warmup)?;
+        if !meta.is_warmup {
+            self.stats.record_tx_bytes(group_id, target_connection_id, retry_data.len());
+        }
 
         Ok(())
     }
@@ -575,21 +617,23 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             let protocol =
                 self.protocols.get_mut(&group_id).expect("Protocol not found for group_id");
 
-            let stats = &mut self.stats;
-            let conn_id_for_stats = connection_id;
-
             #[allow(clippy::excessive_nesting)]
-            let _ = self.pool.recv_responses(connection_id, |data| {
+            if let Ok(responses) = self.pool.recv_responses(connection_id, |data| {
                 match protocol.parse_response(connection_id, data) {
-                    Ok((bytes_consumed, req_id_opt)) => {
-                        if bytes_consumed > 0 {
-                            stats.record_rx_bytes(group_id, conn_id_for_stats, bytes_consumed);
-                        }
-                        Ok((bytes_consumed, req_id_opt))
-                    }
+                    Ok((bytes_consumed, req_id_opt)) => Ok((bytes_consumed, req_id_opt)),
                     Err(e) => Err(e.into()),
                 }
-            });
+            }) {
+                for (_req_id, latency, is_warmup, bytes_consumed) in responses {
+                    if is_warmup {
+                        continue;
+                    }
+                    if bytes_consumed > 0 {
+                        self.stats.record_rx_bytes(group_id, connection_id, bytes_consumed);
+                    }
+                    self.stats.record_latency(group_id, connection_id, latency);
+                }
+            }
         }
 
         Ok(any_pending)
@@ -653,16 +697,20 @@ mod tests {
     impl<P: xylem_protocols::Protocol> Protocol for ProtocolAdapter<P> {
         type RequestId = P::RequestId;
 
-        fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId) {
-            self.inner.next_request(conn_id)
+        fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId, RequestMeta) {
+            let (data, req_id, proto_meta) = self.inner.next_request(conn_id);
+            // Convert xylem_protocols::RequestMeta to xylem_core::RequestMeta
+            (data, req_id, RequestMeta { is_warmup: proto_meta.is_warmup })
         }
 
         fn regenerate_request(
             &mut self,
             conn_id: usize,
             original_request_id: Self::RequestId,
-        ) -> (Vec<u8>, Self::RequestId) {
-            self.inner.regenerate_request(conn_id, original_request_id)
+        ) -> (Vec<u8>, Self::RequestId, RequestMeta) {
+            let (data, req_id, proto_meta) =
+                self.inner.regenerate_request(conn_id, original_request_id);
+            (data, req_id, RequestMeta { is_warmup: proto_meta.is_warmup })
         }
 
         fn parse_response(
@@ -671,6 +719,27 @@ mod tests {
             data: &[u8],
         ) -> anyhow::Result<(usize, Option<Self::RequestId>)> {
             self.inner.parse_response(conn_id, data)
+        }
+
+        fn parse_response_extended(
+            &mut self,
+            conn_id: usize,
+            data: &[u8],
+        ) -> anyhow::Result<ParseResult<Self::RequestId>> {
+            match self.inner.parse_response_extended(conn_id, data)? {
+                xylem_protocols::ParseResult::Complete { bytes_consumed, request_id } => {
+                    Ok(ParseResult::Complete { bytes_consumed, request_id })
+                }
+                xylem_protocols::ParseResult::Incomplete => Ok(ParseResult::Incomplete),
+                xylem_protocols::ParseResult::Retry(r) => Ok(ParseResult::Retry(RetryRequest {
+                    bytes_consumed: r.bytes_consumed,
+                    original_request_id: r.original_request_id,
+                    is_warmup: r.is_warmup,
+                    target_conn_id: r.target_conn_id,
+                    prepare_commands: r.prepare_commands,
+                    attempt: r.attempt,
+                })),
+            }
         }
 
         fn name(&self) -> &'static str {

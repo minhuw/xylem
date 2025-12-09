@@ -7,6 +7,35 @@ use anyhow::Result;
 use std::fmt::Debug;
 use std::hash::Hash;
 
+/// Request metadata returned alongside request data
+///
+/// This struct provides additional information about a request that the
+/// protocol generates, allowing the core to make decisions about how to
+/// handle the request (e.g., whether to collect stats).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RequestMeta {
+    /// True if this is a warm-up request (stats should not be collected).
+    /// Warm-up requests are used for:
+    /// - Protocol handshakes
+    /// - Data population/insertion phases
+    /// - Cache warming
+    pub is_warmup: bool,
+}
+
+impl RequestMeta {
+    /// Create metadata for a normal measurement request
+    #[inline]
+    pub fn measurement() -> Self {
+        Self { is_warmup: false }
+    }
+
+    /// Create metadata for a warm-up request (stats not collected)
+    #[inline]
+    pub fn warmup() -> Self {
+        Self { is_warmup: true }
+    }
+}
+
 /// Retry request information for protocol-level retries
 ///
 /// This is used when a protocol needs to retry a request, typically
@@ -17,6 +46,8 @@ pub struct RetryRequest<ReqId> {
     pub bytes_consumed: usize,
     /// Original request ID that triggered this retry (protocol uses this to look up request data)
     pub original_request_id: ReqId,
+    /// Whether the original request was warmup (used to preserve stats gating on retries)
+    pub is_warmup: bool,
     /// Target connection ID for the retry (None = use routing logic)
     pub target_conn_id: Option<usize>,
     /// Preparation commands to send before the retry (e.g., ASKING for Redis Cluster)
@@ -58,8 +89,9 @@ pub trait Protocol: Send {
     /// * `conn_id` - Connection identifier (for protocols that need per-connection state)
     ///
     /// # Returns
-    /// (request_data, request_id) tuple
-    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId);
+    /// (request_data, request_id, metadata) tuple where metadata indicates
+    /// whether this is a warm-up request (stats should not be collected)
+    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId, RequestMeta);
 
     /// Regenerate a request for retry using the original request ID
     ///
@@ -72,15 +104,18 @@ pub trait Protocol: Send {
     /// * `original_request_id` - The request ID from the original request
     ///
     /// # Returns
-    /// (request_data, new_request_id) tuple
+    /// (request_data, new_request_id, metadata) tuple
     ///
     /// Default implementation just generates a new request (ignores original).
+    /// Retries are always measurement requests (not warmup).
     fn regenerate_request(
         &mut self,
         conn_id: usize,
         _original_request_id: Self::RequestId,
-    ) -> (Vec<u8>, Self::RequestId) {
-        self.next_request(conn_id)
+    ) -> (Vec<u8>, Self::RequestId, RequestMeta) {
+        let (data, req_id, _) = self.next_request(conn_id);
+        // Retries are always measurement requests
+        (data, req_id, RequestMeta::measurement())
     }
 
     /// Parse a response and return the request ID it corresponds to
@@ -158,9 +193,9 @@ pub mod xylem_echo;
 
 // Re-export commonly used types
 pub use configs::{
-    CommandValueSizeConfig, DataImportConfig, HttpConfig, KeysConfig, MasstreeConfig,
-    MasstreeScanConfig, MemcachedConfig, RedisCommandParams, RedisCommandWeight, RedisConfig,
-    RedisOperationsConfig, ValueSizeConfig, VerificationConfig, XylemEchoConfig,
+    CommandValueSizeConfig, DataImportConfig, HttpConfig, InsertPhaseConfig, KeysConfig,
+    MasstreeConfig, MasstreeScanConfig, MemcachedConfig, RedisCommandParams, RedisCommandWeight,
+    RedisConfig, RedisOperationsConfig, ValueSizeConfig, VerificationConfig, XylemEchoConfig,
 };
 pub use factories::{
     HttpFactory, MemcachedAsciiFactory, MemcachedBinaryFactory, ProtocolRegistry, RedisFactory,

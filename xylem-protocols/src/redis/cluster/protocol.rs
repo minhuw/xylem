@@ -37,6 +37,7 @@ struct RequestMetadata {
     value_size: usize,
     slot: u16,
     original_conn_id: usize,
+    is_warmup: bool,
 }
 
 /// Redis Cluster protocol with automatic slot-based routing
@@ -129,8 +130,34 @@ impl RedisClusterProtocol {
         key_gen: crate::workload::KeyGeneration,
         value_size: usize,
     ) -> Self {
+        Self::with_workload_and_options(
+            command_selector,
+            key_gen,
+            value_size,
+            "key:".to_string(),
+            false,
+            None,
+        )
+    }
+
+    /// Create with embedded workload generator and custom options
+    pub fn with_workload_and_options(
+        command_selector: Box<dyn CommandSelector<RedisOp>>,
+        key_gen: crate::workload::KeyGeneration,
+        value_size: usize,
+        key_prefix: String,
+        random_data: bool,
+        seed: Option<u64>,
+    ) -> Self {
         Self {
-            base_protocol: RedisProtocol::with_workload(command_selector, key_gen, value_size),
+            base_protocol: RedisProtocol::with_workload_and_options(
+                command_selector,
+                key_gen,
+                value_size,
+                key_prefix,
+                random_data,
+                seed,
+            ),
             topology: ClusterTopology::new(),
             max_redirects: 5,
             redirect_stats: RedirectStats::default(),
@@ -140,6 +167,12 @@ impl RedisClusterProtocol {
             request_metadata: HashMap::new(),
             retry_counts: HashMap::new(),
         }
+    }
+
+    /// Set up insert phase for data population before measurement
+    pub fn with_insert_phase(mut self, key_count: u64, value_size: usize) -> Self {
+        self.base_protocol = self.base_protocol.with_insert_phase(key_count, value_size);
+        self
     }
 
     /// Register a connection for a specific cluster node
@@ -307,6 +340,7 @@ impl RedisClusterProtocol {
                 Ok(crate::RetryRequest {
                     bytes_consumed: consumed,
                     original_request_id: cluster_req_id,
+                    is_warmup: metadata.is_warmup,
                     target_conn_id,
                     prepare_commands: vec![],
                     attempt: retry_count,
@@ -321,6 +355,7 @@ impl RedisClusterProtocol {
                 Ok(crate::RetryRequest {
                     bytes_consumed: consumed,
                     original_request_id: cluster_req_id,
+                    is_warmup: metadata.is_warmup,
                     target_conn_id,
                     prepare_commands: vec![asking_cmd],
                     attempt: retry_count,
@@ -360,28 +395,63 @@ impl RedisClusterProtocol {
 impl Protocol for RedisClusterProtocol {
     type RequestId = ClusterRequestId;
 
-    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId) {
-        // Delegate to base protocol's key generation then route
-        let key = self.base_protocol.key_gen_mut().map(|g| g.next_key()).unwrap_or(0);
+    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId, crate::RequestMeta) {
+        // Phase 1: Insert phase (warmup) - populate data before measurement
+        if let Some(ref mut insert_state) = self.base_protocol.insert_phase {
+            if let Some(key) = insert_state.next_key() {
+                let value_size = insert_state.value_size;
+                let (data, req_id) = self.generate_request_with_key_and_operation(
+                    conn_id,
+                    key,
+                    value_size,
+                    &RedisOp::Set,
+                );
+                self.mark_request_warmup(req_id);
+                return (data, req_id, crate::RequestMeta::warmup());
+            }
+        }
+
+        // Phase 2: Normal measurement phase
         let value_size = self.base_protocol.value_size();
-        self.generate_request_with_key(conn_id, key, value_size)
+
+        let (data, req_id) = if self.base_protocol.command_selector.has_per_command_keys() {
+            let operation = self.base_protocol.command_selector.next_command();
+            self.base_protocol.record_command(&operation);
+            let key = self
+                .base_protocol
+                .command_selector
+                .generate_key_for_command(&operation)
+                .expect("Per-command key generation should be available");
+
+            self.generate_request_with_key_and_operation(conn_id, key, value_size, &operation)
+        } else {
+            let key = self.base_protocol.key_gen_mut().map(|g| g.next_key()).unwrap_or(0);
+            self.generate_request_with_key(conn_id, key, value_size)
+        };
+
+        (data, req_id, crate::RequestMeta::measurement())
     }
 
     fn regenerate_request(
         &mut self,
         conn_id: usize,
         original_request_id: Self::RequestId,
-    ) -> (Vec<u8>, Self::RequestId) {
+    ) -> (Vec<u8>, Self::RequestId, crate::RequestMeta) {
         // Extract base request ID from cluster request ID
         let (_orig_conn, _slot, base_req_id) = original_request_id;
 
         // Look up original request metadata
-        if let Some(metadata) = self.request_metadata.get(&base_req_id).copied() {
-            self.generate_request_with_key(conn_id, metadata.key, metadata.value_size)
-        } else {
-            // Fallback: generate new request if metadata not found
-            self.next_request(conn_id)
-        }
+        let (data, req_id) =
+            if let Some(metadata) = self.request_metadata.get(&base_req_id).copied() {
+                self.generate_request_with_key(conn_id, metadata.key, metadata.value_size)
+            } else {
+                // Fallback: generate new request if metadata not found
+                let key = self.base_protocol.key_gen_mut().map(|g| g.next_key()).unwrap_or(0);
+                let value_size = self.base_protocol.value_size();
+                self.generate_request_with_key(conn_id, key, value_size)
+            };
+        // Retries are always measurement requests
+        (data, req_id, crate::RequestMeta::measurement())
     }
 
     fn parse_response(
@@ -415,17 +485,17 @@ impl Protocol for RedisClusterProtocol {
 }
 
 impl RedisClusterProtocol {
-    /// Generate a request with specific key and value size
-    ///
-    /// This is used for testing and for routing requests with known keys.
-    pub fn generate_request_with_key(
+    fn build_cluster_request<F>(
         &mut self,
         conn_id: usize,
         key: u64,
         value_size: usize,
-    ) -> (Vec<u8>, ClusterRequestId) {
-        // Format key as "key:{n}"
-        let key_str = format!("key:{}", key);
+        build_request: F,
+    ) -> (Vec<u8>, ClusterRequestId)
+    where
+        F: FnOnce(&mut RedisProtocol, usize, u64, usize) -> (Vec<u8>, (usize, u64)),
+    {
+        let key_str = self.base_protocol.format_key(key);
         let key_bytes = key_str.as_bytes();
 
         // Calculate slot for this key
@@ -462,9 +532,9 @@ impl RedisClusterProtocol {
             }
         };
 
-        // Generate request using base protocol
+        // Generate request using provided builder
         let (request_data, base_req_id) =
-            self.base_protocol.generate_request_with_key(target_conn_id, key, value_size);
+            build_request(&mut self.base_protocol, target_conn_id, key, value_size);
 
         // Store request metadata for potential retry (Phase 7)
         let metadata = RequestMetadata {
@@ -472,6 +542,7 @@ impl RedisClusterProtocol {
             value_size,
             slot,
             original_conn_id: conn_id,
+            is_warmup: false,
         };
         self.request_metadata.insert(base_req_id, metadata);
 
@@ -479,6 +550,50 @@ impl RedisClusterProtocol {
         let cluster_req_id = (conn_id, slot, base_req_id);
 
         (request_data, cluster_req_id)
+    }
+
+    fn mark_request_warmup(&mut self, cluster_req_id: ClusterRequestId) {
+        let base_req_id = cluster_req_id.2;
+        if let Some(meta) = self.request_metadata.get_mut(&base_req_id) {
+            meta.is_warmup = true;
+        }
+    }
+
+    /// Generate a request with specific key and value size
+    ///
+    /// This is used for testing and for routing requests with known keys.
+    pub fn generate_request_with_key(
+        &mut self,
+        conn_id: usize,
+        key: u64,
+        value_size: usize,
+    ) -> (Vec<u8>, ClusterRequestId) {
+        self.build_cluster_request(
+            conn_id,
+            key,
+            value_size,
+            |protocol, target_conn_id, key, value_size| {
+                protocol.generate_request_with_key(target_conn_id, key, value_size)
+            },
+        )
+    }
+
+    /// Generate a request for a specific operation with known key/value size
+    fn generate_request_with_key_and_operation(
+        &mut self,
+        conn_id: usize,
+        key: u64,
+        value_size: usize,
+        operation: &RedisOp,
+    ) -> (Vec<u8>, ClusterRequestId) {
+        self.build_cluster_request(
+            conn_id,
+            key,
+            value_size,
+            |protocol, target_conn_id, key, value_size| {
+                protocol.generate_request_for_op(target_conn_id, key, value_size, operation)
+            },
+        )
     }
 
     fn parse_response_impl(
@@ -491,11 +606,17 @@ impl RedisClusterProtocol {
 
         match result {
             Ok((consumed, Some((target_conn, seq)))) => {
-                // Success - construct cluster request ID
-                // We need the original conn_id and slot, but we don't have them here
-                // For now, use conn_id as original and slot 0 as placeholder
-                // This is a limitation of the current design - Phase 5 will track this properly
-                let cluster_req_id = (conn_id, 0, (target_conn, seq));
+                // Success - construct cluster request ID and clean up metadata
+                let base_req_id = (target_conn, seq);
+                let metadata = self.request_metadata.remove(&base_req_id);
+                self.retry_counts.remove(&base_req_id);
+
+                let cluster_req_id = if let Some(meta) = metadata {
+                    (meta.original_conn_id, meta.slot, base_req_id)
+                } else {
+                    (conn_id, 0, base_req_id)
+                };
+
                 Ok((consumed, Some(cluster_req_id)))
             }
             Ok((consumed, None)) => {

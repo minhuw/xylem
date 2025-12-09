@@ -41,16 +41,30 @@ impl<P: xylem_protocols::Protocol> ProtocolAdapter<P> {
 impl<P: xylem_protocols::Protocol> xylem_core::threading::worker::Protocol for ProtocolAdapter<P> {
     type RequestId = P::RequestId;
 
-    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId) {
-        self.inner.next_request(conn_id)
+    fn next_request(
+        &mut self,
+        conn_id: usize,
+    ) -> (Vec<u8>, Self::RequestId, xylem_core::threading::RequestMeta) {
+        let (data, req_id, proto_meta) = self.inner.next_request(conn_id);
+        (
+            data,
+            req_id,
+            xylem_core::threading::RequestMeta { is_warmup: proto_meta.is_warmup },
+        )
     }
 
     fn regenerate_request(
         &mut self,
         conn_id: usize,
         original_request_id: Self::RequestId,
-    ) -> (Vec<u8>, Self::RequestId) {
-        self.inner.regenerate_request(conn_id, original_request_id)
+    ) -> (Vec<u8>, Self::RequestId, xylem_core::threading::RequestMeta) {
+        let (data, req_id, proto_meta) =
+            self.inner.regenerate_request(conn_id, original_request_id);
+        (
+            data,
+            req_id,
+            xylem_core::threading::RequestMeta { is_warmup: proto_meta.is_warmup },
+        )
     }
 
     fn parse_response(

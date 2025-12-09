@@ -81,6 +81,48 @@ pub enum MasstreeOp {
     Checkpoint,
 }
 
+/// Insert phase state for data population before measurement
+#[derive(Debug)]
+pub struct InsertPhaseState {
+    /// Total number of keys to insert
+    key_count: u64,
+    /// Next key to insert
+    next_key: u64,
+    /// Value size for inserts
+    value_size: usize,
+    /// Whether insert phase is complete
+    complete: bool,
+}
+
+impl InsertPhaseState {
+    /// Create new insert phase state
+    pub fn new(key_count: u64, value_size: usize) -> Self {
+        Self {
+            key_count,
+            next_key: 0,
+            value_size,
+            complete: false,
+        }
+    }
+
+    /// Check if insert phase is complete
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    /// Get next key to insert, returns None if insert phase is complete
+    pub fn next_key(&mut self) -> Option<u64> {
+        if self.next_key >= self.key_count {
+            self.complete = true;
+            None
+        } else {
+            let key = self.next_key;
+            self.next_key += 1;
+            Some(key)
+        }
+    }
+}
+
 pub struct MasstreeProtocol {
     operation: MasstreeOp,
     /// Per-connection sequence numbers
@@ -99,6 +141,8 @@ pub struct MasstreeProtocol {
     random_data: bool,
     /// RNG for random data generation (only used when random_data is true)
     rng: Option<rand::rngs::SmallRng>,
+    /// Insert phase state (None = no insert phase, go straight to measurement)
+    insert_phase: Option<InsertPhaseState>,
 }
 
 impl MasstreeProtocol {
@@ -113,6 +157,7 @@ impl MasstreeProtocol {
             key_prefix: "key:".to_string(),
             random_data: false,
             rng: None,
+            insert_phase: None,
         }
     }
 
@@ -129,6 +174,7 @@ impl MasstreeProtocol {
             "key:".to_string(),
             false,
             None,
+            None,
         )
     }
 
@@ -140,6 +186,7 @@ impl MasstreeProtocol {
         key_prefix: String,
         random_data: bool,
         seed: Option<u64>,
+        insert_phase: Option<InsertPhaseState>,
     ) -> Self {
         use rand::SeedableRng;
 
@@ -162,7 +209,19 @@ impl MasstreeProtocol {
             key_prefix,
             random_data,
             rng,
+            insert_phase,
         }
+    }
+
+    /// Set the insert phase configuration
+    pub fn with_insert_phase(mut self, key_count: u64, value_size: usize) -> Self {
+        self.insert_phase = Some(InsertPhaseState::new(key_count, value_size));
+        self
+    }
+
+    /// Check if currently in insert phase (warmup)
+    pub fn is_in_insert_phase(&self) -> bool {
+        self.insert_phase.as_ref().is_some_and(|p| !p.is_complete())
     }
 
     fn next_send_seq(&mut self, conn_id: usize) -> u16 {
@@ -401,18 +460,13 @@ impl Default for MasstreeProtocol {
 
 impl MasstreeProtocol {
     /// Internal method to generate a request with specific key and value size
+    /// Note: Caller should check handshake state before calling this
     fn generate_request_internal(
         &mut self,
         conn_id: usize,
         key: u64,
         value_size: usize,
     ) -> (Vec<u8>, (usize, u16)) {
-        // Check if handshake is done for this connection
-        if !self.is_handshake_done(conn_id) {
-            let handshake = self.build_handshake().expect("Failed to build handshake request");
-            return (handshake, (conn_id, 0));
-        }
-
         let seq = self.next_send_seq(conn_id);
         // Format key with configurable prefix
         let key_str = self.format_key(key);
@@ -448,9 +502,31 @@ impl MasstreeProtocol {
 impl Protocol for MasstreeProtocol {
     type RequestId = (usize, u16);
 
-    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId) {
+    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId, crate::RequestMeta) {
+        // Phase 1: Handshake (warmup)
+        if !self.is_handshake_done(conn_id) {
+            let handshake = self.build_handshake().expect("Failed to build handshake request");
+            return (handshake, (conn_id, 0), crate::RequestMeta::warmup());
+        }
+
+        // Phase 2: Insert phase (warmup) - populate data before measurement
+        if let Some(ref mut insert_state) = self.insert_phase {
+            if let Some(key) = insert_state.next_key() {
+                let value_size = insert_state.value_size;
+                let seq = self.next_send_seq(conn_id);
+                let key_str = self.format_key(key);
+                let value = self.generate_value(value_size);
+                let request = self
+                    .build_set_request(seq, &key_str, &value)
+                    .expect("Failed to build SET request for insert phase");
+                return (request, (conn_id, seq), crate::RequestMeta::warmup());
+            }
+        }
+
+        // Phase 3: Normal measurement phase
         let key = self.key_gen.as_mut().map(|g| g.next_key()).unwrap_or(0);
-        self.generate_request_internal(conn_id, key, self.value_size)
+        let (data, req_id) = self.generate_request_internal(conn_id, key, self.value_size);
+        (data, req_id, crate::RequestMeta::measurement())
     }
 
     fn parse_response(
@@ -740,7 +816,7 @@ mod tests {
     #[test]
     fn test_handshake_request() {
         let mut proto = MasstreeProtocol::new(MasstreeOp::Get);
-        let (req, (conn_id, seq)) = proto.next_request(0);
+        let (req, (conn_id, seq), _meta) = proto.next_request(0);
 
         assert_eq!(conn_id, 0);
         assert_eq!(seq, 0); // Handshake uses seq 0
@@ -757,7 +833,7 @@ mod tests {
         // Mark handshake as done
         proto.mark_handshake_done(0);
 
-        let (req, (conn_id, seq)) = proto.next_request(0);
+        let (req, (conn_id, seq), _meta) = proto.next_request(0);
 
         assert_eq!(conn_id, 0);
         assert_eq!(seq, 0); // First request after handshake
@@ -773,7 +849,7 @@ mod tests {
         // Mark handshake as done
         proto.mark_handshake_done(0);
 
-        let (req, (conn_id, seq)) = proto.next_request(0);
+        let (req, (conn_id, seq), _meta) = proto.next_request(0);
 
         assert_eq!(conn_id, 0);
         assert_eq!(seq, 0);
@@ -789,9 +865,9 @@ mod tests {
         proto.mark_handshake_done(0);
 
         // Same conn_id, sequence increments
-        let (_, (_, seq1)) = proto.next_request(0);
-        let (_, (_, seq2)) = proto.next_request(0);
-        let (_, (_, seq3)) = proto.next_request(0);
+        let (_, (_, seq1), _) = proto.next_request(0);
+        let (_, (_, seq2), _) = proto.next_request(0);
+        let (_, (_, seq3), _) = proto.next_request(0);
 
         assert_eq!(seq1, 0);
         assert_eq!(seq2, 1);
@@ -804,9 +880,9 @@ mod tests {
         proto.mark_handshake_done(0);
         proto.mark_handshake_done(1);
 
-        let (_, (conn0, seq_conn0_1)) = proto.next_request(0);
-        let (_, (conn1, seq_conn1_1)) = proto.next_request(1);
-        let (_, (_, seq_conn0_2)) = proto.next_request(0);
+        let (_, (conn0, seq_conn0_1), _) = proto.next_request(0);
+        let (_, (conn1, seq_conn1_1), _) = proto.next_request(1);
+        let (_, (_, seq_conn0_2), _) = proto.next_request(0);
 
         assert_eq!(conn0, 0);
         assert_eq!(conn1, 1);
@@ -820,7 +896,7 @@ mod tests {
         let mut proto = MasstreeProtocol::new(MasstreeOp::Remove);
         proto.mark_handshake_done(0);
 
-        let (req, (conn_id, seq)) = proto.next_request(0);
+        let (req, (conn_id, seq), _meta) = proto.next_request(0);
 
         assert_eq!(conn_id, 0);
         assert_eq!(seq, 0);
@@ -837,7 +913,7 @@ mod tests {
         let mut proto = MasstreeProtocol::new(MasstreeOp::Put { columns });
         proto.mark_handshake_done(0);
 
-        let (req, (conn_id, seq)) = proto.next_request(0);
+        let (req, (conn_id, seq), _meta) = proto.next_request(0);
 
         assert_eq!(conn_id, 0);
         assert_eq!(seq, 0);
@@ -857,7 +933,7 @@ mod tests {
         let mut proto = MasstreeProtocol::new(scan_op);
         proto.mark_handshake_done(0);
 
-        let (req, (conn_id, seq)) = proto.next_request(0);
+        let (req, (conn_id, seq), _meta) = proto.next_request(0);
 
         assert_eq!(conn_id, 0);
         assert_eq!(seq, 0);
@@ -873,7 +949,7 @@ mod tests {
         let mut proto = MasstreeProtocol::new(MasstreeOp::Checkpoint);
         proto.mark_handshake_done(0);
 
-        let (req, (conn_id, seq)) = proto.next_request(0);
+        let (req, (conn_id, seq), _meta) = proto.next_request(0);
 
         assert_eq!(conn_id, 0);
         assert_eq!(seq, 0);
@@ -900,11 +976,11 @@ mod tests {
         // Test that different operations work on same protocol instance
         let mut proto1 = MasstreeProtocol::new(MasstreeOp::Get);
         proto1.mark_handshake_done(0);
-        let (req1, _) = proto1.next_request(0);
+        let (req1, _, _) = proto1.next_request(0);
 
         let mut proto2 = MasstreeProtocol::new(MasstreeOp::Remove);
         proto2.mark_handshake_done(0);
-        let (req2, _) = proto2.next_request(0);
+        let (req2, _, _) = proto2.next_request(0);
 
         // Requests should be different
         assert_ne!(req1, req2);
@@ -922,10 +998,11 @@ mod tests {
             "memtier-".to_string(),
             false,
             None,
+            None, // no insert phase
         );
         proto.mark_handshake_done(0);
 
-        let (req, _) = proto.next_request(0);
+        let (req, _, _) = proto.next_request(0);
         let req_str = String::from_utf8_lossy(&req);
 
         assert!(req_str.contains("memtier-"), "Expected custom key prefix 'memtier-'");
@@ -944,10 +1021,11 @@ mod tests {
             "test:".to_string(),
             false,
             None,
+            None, // no insert phase
         );
         proto.mark_handshake_done(0);
 
-        let (req, _) = proto.next_request(0);
+        let (req, _, _) = proto.next_request(0);
         let req_str = String::from_utf8_lossy(&req);
 
         assert!(req_str.contains("test:100"), "Expected custom key prefix 'test:'");
@@ -965,10 +1043,11 @@ mod tests {
             "key:".to_string(),
             true,     // Enable random data
             Some(42), // Use fixed seed for reproducibility
+            None,     // no insert phase
         );
         proto.mark_handshake_done(0);
 
-        let (req, _) = proto.next_request(0);
+        let (req, _, _) = proto.next_request(0);
 
         // Count occurrences of 'x' - random data should have fewer consecutive x's
         let x_count = req.iter().filter(|&&b| b == b'x').count();
@@ -994,6 +1073,7 @@ mod tests {
             "key:".to_string(),
             true,
             Some(12345),
+            None, // no insert phase
         );
         proto1.mark_handshake_done(0);
 
@@ -1005,12 +1085,13 @@ mod tests {
             "key:".to_string(),
             true,
             Some(12345),
+            None, // no insert phase
         );
         proto2.mark_handshake_done(0);
 
         // Generate requests - they should be identical with the same seed
-        let (req1, _) = proto1.next_request(0);
-        let (req2, _) = proto2.next_request(0);
+        let (req1, _, _) = proto1.next_request(0);
+        let (req2, _, _) = proto2.next_request(0);
 
         assert_eq!(req1, req2, "Same seed should produce same random data");
     }
@@ -1027,6 +1108,7 @@ mod tests {
             "custom:".to_string(),
             false,
             None,
+            None, // no insert phase
         );
 
         assert_eq!(proto.key_prefix(), "custom:");
@@ -1045,6 +1127,7 @@ mod tests {
             "key:".to_string(),
             true,
             Some(42),
+            None, // no insert phase
         );
 
         assert!(proto.random_data());
@@ -1055,5 +1138,56 @@ mod tests {
         let proto = MasstreeProtocol::new(MasstreeOp::Get);
         assert_eq!(proto.key_prefix(), "key:");
         assert!(!proto.random_data());
+    }
+
+    #[test]
+    fn test_insert_phase_warmup() {
+        use crate::workload::KeyGeneration;
+
+        // Create protocol with insert phase of 10 keys
+        let key_gen = KeyGeneration::sequential(0);
+        let insert_phase = InsertPhaseState::new(10, 64); // 10 keys, value_size 64
+        let mut proto = MasstreeProtocol::with_workload_and_options(
+            MasstreeOp::Get,
+            key_gen,
+            64,
+            "key:".to_string(),
+            false,
+            None,
+            Some(insert_phase),
+        );
+
+        // First request is handshake (seq 0), should be warmup
+        let (_, (_, seq), meta) = proto.next_request(0);
+        assert_eq!(seq, 0, "First request should be handshake with seq 0");
+        assert!(meta.is_warmup, "Handshake should be warmup");
+
+        // Mark handshake done
+        proto.mark_handshake_done(0);
+
+        // Insert phase requests should be warmup and SET operations
+        for i in 0..10 {
+            let (req, _, meta) = proto.next_request(0);
+            assert!(meta.is_warmup, "Insert phase request {} should be warmup", i);
+            // The request should be a SET operation during insert phase
+            let req_str = String::from_utf8_lossy(&req);
+            assert!(req_str.contains(&format!("key:{}", i)), "Should use sequential keys");
+        }
+
+        // After insert phase, requests should not be warmup
+        let (_, _, meta) = proto.next_request(0);
+        assert!(!meta.is_warmup, "After insert phase, requests should not be warmup");
+    }
+
+    #[test]
+    fn test_insert_phase_with_builder() {
+        // Test the builder method
+        let proto = MasstreeProtocol::new(MasstreeOp::Get).with_insert_phase(100, 128);
+
+        assert!(proto.is_in_insert_phase());
+
+        // Create without insert phase
+        let proto2 = MasstreeProtocol::new(MasstreeOp::Get);
+        assert!(!proto2.is_in_insert_phase());
     }
 }

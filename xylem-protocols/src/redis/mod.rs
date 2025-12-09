@@ -154,6 +154,55 @@ pub enum RedisOp {
     Custom(CommandTemplate),
 }
 
+/// Insert phase state for data population before measurement
+#[derive(Debug)]
+pub struct InsertPhaseState {
+    /// Total number of keys to insert
+    key_count: u64,
+    /// Number of keys inserted so far
+    inserted: u64,
+    /// Value size for inserts
+    value_size: usize,
+    /// Key generator for inserts (clone of workload generator to preserve distribution/seed)
+    key_gen: Option<crate::workload::KeyGeneration>,
+}
+
+impl InsertPhaseState {
+    /// Create new insert phase state
+    pub fn new(
+        key_count: u64,
+        value_size: usize,
+        key_gen: Option<crate::workload::KeyGeneration>,
+    ) -> Self {
+        Self {
+            key_count,
+            inserted: 0,
+            value_size,
+            key_gen,
+        }
+    }
+
+    /// Check if insert phase is complete
+    pub fn is_complete(&self) -> bool {
+        self.inserted >= self.key_count
+    }
+
+    /// Get next key to insert, returns None if insert phase is complete
+    pub fn next_key(&mut self) -> Option<u64> {
+        if self.inserted >= self.key_count {
+            None
+        } else {
+            self.inserted += 1;
+            let key = if let Some(ref mut key_gen) = self.key_gen {
+                key_gen.next_key()
+            } else {
+                self.inserted - 1 // Fallback to sequential if no generator is configured
+            };
+            Some(key)
+        }
+    }
+}
+
 pub struct RedisProtocol {
     command_selector: Box<dyn CommandSelector<RedisOp>>,
     /// Per-connection sequence numbers for send
@@ -182,6 +231,8 @@ pub struct RedisProtocol {
     random_data: bool,
     /// RNG for random data generation (only used when random_data is true)
     rng: Option<rand::rngs::SmallRng>,
+    /// Insert phase state (None = no insert phase, go straight to measurement)
+    insert_phase: Option<InsertPhaseState>,
 }
 
 impl RedisProtocol {
@@ -202,6 +253,7 @@ impl RedisProtocol {
             key_prefix: "key:".to_string(),
             random_data: false,
             rng: None,
+            insert_phase: None,
         }
     }
 
@@ -256,7 +308,21 @@ impl RedisProtocol {
             key_prefix,
             random_data,
             rng,
+            insert_phase: None,
         }
+    }
+
+    /// Set up insert phase for data population before measurement
+    pub fn with_insert_phase(mut self, key_count: u64, value_size: usize) -> Self {
+        // Clone generator so warmup uses same distribution/seed without consuming measurement generator
+        let insert_key_gen = self.key_gen.clone();
+        self.insert_phase = Some(InsertPhaseState::new(key_count, value_size, insert_key_gen));
+        self
+    }
+
+    /// Check if currently in insert phase (warmup)
+    pub fn is_in_insert_phase(&self) -> bool {
+        self.insert_phase.as_ref().is_some_and(|p| !p.is_complete())
     }
 
     /// Record a command execution
@@ -502,6 +568,24 @@ impl RedisProtocol {
 
         let request_data = self.format_command(&operation, key, value_size);
 
+        (request_data, id)
+    }
+
+    /// Generate a request with specific operation, key and value size
+    ///
+    /// This is used for insert phase warmup, where we always want SET regardless
+    /// of the configured command selector.
+    pub fn generate_request_for_op(
+        &mut self,
+        conn_id: usize,
+        key: u64,
+        value_size: usize,
+        operation: &RedisOp,
+    ) -> (Vec<u8>, (usize, u64)) {
+        let seq = self.next_send_seq(conn_id);
+        let id = (conn_id, seq);
+        self.record_command(operation);
+        let request_data = self.format_command(operation, key, value_size);
         (request_data, id)
     }
 
@@ -975,15 +1059,27 @@ impl RedisProtocol {
 impl Protocol for RedisProtocol {
     type RequestId = (usize, u64); // (conn_id, sequence)
 
-    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId) {
-        // Check if command selector has per-command keys
-        if self.command_selector.has_per_command_keys() {
+    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId, crate::RequestMeta) {
+        // Phase 1: Insert phase (warmup) - populate data before measurement
+        if let Some(ref mut insert_state) = self.insert_phase {
+            if let Some(key) = insert_state.next_key() {
+                let value_size = insert_state.value_size;
+                // Generate SET request for insert phase
+                let (data, req_id) =
+                    self.generate_request_for_op(conn_id, key, value_size, &RedisOp::Set);
+                return (data, req_id, crate::RequestMeta::warmup());
+            }
+        }
+
+        // Phase 2: Normal measurement phase
+        let (data, req_id) = if self.command_selector.has_per_command_keys() {
             self.generate_request_with_command_keys(conn_id, self.value_size)
         } else {
             // Use embedded key generator or default to 0
             let key = self.key_gen.as_mut().map(|g| g.next_key()).unwrap_or(0);
             self.generate_request_with_key(conn_id, key, self.value_size)
-        }
+        };
+        (data, req_id, crate::RequestMeta::measurement())
     }
 
     fn parse_response(

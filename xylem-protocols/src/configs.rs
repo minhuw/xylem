@@ -99,6 +99,19 @@ impl KeysConfig {
         }
     }
 
+    /// Get the keyspace size (number of unique keys) from this configuration.
+    /// For Sequential, returns None since keyspace is unbounded.
+    /// For other strategies, returns the configured max/n value.
+    pub fn keyspace_size(&self) -> Option<u64> {
+        match self {
+            Self::Sequential { .. } => None, // Unbounded
+            Self::Random { max, .. } => Some(*max),
+            Self::RoundRobin { max, .. } => Some(*max),
+            Self::Zipfian { n, .. } => Some(*n),
+            Self::Gaussian { max, .. } => Some(*max),
+        }
+    }
+
     /// Convert to a KeyGeneration instance for protocol-embedded workload
     pub fn to_key_gen(
         &self,
@@ -214,6 +227,13 @@ pub struct RedisConfig {
     /// Redis Cluster configuration (only for redis-cluster protocol)
     #[serde(default)]
     pub redis_cluster: Option<RedisClusterConfig>,
+    /// Insert phase configuration (populate keys before measurement)
+    ///
+    /// When configured, the protocol will first insert all keys using SET
+    /// before starting the normal workload. This is useful for benchmarks
+    /// that need pre-populated data (e.g., GET workloads).
+    #[serde(default)]
+    pub insert_phase: Option<InsertPhaseConfig>,
 }
 
 /// Redis Cluster configuration
@@ -306,6 +326,18 @@ impl CommandValueSizeConfig {
 }
 
 impl ValueSizeConfig {
+    /// Get a representative fixed size from this config.
+    /// For Fixed, returns the size. For Uniform, returns mean. For Normal, returns mean (as usize).
+    /// For PerCommand, returns the default's fixed size.
+    pub fn fixed_size(&self) -> usize {
+        match self {
+            Self::Fixed { size } => *size,
+            Self::Uniform { min, max } => (*min + *max) / 2,
+            Self::Normal { mean, .. } => *mean as usize,
+            Self::PerCommand { default, .. } => default.fixed_size(),
+        }
+    }
+
     /// Convert to a ValueSizeGenerator
     pub fn to_generator(
         &self,
@@ -425,6 +457,13 @@ pub struct MemcachedConfig {
     /// Operation to execute (default: GET)
     #[serde(default = "default_memcached_operation")]
     pub operation: String,
+    /// Insert phase configuration (populate keys before measurement)
+    ///
+    /// When configured, the protocol will first insert all keys using SET
+    /// before starting the normal workload. This is useful for benchmarks
+    /// that need pre-populated data (e.g., GET workloads).
+    #[serde(default)]
+    pub insert_phase: Option<InsertPhaseConfig>,
 }
 
 fn default_memcached_operation() -> String {
@@ -436,6 +475,7 @@ impl Default for MemcachedConfig {
         Self {
             keys: KeysConfig::default(),
             operation: default_memcached_operation(),
+            insert_phase: None,
         }
     }
 }
@@ -516,6 +556,60 @@ pub struct MasstreeConfig {
     /// Use random data for values instead of repeated 'x' characters
     #[serde(default)]
     pub random_data: bool,
+    /// Insert phase configuration (populate keys before measurement)
+    ///
+    /// When configured, the protocol will first insert all keys before
+    /// starting the normal workload. This is useful for benchmarks that
+    /// need pre-populated data (e.g., GET workloads).
+    #[serde(default)]
+    pub insert_phase: Option<InsertPhaseConfig>,
+}
+
+/// Insert phase configuration for populating data before measurement
+///
+/// During the insert phase:
+/// - All requests are tagged as "warmup" (stats not collected)
+/// - Keys [0, key_count) are inserted sequentially
+/// - After all keys are inserted, normal measurement begins
+///
+/// Both fields are optional and default to values from the `keys` config:
+/// - `key_count` defaults to the keyspace size from keys config
+/// - `value_size` defaults to `keys.value_size`
+///
+/// Example configurations:
+/// ```toml
+/// # Minimal - use defaults from keys config
+/// insert_phase = {}
+///
+/// # Override key count only (insert fewer keys than keyspace)
+/// insert_phase = { key_count = 100000 }
+///
+/// # Override both
+/// insert_phase = { key_count = 100000, value_size = 128 }
+/// ```
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct InsertPhaseConfig {
+    /// Number of keys to insert before measurement begins.
+    /// Defaults to keyspace size from keys config (n for Zipfian, max for Random, etc.)
+    #[serde(default)]
+    pub key_count: Option<u64>,
+    /// Value size for inserted keys.
+    /// Defaults to keys.value_size if not specified.
+    #[serde(default)]
+    pub value_size: Option<usize>,
+}
+
+impl InsertPhaseConfig {
+    /// Resolve key_count with fallback to provided default
+    pub fn key_count_or(&self, default: u64) -> u64 {
+        self.key_count.unwrap_or(default)
+    }
+
+    /// Resolve value_size with fallback to provided default
+    pub fn value_size_or(&self, default: usize) -> usize {
+        self.value_size.unwrap_or(default)
+    }
 }
 
 /// Masstree scan configuration
@@ -547,6 +641,7 @@ impl Default for MasstreeConfig {
             scan: None,
             value_size: None,
             random_data: false,
+            insert_phase: None,
         }
     }
 }

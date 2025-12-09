@@ -13,6 +13,48 @@ pub enum MemcachedOp {
     Set,
 }
 
+/// Insert phase state for data population before measurement
+#[derive(Debug)]
+pub struct InsertPhaseState {
+    key_count: u64,
+    inserted: u64,
+    value_size: usize,
+    key_gen: Option<crate::workload::KeyGeneration>,
+}
+
+impl InsertPhaseState {
+    pub fn new(
+        key_count: u64,
+        value_size: usize,
+        key_gen: Option<crate::workload::KeyGeneration>,
+    ) -> Self {
+        Self {
+            key_count,
+            inserted: 0,
+            value_size,
+            key_gen,
+        }
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.inserted >= self.key_count
+    }
+
+    pub fn next_key(&mut self) -> Option<u64> {
+        if self.inserted >= self.key_count {
+            None
+        } else {
+            self.inserted += 1;
+            let key = if let Some(ref mut key_gen) = self.key_gen {
+                key_gen.next_key()
+            } else {
+                self.inserted - 1 // Fallback to sequential if no generator is configured
+            };
+            Some(key)
+        }
+    }
+}
+
 pub struct MemcachedAsciiProtocol {
     operation: MemcachedOp,
     /// Per-connection sequence numbers for send
@@ -25,6 +67,8 @@ pub struct MemcachedAsciiProtocol {
     key_gen: Option<crate::workload::KeyGeneration>,
     /// Value size for next_request()
     value_size: usize,
+    /// Insert phase state
+    insert_phase: Option<InsertPhaseState>,
 }
 
 impl MemcachedAsciiProtocol {
@@ -36,6 +80,7 @@ impl MemcachedAsciiProtocol {
             pool: BufferPool::new(),
             key_gen: None,
             value_size: 64,
+            insert_phase: None,
         }
     }
 
@@ -52,7 +97,20 @@ impl MemcachedAsciiProtocol {
             pool: BufferPool::new(),
             key_gen: Some(key_gen),
             value_size,
+            insert_phase: None,
         }
+    }
+
+    /// Set up insert phase for data population before measurement
+    pub fn with_insert_phase(mut self, key_count: u64, value_size: usize) -> Self {
+        let insert_key_gen = self.key_gen.clone();
+        self.insert_phase = Some(InsertPhaseState::new(key_count, value_size, insert_key_gen));
+        self
+    }
+
+    /// Check if currently in insert phase (warmup)
+    pub fn is_in_insert_phase(&self) -> bool {
+        self.insert_phase.as_ref().is_some_and(|p| !p.is_complete())
     }
 
     fn next_send_seq(&mut self, conn_id: usize) -> u64 {
@@ -68,6 +126,26 @@ impl MemcachedAsciiProtocol {
         *seq += 1;
         result
     }
+
+    /// Generate a SET request for a specific key and value
+    fn generate_set_request(
+        &mut self,
+        conn_id: usize,
+        key: u64,
+        value_size: usize,
+    ) -> (Vec<u8>, (usize, u64)) {
+        let seq = self.next_send_seq(conn_id);
+        let mut buf = self.pool.get(256 + value_size);
+        buf.clear();
+        buf.extend_from_slice(b"set key:");
+        buf.extend_from_slice(key.to_string().as_bytes());
+        buf.extend_from_slice(b" 0 0 ");
+        buf.extend_from_slice(value_size.to_string().as_bytes());
+        buf.extend_from_slice(b"\r\n");
+        buf.resize(buf.len() + value_size, b'x');
+        buf.extend_from_slice(b"\r\n");
+        (buf.to_vec(), (conn_id, seq))
+    }
 }
 
 impl Default for MemcachedAsciiProtocol {
@@ -79,7 +157,17 @@ impl Default for MemcachedAsciiProtocol {
 impl Protocol for MemcachedAsciiProtocol {
     type RequestId = (usize, u64);
 
-    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId) {
+    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId, crate::RequestMeta) {
+        // Phase 1: Insert phase (warmup) - populate data before measurement
+        if let Some(ref mut insert_state) = self.insert_phase {
+            if let Some(key) = insert_state.next_key() {
+                let value_size = insert_state.value_size;
+                let (data, req_id) = self.generate_set_request(conn_id, key, value_size);
+                return (data, req_id, crate::RequestMeta::warmup());
+            }
+        }
+
+        // Phase 2: Normal measurement phase
         let key = self.key_gen.as_mut().map(|g| g.next_key()).unwrap_or(0);
         let seq = self.next_send_seq(conn_id);
         let request_data = match self.operation {
@@ -106,7 +194,7 @@ impl Protocol for MemcachedAsciiProtocol {
                 buf.to_vec()
             }
         };
-        (request_data, (conn_id, seq))
+        (request_data, (conn_id, seq), crate::RequestMeta::measurement())
     }
 
     fn parse_response(

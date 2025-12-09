@@ -177,16 +177,31 @@ impl<P: xylem_protocols::Protocol<RequestId = (usize, u64)> + 'static>
 {
     type RequestId = (usize, u64);
 
-    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId) {
-        self.inner.next_request(conn_id)
+    fn next_request(
+        &mut self,
+        conn_id: usize,
+    ) -> (Vec<u8>, Self::RequestId, xylem_core::threading::RequestMeta) {
+        let (data, req_id, proto_meta) = self.inner.next_request(conn_id);
+        // Convert xylem_protocols::RequestMeta to xylem_core::threading::RequestMeta
+        (
+            data,
+            req_id,
+            xylem_core::threading::RequestMeta { is_warmup: proto_meta.is_warmup },
+        )
     }
 
     fn regenerate_request(
         &mut self,
         conn_id: usize,
         original_request_id: Self::RequestId,
-    ) -> (Vec<u8>, Self::RequestId) {
-        self.inner.regenerate_request(conn_id, original_request_id)
+    ) -> (Vec<u8>, Self::RequestId, xylem_core::threading::RequestMeta) {
+        let (data, req_id, proto_meta) =
+            self.inner.regenerate_request(conn_id, original_request_id);
+        (
+            data,
+            req_id,
+            xylem_core::threading::RequestMeta { is_warmup: proto_meta.is_warmup },
+        )
     }
 
     fn parse_response(
@@ -216,6 +231,7 @@ impl<P: xylem_protocols::Protocol<RequestId = (usize, u64)> + 'static>
                 Ok(xylem_core::threading::ParseResult::Retry(xylem_core::threading::RetryRequest {
                     bytes_consumed: retry.bytes_consumed,
                     original_request_id: retry.original_request_id,
+                    is_warmup: retry.is_warmup,
                     target_conn_id: retry.target_conn_id,
                     prepare_commands: retry.prepare_commands,
                     attempt: retry.attempt,
@@ -540,10 +556,12 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                         anyhow::anyhow!("Redis protocol requires keys configuration")
                     })?;
                     let key_gen = keys_config.to_key_gen(config_for_worker.experiment.seed)?;
-                    let value_size = keys_config.value_size();
-                    let p = xylem_cli::multi_protocol::create_redis_protocol_with_workload(
-                        selector, key_gen, value_size,
-                    );
+                    let p = xylem_cli::multi_protocol::create_redis_protocol_from_config(
+                        redis_config,
+                        selector,
+                        key_gen,
+                        config_for_worker.experiment.seed,
+                    )?;
                     ProtocolAdapter::new(p)
                 }
                 (ParsedProtocolConfig::Redis(redis_config), "redis-cluster") => {
@@ -576,28 +594,33 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                         anyhow::anyhow!("Redis-cluster protocol requires keys configuration")
                     })?;
                     let key_gen = keys_config.to_key_gen(config_for_worker.experiment.seed)?;
-                    let value_size = keys_config.value_size();
-
-                    let p = xylem_cli::multi_protocol::create_redis_cluster_protocol_with_workload(
+                    let p = xylem_cli::multi_protocol::create_redis_cluster_protocol_from_config(
+                        redis_config,
                         selector,
                         cluster_proto_config,
-                        Some(key_gen),
-                        value_size,
+                        key_gen,
+                        config_for_worker.experiment.seed,
                     )?;
                     ProtocolAdapter::new(p)
                 }
                 (ParsedProtocolConfig::Memcached(mc_config), "memcached-binary") => {
                     let operation = parse_memcached_op_binary(&mc_config.operation)?;
-                    let p = xylem_cli::multi_protocol::create_memcached_binary_protocol_with_op(
+                    let key_gen = mc_config.keys.to_key_gen(config_for_worker.experiment.seed)?;
+                    let p = xylem_cli::multi_protocol::create_memcached_binary_protocol_from_config(
+                        mc_config,
                         operation,
-                    );
+                        key_gen,
+                    )?;
                     ProtocolAdapter::new(p)
                 }
                 (ParsedProtocolConfig::Memcached(mc_config), "memcached-ascii") => {
                     let operation = parse_memcached_op_ascii(&mc_config.operation)?;
-                    let p = xylem_cli::multi_protocol::create_memcached_ascii_protocol_with_op(
+                    let key_gen = mc_config.keys.to_key_gen(config_for_worker.experiment.seed)?;
+                    let p = xylem_cli::multi_protocol::create_memcached_ascii_protocol_from_config(
+                        mc_config,
                         operation,
-                    );
+                        key_gen,
+                    )?;
                     ProtocolAdapter::new(p)
                 }
                 (ParsedProtocolConfig::XylemEcho(_echo_config), "xylem-echo") => {
@@ -607,7 +630,13 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                 }
                 (ParsedProtocolConfig::Masstree(mt_config), "masstree") => {
                     let operation = parse_masstree_op(mt_config)?;
-                    let p = xylem_cli::multi_protocol::create_masstree_protocol(operation);
+                    let key_gen = mt_config.keys.to_key_gen(config_for_worker.experiment.seed)?;
+                    let p = xylem_cli::multi_protocol::create_masstree_protocol_from_config(
+                        mt_config,
+                        operation,
+                        key_gen,
+                        config_for_worker.experiment.seed,
+                    )?;
                     ProtocolAdapter::new(p)
                 }
                 _ => return Err(anyhow::anyhow!("Unknown protocol: {}", protocol_name).into()),

@@ -59,6 +59,8 @@ struct PendingRequest {
     send_ts: Timestamp,
     /// Hardware TX timestamp (filled in later when received from error queue)
     tx_hw_ts: Option<Timestamp>,
+    /// Whether this is a warmup request (stats should not be collected)
+    is_warmup: bool,
 }
 
 /// Per-connection application state (no transport - I/O goes through ConnectionGroup)
@@ -186,11 +188,19 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
     ///
     /// `tx_start` is accepted for API symmetry with `GroupConnection::send()` but unused;
     /// only `tx_end` is needed to determine when a TX timestamp covers this request.
-    fn record_send(&mut self, req_id: ReqId, send_ts: Timestamp, _tx_start: u32, tx_end: u32) {
+    fn record_send(
+        &mut self,
+        req_id: ReqId,
+        send_ts: Timestamp,
+        _tx_start: u32,
+        tx_end: u32,
+        is_warmup: bool,
+    ) {
         let now_ns = crate::timing::time_ns();
         // Push to queue for TX timestamp correlation (tx_end increases monotonically)
         self.tx_pending_queue.push_back((tx_end, req_id.clone(), now_ns));
-        self.pending_map.insert(req_id, PendingRequest { send_ts, tx_hw_ts: None });
+        self.pending_map
+            .insert(req_id, PendingRequest { send_ts, tx_hw_ts: None, is_warmup });
     }
 
     /// Clean up queue entry for a completed request that didn't receive its TX timestamp
@@ -277,12 +287,14 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
     }
 
     /// Process received data and extract latencies
+    ///
+    /// Returns a vector of (request_id, latency, is_warmup, bytes_consumed) tuples for each completed response.
     fn process_recv<F>(
         &mut self,
         data: &[u8],
         recv_ts: Timestamp,
         mut process_fn: F,
-    ) -> Result<Vec<(ReqId, Duration)>>
+    ) -> Result<Vec<(ReqId, Duration, bool, usize)>>
     where
         F: FnMut(&[u8]) -> Result<(usize, Option<ReqId>)>,
     {
@@ -324,7 +336,8 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
                 // Use hardware TX timestamp if available, otherwise software timestamp
                 let send_ts = pending.tx_hw_ts.unwrap_or(pending.send_ts);
                 let latency = recv_ts.duration_since(&send_ts);
-                latencies.push((req_id, latency));
+                // Report the bytes consumed for THIS response (not cumulative)
+                latencies.push((req_id, latency, pending.is_warmup, consumed));
             } else {
                 return Err(crate::Error::Protocol(format!(
                     "Received response for unknown request ID: {req_id:?}"
@@ -495,7 +508,19 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
     }
 
     /// Send data on a connection
-    pub fn send(&mut self, connection_id: usize, data: &[u8], req_id: ReqId) -> Result<()> {
+    ///
+    /// # Arguments
+    /// * `connection_id` - The connection to send on
+    /// * `data` - The request data
+    /// * `req_id` - The request ID for tracking
+    /// * `is_warmup` - Whether this is a warmup request (stats will not be collected for response)
+    pub fn send(
+        &mut self,
+        connection_id: usize,
+        data: &[u8],
+        req_id: ReqId,
+        is_warmup: bool,
+    ) -> Result<()> {
         let state = self
             .connection_states
             .get_mut(&connection_id)
@@ -513,7 +538,7 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
             .ok_or_else(|| crate::Error::Connection("Connection not found in group".to_string()))?;
 
         let (send_ts, tx_start, tx_end) = connection.send(data)?;
-        state.record_send(req_id, send_ts, tx_start, tx_end);
+        state.record_send(req_id, send_ts, tx_start, tx_end, is_warmup);
 
         Ok(())
     }
@@ -539,11 +564,15 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
     }
 
     /// Receive and process responses for a connection
+    ///
+    /// Returns a vector of (request_id, latency, is_warmup, bytes_consumed) tuples for each completed response.
+    /// The `is_warmup` flag indicates whether the original request was a warmup request
+    /// and stats should not be collected.
     pub fn recv_responses<F>(
         &mut self,
         connection_id: usize,
         process_fn: F,
-    ) -> Result<Vec<(ReqId, Duration)>>
+    ) -> Result<Vec<(ReqId, Duration, bool, usize)>>
     where
         F: FnMut(&[u8]) -> Result<(usize, Option<ReqId>)>,
     {

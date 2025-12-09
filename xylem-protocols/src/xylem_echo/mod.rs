@@ -60,7 +60,7 @@ impl Default for XylemEchoProtocol {
 impl Protocol for XylemEchoProtocol {
     type RequestId = (usize, u64);
 
-    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId) {
+    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId, crate::RequestMeta) {
         let seq = self.next_seq(conn_id);
 
         // Create request ID tuple (conn_id, seq)
@@ -78,7 +78,8 @@ impl Protocol for XylemEchoProtocol {
         // Write delay_us (8 bytes, little-endian)
         buf.extend_from_slice(&self.default_delay_us.to_le_bytes());
 
-        (buf.to_vec(), request_id)
+        // Echo protocol doesn't have a warmup phase
+        (buf.to_vec(), request_id, crate::RequestMeta::measurement())
     }
 
     fn parse_response(
@@ -125,7 +126,7 @@ mod tests {
         let mut protocol = XylemEchoProtocol::new(100);
 
         // Generate a request
-        let (request, req_id) = protocol.next_request(0);
+        let (request, req_id, _meta) = protocol.next_request(0);
 
         assert_eq!(request.len(), MESSAGE_SIZE);
         assert_eq!(req_id, (0, 0)); // (conn_id, seq) - first request is seq 0
@@ -191,10 +192,10 @@ mod tests {
         let mut protocol = XylemEchoProtocol::new(50);
 
         // Connection 0, first request
-        let (_, id0) = protocol.next_request(0);
+        let (_, id0, _) = protocol.next_request(0);
 
         // Connection 1, first request (different connection)
-        let (_, id1) = protocol.next_request(1);
+        let (_, id1, _) = protocol.next_request(1);
 
         // IDs should be different because conn_id differs
         assert_ne!(id0, id1);
