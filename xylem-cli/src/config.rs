@@ -20,6 +20,9 @@ pub struct ProfileConfig {
     /// Optional request dump configuration for recording all requests
     #[serde(default)]
     pub request_dump: Option<xylem_core::request_dump::DumpConfig>,
+    /// Statistics collection configuration
+    #[serde(default)]
+    pub stats: StatsConfig,
 }
 
 /// Experiment metadata
@@ -106,15 +109,13 @@ pub struct OutputConfig {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum OutputFormat {
-    /// Simple JSON format (backward compatible)
+    /// JSON format with per-group breakdown.
+    /// Use `[stats] include_records = true` to include per-second per-connection records.
     #[default]
     Json,
-    /// Detailed JSON with per-group breakdown
-    #[serde(rename = "detailed-json")]
-    DetailedJson,
     /// HTML report with visualizations
     Html,
-    /// Both detailed JSON and HTML
+    /// Both JSON and HTML
     Both,
     /// Human-readable console output only (no file)
     Human,
@@ -150,6 +151,49 @@ fn default_chart_library() -> String {
 
 fn default_theme() -> String {
     "light".to_string()
+}
+
+/// Statistics collection configuration
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct StatsConfig {
+    /// Time bucket duration for per-second per-connection records
+    #[serde(default = "default_bucket_duration", with = "humantime_serde")]
+    #[schemars(with = "String")]
+    pub bucket_duration: Duration,
+    /// Include per-second per-connection records in JSON output
+    #[serde(default)]
+    pub include_records: bool,
+    /// Streaming configuration for writing stats to Parquet files
+    #[serde(default)]
+    pub streaming: Option<StreamingStatsConfig>,
+}
+
+impl Default for StatsConfig {
+    fn default() -> Self {
+        Self {
+            bucket_duration: default_bucket_duration(),
+            include_records: false,
+            streaming: None,
+        }
+    }
+}
+
+fn default_bucket_duration() -> Duration {
+    Duration::from_secs(1)
+}
+
+/// Streaming stats configuration for writing to Parquet files
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct StreamingStatsConfig {
+    /// Output path prefix for Parquet files
+    pub path: PathBuf,
+    /// Number of time buckets to retain in memory before flushing
+    #[serde(default = "default_retention_buckets")]
+    pub retention_buckets: usize,
+}
+
+fn default_retention_buckets() -> usize {
+    60 // 1 minute of 1-second buckets by default
 }
 
 impl ProfileConfig {

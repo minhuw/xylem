@@ -149,16 +149,27 @@ fn default_max_rate() -> f64 {
 
 impl PolicyConfig {
     /// Create a policy scheduler from this configuration
-    pub fn create_scheduler(&self) -> Result<Box<dyn PolicyScheduler>> {
+    ///
+    /// # Arguments
+    /// * `num_connections` - Total number of connections in the group (for rate distribution)
+    ///
+    /// Rate-based policies (FixedRate, Poisson, Adaptive, etc.) distribute the configured
+    /// rate across all connections. For example, if `rate = 5000` and `num_connections = 10`,
+    /// each connection will target 500 requests/second.
+    pub fn create_scheduler(&self, num_connections: usize) -> Result<Box<dyn PolicyScheduler>> {
+        let num_connections = num_connections.max(1) as f64;
+
         match self {
             PolicyConfig::ClosedLoop => {
                 Ok(Box::new(crate::scheduler::UniformPolicyScheduler::closed_loop()))
             }
             PolicyConfig::FixedRate { rate } => {
-                Ok(Box::new(crate::scheduler::UniformPolicyScheduler::fixed_rate(*rate)))
+                let per_conn_rate = *rate / num_connections;
+                Ok(Box::new(crate::scheduler::UniformPolicyScheduler::fixed_rate(per_conn_rate)))
             }
             PolicyConfig::Poisson { rate } => {
-                Ok(Box::new(crate::scheduler::UniformPolicyScheduler::poisson(*rate)?))
+                let per_conn_rate = *rate / num_connections;
+                Ok(Box::new(crate::scheduler::UniformPolicyScheduler::poisson(per_conn_rate)?))
             }
             PolicyConfig::Adaptive {
                 initial_rate,
@@ -167,11 +178,14 @@ impl PolicyConfig {
                 max_rate,
             } => {
                 let target_latency = Duration::from_micros(*target_latency_us);
+                let per_conn_initial = *initial_rate / num_connections;
+                let per_conn_min = *min_rate / num_connections;
+                let per_conn_max = *max_rate / num_connections;
                 Ok(Box::new(crate::scheduler::UniformPolicyScheduler::adaptive(
-                    *initial_rate,
+                    per_conn_initial,
                     target_latency,
-                    *min_rate,
-                    *max_rate,
+                    per_conn_min,
+                    per_conn_max,
                 )))
             }
             PolicyConfig::Sinusoidal {
@@ -180,8 +194,13 @@ impl PolicyConfig {
                 period,
                 phase_shift,
             } => {
-                let pattern =
-                    crate::workload::SinusoidalPattern::new(*base_rate, *amplitude, *period);
+                let per_conn_base = *base_rate / num_connections;
+                let per_conn_amplitude = *amplitude / num_connections;
+                let pattern = crate::workload::SinusoidalPattern::new(
+                    per_conn_base,
+                    per_conn_amplitude,
+                    *period,
+                );
                 let pattern = if let Some(ps) = phase_shift {
                     pattern.with_phase_shift(*ps)
                 } else {
@@ -190,7 +209,10 @@ impl PolicyConfig {
                 Ok(Box::new(crate::scheduler::PatternPolicyScheduler::new(Box::new(pattern))))
             }
             PolicyConfig::Ramp { start_rate, end_rate, duration } => {
-                let pattern = crate::workload::RampPattern::new(*start_rate, *end_rate, *duration);
+                let per_conn_start = *start_rate / num_connections;
+                let per_conn_end = *end_rate / num_connections;
+                let pattern =
+                    crate::workload::RampPattern::new(per_conn_start, per_conn_end, *duration);
                 Ok(Box::new(crate::scheduler::PatternPolicyScheduler::new(Box::new(pattern))))
             }
             PolicyConfig::Spike {
@@ -199,16 +221,21 @@ impl PolicyConfig {
                 spike_start,
                 spike_duration,
             } => {
+                let per_conn_normal = *normal_rate / num_connections;
+                let per_conn_spike = *spike_rate / num_connections;
                 let pattern = crate::workload::SpikePattern::new(
-                    *normal_rate,
-                    *spike_rate,
+                    per_conn_normal,
+                    per_conn_spike,
                     *spike_start,
                     *spike_duration,
                 );
                 Ok(Box::new(crate::scheduler::PatternPolicyScheduler::new(Box::new(pattern))))
             }
             PolicyConfig::Sawtooth { min_rate, max_rate, period } => {
-                let pattern = crate::workload::SawtoothPattern::new(*min_rate, *max_rate, *period);
+                let per_conn_min = *min_rate / num_connections;
+                let per_conn_max = *max_rate / num_connections;
+                let pattern =
+                    crate::workload::SawtoothPattern::new(per_conn_min, per_conn_max, *period);
                 Ok(Box::new(crate::scheduler::PatternPolicyScheduler::new(Box::new(pattern))))
             }
         }

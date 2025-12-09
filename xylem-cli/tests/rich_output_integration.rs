@@ -2,53 +2,24 @@
 
 use std::time::Duration;
 use xylem_cli::output::{html, DetailedExperimentResults};
-use xylem_core::stats::{GroupStatsCollector, SamplingPolicy};
+use xylem_core::stats::{SamplingPolicy, TupleStatsCollector};
 use xylem_core::traffic_group::{PolicyConfig, TrafficGroupConfig};
 
 #[test]
 fn test_detailed_json_output_generation() {
-    // Create mock group stats collector with data
-    let mut group_stats = GroupStatsCollector::new();
-
-    let policy1 = SamplingPolicy::Limited { max_samples: 1000, rate: 1.0 };
-    let policy2 = SamplingPolicy::Limited { max_samples: 1000, rate: 1.0 };
-
-    group_stats.register_group(0, &policy1);
-    group_stats.register_group(1, &policy2);
+    // Create mock tuple stats collector with data
+    let policy = SamplingPolicy::Limited { max_samples: 1000, rate: 1.0 };
+    let mut stats = TupleStatsCollector::new(policy.clone(), Duration::from_secs(1));
 
     // Add latency samples for group 0
-    for _ in 0..500 {
-        group_stats.record_latency(0, Duration::from_micros(100));
+    for i in 0..500 {
+        stats.record_latency(0, i % 10, Duration::from_micros(100));
     }
 
     // Add latency samples for group 1
-    for _ in 0..300 {
-        group_stats.record_latency(1, Duration::from_micros(250));
+    for i in 0..300 {
+        stats.record_latency(1, i % 5, Duration::from_micros(250));
     }
-
-    // Add metadata for both groups
-    group_stats.set_group_metadata(
-        0,
-        serde_json::json!({
-            "commands": {
-                "GET": 400,
-                "SET": 100
-            }
-        }),
-    );
-
-    group_stats.set_group_metadata(
-        1,
-        serde_json::json!({
-            "commands": {
-                "GET": 200,
-                "SET": 100
-            },
-            "redirects": {
-                "moved": 5
-            }
-        }),
-    );
 
     // Create traffic group configs with required protocol_config
     let protocol_config = Some(serde_json::json!({
@@ -65,7 +36,7 @@ fn test_detailed_json_output_generation() {
             target: "127.0.0.1:6379".to_string(),
             transport: "tcp".to_string(),
             traffic_policy: PolicyConfig::ClosedLoop,
-            sampling_policy: policy1,
+            sampling_policy: policy.clone(),
             protocol_config: protocol_config.clone(),
         },
         TrafficGroupConfig {
@@ -77,13 +48,13 @@ fn test_detailed_json_output_generation() {
             target: "127.0.0.1:6380".to_string(),
             transport: "tcp".to_string(),
             traffic_policy: PolicyConfig::FixedRate { rate: 1000.0 },
-            sampling_policy: policy2,
+            sampling_policy: policy.clone(),
             protocol_config: protocol_config.clone(),
         },
     ];
 
-    // Generate detailed results
-    let results = DetailedExperimentResults::from_group_stats(
+    // Generate detailed results with records included
+    let results = DetailedExperimentResults::from_tuple_stats(
         "Integration Test".to_string(),
         Some("Testing detailed JSON output".to_string()),
         Some(42),
@@ -91,8 +62,9 @@ fn test_detailed_json_output_generation() {
         "redis".to_string(),
         "tcp".to_string(),
         Duration::from_secs(10),
-        &group_stats,
+        &stats,
         &traffic_groups,
+        true, // include_records
     );
 
     // Verify experiment metadata
@@ -122,37 +94,30 @@ fn test_detailed_json_output_generation() {
     assert_eq!(group0.connections, 20); // 2 threads * 10 conns
     assert_eq!(group0.policy, "closed-loop");
     assert_eq!(group0.stats.total_requests, 500);
-    assert!(group0.protocol_metadata.is_some());
 
     let group1 = &results.traffic_groups[1];
     assert_eq!(group1.id, 1);
     assert_eq!(group1.name, "slow-group");
     assert_eq!(group1.protocol, "redis-cluster");
     assert_eq!(group1.stats.total_requests, 300);
-    assert!(group1.protocol_metadata.is_some());
 
-    // Verify metadata content
-    let metadata0 = group0.protocol_metadata.as_ref().unwrap();
-    assert_eq!(metadata0["commands"]["GET"], 400);
-    assert_eq!(metadata0["commands"]["SET"], 100);
-
-    let metadata1 = group1.protocol_metadata.as_ref().unwrap();
-    assert_eq!(metadata1["commands"]["GET"], 200);
-    assert_eq!(metadata1["redirects"]["moved"], 5);
+    // Verify records contain per-connection entries
+    assert!(!results.records.is_empty());
+    // Should have entries for both groups
+    let group_ids: std::collections::HashSet<_> =
+        results.records.iter().map(|r| r.group_id).collect();
+    assert!(group_ids.contains(&0));
+    assert!(group_ids.contains(&1));
 }
 
 #[test]
 fn test_json_serialization_deserialization() {
-    let mut group_stats = GroupStatsCollector::new();
     let policy = SamplingPolicy::Limited { max_samples: 1000, rate: 1.0 };
+    let mut stats = TupleStatsCollector::new(policy.clone(), Duration::from_secs(1));
 
-    group_stats.register_group(0, &policy);
-
-    for _ in 0..100 {
-        group_stats.record_latency(0, Duration::from_micros(100));
+    for i in 0..100 {
+        stats.record_latency(0, i % 5, Duration::from_micros(100));
     }
-
-    group_stats.set_group_metadata(0, serde_json::json!({"test": "data"}));
 
     let protocol_config = Some(serde_json::json!({
         "keys": {"strategy": "sequential", "start": 0, "value_size": 64}
@@ -171,7 +136,7 @@ fn test_json_serialization_deserialization() {
         protocol_config,
     }];
 
-    let results = DetailedExperimentResults::from_group_stats(
+    let results = DetailedExperimentResults::from_tuple_stats(
         "Test".to_string(),
         None,
         None,
@@ -179,8 +144,9 @@ fn test_json_serialization_deserialization() {
         "redis".to_string(),
         "tcp".to_string(),
         Duration::from_secs(1),
-        &group_stats,
+        &stats,
         &traffic_groups,
+        true, // include_records
     );
 
     // Serialize to JSON
@@ -198,13 +164,11 @@ fn test_json_serialization_deserialization() {
 
 #[test]
 fn test_html_report_generation() {
-    let mut group_stats = GroupStatsCollector::new();
     let policy = SamplingPolicy::Limited { max_samples: 1000, rate: 1.0 };
+    let mut stats = TupleStatsCollector::new(policy.clone(), Duration::from_secs(1));
 
-    group_stats.register_group(0, &policy);
-
-    for _ in 0..100 {
-        group_stats.record_latency(0, Duration::from_micros(150));
+    for i in 0..100 {
+        stats.record_latency(0, i % 5, Duration::from_micros(150));
     }
 
     let protocol_config = Some(serde_json::json!({
@@ -224,7 +188,7 @@ fn test_html_report_generation() {
         protocol_config,
     }];
 
-    let results = DetailedExperimentResults::from_group_stats(
+    let results = DetailedExperimentResults::from_tuple_stats(
         "HTML Test".to_string(),
         Some("Testing HTML generation".to_string()),
         Some(123),
@@ -232,8 +196,9 @@ fn test_html_report_generation() {
         "redis".to_string(),
         "tcp".to_string(),
         Duration::from_secs(5),
-        &group_stats,
+        &stats,
         &traffic_groups,
+        false, // include_records - not needed for HTML
     );
 
     // Generate HTML to temp file
@@ -264,22 +229,17 @@ fn test_html_report_generation() {
 
 #[test]
 fn test_per_group_statistics_isolation() {
-    let mut group_stats = GroupStatsCollector::new();
-
-    let policy1 = SamplingPolicy::Limited { max_samples: 1000, rate: 1.0 };
-    let policy2 = SamplingPolicy::Limited { max_samples: 1000, rate: 1.0 };
-
-    group_stats.register_group(0, &policy1);
-    group_stats.register_group(1, &policy2);
+    let policy = SamplingPolicy::Limited { max_samples: 1000, rate: 1.0 };
+    let mut stats = TupleStatsCollector::new(policy.clone(), Duration::from_secs(1));
 
     // Group 0: Fast responses
-    for _ in 0..1000 {
-        group_stats.record_latency(0, Duration::from_micros(50));
+    for i in 0..1000 {
+        stats.record_latency(0, i % 10, Duration::from_micros(50));
     }
 
     // Group 1: Slow responses
-    for _ in 0..500 {
-        group_stats.record_latency(1, Duration::from_micros(500));
+    for i in 0..500 {
+        stats.record_latency(1, i % 5, Duration::from_micros(500));
     }
 
     let protocol_config = Some(serde_json::json!({
@@ -296,7 +256,7 @@ fn test_per_group_statistics_isolation() {
             target: "127.0.0.1:6379".to_string(),
             transport: "tcp".to_string(),
             traffic_policy: PolicyConfig::ClosedLoop,
-            sampling_policy: policy1,
+            sampling_policy: policy.clone(),
             protocol_config: protocol_config.clone(),
         },
         TrafficGroupConfig {
@@ -308,12 +268,12 @@ fn test_per_group_statistics_isolation() {
             target: "127.0.0.1:6379".to_string(),
             transport: "tcp".to_string(),
             traffic_policy: PolicyConfig::ClosedLoop,
-            sampling_policy: policy2,
+            sampling_policy: policy.clone(),
             protocol_config,
         },
     ];
 
-    let results = DetailedExperimentResults::from_group_stats(
+    let results = DetailedExperimentResults::from_tuple_stats(
         "Isolation Test".to_string(),
         None,
         None,
@@ -321,8 +281,9 @@ fn test_per_group_statistics_isolation() {
         "redis".to_string(),
         "tcp".to_string(),
         Duration::from_secs(10),
-        &group_stats,
+        &stats,
         &traffic_groups,
+        true, // include_records
     );
 
     // Verify groups have independent statistics
@@ -344,24 +305,27 @@ fn test_per_group_statistics_isolation() {
 }
 
 #[test]
-fn test_metadata_merging_across_groups() {
-    let mut c1 = GroupStatsCollector::new();
-    let mut c2 = GroupStatsCollector::new();
-
+fn test_tuple_stats_merging_across_threads() {
     let policy = SamplingPolicy::Limited { max_samples: 1000, rate: 1.0 };
 
-    c1.register_group(0, &policy);
-    c2.register_group(0, &policy);
-
     // Simulate two threads working on same group
-    c1.set_group_metadata(0, serde_json::json!({"requests": 100, "errors": 5}));
-    c2.set_group_metadata(0, serde_json::json!({"requests": 150, "errors": 3}));
+    let mut c1 = TupleStatsCollector::new(policy.clone(), Duration::from_secs(1));
+    let mut c2 = TupleStatsCollector::new(policy.clone(), Duration::from_secs(1));
+
+    // Thread 1: records latencies for connections 0-4
+    for i in 0..100 {
+        c1.record_latency(0, i % 5, Duration::from_micros(50));
+    }
+
+    // Thread 2: records latencies for connections 5-9
+    for i in 0..150 {
+        c2.record_latency(0, 5 + (i % 5), Duration::from_micros(60));
+    }
 
     // Merge collectors
-    let merged = GroupStatsCollector::merge(vec![c1, c2]);
+    let merged = TupleStatsCollector::merge(vec![c1, c2]);
 
-    // Verify metadata was merged correctly
-    let metadata = merged.get_group_metadata(0).unwrap();
-    assert_eq!(metadata["requests"], 250); // 100 + 150
-    assert_eq!(metadata["errors"], 8); // 5 + 3
+    // Verify stats were merged correctly
+    let aggregated = merged.aggregate_global(Duration::from_secs(1));
+    assert_eq!(aggregated.total_requests, 250); // 100 + 150
 }

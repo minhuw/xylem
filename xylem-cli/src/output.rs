@@ -8,7 +8,7 @@ use serde_json::Value as JsonValue;
 use std::fs::File;
 use std::io::Write;
 use std::time::Duration;
-use xylem_core::stats::AggregatedStats;
+use xylem_core::stats::{AggregatedStats, TupleStatsCollector};
 
 /// Experiment results
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,9 +40,25 @@ pub struct LatencyStats {
     pub sample_count: usize,
 }
 
+/// Per-second per-connection statistics record
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatsRecord {
+    pub time_secs: f64,
+    pub group_id: usize,
+    pub connection_id: usize,
+    pub request_count: u64,
+    pub throughput_rps: f64,
+    pub throughput_mbps: f64,
+    pub latency_p50_us: f64,
+    pub latency_p99_us: f64,
+    pub latency_p999_us: f64,
+    pub latency_mean_us: f64,
+}
+
+#[allow(dead_code)]
 impl ExperimentResults {
     /// Create results from aggregated stats
-    pub fn from_aggregated_stats(
+    fn from_aggregated_stats(
         protocol: String,
         target: String,
         duration: Duration,
@@ -207,6 +223,11 @@ pub struct DetailedExperimentResults {
     pub target: TargetMetadata,
     pub global: GlobalStats,
     pub traffic_groups: Vec<TrafficGroupResults>,
+    /// Raw statistics records at per-second per-connection granularity.
+    /// Users can aggregate by time, group, or connection as needed.
+    /// Only included when `stats.include_records = true` in config.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub records: Vec<StatsRecord>,
 }
 
 /// Experiment metadata
@@ -263,8 +284,11 @@ pub struct GroupStats {
 
 impl DetailedExperimentResults {
     #[allow(clippy::too_many_arguments)]
-    /// Create detailed results from group stats collector
-    pub fn from_group_stats(
+    /// Create detailed results from tuple stats collector
+    ///
+    /// # Arguments
+    /// * `include_records` - Whether to include per-second per-connection records
+    pub fn from_tuple_stats(
         experiment_name: String,
         experiment_description: Option<String>,
         seed: Option<u64>,
@@ -272,18 +296,52 @@ impl DetailedExperimentResults {
         target_protocol: String,
         target_transport: String,
         duration: Duration,
-        group_stats: &xylem_core::stats::GroupStatsCollector,
+        tuple_stats: &TupleStatsCollector,
         traffic_group_configs: &[xylem_core::traffic_group::TrafficGroupConfig],
+        include_records: bool,
     ) -> Self {
         let duration_secs = duration.as_secs_f64();
+        let bucket_duration_secs = tuple_stats.bucket_duration().as_secs_f64();
 
         // Aggregate global stats
-        let global_aggregated =
-            xylem_core::stats::aggregate_stats(group_stats.global(), duration, 0.95);
+        let global_aggregated = tuple_stats.aggregate_global(duration);
 
         // Aggregate per-group stats
-        let per_group_aggregated =
-            xylem_core::stats::aggregate_stats_per_group(group_stats, duration, 0.95);
+        let per_group_aggregated = tuple_stats.aggregate_by_group(duration);
+
+        // Build raw records from entries (only if requested)
+        let mut records: Vec<StatsRecord> = if include_records {
+            tuple_stats
+                .entries()
+                .iter()
+                .map(|(key, entry)| {
+                    let total_bytes = (entry.tx_bytes + entry.rx_bytes) as f64;
+                    StatsRecord {
+                        time_secs: key.time_bucket as f64 * bucket_duration_secs,
+                        group_id: key.group_id,
+                        connection_id: key.connection_id,
+                        request_count: entry.request_count,
+                        throughput_rps: entry.request_count as f64 / bucket_duration_secs,
+                        throughput_mbps: (total_bytes * 8.0) / (bucket_duration_secs * 1_000_000.0),
+                        latency_p50_us: entry.latency.percentile(0.5) as f64 / 1000.0,
+                        latency_p99_us: entry.latency.percentile(0.99) as f64 / 1000.0,
+                        latency_p999_us: entry.latency.percentile(0.999) as f64 / 1000.0,
+                        latency_mean_us: entry.latency.mean() as f64 / 1000.0,
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // Sort by time, then group, then connection for consistent output
+        records.sort_by(|a, b| {
+            a.time_secs
+                .partial_cmp(&b.time_secs)
+                .unwrap()
+                .then_with(|| a.group_id.cmp(&b.group_id))
+                .then_with(|| a.connection_id.cmp(&b.connection_id))
+        });
 
         // Build global stats
         let global = GlobalStats {
@@ -309,74 +367,11 @@ impl DetailedExperimentResults {
 
         // Build per-group results
         let mut traffic_groups = Vec::new();
+
         for (group_id, config) in traffic_group_configs.iter().enumerate() {
             if let Some(aggregated) = per_group_aggregated.get(&group_id) {
                 let protocol_name = config.protocol.clone();
-
-                let policy_str = match &config.traffic_policy {
-                    xylem_core::traffic_group::PolicyConfig::ClosedLoop => {
-                        "closed-loop".to_string()
-                    }
-                    xylem_core::traffic_group::PolicyConfig::FixedRate { rate } => {
-                        format!("fixed-rate({})", rate)
-                    }
-                    xylem_core::traffic_group::PolicyConfig::Poisson { rate } => {
-                        format!("poisson({})", rate)
-                    }
-                    xylem_core::traffic_group::PolicyConfig::Adaptive { .. } => {
-                        "adaptive".to_string()
-                    }
-                    xylem_core::traffic_group::PolicyConfig::Sinusoidal {
-                        base_rate,
-                        amplitude,
-                        period,
-                        ..
-                    } => {
-                        format!(
-                            "sinusoidal(base={}, amp={}, period={}s)",
-                            base_rate,
-                            amplitude,
-                            period.as_secs_f64()
-                        )
-                    }
-                    xylem_core::traffic_group::PolicyConfig::Ramp {
-                        start_rate,
-                        end_rate,
-                        duration,
-                    } => {
-                        format!(
-                            "ramp({} -> {} over {}s)",
-                            start_rate,
-                            end_rate,
-                            duration.as_secs_f64()
-                        )
-                    }
-                    xylem_core::traffic_group::PolicyConfig::Spike {
-                        normal_rate,
-                        spike_rate,
-                        spike_duration,
-                        ..
-                    } => {
-                        format!(
-                            "spike(normal={}, spike={}, dur={}s)",
-                            normal_rate,
-                            spike_rate,
-                            spike_duration.as_secs_f64()
-                        )
-                    }
-                    xylem_core::traffic_group::PolicyConfig::Sawtooth {
-                        min_rate,
-                        max_rate,
-                        period,
-                    } => {
-                        format!(
-                            "sawtooth({}-{}, period={}s)",
-                            min_rate,
-                            max_rate,
-                            period.as_secs_f64()
-                        )
-                    }
-                };
+                let policy_str = Self::format_policy_config(&config.traffic_policy);
 
                 let group_result = TrafficGroupResults {
                     id: group_id,
@@ -406,7 +401,7 @@ impl DetailedExperimentResults {
                             sample_count: 0,
                         },
                     },
-                    protocol_metadata: group_stats.get_group_metadata(group_id).cloned(),
+                    protocol_metadata: None,
                 };
 
                 traffic_groups.push(group_result);
@@ -427,6 +422,53 @@ impl DetailedExperimentResults {
             },
             global,
             traffic_groups,
+            records,
+        }
+    }
+
+    /// Format a policy config as a human-readable string
+    fn format_policy_config(policy: &xylem_core::traffic_group::PolicyConfig) -> String {
+        match policy {
+            xylem_core::traffic_group::PolicyConfig::ClosedLoop => "closed-loop".to_string(),
+            xylem_core::traffic_group::PolicyConfig::FixedRate { rate } => {
+                format!("fixed-rate({})", rate)
+            }
+            xylem_core::traffic_group::PolicyConfig::Poisson { rate } => {
+                format!("poisson({})", rate)
+            }
+            xylem_core::traffic_group::PolicyConfig::Adaptive { .. } => "adaptive".to_string(),
+            xylem_core::traffic_group::PolicyConfig::Sinusoidal {
+                base_rate,
+                amplitude,
+                period,
+                ..
+            } => {
+                format!(
+                    "sinusoidal(base={}, amp={}, period={}s)",
+                    base_rate,
+                    amplitude,
+                    period.as_secs_f64()
+                )
+            }
+            xylem_core::traffic_group::PolicyConfig::Ramp { start_rate, end_rate, duration } => {
+                format!("ramp({} -> {} over {}s)", start_rate, end_rate, duration.as_secs_f64())
+            }
+            xylem_core::traffic_group::PolicyConfig::Spike {
+                normal_rate,
+                spike_rate,
+                spike_duration,
+                ..
+            } => {
+                format!(
+                    "spike(normal={}, spike={}, dur={}s)",
+                    normal_rate,
+                    spike_rate,
+                    spike_duration.as_secs_f64()
+                )
+            }
+            xylem_core::traffic_group::PolicyConfig::Sawtooth { min_rate, max_rate, period } => {
+                format!("sawtooth({}-{}, period={}s)", min_rate, max_rate, period.as_secs_f64())
+            }
         }
     }
 
@@ -495,6 +537,37 @@ impl DetailedExperimentResults {
                 println!();
                 println!("  Protocol Metadata:");
                 println!("{}", serde_json::to_string_pretty(metadata).unwrap_or_default());
+            }
+            println!();
+        }
+
+        // Records summary (per-connection data)
+        if !self.records.is_empty() {
+            // Count unique time buckets and connections
+            let unique_times: std::collections::HashSet<_> =
+                self.records.iter().map(|r| r.time_secs as u64).collect();
+            let unique_conns: std::collections::HashSet<_> =
+                self.records.iter().map(|r| (r.group_id, r.connection_id)).collect();
+
+            println!("{}", "-".repeat(70));
+            println!(
+                "RECORDS ({} entries: {} time buckets x {} connections)",
+                self.records.len(),
+                unique_times.len(),
+                unique_conns.len()
+            );
+            println!("{}", "-".repeat(70));
+
+            // Show first few entries
+            println!("Sample records (time, group, conn, rps, p99):");
+            for r in self.records.iter().take(10) {
+                println!(
+                    "  t={:.1}s g={} c={}: {:.0} rps, p99={:.2}μs",
+                    r.time_secs, r.group_id, r.connection_id, r.throughput_rps, r.latency_p99_us
+                );
+            }
+            if self.records.len() > 10 {
+                println!("  ... and {} more records", self.records.len() - 10);
             }
             println!();
         }

@@ -64,3 +64,7 @@ max_samples = 10000
 format = "json"
 file = "/tmp/redis-bench.json"
 real_time = false
+
+[stats]
+bucket_duration = "1s"
+include_records = true

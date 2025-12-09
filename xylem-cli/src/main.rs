@@ -14,7 +14,6 @@ mod config;
 mod output;
 
 use config::ProfileConfig;
-use output::ExperimentResults;
 
 /// Parsed protocol configuration for a traffic group.
 /// This enum holds the typed configuration for each supported protocol.
@@ -617,8 +616,31 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
             protocols.insert(*group_id, protocol_adapted);
         }
 
-        // Initialize group stats collector and register all groups
-        let mut stats = xylem_core::stats::GroupStatsCollector::new();
+        // Initialize tuple stats collector (use sampling policy from first group)
+        // Note: All groups on the same thread share a single sampling policy for the stats collector.
+        // If groups have different sampling policies, the first group's policy is used.
+        let first_group_id = groups_for_thread.first().map(|(gid, _)| *gid).unwrap_or(0);
+        let sampling_policy = config_for_worker.traffic_groups[first_group_id].sampling_policy.clone();
+
+        // Warn if multiple groups on this thread have different sampling policies
+        for (group_id, _) in groups_for_thread.iter().skip(1) {
+            let other_policy = &config_for_worker.traffic_groups[*group_id].sampling_policy;
+            if std::mem::discriminant(other_policy) != std::mem::discriminant(&sampling_policy) {
+                tracing::warn!(
+                    "Thread {}: Group {} uses a different sampling policy than group {}. \
+                     All groups on this thread will use the sampling policy from group {}.",
+                    thread_idx,
+                    group_id,
+                    first_group_id,
+                    first_group_id
+                );
+            }
+        }
+
+        let stats = xylem_core::stats::TupleStatsCollector::new(
+            sampling_policy,
+            config_for_worker.stats.bucket_duration,
+        );
 
         // Build group configurations for multi-group worker
         let mut groups_config = Vec::new();
@@ -634,9 +656,6 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
         for (group_id, group_meta) in groups_for_thread.iter() {
             let group_config = &config_for_worker.traffic_groups[*group_id];
 
-            // Register group in stats collector
-            stats.register_group(*group_id, &group_config.sampling_policy);
-
             // Unix transport handles targets as paths, not SocketAddr
             // Skip groups_config building - Unix branch handles this separately
             if is_unix_transport {
@@ -645,8 +664,10 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
 
             // Non-cluster protocol: single target
             if group_config.protocol != "redis-cluster" {
+                // Calculate total connections for rate distribution
+                let total_connections = group_config.connections_per_thread * group_config.threads.len();
                 let policy_scheduler: Box<dyn xylem_core::scheduler::PolicyScheduler> =
-                    group_config.traffic_policy.create_scheduler()?;
+                    group_config.traffic_policy.create_scheduler(total_connections)?;
 
                 let group_target: std::net::SocketAddr =
                     group_config.target.parse().with_context(|| {
@@ -704,10 +725,10 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                     continue;
                 }
 
-                // Rate is per-connection, not per-group, so no division needed
-                // Each connection gets its own scheduler with the configured rate
+                // Calculate total connections for rate distribution (across all cluster nodes)
+                let total_connections = group_config.connections_per_thread * group_config.threads.len();
                 let policy_scheduler: Box<dyn xylem_core::scheduler::PolicyScheduler> =
-                    group_config.traffic_policy.create_scheduler()?;
+                    group_config.traffic_policy.create_scheduler(total_connections)?;
 
                 groups_config.push((
                     *group_id,
@@ -745,10 +766,13 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
         };
 
         // Helper function to wire redis-cluster connections after worker creation
-        fn wire_cluster_connections<G: xylem_transport::ConnectionGroup>(
-            worker: &mut Worker<G, ProtocolAdapter<xylem_cli::multi_protocol::MultiProtocol>>,
+        fn wire_cluster_connections<G, S>(
+            worker: &mut Worker<G, ProtocolAdapter<xylem_cli::multi_protocol::MultiProtocol>, S>,
             cluster_groups: &[usize],
-        ) {
+        ) where
+            G: xylem_transport::ConnectionGroup,
+            S: xylem_core::stats::StatsRecorder,
+        {
             // Wire connections to each redis-cluster protocol, filtered by group_id
             // to avoid cross-group socket confusion (e.g., routing Redis to HTTP socket)
             for &group_id in cluster_groups {
@@ -811,7 +835,9 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
 
                 for (group_id, group_meta) in groups_for_thread.iter() {
                     let group_config = &config_for_worker.traffic_groups[*group_id];
-                    let policy_scheduler = group_config.traffic_policy.create_scheduler()?;
+                    // Calculate total connections for rate distribution
+                    let total_connections = group_config.connections_per_thread * group_config.threads.len();
+                    let policy_scheduler = group_config.traffic_policy.create_scheduler(total_connections)?;
                     unix_groups_config.push((
                         *group_id,
                         group_config.target.clone(),
@@ -856,100 +882,77 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
     }
 
     tracing::info!("Experiment completed successfully");
-    let stats = xylem_core::stats::GroupStatsCollector::merge(results);
-
-    // Aggregate statistics with percentiles and confidence intervals
-    // Use global stats which aggregates all traffic groups
-    let aggregated_stats = xylem_core::stats::aggregate_stats(stats.global(), duration, 0.95);
+    let stats = xylem_core::stats::TupleStatsCollector::merge(results);
 
     // Write output file if configured
     use config::OutputFormat;
-    match config.output.format {
-        OutputFormat::Json => {
-            // Simple JSON format (backward compatible)
-            let results = ExperimentResults::from_aggregated_stats(
-                output_protocol.clone(),
-                target_address_string.clone(),
-                duration,
-                aggregated_stats,
-            );
-            results.print_human();
 
-            let path_str = config
-                .output
-                .file
-                .to_str()
-                .ok_or_else(|| anyhow::anyhow!("Invalid output file path"))?;
-            results.write_json(path_str)?;
-            tracing::info!("Results written to: {}", config.output.file.display());
-        }
+    // Get transport summary from traffic groups
+    let unique_transports: std::collections::HashSet<_> =
+        config.traffic_groups.iter().map(|g| g.transport.as_str()).collect();
+    let output_transport = if unique_transports.len() == 1 {
+        config.traffic_groups[0].transport.clone()
+    } else {
+        format!("{} transports", unique_transports.len())
+    };
+
+    // Build detailed results (used for all formats except Human)
+    let detailed_results = output::DetailedExperimentResults::from_tuple_stats(
+        config.experiment.name.clone(),
+        config.experiment.description.clone(),
+        config.experiment.seed,
+        target_address_string,
+        output_protocol,
+        output_transport,
+        duration,
+        &stats,
+        &config.traffic_groups,
+        config.stats.include_records,
+    );
+
+    match config.output.format {
         OutputFormat::Human => {
             // Human format - console output only, no file
-            let results = ExperimentResults::from_aggregated_stats(
-                output_protocol,
-                target_address_string,
-                duration,
-                aggregated_stats,
-            );
-            results.print_human();
+            detailed_results.print_human();
             tracing::debug!("Human format selected - output printed to console");
         }
-        OutputFormat::DetailedJson | OutputFormat::Both | OutputFormat::Html => {
-            // Get transport summary from traffic groups
-            let unique_transports: std::collections::HashSet<_> =
-                config.traffic_groups.iter().map(|g| g.transport.as_str()).collect();
-            let output_transport = if unique_transports.len() == 1 {
-                config.traffic_groups[0].transport.clone()
-            } else {
-                format!("{} transports", unique_transports.len())
-            };
+        OutputFormat::Json => {
+            detailed_results.print_human();
 
-            // Detailed format with per-group statistics
-            let detailed_results = output::DetailedExperimentResults::from_group_stats(
-                config.experiment.name.clone(),
-                config.experiment.description.clone(),
-                config.experiment.seed,
-                target_address_string,
-                output_protocol,
-                output_transport,
-                duration,
-                &stats,
-                &config.traffic_groups,
-            );
+            let json_path = config.output.file.with_extension("json");
+            let path_str =
+                json_path.to_str().ok_or_else(|| anyhow::anyhow!("Invalid output file path"))?;
+            detailed_results.write_json(path_str)?;
+            tracing::info!("Results written to: {}", json_path.display());
+        }
+        OutputFormat::Html => {
+            detailed_results.print_human();
 
+            let html_path = config.output.file.with_extension("html");
+            let path_str =
+                html_path.to_str().ok_or_else(|| anyhow::anyhow!("Invalid output file path"))?;
+            output::html::generate_html_report(&detailed_results, path_str)?;
+            tracing::info!("HTML report written to: {}", html_path.display());
+        }
+        OutputFormat::Both => {
             detailed_results.print_human();
 
             let base_path = config.output.file.with_extension("");
+            let json_path = base_path.with_extension("json");
+            let html_path = base_path.with_extension("html");
 
-            match config.output.format {
-                OutputFormat::DetailedJson => {
-                    let json_path = base_path.with_extension("json");
-                    let path_str = json_path
-                        .to_str()
-                        .ok_or_else(|| anyhow::anyhow!("Invalid output file path"))?;
-                    detailed_results.write_json(path_str)?;
-                }
-                OutputFormat::Html => {
-                    let html_path = base_path.with_extension("html");
-                    let path_str = html_path
-                        .to_str()
-                        .ok_or_else(|| anyhow::anyhow!("Invalid output file path"))?;
-                    output::html::generate_html_report(&detailed_results, path_str)?;
-                }
-                OutputFormat::Both => {
-                    let json_path = base_path.with_extension("json");
-                    let html_path = base_path.with_extension("html");
+            let json_str =
+                json_path.to_str().ok_or_else(|| anyhow::anyhow!("Invalid JSON path"))?;
+            let html_str =
+                html_path.to_str().ok_or_else(|| anyhow::anyhow!("Invalid HTML path"))?;
 
-                    let json_str =
-                        json_path.to_str().ok_or_else(|| anyhow::anyhow!("Invalid JSON path"))?;
-                    let html_str =
-                        html_path.to_str().ok_or_else(|| anyhow::anyhow!("Invalid HTML path"))?;
-
-                    detailed_results.write_json(json_str)?;
-                    output::html::generate_html_report(&detailed_results, html_str)?;
-                }
-                _ => unreachable!(),
-            }
+            detailed_results.write_json(json_str)?;
+            output::html::generate_html_report(&detailed_results, html_str)?;
+            tracing::info!(
+                "Results written to: {} and {}",
+                json_path.display(),
+                html_path.display()
+            );
         }
     }
 

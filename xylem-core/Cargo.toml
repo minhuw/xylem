@@ -30,6 +30,8 @@ sketches-ddsketch = "0.3.0"
 tdigest = "0.2"
 hdrhistogram = "7.5"
 zeropool = "0.2"
+parquet = { workspace = true }
+arrow = { workspace = true }
 
 [features]
 schema = ["schemars"]

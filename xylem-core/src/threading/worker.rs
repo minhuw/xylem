@@ -9,7 +9,7 @@
 
 use crate::connection::{ConnectionPool, TrafficGroupConfig};
 use crate::request_dump::RequestDumper;
-use crate::stats::GroupStatsCollector;
+use crate::stats::{GroupStatsCollector, StatsRecorder};
 use crate::timing;
 use crate::Result;
 use std::collections::HashMap;
@@ -145,11 +145,16 @@ pub struct WorkerConfig {
 /// Worker with connection pooling and request pipelining
 ///
 /// Uses `ConnectionGroup` internally for efficient I/O multiplexing.
-pub struct Worker<G: ConnectionGroup, P: Protocol> {
+///
+/// The worker is generic over the stats collector type `S` which must implement
+/// `StatsRecorder`. This allows using either:
+/// - `GroupStatsCollector` - aggregates by traffic group only (default)
+/// - `TupleStatsCollector` - aggregates by (time_bucket, group_id, connection_id)
+pub struct Worker<G: ConnectionGroup, P: Protocol, S: StatsRecorder = GroupStatsCollector> {
     pool: ConnectionPool<G, P::RequestId>,
     /// Map of traffic group ID to protocol instance
     protocols: HashMap<usize, P>,
-    stats: GroupStatsCollector,
+    stats: S,
     config: WorkerConfig,
     /// Optional request dumper for recording all requests
     request_dumper: Option<Arc<RequestDumper>>,
@@ -157,12 +162,12 @@ pub struct Worker<G: ConnectionGroup, P: Protocol> {
     thread_id: usize,
 }
 
-impl<G: ConnectionGroup, P: Protocol> Worker<G, P> {
+impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
     /// Create a new pipelined worker with per-connection policies
     pub fn new<F: TransportFactory<Group = G>>(
         factory: &F,
         protocol: P,
-        stats: GroupStatsCollector,
+        stats: S,
         config: WorkerConfig,
         policy_scheduler: Box<dyn crate::scheduler::PolicyScheduler>,
     ) -> Result<Self> {
@@ -192,7 +197,7 @@ impl<G: ConnectionGroup, P: Protocol> Worker<G, P> {
     pub fn with_closed_loop<F: TransportFactory<Group = G>>(
         factory: &F,
         protocol: P,
-        stats: GroupStatsCollector,
+        stats: S,
         config: WorkerConfig,
     ) -> Result<Self> {
         let policy_scheduler = Box::new(crate::scheduler::UniformPolicyScheduler::closed_loop());
@@ -203,7 +208,7 @@ impl<G: ConnectionGroup, P: Protocol> Worker<G, P> {
     pub fn new_multi_group<F: TransportFactory<Group = G>>(
         factory: &F,
         protocols: HashMap<usize, P>,
-        stats: GroupStatsCollector,
+        stats: S,
         config: WorkerConfig,
         groups: Vec<(usize, usize, usize, Box<dyn crate::scheduler::PolicyScheduler>)>,
     ) -> Result<Self> {
@@ -223,7 +228,7 @@ impl<G: ConnectionGroup, P: Protocol> Worker<G, P> {
     pub fn new_multi_group_with_targets<F: TransportFactory<Group = G>>(
         factory: &F,
         protocols: HashMap<usize, P>,
-        stats: GroupStatsCollector,
+        stats: S,
         config: WorkerConfig,
         groups: Vec<TrafficGroupConfig>,
     ) -> Result<Self> {
@@ -332,7 +337,7 @@ impl<G: ConnectionGroup, P: Protocol> Worker<G, P> {
                 if let Some(state) = self.pool.get_state_mut(connection_id) {
                     state.on_request_sent(sent_time_ns);
                 }
-                self.stats.record_tx_bytes(group_id, request_data.len());
+                self.stats.record_tx_bytes(group_id, connection_id, request_data.len());
             }
 
             // RECEIVE PHASE: Poll all connections for responses (single syscall)
@@ -416,6 +421,7 @@ impl<G: ConnectionGroup, P: Protocol> Worker<G, P> {
 
             let stats = &mut self.stats;
             let mut connection_retries = Vec::new();
+            let conn_id_for_stats = connection_id; // Capture for closure
 
             #[allow(clippy::excessive_nesting)]
             let latencies = match self.pool.recv_responses(connection_id, |data| {
@@ -423,7 +429,7 @@ impl<G: ConnectionGroup, P: Protocol> Worker<G, P> {
                 match result {
                     Ok(ParseResult::Complete { bytes_consumed, request_id }) => {
                         if bytes_consumed > 0 {
-                            stats.record_rx_bytes(group_id, bytes_consumed);
+                            stats.record_rx_bytes(group_id, conn_id_for_stats, bytes_consumed);
                         }
                         Ok((bytes_consumed, Some(request_id)))
                     }
@@ -431,7 +437,11 @@ impl<G: ConnectionGroup, P: Protocol> Worker<G, P> {
                     Ok(ParseResult::Retry(retry_req)) => {
                         connection_retries.push(retry_req.clone());
                         if retry_req.bytes_consumed > 0 {
-                            stats.record_rx_bytes(group_id, retry_req.bytes_consumed);
+                            stats.record_rx_bytes(
+                                group_id,
+                                conn_id_for_stats,
+                                retry_req.bytes_consumed,
+                            );
                         }
                         Ok((retry_req.bytes_consumed, Some(retry_req.original_request_id)))
                     }
@@ -448,9 +458,9 @@ impl<G: ConnectionGroup, P: Protocol> Worker<G, P> {
                 }
             };
 
-            // Record all latencies with group_id
+            // Record all latencies with group_id and connection_id
             for (_req_id, latency) in latencies {
-                self.stats.record_latency(group_id, latency);
+                self.stats.record_latency(group_id, connection_id, latency);
             }
 
             // Re-add connection to scheduler now that it may have capacity
@@ -513,7 +523,7 @@ impl<G: ConnectionGroup, P: Protocol> Worker<G, P> {
         // because retries are already counted as in-flight from the original request. Double-counting
         // would skew rate limiting and statistics (especially for Redis Cluster MOVED/ASK redirects).
         self.pool.send(target_connection_id, &retry_data, retry_req_id)?;
-        self.stats.record_tx_bytes(group_id, retry_data.len());
+        self.stats.record_tx_bytes(group_id, target_connection_id, retry_data.len());
 
         Ok(())
     }
@@ -566,13 +576,14 @@ impl<G: ConnectionGroup, P: Protocol> Worker<G, P> {
                 self.protocols.get_mut(&group_id).expect("Protocol not found for group_id");
 
             let stats = &mut self.stats;
+            let conn_id_for_stats = connection_id;
 
             #[allow(clippy::excessive_nesting)]
             let _ = self.pool.recv_responses(connection_id, |data| {
                 match protocol.parse_response(connection_id, data) {
                     Ok((bytes_consumed, req_id_opt)) => {
                         if bytes_consumed > 0 {
-                            stats.record_rx_bytes(group_id, bytes_consumed);
+                            stats.record_rx_bytes(group_id, conn_id_for_stats, bytes_consumed);
                         }
                         Ok((bytes_consumed, req_id_opt))
                     }
@@ -585,25 +596,25 @@ impl<G: ConnectionGroup, P: Protocol> Worker<G, P> {
     }
 
     /// Get the stats collector
-    pub fn stats(&self) -> &GroupStatsCollector {
+    pub fn stats(&self) -> &S {
         &self.stats
     }
 
     /// Consume the worker and return stats
-    pub fn into_stats(self) -> GroupStatsCollector {
+    pub fn into_stats(self) -> S {
         self.stats
     }
 }
 
 /// Specialized implementation for Unix domain sockets
-impl<P: Protocol> Worker<xylem_transport::UnixConnectionGroup, P> {
+impl<P: Protocol, S: StatsRecorder> Worker<xylem_transport::UnixConnectionGroup, P, S> {
     /// Create a new pipelined worker for Unix domain sockets
     ///
     /// This constructor handles Unix socket paths instead of SocketAddr targets.
     pub fn new_multi_group_unix(
         factory: &xylem_transport::UnixTransportFactory,
         protocols: HashMap<usize, P>,
-        stats: GroupStatsCollector,
+        stats: S,
         config: WorkerConfig,
         groups: Vec<crate::connection::UnixTrafficGroupConfig>,
     ) -> Result<Self> {
