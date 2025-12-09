@@ -132,6 +132,24 @@ pub trait Protocol: Send {
         data: &[u8],
     ) -> anyhow::Result<(usize, Option<Self::RequestId>)>;
 
+    /// Check if the protocol is ready to send a request on this connection
+    ///
+    /// This allows protocols to impose their own constraints beyond pipeline depth.
+    /// For example, protocols that require handshakes (like Masstree) can return
+    /// false until the handshake completes, preventing duplicate handshake requests
+    /// from filling the pipeline with the same request ID.
+    ///
+    /// # Arguments
+    /// * `conn_id` - Connection identifier
+    ///
+    /// # Returns
+    /// true if the protocol is ready to generate a request for this connection
+    ///
+    /// Default implementation always returns true (no protocol-level constraints).
+    fn can_send(&self, _conn_id: usize) -> bool {
+        true
+    }
+
     /// Parse a response with retry support (extended version)
     ///
     /// Default implementation delegates to `parse_response()` for backward compatibility.
@@ -341,16 +359,22 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
 
             // SEND PHASE: Send requests to ready connections
             // Rate limiting is handled by connection-level policies via pool's ready_heap
+            //
+            // Safety limit: Cap the number of consecutive sends to prevent infinite loops
+            // For closed-loop with pipelining, we want to fill all pipelines, but not spin forever
+            // With N connections and depth D, we should need at most N*D sends to fill all pipelines
+            let max_sends_per_iteration = self.pool.connection_count() * 16; // Allow generous headroom
+            let mut sends_this_iteration = 0;
+
             while let Some(connection_id) = self.pool.pick_connection() {
                 let state = self.pool.get_state(connection_id).expect("Connection state not found");
                 let group_id = state.group_id();
 
-                // Look up protocol for this connection's traffic group
-                let protocol =
-                    self.protocols.get_mut(&group_id).expect("Protocol not found for group_id");
-
-                // Generate request using protocol's embedded generator
-                let (request_data, req_id, meta) = protocol.next_request(connection_id);
+                let (request_data, req_id, meta) = {
+                    let protocol =
+                        self.protocols.get_mut(&group_id).expect("Protocol not found for group_id");
+                    protocol.next_request(connection_id)
+                };
 
                 // Record request to dump file if enabled
                 if let Some(ref dumper) = self.request_dumper {
@@ -374,6 +398,26 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
                 }
                 if !meta.is_warmup {
                     self.stats.record_tx_bytes(group_id, connection_id, request_data.len());
+                }
+
+                // Try to re-add connection to heap if it still has capacity
+                // This enables pipelining for both closed-loop and rate-limited policies
+                //
+                // - Closed-loop (next_send_time = None): will be picked immediately to fill pipeline
+                // - Rate-limited (next_send_time = future): stored on heap, popped when time arrives
+                //
+                // This maintains invariant: connection on heap ⟺ can send (pipeline not full AND protocol ready)
+                let protocol =
+                    self.protocols.get(&group_id).expect("Protocol not found for group_id");
+                self.pool.try_schedule_connection(connection_id, protocol);
+
+                sends_this_iteration += 1;
+                if sends_this_iteration >= max_sends_per_iteration {
+                    eprintln!(
+                        "[WARN] Hit send limit ({}) in one iteration - forcing receive phase",
+                        max_sends_per_iteration
+                    );
+                    break;
                 }
             }
 
@@ -452,52 +496,58 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
 
             let group_id = state.group_id();
 
-            // Look up protocol for this connection's traffic group
-            let protocol =
-                self.protocols.get_mut(&group_id).expect("Protocol not found for group_id");
-
             let mut connection_retries = Vec::new();
             let mut response_warmup: HashMap<P::RequestId, bool> = HashMap::new();
 
+            // Parse responses (scope the mutable protocol borrow)
             #[allow(clippy::excessive_nesting)]
-            let responses = match self.pool.recv_responses(connection_id, |data| {
-                match protocol.parse_response_extended(connection_id, data) {
-                    Ok(ParseResult::Complete { bytes_consumed, request_id }) => {
-                        Ok((bytes_consumed, Some(request_id)))
+            let responses = {
+                let protocol =
+                    self.protocols.get_mut(&group_id).expect("Protocol not found for group_id");
+
+                match self.pool.recv_responses(connection_id, |data| {
+                    match protocol.parse_response_extended(connection_id, data) {
+                        Ok(ParseResult::Complete { bytes_consumed, request_id }) => {
+                            Ok((bytes_consumed, Some(request_id)))
+                        }
+                        Ok(ParseResult::Incomplete) => Ok((0, None)),
+                        Ok(ParseResult::Retry(retry_req)) => {
+                            connection_retries.push(retry_req.clone());
+                            Ok((retry_req.bytes_consumed, Some(retry_req.original_request_id)))
+                        }
+                        Err(e) => Err(e.into()),
                     }
-                    Ok(ParseResult::Incomplete) => Ok((0, None)),
-                    Ok(ParseResult::Retry(retry_req)) => {
-                        connection_retries.push(retry_req.clone());
-                        Ok((retry_req.bytes_consumed, Some(retry_req.original_request_id)))
+                }) {
+                    Ok(responses) => responses,
+                    Err(e) => {
+                        if let crate::Error::Connection(_) = e {
+                            let _ = self.pool.close(connection_id);
+                            continue;
+                        }
+                        return Err(e);
                     }
-                    Err(e) => Err(e.into()),
-                }
-            }) {
-                Ok(responses) => responses,
-                Err(e) => {
-                    if let crate::Error::Connection(_) = e {
-                        let _ = self.pool.close(connection_id);
-                        continue;
-                    }
-                    return Err(e);
                 }
             };
 
             // Record latencies and RX bytes with group_id and connection_id (skip warmup requests)
-            for (req_id, latency, is_warmup, bytes_consumed) in responses {
-                if is_warmup {
-                    response_warmup.insert(req_id, true);
+            for (req_id, latency, is_warmup, bytes_consumed) in &responses {
+                if *is_warmup {
+                    response_warmup.insert(*req_id, true);
                     continue;
                 }
-                response_warmup.insert(req_id, false);
-                if bytes_consumed > 0 {
-                    self.stats.record_rx_bytes(group_id, connection_id, bytes_consumed);
+                response_warmup.insert(*req_id, false);
+                if *bytes_consumed > 0 {
+                    self.stats.record_rx_bytes(group_id, connection_id, *bytes_consumed);
                 }
-                self.stats.record_latency(group_id, connection_id, latency);
+                self.stats.record_latency(group_id, connection_id, *latency);
             }
 
-            // Re-add connection to scheduler now that it may have capacity
-            self.pool.reschedule_connection(connection_id);
+            // Reschedule connection if it can send but isn't on heap
+            // This handles two cases:
+            // 1. Pipeline transitioned from full to available
+            // 2. Protocol became ready (e.g., handshake completed)
+            let protocol = self.protocols.get(&group_id).expect("Protocol not found for group_id");
+            self.pool.try_schedule_connection(connection_id, protocol);
 
             // Collect retries for this connection
             for mut retry in connection_retries {
@@ -748,6 +798,10 @@ mod tests {
 
         fn reset(&mut self) {
             self.inner.reset()
+        }
+
+        fn can_send(&self, conn_id: usize) -> bool {
+            self.inner.can_send(conn_id)
         }
     }
 

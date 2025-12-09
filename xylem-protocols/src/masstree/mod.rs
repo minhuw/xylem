@@ -123,12 +123,23 @@ impl InsertPhaseState {
     }
 }
 
+/// Handshake state for a connection
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandshakeState {
+    /// Handshake not yet sent
+    NotSent,
+    /// Handshake sent, waiting for response
+    Pending,
+    /// Handshake complete
+    Done,
+}
+
 pub struct MasstreeProtocol {
     operation: MasstreeOp,
     /// Per-connection sequence numbers
     conn_send_seq: HashMap<usize, u16>,
     /// Per-connection handshake state
-    conn_handshake_done: HashMap<usize, bool>,
+    conn_handshake_state: HashMap<usize, HandshakeState>,
     /// Buffer pool for request generation
     pool: BufferPool,
     /// Key generator for next_request()
@@ -150,7 +161,7 @@ impl MasstreeProtocol {
         Self {
             operation,
             conn_send_seq: HashMap::new(),
-            conn_handshake_done: HashMap::new(),
+            conn_handshake_state: HashMap::new(),
             pool: BufferPool::new(),
             key_gen: None,
             value_size: 64,
@@ -202,7 +213,7 @@ impl MasstreeProtocol {
         Self {
             operation,
             conn_send_seq: HashMap::new(),
-            conn_handshake_done: HashMap::new(),
+            conn_handshake_state: HashMap::new(),
             pool: BufferPool::new(),
             key_gen: Some(key_gen),
             value_size,
@@ -231,14 +242,22 @@ impl MasstreeProtocol {
         result
     }
 
+    fn get_handshake_state(&self, conn_id: usize) -> HandshakeState {
+        *self.conn_handshake_state.get(&conn_id).unwrap_or(&HandshakeState::NotSent)
+    }
+
     fn is_handshake_done(&self, conn_id: usize) -> bool {
-        *self.conn_handshake_done.get(&conn_id).unwrap_or(&false)
+        self.get_handshake_state(conn_id) == HandshakeState::Done
+    }
+
+    fn set_handshake_pending(&mut self, conn_id: usize) {
+        self.conn_handshake_state.insert(conn_id, HandshakeState::Pending);
     }
 
     /// Mark a connection's handshake as complete
     /// This is useful for testing to skip the handshake phase
     pub fn mark_handshake_done(&mut self, conn_id: usize) {
-        self.conn_handshake_done.insert(conn_id, true);
+        self.conn_handshake_state.insert(conn_id, HandshakeState::Done);
     }
 
     /// Get the key prefix
@@ -506,6 +525,8 @@ impl Protocol for MasstreeProtocol {
         // Phase 1: Handshake (warmup)
         if !self.is_handshake_done(conn_id) {
             let handshake = self.build_handshake().expect("Failed to build handshake request");
+            // Mark handshake as pending to prevent duplicate handshakes
+            self.set_handshake_pending(conn_id);
             return (handshake, (conn_id, 0), crate::RequestMeta::warmup());
         }
 
@@ -639,10 +660,24 @@ impl Protocol for MasstreeProtocol {
 
     fn reset(&mut self) {
         self.conn_send_seq.clear();
-        self.conn_handshake_done.clear();
+        self.conn_handshake_state.clear();
         if let Some(ref mut key_gen) = self.key_gen {
             key_gen.reset();
         }
+    }
+
+    fn can_send(&self, conn_id: usize) -> bool {
+        // Allow sending unless handshake is pending (sent but not responded)
+        //
+        // This prevents duplicate handshake requests with the same ID (conn_id, 0)
+        // when max_pending > 1:
+        //
+        // State machine:
+        // - NotSent → can send (will send handshake)
+        // - Pending → CANNOT send (waiting for handshake response)
+        // - Done → can send (normal operation)
+        let state = self.get_handshake_state(conn_id);
+        state != HandshakeState::Pending
     }
 }
 

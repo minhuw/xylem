@@ -250,6 +250,18 @@ impl Protocol for MultiProtocol {
             MultiProtocol::Masstree(p) => p.reset(),
         }
     }
+
+    fn can_send(&self, conn_id: usize) -> bool {
+        match self {
+            MultiProtocol::Redis(p) => p.can_send(conn_id),
+            MultiProtocol::RedisCluster(p) => p.protocol.can_send(conn_id),
+            MultiProtocol::MemcachedBinary(p) => p.can_send(conn_id),
+            MultiProtocol::MemcachedAscii(p) => p.can_send(conn_id),
+            MultiProtocol::Http(p) => p.can_send(conn_id),
+            MultiProtocol::XylemEcho(p) => p.can_send(conn_id),
+            MultiProtocol::Masstree(p) => p.can_send(conn_id),
+        }
+    }
 }
 
 fn resolve_insert_key_count(

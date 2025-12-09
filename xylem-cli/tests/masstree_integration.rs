@@ -66,6 +66,10 @@ impl<P: xylem_protocols::Protocol> xylem_core::threading::worker::Protocol for P
     fn reset(&mut self) {
         self.inner.reset()
     }
+
+    fn can_send(&self, conn_id: usize) -> bool {
+        self.inner.can_send(conn_id)
+    }
 }
 
 #[test]
@@ -369,6 +373,73 @@ fn test_masstree_rate_limited() {
     assert!(
         rate_ratio > 0.5 && rate_ratio < 1.5,
         "Actual rate should be within 50% of target rate, got {rate_ratio:.2}x"
+    );
+
+    println!("Test passed!");
+}
+
+#[test]
+fn test_masstree_pipelined() {
+    // Start Masstree server (will auto-cleanup on drop)
+    let _masstree = common::masstree::MasstreeGuard::new().expect("Failed to start Masstree");
+
+    println!("Running Masstree pipelined test (pipeline depth=4)...");
+
+    let target_addr = "127.0.0.1:2117".parse().unwrap();
+    let duration = Duration::from_secs(3);
+
+    // Create Masstree protocol with GET operations
+    let protocol = xylem_protocols::masstree::MasstreeProtocol::new(
+        xylem_protocols::masstree::MasstreeOp::Get,
+    );
+    let protocol = ProtocolAdapter::new(protocol);
+
+    // Create worker components with pipelining enabled
+    let stats = common::create_test_stats();
+    let worker_config = WorkerConfig {
+        target: target_addr,
+        duration,
+        conn_count: 1,
+        max_pending_per_conn: 4, // Enable pipelining with depth=4
+    };
+
+    let mut worker =
+        Worker::with_closed_loop(&TcpTransportFactory::default(), protocol, stats, worker_config)
+            .expect("Failed to create worker");
+
+    // Run the worker
+    println!("Starting pipelined Masstree test (max_pending=4)...");
+    let result = worker.run();
+
+    assert!(result.is_ok(), "Worker should complete successfully: {:?}", result.err());
+
+    // Check stats
+    let stats = worker.into_stats();
+    let basic_stats = stats.global().calculate_basic_stats();
+
+    println!("Results:");
+    println!("  Total requests: {}", stats.global().tx_requests());
+    println!(
+        "  Throughput: {:.2} req/s",
+        stats.global().tx_requests() as f64 / duration.as_secs_f64()
+    );
+    println!("  Min latency: {:.2} us", basic_stats.min.as_micros());
+    println!("  Mean latency: {:.2} us", basic_stats.mean.as_micros());
+    println!("  Max latency: {:.2} us", basic_stats.max.as_micros());
+
+    // Verify we got some requests through
+    assert!(stats.global().tx_requests() > 0, "Should have sent some requests");
+    assert!(stats.global().rx_requests() > 0, "Should have received some responses");
+    assert!(!stats.global().samples().is_empty(), "Should have collected latency samples");
+
+    // With pipelining, we should get higher throughput than without
+    let throughput = stats.global().tx_requests() as f64 / duration.as_secs_f64();
+    println!("✓ Pipelined throughput: {throughput:.0} req/s");
+
+    // Basic sanity check - should be more than 100 req/s with pipelining
+    assert!(
+        throughput > 100.0,
+        "Pipelined throughput should be > 100 req/s, got {throughput:.0}"
     );
 
     println!("Test passed!");

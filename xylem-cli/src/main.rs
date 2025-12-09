@@ -247,6 +247,10 @@ impl<P: xylem_protocols::Protocol<RequestId = (usize, u64)> + 'static>
     fn reset(&mut self) {
         self.inner.reset()
     }
+
+    fn can_send(&self, conn_id: usize) -> bool {
+        self.inner.can_send(conn_id)
+    }
 }
 
 impl<P: xylem_protocols::Protocol<RequestId = (usize, u64)> + 'static> ProtocolAdapter<P> {
@@ -939,6 +943,12 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
         config.stats.include_records,
     );
 
+    tracing::debug!(
+        "Output format: {:?}, path: {}",
+        config.output.format,
+        config.output.file.display()
+    );
+
     match config.output.format {
         OutputFormat::Human => {
             // Human format - console output only, no file
@@ -951,8 +961,18 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
             let json_path = config.output.file.with_extension("json");
             let path_str =
                 json_path.to_str().ok_or_else(|| anyhow::anyhow!("Invalid output file path"))?;
-            detailed_results.write_json(path_str)?;
-            tracing::info!("Results written to: {}", json_path.display());
+            tracing::debug!("Writing JSON results to {}", json_path.display());
+            match detailed_results.write_json(path_str) {
+                Ok(_) => tracing::info!("Results written to: {}", json_path.display()),
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to write JSON results to {}: {}",
+                        json_path.display(),
+                        e
+                    );
+                    return Err(e);
+                }
+            }
         }
         OutputFormat::Html => {
             detailed_results.print_human();
@@ -960,7 +980,11 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
             let html_path = config.output.file.with_extension("html");
             let path_str =
                 html_path.to_str().ok_or_else(|| anyhow::anyhow!("Invalid output file path"))?;
-            output::html::generate_html_report(&detailed_results, path_str)?;
+            tracing::debug!("Writing HTML report to {}", html_path.display());
+            if let Err(e) = output::html::generate_html_report(&detailed_results, path_str) {
+                tracing::error!("Failed to write HTML report to {}: {}", html_path.display(), e);
+                return Err(e);
+            }
             tracing::info!("HTML report written to: {}", html_path.display());
         }
         OutputFormat::Both => {
@@ -975,8 +999,19 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
             let html_str =
                 html_path.to_str().ok_or_else(|| anyhow::anyhow!("Invalid HTML path"))?;
 
-            detailed_results.write_json(json_str)?;
-            output::html::generate_html_report(&detailed_results, html_str)?;
+            tracing::debug!(
+                "Writing JSON and HTML results to {} and {}",
+                json_path.display(),
+                html_path.display()
+            );
+            if let Err(e) = detailed_results.write_json(json_str) {
+                tracing::error!("Failed to write JSON results to {}: {}", json_path.display(), e);
+                return Err(e);
+            }
+            if let Err(e) = output::html::generate_html_report(&detailed_results, html_str) {
+                tracing::error!("Failed to write HTML report to {}: {}", html_path.display(), e);
+                return Err(e);
+            }
             tracing::info!(
                 "Results written to: {} and {}",
                 json_path.display(),

@@ -84,6 +84,15 @@ struct PendingRequest {
 ///
 /// Queue cleanup: When a response arrives before its TX timestamp (or for transports without
 /// HW timestamps like Unix sockets), the queue entry is cleaned up by popping from front.
+///
+/// # Scheduling Invariant
+///
+/// A connection is on the ready heap if and only if it can accept more requests:
+/// - `on_heap == true` ⟺ `pending_count < max_pending`
+///
+/// The heap stores ALL connections that can send, including rate-limited connections
+/// with future send times. This allows efficient timeout calculation by peeking at the
+/// earliest ready time (needed for epoll_wait timeout).
 pub struct ConnectionState<ReqId: Eq + Hash + Clone> {
     /// Connection ID in the ConnectionGroup
     connection_id: usize,
@@ -108,6 +117,9 @@ pub struct ConnectionState<ReqId: Eq + Hash + Clone> {
     group_id: usize,
     /// Timestamp (in nanoseconds) when this connection was last used for sending
     last_active: u64,
+    /// Whether this connection is currently in the ready heap
+    /// Invariant: on_heap == true ⟺ connection can accept more requests
+    on_heap: bool,
 }
 
 impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
@@ -131,6 +143,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
             policy,
             group_id,
             last_active: 0,
+            on_heap: false,
         }
     }
 
@@ -152,6 +165,11 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
     /// Get pending request count
     pub fn pending_count(&self) -> usize {
         self.pending_map.len()
+    }
+
+    /// Get maximum pending requests allowed
+    pub fn max_pending(&self) -> usize {
+        self.max_pending_requests
     }
 
     /// Check if connection is closed
@@ -182,6 +200,16 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
     /// Get the policy name (for debugging)
     pub fn policy_name(&self) -> &'static str {
         self.policy.name()
+    }
+
+    /// Check if this connection is currently on the ready heap
+    pub fn is_on_heap(&self) -> bool {
+        self.on_heap
+    }
+
+    /// Mark this connection as being on the ready heap
+    pub fn set_on_heap(&mut self, on_heap: bool) {
+        self.on_heap = on_heap;
     }
 
     /// Record a sent request with TX byte range for hardware timestamp correlation
@@ -413,13 +441,15 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
             let next_send_time = policy.next_send_time(current_time_ns);
             ready_heap.push(connection_id, next_send_time);
 
-            let state = ConnectionState::new(
+            let mut state = ConnectionState::new(
                 connection_id,
                 target,
                 max_pending_per_connection,
                 policy,
                 group_id,
             );
+
+            state.set_on_heap(true);
             connection_states.insert(connection_id, state);
             connection_ids.push(connection_id);
         }
@@ -477,13 +507,15 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
                 let next_send_time = policy.next_send_time(current_time_ns);
                 ready_heap.push(connection_id, next_send_time);
 
-                let state = ConnectionState::new(
+                let mut state = ConnectionState::new(
                     connection_id,
                     target,
                     max_pending_per_connection,
                     policy,
                     group_id,
                 );
+
+                state.set_on_heap(true);
                 connection_states.insert(connection_id, state);
                 connection_ids.push(connection_id);
                 idx += 1;
@@ -538,7 +570,9 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
             .ok_or_else(|| crate::Error::Connection("Connection not found in group".to_string()))?;
 
         let (send_ts, tx_start, tx_end) = connection.send(data)?;
-        state.record_send(req_id, send_ts, tx_start, tx_end, is_warmup);
+
+        let state = self.connection_states.get_mut(&connection_id).unwrap();
+        state.record_send(req_id.clone(), send_ts, tx_start, tx_end, is_warmup);
 
         Ok(())
     }
@@ -630,37 +664,90 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
 
     /// Pick the next ready connection (O(log N) via min-heap)
     ///
-    /// Pops connections from the heap until finding one that can send.
-    /// Stale entries (connections that can't send due to full pipeline) are discarded.
+    /// Pops the next ready connection from the heap and marks it as off-heap.
+    ///
+    /// Note: With the new scheduling invariant, all connections on the heap
+    /// should be sendable. This method still checks `can_send()` defensively
+    /// but should never encounter a connection that can't send.
     pub fn pick_connection(&mut self) -> Option<usize> {
         let current_time_ns = crate::timing::time_ns();
 
-        // Pop from heap until we find a connection that can actually send
-        while let Some(connection_id) = self.ready_heap.pop_ready(current_time_ns) {
+        if let Some(connection_id) = self.ready_heap.pop_ready(current_time_ns) {
             if let Some(state) = self.connection_states.get_mut(&connection_id) {
                 if state.can_send() {
+                    state.set_on_heap(false);
                     state.last_active = current_time_ns;
                     return Some(connection_id);
+                } else {
+                    eprintln!(
+                        "[ERROR] INVARIANT VIOLATION: Connection {} popped from heap but can't send (pending={}, max={}, closed={})",
+                        connection_id,
+                        state.pending_count(),
+                        state.max_pending_requests,
+                        state.is_closed()
+                    );
                 }
-                // Connection can't send (pipeline full or closed) - don't re-add, it will
-                // be re-added when a response is received and pipeline has capacity
+            } else {
+                eprintln!(
+                    "[ERROR] Connection {} popped from heap but state not found!",
+                    connection_id
+                );
             }
         }
 
         None
     }
 
-    /// Re-add a connection to the heap after it becomes sendable again
+    /// Add a connection to the ready heap if not already on it
     ///
-    /// Called after receiving a response to re-enable the connection for scheduling.
-    pub fn reschedule_connection(&mut self, connection_id: usize) {
+    /// Maintains the invariant: on_heap == true ⟺ connection can send (pipeline not full AND protocol ready).
+    ///
+    /// The heap stores ALL connections that can send, including rate-limited connections
+    /// with future send times. This allows us to peek at the earliest ready time for
+    /// efficient epoll_wait timeout calculation.
+    ///
+    /// This method should be called:
+    /// 1. After sending a request (if pipeline still has capacity AND protocol is ready)
+    /// 2. After receiving a response (if pipeline transitioned from full to available AND protocol is ready)
+    ///
+    /// # Parameters
+    /// - `connection_id`: Connection to potentially schedule
+    /// - `protocol`: Protocol instance to check readiness
+    ///
+    /// # Returns
+    /// - `true` if connection was added to heap
+    /// - `false` if connection was already on heap or cannot be scheduled (pipeline full or protocol not ready)
+    pub fn try_schedule_connection<P>(&mut self, connection_id: usize, protocol: &P) -> bool
+    where
+        P: crate::threading::worker::Protocol,
+    {
         let current_time_ns = crate::timing::time_ns();
+
         if let Some(state) = self.connection_states.get_mut(&connection_id) {
-            if state.can_send() {
-                let next_send_time = state.next_send_time(current_time_ns);
-                self.ready_heap.push(connection_id, next_send_time);
+            // Don't add if already on heap (maintain invariant: no duplicates)
+            if state.is_on_heap() {
+                return false;
             }
+
+            // Can't send (pipeline full or closed)
+            if !state.can_send() {
+                return false;
+            }
+
+            // Check protocol readiness (e.g., handshake not done)
+            if !protocol.can_send(connection_id) {
+                return false;
+            }
+
+            // Add to heap regardless of next_send_time
+            // - Closed-loop (None): ready immediately
+            // - Rate-limited (Some(future)): will be popped when time arrives
+            let next_send_time = state.next_send_time(current_time_ns);
+            state.set_on_heap(true);
+            self.ready_heap.push(connection_id, next_send_time);
+            return true;
         }
+        false
     }
 
     /// Get the next time when a connection will be ready to send
@@ -686,6 +773,11 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
     /// Iterate over all connection IDs
     pub fn connection_ids(&self) -> &[usize] {
         &self.connection_ids
+    }
+
+    /// Get the number of connections in the pool
+    pub fn connection_count(&self) -> usize {
+        self.connection_ids.len()
     }
 
     /// Get mapping of connection ID to target address
@@ -788,13 +880,15 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug>
                 let next_send_time = policy.next_send_time(current_time_ns);
                 ready_heap.push(connection_id, next_send_time);
 
-                let state = ConnectionState::new(
+                let mut state = ConnectionState::new(
                     connection_id,
                     placeholder_addr, // Unix sockets don't have a SocketAddr
                     max_pending_per_connection,
                     policy,
                     group_id,
                 );
+
+                state.set_on_heap(true);
                 connection_states.insert(connection_id, state);
                 connection_ids.push(connection_id);
                 idx += 1;

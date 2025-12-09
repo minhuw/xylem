@@ -7,17 +7,31 @@
 //! The actual scheduling decisions are made by each connection's `Policy` - this heap
 //! just organizes them efficiently for lookup.
 //!
+//! ## Scheduling Invariant
+//!
+//! Each connection maintains an `on_heap` flag to ensure the invariant:
+//! **A connection is on the heap ⟺ it can send and is ready**
+//!
+//! This invariant ensures:
+//! - **No duplicate entries**: Each connection appears at most once on the heap
+//! - **Efficient scheduling**: No stale entries to filter during `pick_connection()`
+//! - **Clear state machine**: Explicit transitions when adding/removing from heap
+//!
+//! The heap itself doesn't enforce uniqueness (it's just a BinaryHeap), but the
+//! ConnectionPool maintains the invariant by checking the `on_heap` flag before
+//! calling `push()`.
+//!
 //! ## Architecture
 //!
 //! ```text
 //! ReadyHeap (data structure)
 //! └── Min-Heap of (next_send_time, connection_id)
 //!
-//! ConnectionPool (owns the heap)
-//! └── Connections (each with own Policy that decides next_send_time)
-//!     ├── Connection 0: FixedRatePolicy(1000 req/s)
-//!     ├── Connection 1: PoissonPolicy(500 req/s)
-//!     └── Connection 2: ClosedLoopPolicy
+//! ConnectionPool (owns the heap + maintains invariant)
+//! └── Connections (each with own Policy + on_heap flag)
+//!     ├── Connection 0: FixedRatePolicy(1000 req/s), on_heap=true
+//!     ├── Connection 1: PoissonPolicy(500 req/s), on_heap=false (pipeline full)
+//!     └── Connection 2: ClosedLoopPolicy, on_heap=true
 //! ```
 
 use std::cmp::Ordering;
@@ -342,18 +356,13 @@ mod tests {
     }
 
     #[test]
-    fn test_ready_heap_duplicate_entries() {
+    fn test_ready_heap_no_duplicates_with_tracking() {
         let mut heap = ReadyHeap::new();
 
-        // Add connection
         heap.push(0, Some(1000));
+        assert_eq!(heap.len(), 1);
 
-        // Add same connection with new time
         heap.push(0, Some(2000));
-
-        // Both entries are in the heap, but we'll pick the earliest one first
-        // Note: This means we may have duplicate entries, but that's okay
-        // The connection's actual state will determine if it can actually send
-        assert_eq!(heap.len(), 2);
+        assert_eq!(heap.len(), 2, "Heap allows duplicates - ConnectionPool must prevent them");
     }
 }

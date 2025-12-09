@@ -177,6 +177,24 @@ pub trait Protocol: Send {
 
     /// Reset protocol state
     fn reset(&mut self);
+
+    /// Check if the protocol is ready to send a request on this connection
+    ///
+    /// This allows protocols to impose their own constraints beyond pipeline depth.
+    /// For example, protocols that require handshakes (like Masstree) can return
+    /// false until the handshake completes, preventing duplicate handshake requests
+    /// from filling the pipeline with the same request ID.
+    ///
+    /// # Arguments
+    /// * `conn_id` - Connection identifier
+    ///
+    /// # Returns
+    /// true if the protocol is ready to generate a request for this connection
+    ///
+    /// Default implementation always returns true (no protocol-level constraints).
+    fn can_send(&self, _conn_id: usize) -> bool {
+        true
+    }
 }
 
 pub mod configs;

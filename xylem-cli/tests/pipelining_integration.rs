@@ -1,6 +1,16 @@
 //! Pipelining integration tests
 //!
 //! Tests pipelining behavior with Redis - multiple outstanding requests per connection.
+//!
+//! ## Closed-loop vs Open-loop Semantics
+//!
+//! - **Closed-loop**: Send next request when a response arrives (feedback-driven).
+//!   `max_pending_per_connection` controls max concurrent in-flight requests.
+//!   Throughput is naturally limited by RTT and pipeline depth.
+//!
+//! - **Open-loop (rate-limited)**: Send requests at a fixed rate regardless of responses.
+//!   `max_pending_per_connection` acts as backpressure to avoid overload.
+//!   Throughput is controlled by the configured rate.
 
 use std::time::Duration;
 use xylem_core::threading::{Worker, WorkerConfig};
@@ -63,6 +73,10 @@ impl<P: xylem_protocols::Protocol> xylem_core::threading::worker::Protocol for P
 
     fn reset(&mut self) {
         self.inner.reset()
+    }
+
+    fn can_send(&self, conn_id: usize) -> bool {
+        self.inner.can_send(conn_id)
     }
 }
 
