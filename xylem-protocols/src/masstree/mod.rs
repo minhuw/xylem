@@ -485,7 +485,7 @@ impl MasstreeProtocol {
         conn_id: usize,
         key: u64,
         value_size: usize,
-    ) -> (Vec<u8>, (usize, u16)) {
+    ) -> crate::Request<(usize, u16)> {
         let seq = self.next_send_seq(conn_id);
         // Format key with configurable prefix
         let key_str = self.format_key(key);
@@ -514,20 +514,20 @@ impl MasstreeProtocol {
             }
         };
 
-        (request, (conn_id, seq))
+        crate::Request::measurement(request, (conn_id, seq))
     }
 }
 
 impl Protocol for MasstreeProtocol {
     type RequestId = (usize, u16);
 
-    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId, crate::RequestMeta) {
+    fn next_request(&mut self, conn_id: usize) -> crate::Request<Self::RequestId> {
         // Phase 1: Handshake (warmup)
         if !self.is_handshake_done(conn_id) {
             let handshake = self.build_handshake().expect("Failed to build handshake request");
             // Mark handshake as pending to prevent duplicate handshakes
             self.set_handshake_pending(conn_id);
-            return (handshake, (conn_id, 0), crate::RequestMeta::warmup());
+            return crate::Request::warmup(handshake, (conn_id, 0));
         }
 
         // Phase 2: Insert phase (warmup) - populate data before measurement
@@ -540,14 +540,13 @@ impl Protocol for MasstreeProtocol {
                 let request = self
                     .build_set_request(seq, &key_str, &value)
                     .expect("Failed to build SET request for insert phase");
-                return (request, (conn_id, seq), crate::RequestMeta::warmup());
+                return crate::Request::warmup(request, (conn_id, seq));
             }
         }
 
         // Phase 3: Normal measurement phase
         let key = self.key_gen.as_mut().map(|g| g.next_key()).unwrap_or(0);
-        let (data, req_id) = self.generate_request_internal(conn_id, key, self.value_size);
-        (data, req_id, crate::RequestMeta::measurement())
+        self.generate_request_internal(conn_id, key, self.value_size)
     }
 
     fn parse_response(
@@ -851,14 +850,15 @@ mod tests {
     #[test]
     fn test_handshake_request() {
         let mut proto = MasstreeProtocol::new(MasstreeOp::Get);
-        let (req, (conn_id, seq), _meta) = proto.next_request(0);
+        let request = proto.next_request(0);
+        let (conn_id, seq) = request.request_id;
 
         assert_eq!(conn_id, 0);
         assert_eq!(seq, 0); // Handshake uses seq 0
 
         // Verify it's a valid MessagePack array
-        assert!(!req.is_empty());
-        assert_eq!(req[0] & 0xf0, 0x90); // fixarray marker
+        assert!(!request.data.is_empty());
+        assert_eq!(request.data[0] & 0xf0, 0x90); // fixarray marker
     }
 
     #[test]
@@ -868,13 +868,14 @@ mod tests {
         // Mark handshake as done
         proto.mark_handshake_done(0);
 
-        let (req, (conn_id, seq), _meta) = proto.next_request(0);
+        let request = proto.next_request(0);
+        let (conn_id, seq) = request.request_id;
 
         assert_eq!(conn_id, 0);
         assert_eq!(seq, 0); // First request after handshake
 
         // Verify it's a valid MessagePack array
-        assert!(!req.is_empty());
+        assert!(!request.data.is_empty());
     }
 
     #[test]
@@ -884,14 +885,15 @@ mod tests {
         // Mark handshake as done
         proto.mark_handshake_done(0);
 
-        let (req, (conn_id, seq), _meta) = proto.next_request(0);
+        let request = proto.next_request(0);
+        let (conn_id, seq) = request.request_id;
 
         assert_eq!(conn_id, 0);
         assert_eq!(seq, 0);
 
         // SET requests should be larger (include value)
         // Default value_size is 64, plus overhead for key, seq, cmd
-        assert!(req.len() > 64, "SET request too small: {} bytes", req.len());
+        assert!(request.data.len() > 64, "SET request too small: {} bytes", request.data.len());
     }
 
     #[test]
@@ -900,9 +902,12 @@ mod tests {
         proto.mark_handshake_done(0);
 
         // Same conn_id, sequence increments
-        let (_, (_, seq1), _) = proto.next_request(0);
-        let (_, (_, seq2), _) = proto.next_request(0);
-        let (_, (_, seq3), _) = proto.next_request(0);
+        let request1 = proto.next_request(0);
+        let (_, seq1) = request1.request_id;
+        let request2 = proto.next_request(0);
+        let (_, seq2) = request2.request_id;
+        let request3 = proto.next_request(0);
+        let (_, seq3) = request3.request_id;
 
         assert_eq!(seq1, 0);
         assert_eq!(seq2, 1);
@@ -915,9 +920,12 @@ mod tests {
         proto.mark_handshake_done(0);
         proto.mark_handshake_done(1);
 
-        let (_, (conn0, seq_conn0_1), _) = proto.next_request(0);
-        let (_, (conn1, seq_conn1_1), _) = proto.next_request(1);
-        let (_, (_, seq_conn0_2), _) = proto.next_request(0);
+        let request0_1 = proto.next_request(0);
+        let (conn0, seq_conn0_1) = request0_1.request_id;
+        let request1_1 = proto.next_request(1);
+        let (conn1, seq_conn1_1) = request1_1.request_id;
+        let request0_2 = proto.next_request(0);
+        let (_, seq_conn0_2) = request0_2.request_id;
 
         assert_eq!(conn0, 0);
         assert_eq!(conn1, 1);
@@ -931,15 +939,16 @@ mod tests {
         let mut proto = MasstreeProtocol::new(MasstreeOp::Remove);
         proto.mark_handshake_done(0);
 
-        let (req, (conn_id, seq), _meta) = proto.next_request(0);
+        let request = proto.next_request(0);
+        let (conn_id, seq) = request.request_id;
 
         assert_eq!(conn_id, 0);
         assert_eq!(seq, 0);
 
         // Verify it's a valid MessagePack array
-        assert!(!req.is_empty());
+        assert!(!request.data.is_empty());
         // REMOVE requests are small (just seq, cmd, key)
-        assert!(req.len() < 50);
+        assert!(request.data.len() < 50);
     }
 
     #[test]
@@ -948,14 +957,15 @@ mod tests {
         let mut proto = MasstreeProtocol::new(MasstreeOp::Put { columns });
         proto.mark_handshake_done(0);
 
-        let (req, (conn_id, seq), _meta) = proto.next_request(0);
+        let request = proto.next_request(0);
+        let (conn_id, seq) = request.request_id;
 
         assert_eq!(conn_id, 0);
         assert_eq!(seq, 0);
 
         // PUT requests have seq, cmd, key, + column pairs
-        assert!(!req.is_empty());
-        assert!(req.len() > 20); // Should have reasonable size
+        assert!(!request.data.is_empty());
+        assert!(request.data.len() > 20); // Should have reasonable size
     }
 
     #[test]
@@ -968,14 +978,15 @@ mod tests {
         let mut proto = MasstreeProtocol::new(scan_op);
         proto.mark_handshake_done(0);
 
-        let (req, (conn_id, seq), _meta) = proto.next_request(0);
+        let request = proto.next_request(0);
+        let (conn_id, seq) = request.request_id;
 
         assert_eq!(conn_id, 0);
         assert_eq!(seq, 0);
 
         // SCAN requests have seq, cmd, firstkey, count, field indices
-        assert!(!req.is_empty());
-        let req_str = String::from_utf8_lossy(&req);
+        assert!(!request.data.is_empty());
+        let req_str = String::from_utf8_lossy(&request.data);
         assert!(req_str.contains("start_key"));
     }
 
@@ -984,14 +995,15 @@ mod tests {
         let mut proto = MasstreeProtocol::new(MasstreeOp::Checkpoint);
         proto.mark_handshake_done(0);
 
-        let (req, (conn_id, seq), _meta) = proto.next_request(0);
+        let request = proto.next_request(0);
+        let (conn_id, seq) = request.request_id;
 
         assert_eq!(conn_id, 0);
         assert_eq!(seq, 0);
 
         // CHECKPOINT requests are minimal (just seq, cmd)
-        assert!(!req.is_empty());
-        assert!(req.len() < 20);
+        assert!(!request.data.is_empty());
+        assert!(request.data.len() < 20);
     }
 
     #[test]
@@ -1011,11 +1023,11 @@ mod tests {
         // Test that different operations work on same protocol instance
         let mut proto1 = MasstreeProtocol::new(MasstreeOp::Get);
         proto1.mark_handshake_done(0);
-        let (req1, _, _) = proto1.next_request(0);
+        let req1 = proto1.next_request(0);
 
         let mut proto2 = MasstreeProtocol::new(MasstreeOp::Remove);
         proto2.mark_handshake_done(0);
-        let (req2, _, _) = proto2.next_request(0);
+        let req2 = proto2.next_request(0);
 
         // Requests should be different
         assert_ne!(req1, req2);
@@ -1037,8 +1049,8 @@ mod tests {
         );
         proto.mark_handshake_done(0);
 
-        let (req, _, _) = proto.next_request(0);
-        let req_str = String::from_utf8_lossy(&req);
+        let request = proto.next_request(0);
+        let req_str = String::from_utf8_lossy(&request.data);
 
         assert!(req_str.contains("memtier-"), "Expected custom key prefix 'memtier-'");
         assert!(!req_str.contains("key:"), "Should not contain default prefix 'key:'");
@@ -1060,8 +1072,8 @@ mod tests {
         );
         proto.mark_handshake_done(0);
 
-        let (req, _, _) = proto.next_request(0);
-        let req_str = String::from_utf8_lossy(&req);
+        let request = proto.next_request(0);
+        let req_str = String::from_utf8_lossy(&request.data);
 
         assert!(req_str.contains("test:100"), "Expected custom key prefix 'test:'");
     }
@@ -1082,10 +1094,10 @@ mod tests {
         );
         proto.mark_handshake_done(0);
 
-        let (req, _, _) = proto.next_request(0);
+        let request = proto.next_request(0);
 
         // Count occurrences of 'x' - random data should have fewer consecutive x's
-        let x_count = req.iter().filter(|&&b| b == b'x').count();
+        let x_count = request.data.iter().filter(|&&b| b == b'x').count();
         // With random data of size 100, we shouldn't have 100 consecutive x's
         // (statistically very unlikely with random ASCII 33-126)
         assert!(
@@ -1125,8 +1137,8 @@ mod tests {
         proto2.mark_handshake_done(0);
 
         // Generate requests - they should be identical with the same seed
-        let (req1, _, _) = proto1.next_request(0);
-        let (req2, _, _) = proto2.next_request(0);
+        let req1 = proto1.next_request(0);
+        let req2 = proto2.next_request(0);
 
         assert_eq!(req1, req2, "Same seed should produce same random data");
     }
@@ -1193,25 +1205,29 @@ mod tests {
         );
 
         // First request is handshake (seq 0), should be warmup
-        let (_, (_, seq), meta) = proto.next_request(0);
+        let request1 = proto.next_request(0);
+        let (_, seq) = request1.request_id;
         assert_eq!(seq, 0, "First request should be handshake with seq 0");
-        assert!(meta.is_warmup, "Handshake should be warmup");
+        assert!(request1.metadata.is_warmup, "Handshake should be warmup");
 
         // Mark handshake done
         proto.mark_handshake_done(0);
 
         // Insert phase requests should be warmup and SET operations
         for i in 0..10 {
-            let (req, _, meta) = proto.next_request(0);
-            assert!(meta.is_warmup, "Insert phase request {} should be warmup", i);
+            let request = proto.next_request(0);
+            assert!(request.metadata.is_warmup, "Insert phase request {} should be warmup", i);
             // The request should be a SET operation during insert phase
-            let req_str = String::from_utf8_lossy(&req);
+            let req_str = String::from_utf8_lossy(&request.data);
             assert!(req_str.contains(&format!("key:{}", i)), "Should use sequential keys");
         }
 
         // After insert phase, requests should not be warmup
-        let (_, _, meta) = proto.next_request(0);
-        assert!(!meta.is_warmup, "After insert phase, requests should not be warmup");
+        let request_after = proto.next_request(0);
+        assert!(
+            !request_after.metadata.is_warmup,
+            "After insert phase, requests should not be warmup"
+        );
     }
 
     #[test]

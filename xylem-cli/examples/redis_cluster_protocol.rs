@@ -92,8 +92,8 @@ fn main() {
         };
 
         // Generate request
-        let (request_data, req_id) = protocol.generate_request_with_key(0, *key, 100);
-        let (_orig_conn, req_slot, (target_conn, _seq)) = req_id;
+        let request = protocol.generate_request_with_key(0, *key, 100);
+        let (_orig_conn, req_slot, (target_conn, _seq)) = request.request_id;
 
         // Verify routing
         let actual_node = if target_conn == 0 {
@@ -118,7 +118,7 @@ fn main() {
 
         assert_eq!(slot, req_slot, "Slot mismatch in request ID");
         assert_eq!(actual_node, expected_node, "Request routed to wrong node");
-        assert!(!request_data.is_empty(), "Request data is empty");
+        assert!(!request.data.is_empty(), "Request data is empty");
     }
     println!();
 

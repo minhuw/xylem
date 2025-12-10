@@ -481,7 +481,7 @@ impl RedisProtocol {
         &mut self,
         conn_id: usize,
         value_size: usize,
-    ) -> (Vec<u8>, (usize, u64)) {
+    ) -> crate::Request<(usize, u64)> {
         let seq = self.next_send_seq(conn_id);
         let id = (conn_id, seq);
 
@@ -496,7 +496,7 @@ impl RedisProtocol {
             .expect("Per-command key generation should be available");
 
         let request_data = self.format_command(&operation, key, value_size);
-        (request_data, id)
+        crate::Request::measurement(request_data, id)
     }
 
     /// Generate a SET request with imported data (string key + value bytes)
@@ -505,7 +505,7 @@ impl RedisProtocol {
         conn_id: usize,
         key: &str,
         value: &[u8],
-    ) -> (Vec<u8>, (usize, u64)) {
+    ) -> crate::Request<(usize, u64)> {
         let seq = self.next_send_seq(conn_id);
         let id = (conn_id, seq);
 
@@ -520,7 +520,7 @@ impl RedisProtocol {
         request.extend_from_slice(value);
         request.extend_from_slice(b"\r\n");
 
-        (request.to_vec(), id)
+        crate::Request::measurement(request, id)
     }
 
     /// Generate a GET request with imported data (string key)
@@ -528,7 +528,7 @@ impl RedisProtocol {
         &mut self,
         conn_id: usize,
         key: &str,
-    ) -> (Vec<u8>, (usize, u64)) {
+    ) -> crate::Request<(usize, u64)> {
         let seq = self.next_send_seq(conn_id);
         let id = (conn_id, seq);
 
@@ -540,7 +540,7 @@ impl RedisProtocol {
         request.extend_from_slice(key.as_bytes());
         request.extend_from_slice(b"\r\n");
 
-        (request.to_vec(), id)
+        crate::Request::measurement(request.to_vec(), id)
     }
 
     /// Generate a request with specific key and value size
@@ -551,7 +551,7 @@ impl RedisProtocol {
         conn_id: usize,
         key: u64,
         value_size: usize,
-    ) -> (Vec<u8>, (usize, u64)) {
+    ) -> crate::Request<(usize, u64)> {
         let seq = self.next_send_seq(conn_id);
         let id = (conn_id, seq);
 
@@ -568,7 +568,7 @@ impl RedisProtocol {
 
         let request_data = self.format_command(&operation, key, value_size);
 
-        (request_data, id)
+        crate::Request::measurement(request_data, id)
     }
 
     /// Generate a request with specific operation, key and value size
@@ -581,12 +581,12 @@ impl RedisProtocol {
         key: u64,
         value_size: usize,
         operation: &RedisOp,
-    ) -> (Vec<u8>, (usize, u64)) {
+    ) -> crate::Request<(usize, u64)> {
         let seq = self.next_send_seq(conn_id);
         let id = (conn_id, seq);
         self.record_command(operation);
         let request_data = self.format_command(operation, key, value_size);
-        (request_data, id)
+        crate::Request::measurement(request_data, id)
     }
 
     /// Format a Redis command into RESP bytes
@@ -1059,27 +1059,26 @@ impl RedisProtocol {
 impl Protocol for RedisProtocol {
     type RequestId = (usize, u64); // (conn_id, sequence)
 
-    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId, crate::RequestMeta) {
+    fn next_request(&mut self, conn_id: usize) -> crate::Request<Self::RequestId> {
         // Phase 1: Insert phase (warmup) - populate data before measurement
         if let Some(ref mut insert_state) = self.insert_phase {
             if let Some(key) = insert_state.next_key() {
                 let value_size = insert_state.value_size;
                 // Generate SET request for insert phase
-                let (data, req_id) =
-                    self.generate_request_for_op(conn_id, key, value_size, &RedisOp::Set);
-                return (data, req_id, crate::RequestMeta::warmup());
+                let request = self.generate_request_for_op(conn_id, key, value_size, &RedisOp::Set);
+                return crate::Request::warmup(request.data, request.request_id);
             }
         }
 
         // Phase 2: Normal measurement phase
-        let (data, req_id) = if self.command_selector.has_per_command_keys() {
+        let request = if self.command_selector.has_per_command_keys() {
             self.generate_request_with_command_keys(conn_id, self.value_size)
         } else {
             // Use embedded key generator or default to 0
             let key = self.key_gen.as_mut().map(|g| g.next_key()).unwrap_or(0);
             self.generate_request_with_key(conn_id, key, self.value_size)
         };
-        (data, req_id, crate::RequestMeta::measurement())
+        request
     }
 
     fn parse_response(
@@ -1278,10 +1277,10 @@ mod tests {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, id) = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
-        assert_eq!(id, (0, 0)); // First request on connection 0
+        assert_eq!(request.request_id, (0, 0)); // First request on connection 0
         assert!(request_str.contains("GET"));
         assert!(request_str.contains("key:42"));
         assert!(request_str.starts_with("*2\r\n")); // Array with 2 elements
@@ -1292,10 +1291,10 @@ mod tests {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::Set));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, id) = protocol.generate_request_with_key(0, 100, 5);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 100, 5);
+        let request_str = String::from_utf8_lossy(&request.data);
 
-        assert_eq!(id, (0, 0));
+        assert_eq!(request.request_id, (0, 0));
         assert!(request_str.contains("SET"));
         assert!(request_str.contains("key:100"));
         assert!(request_str.contains("xxxxx")); // 5 bytes of value
@@ -1307,8 +1306,8 @@ mod tests {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::Incr));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 999, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 999, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.contains("INCR"));
         assert!(request_str.contains("key:999"));
@@ -1320,8 +1319,8 @@ mod tests {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::MGet { count: 3 }));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 10, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 10, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.contains("MGET"));
         assert!(request_str.contains("key:10"));
@@ -1338,8 +1337,8 @@ mod tests {
         }));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.contains("WAIT"));
         assert!(request_str.contains("2")); // num_replicas
@@ -1353,8 +1352,8 @@ mod tests {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::Custom(template)));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 5, 3);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 5, 3);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.contains("HSET"));
         assert!(request_str.contains("myhash"));
@@ -1368,17 +1367,17 @@ mod tests {
         let mut protocol = RedisProtocol::new(selector);
 
         // Generate multiple requests on same connection
-        let (_, id1) = protocol.generate_request_with_key(0, 1, 64);
-        let (_, id2) = protocol.generate_request_with_key(0, 2, 64);
-        let (_, id3) = protocol.generate_request_with_key(0, 3, 64);
+        let request = protocol.generate_request_with_key(0, 1, 64);
+        let request2 = protocol.generate_request_with_key(0, 2, 64);
+        let request3 = protocol.generate_request_with_key(0, 3, 64);
 
-        assert_eq!(id1, (0, 0));
-        assert_eq!(id2, (0, 1));
-        assert_eq!(id3, (0, 2));
+        assert_eq!(request.request_id, (0, 0));
+        assert_eq!(request2.request_id, (0, 1));
+        assert_eq!(request3.request_id, (0, 2));
 
         // Different connection has independent sequence
-        let (_, id4) = protocol.generate_request_with_key(1, 1, 64);
-        assert_eq!(id4, (1, 0));
+        let request4 = protocol.generate_request_with_key(1, 1, 64);
+        assert_eq!(request4.request_id, (1, 0));
     }
 
     #[test]
@@ -1529,8 +1528,8 @@ mod tests {
         protocol.reset();
 
         // Next request should start from sequence 0 again
-        let (_, id) = protocol.generate_request_with_key(0, 1, 64);
-        assert_eq!(id, (0, 0));
+        let request = protocol.generate_request_with_key(0, 1, 64);
+        assert_eq!(request.request_id, (0, 0));
     }
 
     #[test]
@@ -1539,20 +1538,20 @@ mod tests {
         let mut protocol = RedisProtocol::new(selector);
 
         // Generate requests on different connections
-        let (_, id1) = protocol.generate_request_with_key(0, 1, 64);
-        let (_, id2) = protocol.generate_request_with_key(1, 1, 64);
-        let (_, id3) = protocol.generate_request_with_key(2, 1, 64);
+        let request = protocol.generate_request_with_key(0, 1, 64);
+        let request2 = protocol.generate_request_with_key(1, 1, 64);
+        let request3 = protocol.generate_request_with_key(2, 1, 64);
 
-        assert_eq!(id1, (0, 0));
-        assert_eq!(id2, (1, 0));
-        assert_eq!(id3, (2, 0));
+        assert_eq!(request.request_id, (0, 0));
+        assert_eq!(request2.request_id, (1, 0));
+        assert_eq!(request3.request_id, (2, 0));
 
         // Each connection maintains independent sequence
-        let (_, id4) = protocol.generate_request_with_key(0, 2, 64);
-        let (_, id5) = protocol.generate_request_with_key(1, 2, 64);
+        let request4 = protocol.generate_request_with_key(0, 2, 64);
+        let request5 = protocol.generate_request_with_key(1, 2, 64);
 
-        assert_eq!(id4, (0, 1));
-        assert_eq!(id5, (1, 1));
+        assert_eq!(request4.request_id, (0, 1));
+        assert_eq!(request5.request_id, (1, 1));
     }
 
     #[test]
@@ -1710,10 +1709,10 @@ mod tests {
         }));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, id) = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
-        assert_eq!(id, (0, 0));
+        assert_eq!(request.request_id, (0, 0));
         assert!(request_str.starts_with("*2\r\n"));
         assert!(request_str.contains("AUTH"));
         assert!(request_str.contains("mypassword"));
@@ -1728,10 +1727,10 @@ mod tests {
         }));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, id) = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
-        assert_eq!(id, (0, 0));
+        assert_eq!(request.request_id, (0, 0));
         assert!(request_str.starts_with("*3\r\n")); // 3 elements for ACL auth
         assert!(request_str.contains("AUTH"));
         assert!(request_str.contains("myuser"));
@@ -1743,8 +1742,8 @@ mod tests {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::SelectDb { db: 5 }));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*2\r\n"));
         assert!(request_str.contains("SELECT"));
@@ -1756,8 +1755,8 @@ mod tests {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::Hello { version: 2 }));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*2\r\n"));
         assert!(request_str.contains("HELLO"));
@@ -1769,8 +1768,8 @@ mod tests {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::Hello { version: 3 }));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*2\r\n"));
         assert!(request_str.contains("HELLO"));
@@ -1782,8 +1781,8 @@ mod tests {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::SetEx { ttl_seconds: 300 }));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 100, 10);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 100, 10);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*4\r\n")); // 4 elements: SETEX key ttl value
         assert!(request_str.contains("SETEX"));
@@ -1797,8 +1796,8 @@ mod tests {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::SetRange { offset: 5 }));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 100, 3);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 100, 3);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*4\r\n"));
         assert!(request_str.contains("SETRANGE"));
@@ -1813,8 +1812,8 @@ mod tests {
             Box::new(FixedCommandSelector::new(RedisOp::GetRange { offset: 10, end: -1 }));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 100, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 100, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*4\r\n"));
         assert!(request_str.contains("GETRANGE"));
@@ -1828,8 +1827,8 @@ mod tests {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::ClusterSlots));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*2\r\n"));
         assert!(request_str.contains("CLUSTER"));
@@ -2016,13 +2015,13 @@ mod tests {
 
         let key = "user:1000";
         let value = b"alice";
-        let (request, id) = protocol.generate_set_with_imported_data(0, key, value);
+        let request = protocol.generate_set_with_imported_data(0, key, value);
 
         // Verify request ID
-        assert_eq!(id, (0, 0));
+        assert_eq!(request.request_id, (0, 0));
 
         // Verify RESP format: *3\r\n$3\r\nSET\r\n$<keylen>\r\n<key>\r\n$<vallen>\r\n<value>\r\n
-        let request_str = String::from_utf8_lossy(&request);
+        let request_str = String::from_utf8_lossy(&request.data);
         assert!(request_str.starts_with("*3\r\n")); // Array with 3 elements
         assert!(request_str.contains("$3\r\nSET\r\n")); // SET command
         assert!(request_str.contains(&format!("${}\r\n{}\r\n", key.len(), key))); // Key
@@ -2037,19 +2036,19 @@ mod tests {
 
         let key = "session:abc";
         let value = b"\x00\x01\x02\x03\xff\xfe"; // Binary data
-        let (request, id) = protocol.generate_set_with_imported_data(1, key, value);
+        let request = protocol.generate_set_with_imported_data(1, key, value);
 
         // Verify request ID
-        assert_eq!(id, (1, 0));
+        assert_eq!(request.request_id, (1, 0));
 
         // Verify RESP format is correct for binary data
-        let request_str = String::from_utf8_lossy(&request);
+        let request_str = String::from_utf8_lossy(&request.data);
         assert!(request_str.starts_with("*3\r\n$3\r\nSET\r\n"));
         assert!(request_str.contains(&format!("${}\r\n{}\r\n", key.len(), key)));
         assert!(request_str.contains(&format!("${}\r\n", value.len())));
 
         // Verify binary data is preserved
-        assert!(request.len() > 30); // Should have all the data
+        assert!(request.data.len() > 30); // Should have all the data
     }
 
     #[test]
@@ -2059,12 +2058,12 @@ mod tests {
 
         let key = "empty:key";
         let value = b"";
-        let (request, id) = protocol.generate_set_with_imported_data(0, key, value);
+        let request = protocol.generate_set_with_imported_data(0, key, value);
 
-        assert_eq!(id, (0, 0));
+        assert_eq!(request.request_id, (0, 0));
 
         // Should still be valid RESP with $0\r\n\r\n for empty value
-        let request_str = String::from_utf8_lossy(&request);
+        let request_str = String::from_utf8_lossy(&request.data);
         assert!(request_str.contains("$0\r\n\r\n"));
     }
 
@@ -2074,13 +2073,13 @@ mod tests {
         let mut protocol = RedisProtocol::new(selector);
 
         // Generate multiple requests, verify sequence numbers increment
-        let (_, id1) = protocol.generate_set_with_imported_data(0, "key1", b"val1");
-        let (_, id2) = protocol.generate_set_with_imported_data(0, "key2", b"val2");
-        let (_, id3) = protocol.generate_set_with_imported_data(0, "key3", b"val3");
+        let request1 = protocol.generate_set_with_imported_data(0, "key1", b"val1");
+        let request2 = protocol.generate_set_with_imported_data(0, "key2", b"val2");
+        let request3 = protocol.generate_set_with_imported_data(0, "key3", b"val3");
 
-        assert_eq!(id1, (0, 0));
-        assert_eq!(id2, (0, 1));
-        assert_eq!(id3, (0, 2));
+        assert_eq!(request1.request_id, (0, 0));
+        assert_eq!(request2.request_id, (0, 1));
+        assert_eq!(request3.request_id, (0, 2));
     }
 
     #[test]
@@ -2089,13 +2088,13 @@ mod tests {
         let mut protocol = RedisProtocol::new(selector);
 
         // Different connections should have independent sequences
-        let (_, id1) = protocol.generate_set_with_imported_data(0, "key1", b"val1");
-        let (_, id2) = protocol.generate_set_with_imported_data(1, "key2", b"val2");
-        let (_, id3) = protocol.generate_set_with_imported_data(0, "key3", b"val3");
+        let request1 = protocol.generate_set_with_imported_data(0, "key1", b"val1");
+        let request2 = protocol.generate_set_with_imported_data(1, "key2", b"val2");
+        let request3 = protocol.generate_set_with_imported_data(0, "key3", b"val3");
 
-        assert_eq!(id1, (0, 0));
-        assert_eq!(id2, (1, 0)); // Conn 1, sequence 0
-        assert_eq!(id3, (0, 1)); // Conn 0, sequence 1
+        assert_eq!(request1.request_id, (0, 0));
+        assert_eq!(request2.request_id, (1, 0)); // Conn 1, sequence 0
+        assert_eq!(request3.request_id, (0, 1)); // Conn 0, sequence 1
     }
 
     #[test]
@@ -2107,8 +2106,8 @@ mod tests {
         }));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*2\r\n")); // 2 elements: SCAN + cursor
         assert!(request_str.contains("$4\r\nSCAN\r\n"));
@@ -2126,8 +2125,8 @@ mod tests {
         }));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*4\r\n")); // 4 elements: SCAN + cursor + COUNT + count
         assert!(request_str.contains("SCAN"));
@@ -2145,8 +2144,8 @@ mod tests {
         }));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*4\r\n")); // 4 elements: SCAN + cursor + MATCH + pattern
         assert!(request_str.contains("SCAN"));
@@ -2164,8 +2163,8 @@ mod tests {
         }));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*6\r\n")); // 6 elements: SCAN + cursor + COUNT + count + MATCH + pattern
         assert!(request_str.contains("SCAN"));
@@ -2185,13 +2184,13 @@ mod tests {
         }));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (_, id1) = protocol.generate_request_with_key(0, 1, 64);
-        let (_, id2) = protocol.generate_request_with_key(0, 2, 64);
-        let (_, id3) = protocol.generate_request_with_key(0, 3, 64);
+        let request = protocol.generate_request_with_key(0, 1, 64);
+        let request2 = protocol.generate_request_with_key(0, 2, 64);
+        let request3 = protocol.generate_request_with_key(0, 3, 64);
 
-        assert_eq!(id1, (0, 0));
-        assert_eq!(id2, (0, 1));
-        assert_eq!(id3, (0, 2));
+        assert_eq!(request.request_id, (0, 0));
+        assert_eq!(request2.request_id, (0, 1));
+        assert_eq!(request3.request_id, (0, 2));
     }
 
     #[test]
@@ -2219,8 +2218,8 @@ mod tests {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::Multi));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*1\r\n")); // 1 element: MULTI
         assert!(request_str.contains("$5\r\nMULTI\r\n"));
@@ -2231,8 +2230,8 @@ mod tests {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::Exec));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*1\r\n")); // 1 element: EXEC
         assert!(request_str.contains("$4\r\nEXEC\r\n"));
@@ -2243,8 +2242,8 @@ mod tests {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::Discard));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*1\r\n")); // 1 element: DISCARD
         assert!(request_str.contains("$7\r\nDISCARD\r\n"));
@@ -2447,8 +2446,8 @@ mod tests {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::Del));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*2\r\n"));
         assert!(request_str.contains("DEL"));
@@ -2460,8 +2459,8 @@ mod tests {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::MSet { count: 3 }));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 10, 5);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 10, 5);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*7\r\n")); // MSET + 3 * (key + value)
         assert!(request_str.contains("MSET"));
@@ -2476,8 +2475,8 @@ mod tests {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::LPush));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 10);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 10);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*3\r\n"));
         assert!(request_str.contains("LPUSH"));
@@ -2490,8 +2489,8 @@ mod tests {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::RPush));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 10);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 10);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*3\r\n"));
         assert!(request_str.contains("RPUSH"));
@@ -2503,8 +2502,8 @@ mod tests {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::LPop));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*2\r\n"));
         assert!(request_str.contains("LPOP"));
@@ -2516,8 +2515,8 @@ mod tests {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::RPop));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*2\r\n"));
         assert!(request_str.contains("RPOP"));
@@ -2529,8 +2528,8 @@ mod tests {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::LRange { start: 0, stop: 10 }));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*4\r\n"));
         assert!(request_str.contains("LRANGE"));
@@ -2544,8 +2543,8 @@ mod tests {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::LLen));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*2\r\n"));
         assert!(request_str.contains("LLEN"));
@@ -2557,8 +2556,8 @@ mod tests {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::SAdd));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*3\r\n"));
         assert!(request_str.contains("SADD"));
@@ -2571,8 +2570,8 @@ mod tests {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::SRem));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*3\r\n"));
         assert!(request_str.contains("SREM"));
@@ -2585,8 +2584,8 @@ mod tests {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::SMembers));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*2\r\n"));
         assert!(request_str.contains("SMEMBERS"));
@@ -2598,8 +2597,8 @@ mod tests {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::SIsMember));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*3\r\n"));
         assert!(request_str.contains("SISMEMBER"));
@@ -2612,8 +2611,8 @@ mod tests {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::SPop { count: None }));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*2\r\n"));
         assert!(request_str.contains("SPOP"));
@@ -2625,8 +2624,8 @@ mod tests {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::SPop { count: Some(5) }));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*3\r\n"));
         assert!(request_str.contains("SPOP"));
@@ -2639,8 +2638,8 @@ mod tests {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::SCard));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*2\r\n"));
         assert!(request_str.contains("SCARD"));
@@ -2652,8 +2651,8 @@ mod tests {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::ZAdd { score: 1.5 }));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*4\r\n"));
         assert!(request_str.contains("ZADD"));
@@ -2667,8 +2666,8 @@ mod tests {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::ZRem));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*3\r\n"));
         assert!(request_str.contains("ZREM"));
@@ -2685,8 +2684,8 @@ mod tests {
         }));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*4\r\n"));
         assert!(request_str.contains("ZRANGE"));
@@ -2703,8 +2702,8 @@ mod tests {
         }));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*5\r\n"));
         assert!(request_str.contains("ZRANGE"));
@@ -2721,8 +2720,8 @@ mod tests {
         }));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*4\r\n"));
         assert!(request_str.contains("ZRANGEBYSCORE"));
@@ -2734,8 +2733,8 @@ mod tests {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::ZScore));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*3\r\n"));
         assert!(request_str.contains("ZSCORE"));
@@ -2748,8 +2747,8 @@ mod tests {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::ZCard));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*2\r\n"));
         assert!(request_str.contains("ZCARD"));
@@ -2762,8 +2761,8 @@ mod tests {
             Box::new(FixedCommandSelector::new(RedisOp::HSet { field: "field1".to_string() }));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 10);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 10);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*4\r\n"));
         assert!(request_str.contains("HSET"));
@@ -2778,8 +2777,8 @@ mod tests {
             Box::new(FixedCommandSelector::new(RedisOp::HGet { field: "field1".to_string() }));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*3\r\n"));
         assert!(request_str.contains("HGET"));
@@ -2794,8 +2793,8 @@ mod tests {
         }));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 5);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 5);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*8\r\n")); // HMSET + key + 3 * (field + value)
         assert!(request_str.contains("HMSET"));
@@ -2812,8 +2811,8 @@ mod tests {
         }));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*4\r\n")); // HMGET + key + 2 fields
         assert!(request_str.contains("HMGET"));
@@ -2827,8 +2826,8 @@ mod tests {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::HGetAll));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*2\r\n"));
         assert!(request_str.contains("HGETALL"));
@@ -2841,8 +2840,8 @@ mod tests {
             Box::new(FixedCommandSelector::new(RedisOp::HDel { field: "field1".to_string() }));
         let mut protocol = RedisProtocol::new(selector);
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.starts_with("*3\r\n"));
         assert!(request_str.contains("HDEL"));
@@ -2865,8 +2864,8 @@ mod tests {
             None,
         );
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 64);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.contains("memtier-42"), "Expected custom key prefix 'memtier-'");
         assert!(!request_str.contains("key:"), "Should not contain default prefix 'key:'");
@@ -2887,8 +2886,8 @@ mod tests {
             None,
         );
 
-        let (request, _) = protocol.generate_request_with_key(0, 100, 10);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 100, 10);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.contains("test:100"), "Expected custom key prefix 'test:'");
         assert!(request_str.contains("xxxxxxxxxx"), "Expected 10 x's for value");
@@ -2909,8 +2908,8 @@ mod tests {
             Some(42), // Use fixed seed for reproducibility
         );
 
-        let (request1, _) = protocol.generate_request_with_key(0, 1, 100);
-        let request_str1 = String::from_utf8_lossy(&request1);
+        let request1 = protocol.generate_request_with_key(0, 1, 100);
+        let request_str1 = String::from_utf8_lossy(&request1.data);
 
         // Random data should NOT contain all 'x's
         assert!(
@@ -2950,8 +2949,8 @@ mod tests {
         );
 
         // Generate requests - they should be identical with the same seed
-        let (request1, _) = protocol1.generate_request_with_key(0, 1, 50);
-        let (request2, _) = protocol2.generate_request_with_key(0, 1, 50);
+        let request1 = protocol1.generate_request_with_key(0, 1, 50);
+        let request2 = protocol2.generate_request_with_key(0, 1, 50);
 
         assert_eq!(request1, request2, "Same seed should produce same random data");
     }
@@ -2972,8 +2971,8 @@ mod tests {
             None,
         );
 
-        let (request, _) = protocol.generate_request_with_key(0, 42, 10);
-        let request_str = String::from_utf8_lossy(&request);
+        let request = protocol.generate_request_with_key(0, 42, 10);
+        let request_str = String::from_utf8_lossy(&request.data);
 
         assert!(request_str.contains("myapp:list:42"), "List key should have custom prefix");
     }

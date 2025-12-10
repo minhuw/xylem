@@ -133,7 +133,7 @@ impl MemcachedAsciiProtocol {
         conn_id: usize,
         key: u64,
         value_size: usize,
-    ) -> (Vec<u8>, (usize, u64)) {
+    ) -> crate::Request<(usize, u64)> {
         let seq = self.next_send_seq(conn_id);
         let mut buf = self.pool.get(256 + value_size);
         buf.clear();
@@ -144,7 +144,7 @@ impl MemcachedAsciiProtocol {
         buf.extend_from_slice(b"\r\n");
         buf.resize(buf.len() + value_size, b'x');
         buf.extend_from_slice(b"\r\n");
-        (buf.to_vec(), (conn_id, seq))
+        crate::Request::measurement(buf.to_vec(), (conn_id, seq))
     }
 }
 
@@ -157,13 +157,13 @@ impl Default for MemcachedAsciiProtocol {
 impl Protocol for MemcachedAsciiProtocol {
     type RequestId = (usize, u64);
 
-    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId, crate::RequestMeta) {
+    fn next_request(&mut self, conn_id: usize) -> crate::Request<Self::RequestId> {
         // Phase 1: Insert phase (warmup) - populate data before measurement
         if let Some(ref mut insert_state) = self.insert_phase {
             if let Some(key) = insert_state.next_key() {
                 let value_size = insert_state.value_size;
-                let (data, req_id) = self.generate_set_request(conn_id, key, value_size);
-                return (data, req_id, crate::RequestMeta::warmup());
+                let request = self.generate_set_request(conn_id, key, value_size);
+                return crate::Request::warmup(request.data, request.request_id);
             }
         }
 
@@ -194,7 +194,7 @@ impl Protocol for MemcachedAsciiProtocol {
                 buf.to_vec()
             }
         };
-        (request_data, (conn_id, seq), crate::RequestMeta::measurement())
+        crate::Request::measurement(request_data, (conn_id, seq))
     }
 
     fn parse_response(

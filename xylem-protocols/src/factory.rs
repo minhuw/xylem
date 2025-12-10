@@ -147,21 +147,16 @@ pub trait DynProtocolFactory: Send + Sync {
 
 /// Type-erased protocol trait for runtime dispatch.
 pub trait DynProtocol: Send {
-    /// Generate the next request for a connection
-    ///
-    /// This is the primary method that should be called by the worker.
-    /// The protocol decides what to send based on its internal state.
-    ///
-    /// Returns (request_data, request_id, metadata) where metadata indicates
+    /// Returns a Request containing data, ID, and metadata where metadata indicates
     /// whether this is a warmup request.
-    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, (usize, u64), crate::RequestMeta);
+    fn next_request(&mut self, conn_id: usize) -> crate::Request<(usize, u64)>;
 
     /// Regenerate a request for retry using the original request ID
     fn regenerate_request(
         &mut self,
         conn_id: usize,
         original_request_id: (usize, u64),
-    ) -> (Vec<u8>, (usize, u64), crate::RequestMeta);
+    ) -> crate::Request<(usize, u64)>;
 
     /// Parse a response
     fn parse_response(
@@ -182,7 +177,7 @@ impl<P> DynProtocol for P
 where
     P: Protocol<RequestId = (usize, u64)> + Send,
 {
-    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, (usize, u64), crate::RequestMeta) {
+    fn next_request(&mut self, conn_id: usize) -> crate::Request<(usize, u64)> {
         Protocol::next_request(self, conn_id)
     }
 
@@ -190,7 +185,7 @@ where
         &mut self,
         conn_id: usize,
         original_request_id: (usize, u64),
-    ) -> (Vec<u8>, (usize, u64), crate::RequestMeta) {
+    ) -> crate::Request<(usize, u64)> {
         Protocol::regenerate_request(self, conn_id, original_request_id)
     }
 
@@ -274,11 +269,12 @@ mod tests {
     impl Protocol for TestProtocol {
         type RequestId = (usize, u64);
 
-        fn next_request(
-            &mut self,
-            conn_id: usize,
-        ) -> (Vec<u8>, Self::RequestId, crate::RequestMeta) {
-            (vec![self.value as u8], (conn_id, 0), crate::RequestMeta::measurement())
+        fn next_request(&mut self, conn_id: usize) -> crate::Request<(usize, u64)> {
+            crate::Request::new(
+                vec![self.value as u8],
+                (conn_id, 0),
+                crate::RequestMeta::measurement(),
+            )
         }
 
         fn parse_response(
@@ -325,8 +321,8 @@ mod tests {
         let config = TestConfig { value: 100 };
         let mut protocol = factory.create(config, None).unwrap();
 
-        let (data, _id, _meta) = Protocol::next_request(&mut protocol, 0);
-        assert_eq!(data, vec![100]);
+        let request = Protocol::next_request(&mut protocol, 0);
+        assert_eq!(request.data, vec![100]);
     }
 
     #[test]
@@ -338,8 +334,8 @@ mod tests {
         let config = serde_json::json!({"value": 50});
         let mut protocol = factory.create_from_value(config, None).unwrap();
 
-        let (data, _id, _meta) = DynProtocol::next_request(protocol.as_mut(), 0);
-        assert_eq!(data, vec![50]);
+        let request = DynProtocol::next_request(protocol.as_mut(), 0);
+        assert_eq!(request.data, vec![50]);
     }
 
     #[test]
@@ -347,7 +343,7 @@ mod tests {
         let factory: &dyn DynProtocolFactory = &TestFactory;
 
         let mut protocol = factory.create_from_value(serde_json::Value::Null, None).unwrap();
-        let (data, _id, _meta) = DynProtocol::next_request(protocol.as_mut(), 0);
-        assert_eq!(data, vec![42]); // default value
+        let request = DynProtocol::next_request(protocol.as_mut(), 0);
+        assert_eq!(request.data, vec![42]); // default value
     }
 }

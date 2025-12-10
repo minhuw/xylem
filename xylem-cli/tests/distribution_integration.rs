@@ -266,8 +266,8 @@ mod redis_distributions {
         );
 
         for i in 0..100 {
-            let (request, _, _) = protocol.next_request(0);
-            let request_str = String::from_utf8_lossy(&request);
+            let request = protocol.next_request(0);
+            let request_str = String::from_utf8_lossy(&request.data);
 
             assert!(
                 request_str.contains(&format!("myapp:user:{}", i)),
@@ -290,10 +290,10 @@ mod redis_distributions {
             Some(42),
         );
 
-        let (request, _, _) = protocol.next_request(0);
+        let request = protocol.next_request(0);
 
         // Count 'x' characters - random data should have very few
-        let x_count = request.iter().filter(|&&b| b == b'x').count();
+        let x_count = request.data.iter().filter(|&&b| b == b'x').count();
         assert!(x_count < 20, "Random data should not contain many 'x' chars, found {}", x_count);
     }
 
@@ -307,8 +307,8 @@ mod redis_distributions {
         let mut key_counts: HashMap<String, usize> = HashMap::new();
 
         for _ in 0..10000 {
-            let (request, _, _) = protocol.next_request(0);
-            let request_str = String::from_utf8_lossy(&request);
+            let request = protocol.next_request(0);
+            let request_str = String::from_utf8_lossy(&request.data);
 
             // Extract key from request
             if let Some(start) = request_str.find("key:") {
@@ -342,8 +342,8 @@ mod redis_distributions {
         let mut keys: Vec<u64> = Vec::new();
 
         for _ in 0..10000 {
-            let (request, _, _) = protocol.next_request(0);
-            let request_str = String::from_utf8_lossy(&request);
+            let request = protocol.next_request(0);
+            let request_str = String::from_utf8_lossy(&request.data);
 
             // Extract key number from request
             if let Some(key_num) = extract_redis_key_number(&request_str) {
@@ -393,9 +393,9 @@ mod redis_distributions {
         );
 
         for _ in 0..100 {
-            let (req1, _, _) = proto1.next_request(0);
-            let (req2, _, _) = proto2.next_request(0);
-            assert_eq!(req1, req2, "Same seeds should produce identical requests");
+            let req1 = proto1.next_request(0);
+            let req2 = proto2.next_request(0);
+            assert_eq!(req1.data, req2.data, "Same seeds should produce identical requests");
         }
     }
 }
@@ -426,8 +426,8 @@ mod masstree_distributions {
         protocol.mark_handshake_done(0);
 
         for i in 0..100 {
-            let (request, _, _) = protocol.next_request(0);
-            let request_str = String::from_utf8_lossy(&request);
+            let request = protocol.next_request(0);
+            let request_str = String::from_utf8_lossy(&request.data);
 
             assert!(
                 request_str.contains(&format!("mydb:record:{}", i)),
@@ -452,10 +452,10 @@ mod masstree_distributions {
         );
         protocol.mark_handshake_done(0);
 
-        let (request, _, _) = protocol.next_request(0);
+        let request = protocol.next_request(0);
 
         // Count 'x' characters - random data should have very few
-        let x_count = request.iter().filter(|&&b| b == b'x').count();
+        let x_count = request.data.iter().filter(|&&b| b == b'x').count();
         assert!(x_count < 20, "Random data should not contain many 'x' chars, found {}", x_count);
     }
 
@@ -469,8 +469,8 @@ mod masstree_distributions {
         let mut key_counts: HashMap<String, usize> = HashMap::new();
 
         for _ in 0..10000 {
-            let (request, _, _) = protocol.next_request(0);
-            let request_str = String::from_utf8_lossy(&request);
+            let request = protocol.next_request(0);
+            let request_str = String::from_utf8_lossy(&request.data);
 
             // Extract key from request (format: key:N)
             if let Some(start) = request_str.find("key:") {
@@ -510,8 +510,8 @@ mod masstree_distributions {
         let mut keys: Vec<u64> = Vec::new();
 
         for _ in 0..10000 {
-            let (request, _, _) = protocol.next_request(0);
-            let request_str = String::from_utf8_lossy(&request);
+            let request = protocol.next_request(0);
+            let request_str = String::from_utf8_lossy(&request.data);
 
             // Extract key number
             if let Some(start) = request_str.find("key:") {
@@ -560,9 +560,9 @@ mod masstree_distributions {
         proto2.mark_handshake_done(0);
 
         for _ in 0..100 {
-            let (req1, _, _) = proto1.next_request(0);
-            let (req2, _, _) = proto2.next_request(0);
-            assert_eq!(req1, req2, "Same seeds should produce identical requests");
+            let req1 = proto1.next_request(0);
+            let req2 = proto2.next_request(0);
+            assert_eq!(req1.data, req2.data, "Same seeds should produce identical requests");
         }
     }
 
@@ -576,8 +576,8 @@ mod masstree_distributions {
         let mut key_sequence: Vec<String> = Vec::new();
 
         for _ in 0..30 {
-            let (request, _, _) = protocol.next_request(0);
-            let request_str = String::from_utf8_lossy(&request);
+            let request = protocol.next_request(0);
+            let request_str = String::from_utf8_lossy(&request.data);
 
             if let Some(start) = request_str.find("key:") {
                 let key_part = &request_str[start + 4..];
@@ -620,11 +620,11 @@ mod cross_protocol {
 
         // Extract keys from both and compare
         for _ in 0..100 {
-            let (redis_req, _, _) = redis.next_request(0);
-            let (masstree_req, _, _) = masstree.next_request(0);
+            let redis_req = redis.next_request(0);
+            let masstree_req = masstree.next_request(0);
 
-            let redis_str = String::from_utf8_lossy(&redis_req);
-            let masstree_str = String::from_utf8_lossy(&masstree_req);
+            let redis_str = String::from_utf8_lossy(&redis_req.data);
+            let masstree_str = String::from_utf8_lossy(&masstree_req.data);
 
             // Both should contain the same key number
             let redis_key = extract_key_number(&redis_str);
@@ -673,11 +673,11 @@ mod cross_protocol {
         masstree.mark_handshake_done(0);
 
         // Both should use the same prefix
-        let (redis_req, _, _) = redis.next_request(0);
-        let (masstree_req, _, _) = masstree.next_request(0);
+        let redis_req = redis.next_request(0);
+        let masstree_req = masstree.next_request(0);
 
-        let redis_str = String::from_utf8_lossy(&redis_req);
-        let masstree_str = String::from_utf8_lossy(&masstree_req);
+        let redis_str = String::from_utf8_lossy(&redis_req.data);
+        let masstree_str = String::from_utf8_lossy(&masstree_req.data);
 
         assert!(redis_str.contains("benchmark:test:0"), "Redis should use custom prefix");
         assert!(masstree_str.contains("benchmark:test:0"), "Masstree should use custom prefix");

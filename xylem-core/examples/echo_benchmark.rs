@@ -42,7 +42,7 @@ impl xylem_core::threading::worker::Protocol for EchoProtocol {
     fn next_request(
         &mut self,
         _conn_id: usize,
-    ) -> (Vec<u8>, Self::RequestId, xylem_core::threading::RequestMeta) {
+    ) -> xylem_core::threading::worker::Request<Self::RequestId> {
         let req_id = self.next_req_id;
         self.next_req_id += 1;
 
@@ -50,7 +50,7 @@ impl xylem_core::threading::worker::Protocol for EchoProtocol {
         buf[0..8].copy_from_slice(&req_id.to_le_bytes());
         // bytes 8-15 are delay (0 for max speed)
 
-        (buf, req_id, xylem_core::threading::RequestMeta { is_warmup: false })
+        xylem_core::threading::worker::Request::measurement(buf, req_id)
     }
 
     fn parse_response(

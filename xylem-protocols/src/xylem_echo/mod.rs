@@ -60,7 +60,7 @@ impl Default for XylemEchoProtocol {
 impl Protocol for XylemEchoProtocol {
     type RequestId = (usize, u64);
 
-    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId, crate::RequestMeta) {
+    fn next_request(&mut self, conn_id: usize) -> crate::Request<Self::RequestId> {
         let seq = self.next_seq(conn_id);
 
         // Create request ID tuple (conn_id, seq)
@@ -79,7 +79,7 @@ impl Protocol for XylemEchoProtocol {
         buf.extend_from_slice(&self.default_delay_us.to_le_bytes());
 
         // Echo protocol doesn't have a warmup phase
-        (buf.to_vec(), request_id, crate::RequestMeta::measurement())
+        crate::Request::measurement(buf.to_vec(), request_id)
     }
 
     fn parse_response(
@@ -126,29 +126,35 @@ mod tests {
         let mut protocol = XylemEchoProtocol::new(100);
 
         // Generate a request
-        let (request, req_id, _meta) = protocol.next_request(0);
+        let request = protocol.next_request(0);
 
-        assert_eq!(request.len(), MESSAGE_SIZE);
-        assert_eq!(req_id, (0, 0)); // (conn_id, seq) - first request is seq 0
+        assert_eq!(request.data.len(), MESSAGE_SIZE);
+        assert_eq!(request.request_id, (0, 0)); // (conn_id, seq) - first request is seq 0
 
         // Check encoded request_id (high 32 bits = conn_id=0, low 32 bits = seq=0)
         let encoded_id = u64::from_le_bytes([
-            request[0], request[1], request[2], request[3], request[4], request[5], request[6],
-            request[7],
+            request.data[0],
+            request.data[1],
+            request.data[2],
+            request.data[3],
+            request.data[4],
+            request.data[5],
+            request.data[6],
+            request.data[7],
         ]);
         assert_eq!(encoded_id >> 32, 0); // conn_id
         assert_eq!(encoded_id & 0xFFFFFFFF, 0); // seq
 
         // Check delay_us encoding
         let delay_us = u64::from_le_bytes([
-            request[8],
-            request[9],
-            request[10],
-            request[11],
-            request[12],
-            request[13],
-            request[14],
-            request[15],
+            request.data[8],
+            request.data[9],
+            request.data[10],
+            request.data[11],
+            request.data[12],
+            request.data[13],
+            request.data[14],
+            request.data[15],
         ]);
         assert_eq!(delay_us, 100);
     }
@@ -192,16 +198,16 @@ mod tests {
         let mut protocol = XylemEchoProtocol::new(50);
 
         // Connection 0, first request
-        let (_, id0, _) = protocol.next_request(0);
+        let request0 = protocol.next_request(0);
 
         // Connection 1, first request (different connection)
-        let (_, id1, _) = protocol.next_request(1);
+        let request1 = protocol.next_request(1);
 
         // IDs should be different because conn_id differs
-        assert_ne!(id0, id1);
+        assert_ne!(request0.request_id, request1.request_id);
 
         // Check request IDs - each connection starts at seq 0
-        assert_eq!(id0, (0, 0)); // (conn_id=0, seq=0)
-        assert_eq!(id1, (1, 0)); // (conn_id=1, seq=0)
+        assert_eq!(request0.request_id, (0, 0)); // (conn_id=0, seq=0)
+        assert_eq!(request1.request_id, (1, 0)); // (conn_id=1, seq=0)
     }
 }

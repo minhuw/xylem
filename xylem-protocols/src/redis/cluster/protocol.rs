@@ -60,7 +60,7 @@ struct RequestMetadata {
 /// protocol.register_connection("127.0.0.1:7002".parse()?, 2);
 ///
 /// // Requests automatically route to correct node
-/// let (request, id) = protocol.generate_request_with_key(0, 1000, 100);
+/// let request = protocol.generate_request_with_key(0, 1000, 100);
 /// ```
 pub struct RedisClusterProtocol {
     /// Underlying single-node Redis protocol
@@ -395,26 +395,27 @@ impl RedisClusterProtocol {
 impl Protocol for RedisClusterProtocol {
     type RequestId = ClusterRequestId;
 
-    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId, crate::RequestMeta) {
+    fn next_request(&mut self, conn_id: usize) -> crate::Request<Self::RequestId> {
         // Phase 1: Insert phase (warmup) - populate data before measurement
         if let Some(ref mut insert_state) = self.base_protocol.insert_phase {
             if let Some(key) = insert_state.next_key() {
                 let value_size = insert_state.value_size;
-                let (data, req_id) = self.generate_request_with_key_and_operation(
+                let mut request = self.generate_request_with_key_and_operation(
                     conn_id,
                     key,
                     value_size,
                     &RedisOp::Set,
                 );
-                self.mark_request_warmup(req_id);
-                return (data, req_id, crate::RequestMeta::warmup());
+                self.mark_request_warmup(request.request_id);
+                request.metadata.is_warmup = true;
+                return request;
             }
         }
 
         // Phase 2: Normal measurement phase
         let value_size = self.base_protocol.value_size();
 
-        let (data, req_id) = if self.base_protocol.command_selector.has_per_command_keys() {
+        let request = if self.base_protocol.command_selector.has_per_command_keys() {
             let operation = self.base_protocol.command_selector.next_command();
             self.base_protocol.record_command(&operation);
             let key = self
@@ -429,29 +430,54 @@ impl Protocol for RedisClusterProtocol {
             self.generate_request_with_key(conn_id, key, value_size)
         };
 
-        (data, req_id, crate::RequestMeta::measurement())
+        request
     }
 
     fn regenerate_request(
         &mut self,
         conn_id: usize,
         original_request_id: Self::RequestId,
-    ) -> (Vec<u8>, Self::RequestId, crate::RequestMeta) {
+    ) -> crate::Request<Self::RequestId> {
         // Extract base request ID from cluster request ID
-        let (_orig_conn, _slot, base_req_id) = original_request_id;
+        let (orig_conn, slot, base_req_id) = original_request_id;
 
-        // Look up original request metadata
-        let (data, req_id) =
-            if let Some(metadata) = self.request_metadata.get(&base_req_id).copied() {
-                self.generate_request_with_key(conn_id, metadata.key, metadata.value_size)
-            } else {
-                // Fallback: generate new request if metadata not found
-                let key = self.base_protocol.key_gen_mut().map(|g| g.next_key()).unwrap_or(0);
-                let value_size = self.base_protocol.value_size();
-                self.generate_request_with_key(conn_id, key, value_size)
+        // Remove old metadata (if any) so we don't leak entries
+        let old_metadata = self.request_metadata.remove(&base_req_id);
+
+        // Recreate the request, preserving key/value/slot info when available
+        let (request, new_metadata) = if let Some(meta) = old_metadata {
+            let mut req =
+                self.base_protocol.generate_request_with_key(conn_id, meta.key, meta.value_size);
+            // Preserve warmup flag from original request
+            req.metadata.is_warmup = meta.is_warmup;
+
+            let new_meta = RequestMetadata {
+                key: meta.key,
+                value_size: meta.value_size,
+                slot: meta.slot,
+                original_conn_id: meta.original_conn_id,
+                is_warmup: meta.is_warmup,
             };
-        // Retries are always measurement requests
-        (data, req_id, crate::RequestMeta::measurement())
+            (req, new_meta)
+        } else {
+            let req = self.base_protocol.regenerate_request(conn_id, base_req_id);
+            let new_meta = RequestMetadata {
+                key: 0,
+                value_size: 0,
+                slot,
+                original_conn_id: orig_conn,
+                is_warmup: req.metadata.is_warmup,
+            };
+            (req, new_meta)
+        };
+
+        let new_base_req_id = request.request_id;
+        self.request_metadata.insert(new_base_req_id, new_metadata);
+
+        // Create new cluster request ID with same slot/original connection
+        let new_cluster_id = (orig_conn, slot, new_base_req_id);
+
+        crate::Request::new(request.data, new_cluster_id, request.metadata)
     }
 
     fn parse_response(
@@ -567,15 +593,17 @@ impl RedisClusterProtocol {
         conn_id: usize,
         key: u64,
         value_size: usize,
-    ) -> (Vec<u8>, ClusterRequestId) {
-        self.build_cluster_request(
+    ) -> crate::Request<ClusterRequestId> {
+        let request = self.build_cluster_request(
             conn_id,
             key,
             value_size,
             |protocol, target_conn_id, key, value_size| {
-                protocol.generate_request_with_key(target_conn_id, key, value_size)
+                let req = protocol.generate_request_with_key(target_conn_id, key, value_size);
+                (req.data, req.request_id)
             },
-        )
+        );
+        crate::Request::measurement(request.0, request.1)
     }
 
     /// Generate a request for a specific operation with known key/value size
@@ -585,15 +613,18 @@ impl RedisClusterProtocol {
         key: u64,
         value_size: usize,
         operation: &RedisOp,
-    ) -> (Vec<u8>, ClusterRequestId) {
-        self.build_cluster_request(
+    ) -> crate::Request<ClusterRequestId> {
+        let request = self.build_cluster_request(
             conn_id,
             key,
             value_size,
             |protocol, target_conn_id, key, value_size| {
-                protocol.generate_request_for_op(target_conn_id, key, value_size, operation)
+                let req =
+                    protocol.generate_request_for_op(target_conn_id, key, value_size, operation);
+                (req.data, req.request_id)
             },
-        )
+        );
+        crate::Request::measurement(request.0, request.1)
     }
 
     fn parse_response_impl(
@@ -810,13 +841,13 @@ mod tests {
         protocol.register_connection("127.0.0.1:7000".parse().unwrap(), 0);
 
         // Generate request
-        let (request_data, req_id) = protocol.generate_request_with_key(0, 1000, 100);
+        let request = protocol.generate_request_with_key(0, 1000, 100);
 
         // Verify request data is not empty
-        assert!(!request_data.is_empty());
+        assert!(!request.data.is_empty());
 
         // Verify request ID structure
-        let (orig_conn, slot, (_target_conn, _seq)) = req_id;
+        let (orig_conn, slot, (_target_conn, _seq)) = request.request_id;
         assert_eq!(orig_conn, 0);
         // slot should be calculated from "key:1000"
         assert!(slot < 16384);
@@ -834,8 +865,8 @@ mod tests {
         protocol.register_connection("127.0.0.1:7002".parse().unwrap(), 2);
 
         // Generate request and verify slot calculation
-        let (_, req_id1) = protocol.generate_request_with_key(99, 1000, 100);
-        let (_, slot1, (target_conn1, _)) = req_id1;
+        let request = protocol.generate_request_with_key(99, 1000, 100);
+        let (_, slot1, (target_conn1, _)) = request.request_id;
         assert_eq!(slot1, calculate_slot(b"key:1000"));
 
         // Verify it routes to the correct node based on topology
@@ -849,8 +880,8 @@ mod tests {
         }
 
         // Different key should potentially route to different node
-        let (_, req_id2) = protocol.generate_request_with_key(99, 9999, 100);
-        let (_, slot2, _) = req_id2;
+        let request2 = protocol.generate_request_with_key(99, 9999, 100);
+        let (_, slot2, _) = request2.request_id;
         assert_eq!(slot2, calculate_slot(b"key:9999"));
 
         // Verify slot2 is also routed correctly
@@ -891,13 +922,13 @@ mod tests {
         protocol.register_connection(node, 0);
 
         // Don't set topology - should use default node
-        let (request, req_id) = protocol.generate_request_with_key(0, 1000, 100);
+        let request = protocol.generate_request_with_key(0, 1000, 100);
 
         // Should still generate valid request
-        assert!(!request.is_empty());
+        assert!(!request.data.is_empty());
 
         // Should use the registered connection
-        let (_, _, (target_conn, _)) = req_id;
+        let (_, _, (target_conn, _)) = request.request_id;
         assert_eq!(target_conn, 0);
     }
 }

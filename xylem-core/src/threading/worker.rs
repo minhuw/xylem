@@ -47,6 +47,45 @@ impl RequestMeta {
     }
 }
 
+/// A complete request containing data, ID, and metadata
+///
+/// This struct encapsulates all information needed to send a request,
+/// providing a cleaner interface than tuple destructuring.
+#[derive(Debug, Clone)]
+pub struct Request<ReqId> {
+    /// The raw request data to send
+    pub data: Vec<u8>,
+    /// Unique identifier for this request
+    pub request_id: ReqId,
+    /// Additional metadata about the request
+    pub metadata: RequestMeta,
+}
+
+impl<ReqId> Request<ReqId> {
+    /// Create a new request
+    pub fn new(data: Vec<u8>, request_id: ReqId, metadata: RequestMeta) -> Self {
+        Self { data, request_id, metadata }
+    }
+
+    /// Create a measurement request (not warmup)
+    pub fn measurement(data: Vec<u8>, request_id: ReqId) -> Self {
+        Self {
+            data,
+            request_id,
+            metadata: RequestMeta::measurement(),
+        }
+    }
+
+    /// Create a warmup request (stats not collected)
+    pub fn warmup(data: Vec<u8>, request_id: ReqId) -> Self {
+        Self {
+            data,
+            request_id,
+            metadata: RequestMeta::warmup(),
+        }
+    }
+}
+
 /// Retry request information for protocol-level retries
 #[derive(Debug, Clone)]
 pub struct RetryRequest<ReqId> {
@@ -94,9 +133,9 @@ pub trait Protocol: Send {
     /// * `conn_id` - Connection identifier
     ///
     /// # Returns
-    /// (request_data, request_id, metadata) tuple where metadata indicates
+    /// A Request containing data, ID, and metadata where metadata indicates
     /// whether this is a warm-up request (stats should not be collected)
-    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId, RequestMeta);
+    fn next_request(&mut self, conn_id: usize) -> Request<Self::RequestId>;
 
     /// Regenerate a request for retry using the original request ID
     ///
@@ -109,7 +148,7 @@ pub trait Protocol: Send {
     /// * `original_request_id` - The request ID from the original request
     ///
     /// # Returns
-    /// (request_data, new_request_id, metadata) tuple
+    /// A new Request with data, ID, and metadata
     ///
     /// Default implementation just generates a new request (ignores original).
     /// Retries are always measurement requests (not warmup).
@@ -117,10 +156,10 @@ pub trait Protocol: Send {
         &mut self,
         conn_id: usize,
         _original_request_id: Self::RequestId,
-    ) -> (Vec<u8>, Self::RequestId, RequestMeta) {
-        let (data, req_id, _) = self.next_request(conn_id);
+    ) -> Request<Self::RequestId> {
+        let request = self.next_request(conn_id);
         // Retries are always measurement requests
-        (data, req_id, RequestMeta::measurement())
+        Request::measurement(request.data, request.request_id)
     }
 
     /// Parse a response and return the request ID it corresponds to
@@ -370,7 +409,7 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
                 let state = self.pool.get_state(connection_id).expect("Connection state not found");
                 let group_id = state.group_id();
 
-                let (request_data, req_id, meta) = {
+                let request = {
                     let protocol =
                         self.protocols.get_mut(&group_id).expect("Protocol not found for group_id");
                     protocol.next_request(connection_id)
@@ -378,26 +417,31 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
 
                 // Record request to dump file if enabled
                 if let Some(ref dumper) = self.request_dumper {
-                    let req_id_str = format!("{:?}", req_id);
+                    let req_id_str = format!("{:?}", request.request_id);
                     self.record_request(
                         dumper,
                         group_id,
                         connection_id,
-                        &request_data,
+                        &request.data,
                         &req_id_str,
                     );
                 }
 
                 // Send request (track warmup status for response handling)
                 let sent_time_ns = timing::time_ns();
-                self.pool.send(connection_id, &request_data, req_id, meta.is_warmup)?;
+                self.pool.send(
+                    connection_id,
+                    &request.data,
+                    request.request_id,
+                    request.metadata.is_warmup,
+                )?;
 
                 // Notify policy and record stats (skip stats for warmup requests)
                 if let Some(state) = self.pool.get_state_mut(connection_id) {
                     state.on_request_sent(sent_time_ns);
                 }
-                if !meta.is_warmup {
-                    self.stats.record_tx_bytes(group_id, connection_id, request_data.len());
+                if !request.metadata.is_warmup {
+                    self.stats.record_tx_bytes(group_id, connection_id, request.data.len());
                 }
 
                 // Try to re-add connection to heap if it still has capacity
@@ -595,26 +639,30 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         // Generate and send retry request using the original request ID
         let protocol = self.protocols.get_mut(&group_id).expect("Protocol not found for group_id");
 
-        let (retry_data, retry_req_id, mut meta) =
+        let mut request =
             protocol.regenerate_request(target_connection_id, retry_req.original_request_id);
         if retry_req.is_warmup {
-            meta.is_warmup = true;
+            request.metadata.is_warmup = true;
         }
 
         // Record retry request to dump file if enabled
         if let Some(ref dumper) = self.request_dumper {
-            let req_id_str = format!("{:?}_retry{}", retry_req_id, retry_req.attempt);
-            self.record_request(dumper, group_id, target_connection_id, &retry_data, &req_id_str);
+            let req_id_str = format!("{:?}_retry{}", request.request_id, retry_req.attempt);
+            self.record_request(dumper, group_id, target_connection_id, &request.data, &req_id_str);
         }
 
         // Send the retry request
         // Note: We intentionally do NOT call state.on_request_sent() or generator.mark_request_sent()
         // because retries are already counted as in-flight from the original request. Double-counting
         // would skew rate limiting and statistics (especially for Redis Cluster MOVED/ASK redirects).
-        self.pool
-            .send(target_connection_id, &retry_data, retry_req_id, meta.is_warmup)?;
-        if !meta.is_warmup {
-            self.stats.record_tx_bytes(group_id, target_connection_id, retry_data.len());
+        self.pool.send(
+            target_connection_id,
+            &request.data,
+            request.request_id,
+            request.metadata.is_warmup,
+        )?;
+        if !request.metadata.is_warmup {
+            self.stats.record_tx_bytes(group_id, target_connection_id, request.data.len());
         }
 
         Ok(())
@@ -747,20 +795,27 @@ mod tests {
     impl<P: xylem_protocols::Protocol> Protocol for ProtocolAdapter<P> {
         type RequestId = P::RequestId;
 
-        fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId, RequestMeta) {
-            let (data, req_id, proto_meta) = self.inner.next_request(conn_id);
-            // Convert xylem_protocols::RequestMeta to xylem_core::RequestMeta
-            (data, req_id, RequestMeta { is_warmup: proto_meta.is_warmup })
+        fn next_request(&mut self, conn_id: usize) -> Request<Self::RequestId> {
+            let request = self.inner.next_request(conn_id);
+            // Convert xylem_protocols::Request to xylem_core::Request
+            Request::new(
+                request.data,
+                request.request_id,
+                RequestMeta { is_warmup: request.metadata.is_warmup },
+            )
         }
 
         fn regenerate_request(
             &mut self,
             conn_id: usize,
             original_request_id: Self::RequestId,
-        ) -> (Vec<u8>, Self::RequestId, RequestMeta) {
-            let (data, req_id, proto_meta) =
-                self.inner.regenerate_request(conn_id, original_request_id);
-            (data, req_id, RequestMeta { is_warmup: proto_meta.is_warmup })
+        ) -> Request<Self::RequestId> {
+            let request = self.inner.regenerate_request(conn_id, original_request_id);
+            Request::new(
+                request.data,
+                request.request_id,
+                RequestMeta { is_warmup: request.metadata.is_warmup },
+            )
         }
 
         fn parse_response(

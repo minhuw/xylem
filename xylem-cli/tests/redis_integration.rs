@@ -29,12 +29,12 @@ impl<P: xylem_protocols::Protocol> xylem_core::threading::worker::Protocol for P
     fn next_request(
         &mut self,
         conn_id: usize,
-    ) -> (Vec<u8>, Self::RequestId, xylem_core::threading::RequestMeta) {
-        let (data, req_id, proto_meta) = self.inner.next_request(conn_id);
-        (
-            data,
-            req_id,
-            xylem_core::threading::RequestMeta { is_warmup: proto_meta.is_warmup },
+    ) -> xylem_core::threading::worker::Request<Self::RequestId> {
+        let request = self.inner.next_request(conn_id);
+        xylem_core::threading::worker::Request::new(
+            request.data,
+            request.request_id,
+            xylem_core::threading::worker::RequestMeta { is_warmup: request.metadata.is_warmup },
         )
     }
 
@@ -42,13 +42,12 @@ impl<P: xylem_protocols::Protocol> xylem_core::threading::worker::Protocol for P
         &mut self,
         conn_id: usize,
         original_request_id: Self::RequestId,
-    ) -> (Vec<u8>, Self::RequestId, xylem_core::threading::RequestMeta) {
-        let (data, req_id, proto_meta) =
-            self.inner.regenerate_request(conn_id, original_request_id);
-        (
-            data,
-            req_id,
-            xylem_core::threading::RequestMeta { is_warmup: proto_meta.is_warmup },
+    ) -> xylem_core::threading::worker::Request<Self::RequestId> {
+        let request = self.inner.regenerate_request(conn_id, original_request_id);
+        xylem_core::threading::worker::Request::new(
+            request.data,
+            request.request_id,
+            xylem_core::threading::worker::RequestMeta { is_warmup: request.metadata.is_warmup },
         )
     }
 

@@ -105,7 +105,7 @@ impl Default for HttpProtocol {
 impl Protocol for HttpProtocol {
     type RequestId = (usize, u64);
 
-    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId, crate::RequestMeta) {
+    fn next_request(&mut self, conn_id: usize) -> crate::Request<Self::RequestId> {
         let seq = self.next_seq(conn_id);
 
         let body = match self.method {
@@ -121,7 +121,7 @@ impl Protocol for HttpProtocol {
 
         let request = self.build_request(body.as_deref());
         // HTTP protocol doesn't have a warmup phase
-        (request, (conn_id, seq), crate::RequestMeta::measurement())
+        crate::Request::measurement(request, (conn_id, seq))
     }
 
     fn parse_response(
@@ -196,8 +196,9 @@ mod tests {
         let mut proto =
             HttpProtocol::new(HttpMethod::Get, "/api/test".to_string(), "example.com".to_string());
 
-        let (req, (conn_id, seq), _meta) = proto.next_request(0);
-        let req_str = String::from_utf8_lossy(&req);
+        let request = proto.next_request(0);
+        let (conn_id, seq) = request.request_id;
+        let req_str = String::from_utf8_lossy(&request.data);
 
         assert_eq!(conn_id, 0);
         assert_eq!(seq, 0);
@@ -212,8 +213,9 @@ mod tests {
         let mut proto =
             HttpProtocol::new(HttpMethod::Post, "/data".to_string(), "api.example.com".to_string());
 
-        let (req, (conn_id, seq), _meta) = proto.next_request(0);
-        let req_str = String::from_utf8_lossy(&req);
+        let request = proto.next_request(0);
+        let (conn_id, seq) = request.request_id;
+        let req_str = String::from_utf8_lossy(&request.data);
 
         assert_eq!(conn_id, 0);
         assert_eq!(seq, 0);
@@ -232,9 +234,12 @@ mod tests {
             HttpProtocol::new(HttpMethod::Get, "/".to_string(), "localhost".to_string());
 
         // Using same conn_id increments sequence
-        let (_, (_, seq1), _) = proto.next_request(0);
-        let (_, (_, seq2), _) = proto.next_request(0);
-        let (_, (_, seq3), _) = proto.next_request(0);
+        let request1 = proto.next_request(0);
+        let (_, seq1) = request1.request_id;
+        let request2 = proto.next_request(0);
+        let (_, seq2) = request2.request_id;
+        let request3 = proto.next_request(0);
+        let (_, seq3) = request3.request_id;
 
         assert_eq!(seq1, 0);
         assert_eq!(seq2, 1);

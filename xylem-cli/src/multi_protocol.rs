@@ -53,7 +53,7 @@ impl MultiProtocol {
         conn_id: usize,
         key: &str,
         value: &[u8],
-    ) -> (Vec<u8>, (usize, u64)) {
+    ) -> xylem_protocols::Request<(usize, u64)> {
         match self {
             MultiProtocol::Redis(p) => p.generate_set_with_imported_data(conn_id, key, value),
             _ => panic!("generate_set_with_imported_data only supported for Redis protocol"),
@@ -77,24 +77,25 @@ impl MultiProtocol {
 impl Protocol for MultiProtocol {
     type RequestId = (usize, u64);
 
-    fn next_request(
-        &mut self,
-        conn_id: usize,
-    ) -> (Vec<u8>, Self::RequestId, xylem_protocols::RequestMeta) {
+    fn next_request(&mut self, conn_id: usize) -> xylem_protocols::Request<Self::RequestId> {
         match self {
             MultiProtocol::Redis(p) => p.next_request(conn_id),
             MultiProtocol::RedisCluster(p) => {
-                let (data, cluster_req_id, meta) = p.protocol.next_request(conn_id);
-                let simple_id = p.store_mapping(cluster_req_id);
-                (data, simple_id, meta)
+                let request = p.protocol.next_request(conn_id);
+                let simple_id = p.store_mapping(request.request_id);
+                xylem_protocols::Request::new(request.data, simple_id, request.metadata)
             }
             MultiProtocol::MemcachedBinary(p) => p.next_request(conn_id),
             MultiProtocol::MemcachedAscii(p) => p.next_request(conn_id),
             MultiProtocol::Http(p) => p.next_request(conn_id),
             MultiProtocol::XylemEcho(p) => p.next_request(conn_id),
             MultiProtocol::Masstree(p) => {
-                let (data, (conn, seq), meta) = p.next_request(conn_id);
-                (data, (conn, seq as u64), meta)
+                let request = p.next_request(conn_id);
+                xylem_protocols::Request::new(
+                    request.data,
+                    (request.request_id.0, request.request_id.1 as u64),
+                    request.metadata,
+                )
             }
         }
     }
@@ -103,26 +104,29 @@ impl Protocol for MultiProtocol {
         &mut self,
         conn_id: usize,
         original_request_id: Self::RequestId,
-    ) -> (Vec<u8>, Self::RequestId, xylem_protocols::RequestMeta) {
+    ) -> xylem_protocols::Request<Self::RequestId> {
         match self {
             MultiProtocol::Redis(p) => p.regenerate_request(conn_id, original_request_id),
             MultiProtocol::RedisCluster(p) => {
                 let cluster_req_id = p.resolve_cluster_id(conn_id, original_request_id);
-                let (data, new_cluster_id, meta) =
-                    p.protocol.regenerate_request(conn_id, cluster_req_id);
-                let simple_id = p.store_mapping(new_cluster_id);
-                (data, simple_id, meta)
+                let request = p.protocol.regenerate_request(conn_id, cluster_req_id);
+                let simple_id = p.store_mapping(request.request_id);
+                xylem_protocols::Request::new(request.data, simple_id, request.metadata)
             }
             MultiProtocol::MemcachedBinary(p) => p.regenerate_request(conn_id, original_request_id),
             MultiProtocol::MemcachedAscii(p) => p.regenerate_request(conn_id, original_request_id),
             MultiProtocol::Http(p) => p.regenerate_request(conn_id, original_request_id),
             MultiProtocol::XylemEcho(p) => p.regenerate_request(conn_id, original_request_id),
             MultiProtocol::Masstree(p) => {
-                let (data, (conn, seq), meta) = p.regenerate_request(
+                let request = p.regenerate_request(
                     conn_id,
                     (original_request_id.0, original_request_id.1 as u16),
                 );
-                (data, (conn, seq as u64), meta)
+                xylem_protocols::Request::new(
+                    request.data,
+                    (request.request_id.0, request.request_id.1 as u64),
+                    request.metadata,
+                )
             }
         }
     }
@@ -687,13 +691,13 @@ mod tests {
 
         let key = "test:key";
         let value = b"test_value";
-        let (request, id) = protocol.generate_set_with_imported_data(0, key, value);
+        let request = protocol.generate_set_with_imported_data(0, key, value);
 
         // Verify request ID
-        assert_eq!(id, (0, 0));
+        assert_eq!(request.request_id, (0, 0));
 
         // Verify it's a valid RESP SET command
-        let request_str = String::from_utf8_lossy(&request);
+        let request_str = String::from_utf8_lossy(&request.data);
         assert!(request_str.contains("SET"));
         assert!(request_str.contains(key));
         assert!(request_str.contains("test_value"));

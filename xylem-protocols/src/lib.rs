@@ -36,6 +36,45 @@ impl RequestMeta {
     }
 }
 
+/// A complete request containing data, ID, and metadata
+///
+/// This struct encapsulates all information needed to send a request,
+/// providing a cleaner interface than tuple destructuring.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Request<ReqId> {
+    /// The raw request data to send
+    pub data: Vec<u8>,
+    /// Unique identifier for this request
+    pub request_id: ReqId,
+    /// Additional metadata about the request
+    pub metadata: RequestMeta,
+}
+
+impl<ReqId> Request<ReqId> {
+    /// Create a new request
+    pub fn new(data: Vec<u8>, request_id: ReqId, metadata: RequestMeta) -> Self {
+        Self { data, request_id, metadata }
+    }
+
+    /// Create a new measurement request (stats will be collected)
+    pub fn measurement(data: Vec<u8>, request_id: ReqId) -> Self {
+        Self {
+            data,
+            request_id,
+            metadata: RequestMeta::measurement(),
+        }
+    }
+
+    /// Create a new warm-up request (stats will not be collected)
+    pub fn warmup(data: Vec<u8>, request_id: ReqId) -> Self {
+        Self {
+            data,
+            request_id,
+            metadata: RequestMeta::warmup(),
+        }
+    }
+}
+
 /// Retry request information for protocol-level retries
 ///
 /// This is used when a protocol needs to retry a request, typically
@@ -89,9 +128,9 @@ pub trait Protocol: Send {
     /// * `conn_id` - Connection identifier (for protocols that need per-connection state)
     ///
     /// # Returns
-    /// (request_data, request_id, metadata) tuple where metadata indicates
+    /// A Request containing data, ID, and metadata where metadata indicates
     /// whether this is a warm-up request (stats should not be collected)
-    fn next_request(&mut self, conn_id: usize) -> (Vec<u8>, Self::RequestId, RequestMeta);
+    fn next_request(&mut self, conn_id: usize) -> Request<Self::RequestId>;
 
     /// Regenerate a request for retry using the original request ID
     ///
@@ -104,7 +143,7 @@ pub trait Protocol: Send {
     /// * `original_request_id` - The request ID from the original request
     ///
     /// # Returns
-    /// (request_data, new_request_id, metadata) tuple
+    /// A new Request with data, ID, and metadata
     ///
     /// Default implementation just generates a new request (ignores original).
     /// Retries are always measurement requests (not warmup).
@@ -112,10 +151,10 @@ pub trait Protocol: Send {
         &mut self,
         conn_id: usize,
         _original_request_id: Self::RequestId,
-    ) -> (Vec<u8>, Self::RequestId, RequestMeta) {
-        let (data, req_id, _) = self.next_request(conn_id);
+    ) -> Request<Self::RequestId> {
+        let request = self.next_request(conn_id);
         // Retries are always measurement requests
-        (data, req_id, RequestMeta::measurement())
+        Request::measurement(request.data, request.request_id)
     }
 
     /// Parse a response and return the request ID it corresponds to
