@@ -9,6 +9,7 @@
 use std::net::SocketAddr;
 use std::thread;
 use std::time::Duration;
+use xylem_common::Request;
 use xylem_core::stats::GroupStatsCollector;
 use xylem_core::threading::{Worker, WorkerConfig};
 use xylem_transport::TcpTransportFactory;
@@ -39,10 +40,7 @@ impl EchoProtocol {
 impl xylem_core::threading::worker::Protocol for EchoProtocol {
     type RequestId = u64;
 
-    fn next_request(
-        &mut self,
-        _conn_id: usize,
-    ) -> xylem_core::threading::worker::Request<Self::RequestId> {
+    fn next_request(&mut self, _conn_id: usize) -> Request<Self::RequestId> {
         let req_id = self.next_req_id;
         self.next_req_id += 1;
 
@@ -50,7 +48,7 @@ impl xylem_core::threading::worker::Protocol for EchoProtocol {
         buf[0..8].copy_from_slice(&req_id.to_le_bytes());
         // bytes 8-15 are delay (0 for max speed)
 
-        xylem_core::threading::worker::Request::measurement(buf, req_id)
+        Request::measurement(buf, req_id)
     }
 
     fn parse_response(

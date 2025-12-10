@@ -6,6 +6,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use xylem_common::Request;
 use xylem_core::threading::{CpuPinning, ThreadingRuntime, Worker, WorkerConfig};
 use xylem_transport::{TcpTransportFactory, UdpTransportFactory};
 
@@ -177,30 +178,16 @@ impl<P: xylem_protocols::Protocol<RequestId = (usize, u64)> + 'static>
 {
     type RequestId = (usize, u64);
 
-    fn next_request(
-        &mut self,
-        conn_id: usize,
-    ) -> xylem_core::threading::worker::Request<Self::RequestId> {
-        let request = self.inner.next_request(conn_id);
-        // Convert xylem_protocols::Request to xylem_core::threading::Request
-        xylem_core::threading::worker::Request::new(
-            request.data,
-            request.request_id,
-            xylem_core::threading::worker::RequestMeta { is_warmup: request.metadata.is_warmup },
-        )
+    fn next_request(&mut self, conn_id: usize) -> Request<Self::RequestId> {
+        self.inner.next_request(conn_id)
     }
 
     fn regenerate_request(
         &mut self,
         conn_id: usize,
         original_request_id: Self::RequestId,
-    ) -> xylem_core::threading::worker::Request<Self::RequestId> {
-        let request = self.inner.regenerate_request(conn_id, original_request_id);
-        xylem_core::threading::worker::Request::new(
-            request.data,
-            request.request_id,
-            xylem_core::threading::worker::RequestMeta { is_warmup: request.metadata.is_warmup },
-        )
+    ) -> Request<Self::RequestId> {
+        self.inner.regenerate_request(conn_id, original_request_id)
     }
 
     fn parse_response(

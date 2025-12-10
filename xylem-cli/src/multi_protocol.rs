@@ -1,5 +1,6 @@
 use anyhow::{bail, Result};
 use std::collections::HashMap;
+use xylem_common::Request;
 use xylem_protocols::Protocol;
 
 pub struct RedisClusterState {
@@ -53,7 +54,7 @@ impl MultiProtocol {
         conn_id: usize,
         key: &str,
         value: &[u8],
-    ) -> xylem_protocols::Request<(usize, u64)> {
+    ) -> Request<(usize, u64)> {
         match self {
             MultiProtocol::Redis(p) => p.generate_set_with_imported_data(conn_id, key, value),
             _ => panic!("generate_set_with_imported_data only supported for Redis protocol"),
@@ -77,13 +78,13 @@ impl MultiProtocol {
 impl Protocol for MultiProtocol {
     type RequestId = (usize, u64);
 
-    fn next_request(&mut self, conn_id: usize) -> xylem_protocols::Request<Self::RequestId> {
+    fn next_request(&mut self, conn_id: usize) -> Request<Self::RequestId> {
         match self {
             MultiProtocol::Redis(p) => p.next_request(conn_id),
             MultiProtocol::RedisCluster(p) => {
                 let request = p.protocol.next_request(conn_id);
                 let simple_id = p.store_mapping(request.request_id);
-                xylem_protocols::Request::new(request.data, simple_id, request.metadata)
+                Request::new(request.data, simple_id, request.metadata)
             }
             MultiProtocol::MemcachedBinary(p) => p.next_request(conn_id),
             MultiProtocol::MemcachedAscii(p) => p.next_request(conn_id),
@@ -91,7 +92,7 @@ impl Protocol for MultiProtocol {
             MultiProtocol::XylemEcho(p) => p.next_request(conn_id),
             MultiProtocol::Masstree(p) => {
                 let request = p.next_request(conn_id);
-                xylem_protocols::Request::new(
+                Request::new(
                     request.data,
                     (request.request_id.0, request.request_id.1 as u64),
                     request.metadata,
@@ -104,14 +105,14 @@ impl Protocol for MultiProtocol {
         &mut self,
         conn_id: usize,
         original_request_id: Self::RequestId,
-    ) -> xylem_protocols::Request<Self::RequestId> {
+    ) -> Request<Self::RequestId> {
         match self {
             MultiProtocol::Redis(p) => p.regenerate_request(conn_id, original_request_id),
             MultiProtocol::RedisCluster(p) => {
                 let cluster_req_id = p.resolve_cluster_id(conn_id, original_request_id);
                 let request = p.protocol.regenerate_request(conn_id, cluster_req_id);
                 let simple_id = p.store_mapping(request.request_id);
-                xylem_protocols::Request::new(request.data, simple_id, request.metadata)
+                Request::new(request.data, simple_id, request.metadata)
             }
             MultiProtocol::MemcachedBinary(p) => p.regenerate_request(conn_id, original_request_id),
             MultiProtocol::MemcachedAscii(p) => p.regenerate_request(conn_id, original_request_id),
@@ -122,7 +123,7 @@ impl Protocol for MultiProtocol {
                     conn_id,
                     (original_request_id.0, original_request_id.1 as u16),
                 );
-                xylem_protocols::Request::new(
+                Request::new(
                     request.data,
                     (request.request_id.0, request.request_id.1 as u64),
                     request.metadata,
