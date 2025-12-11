@@ -24,6 +24,8 @@ pub struct StatsKey {
 
 /// Latency storage variants based on sampling policy
 pub enum LatencyStorage {
+    /// Latency sampling disabled
+    None,
     /// Sample-based storage (Limited/Unlimited modes)
     Samples {
         samples: Vec<Duration>,
@@ -42,6 +44,7 @@ impl LatencyStorage {
     /// Create new storage based on sampling policy
     pub fn from_policy(policy: &SamplingPolicy) -> Self {
         match policy {
+            SamplingPolicy::None => LatencyStorage::None,
             SamplingPolicy::Limited { max_samples, rate } => LatencyStorage::Samples {
                 samples: Vec::with_capacity((*max_samples).min(1024)),
                 max_samples: *max_samples,
@@ -76,6 +79,9 @@ impl LatencyStorage {
     /// Record a latency sample
     pub fn record(&mut self, latency: Duration) {
         match self {
+            LatencyStorage::None => {
+                // Skip latency storage
+            }
             LatencyStorage::Samples { samples, max_samples, sampling_rate } => {
                 if samples.len() < *max_samples
                     && (*sampling_rate >= 1.0 || rand::random::<f64>() < *sampling_rate)
@@ -98,6 +104,12 @@ impl LatencyStorage {
     /// Merge another storage into this one (consumes other)
     pub fn merge(&mut self, other: Self) {
         match (self, other) {
+            (LatencyStorage::None, _) => {
+                // Remain none; ignore other
+            }
+            (_, LatencyStorage::None) => {
+                // Nothing to merge
+            }
             (
                 LatencyStorage::Samples { samples, max_samples, .. },
                 LatencyStorage::Samples { samples: other_samples, .. },
@@ -127,6 +139,12 @@ impl LatencyStorage {
     /// Merge from a reference (for aggregation without consuming)
     pub fn merge_ref(&mut self, other: &Self) {
         match (self, other) {
+            (LatencyStorage::None, _) => {
+                // Remain none
+            }
+            (_, LatencyStorage::None) => {
+                // Nothing to merge
+            }
             (
                 LatencyStorage::Samples { samples, max_samples, .. },
                 LatencyStorage::Samples { samples: other_samples, .. },
@@ -155,6 +173,7 @@ impl LatencyStorage {
     /// Get sample count
     pub fn count(&self) -> u64 {
         match self {
+            LatencyStorage::None => 0,
             LatencyStorage::Samples { samples, .. } => samples.len() as u64,
             LatencyStorage::DdSketch(sketch) => sketch.count() as u64,
             LatencyStorage::TDigest(digest) => digest.count() as u64,
@@ -165,6 +184,7 @@ impl LatencyStorage {
     /// Calculate percentile (returns nanoseconds)
     pub fn percentile(&self, p: f64) -> u64 {
         match self {
+            LatencyStorage::None => 0,
             LatencyStorage::Samples { samples, .. } => {
                 if samples.is_empty() {
                     return 0;
@@ -185,6 +205,7 @@ impl LatencyStorage {
     /// Calculate mean (returns nanoseconds)
     pub fn mean(&self) -> u64 {
         match self {
+            LatencyStorage::None => 0,
             LatencyStorage::Samples { samples, .. } => {
                 if samples.is_empty() {
                     return 0;
@@ -204,6 +225,7 @@ impl LatencyStorage {
     /// Get min value (returns nanoseconds)
     pub fn min(&self) -> u64 {
         match self {
+            LatencyStorage::None => 0,
             LatencyStorage::Samples { samples, .. } => {
                 samples.iter().min().map(|d| d.as_nanos() as u64).unwrap_or(0)
             }
@@ -216,6 +238,7 @@ impl LatencyStorage {
     /// Get max value (returns nanoseconds)
     pub fn max(&self) -> u64 {
         match self {
+            LatencyStorage::None => 0,
             LatencyStorage::Samples { samples, .. } => {
                 samples.iter().max().map(|d| d.as_nanos() as u64).unwrap_or(0)
             }
@@ -323,8 +346,11 @@ pub struct ConnectionStats {
 pub struct TupleStatsCollector {
     /// Statistics entries keyed by (time_bucket, group_id, connection_id)
     entries: HashMap<StatsKey, StatsEntry>,
-    /// Sampling policy for latency storage
+    /// Global sampling policy for latency storage (used for global aggregation)
     sampling_policy: SamplingPolicy,
+    /// Per-group sampling policies (used for per-group aggregation)
+    /// If a group is not in this map, falls back to global sampling_policy
+    group_sampling_policies: HashMap<usize, SamplingPolicy>,
     /// Time bucket duration in nanoseconds
     bucket_duration_ns: u64,
     /// Experiment start time in nanoseconds
@@ -343,6 +369,7 @@ impl TupleStatsCollector {
         Self {
             entries: HashMap::new(),
             sampling_policy,
+            group_sampling_policies: HashMap::new(),
             bucket_duration_ns: bucket_duration.as_nanos() as u64,
             experiment_start_ns: crate::timing::time_ns(),
             current_bucket: 0,
@@ -360,6 +387,7 @@ impl TupleStatsCollector {
         Self {
             entries: HashMap::new(),
             sampling_policy,
+            group_sampling_policies: HashMap::new(),
             bucket_duration_ns: bucket_duration.as_nanos() as u64,
             experiment_start_ns: start_time_ns,
             current_bucket: 0,
@@ -386,12 +414,30 @@ impl TupleStatsCollector {
         Self {
             entries: HashMap::new(),
             sampling_policy,
+            group_sampling_policies: HashMap::new(),
             bucket_duration_ns: bucket_duration.as_nanos() as u64,
             experiment_start_ns: start_time_ns,
             current_bucket: 0,
             dumper: Some(dumper),
             retention_buckets: retention_buckets as u64,
         }
+    }
+
+    /// Register a per-group sampling policy
+    ///
+    /// This allows different traffic groups to have independent sampling policies.
+    /// When aggregating per-group stats, the registered policy for each group is used.
+    pub fn register_group_policy(&mut self, group_id: usize, policy: SamplingPolicy) {
+        self.group_sampling_policies.insert(group_id, policy);
+    }
+
+    /// Get the sampling policy for a specific group
+    ///
+    /// Panics if the group was not registered (this is a programmer error)
+    fn get_group_policy(&self, group_id: usize) -> &SamplingPolicy {
+        self.group_sampling_policies
+            .get(&group_id)
+            .unwrap_or_else(|| panic!("Group {} sampling policy not registered", group_id))
     }
 
     /// Compute time bucket for the current time
@@ -538,16 +584,23 @@ impl TupleStatsCollector {
 
     /// Aggregate all entries into global statistics
     pub fn aggregate_global(&self, duration: Duration) -> AggregatedStats {
-        let mut merged_latency = LatencyStorage::from_policy(&self.sampling_policy);
         let mut total_requests = 0u64;
         let mut total_tx_bytes = 0u64;
         let mut total_rx_bytes = 0u64;
+
+        // Create latency storage based on global sampling policy
+        // If policy is None, we skip latency aggregation but still count requests/bytes
+        let mut merged_latency = LatencyStorage::from_policy(&self.sampling_policy);
 
         for entry in self.entries.values() {
             total_requests += entry.request_count;
             total_tx_bytes += entry.tx_bytes;
             total_rx_bytes += entry.rx_bytes;
-            merged_latency.merge_ref(&entry.latency);
+
+            // Only merge latency if global policy is not None
+            if !matches!(self.sampling_policy, SamplingPolicy::None) {
+                merged_latency.merge_ref(&entry.latency);
+            }
         }
 
         self.compute_aggregated_stats(
@@ -567,13 +620,23 @@ impl TupleStatsCollector {
             let mut total_requests = 0u64;
             let mut total_tx_bytes = 0u64;
             let mut total_rx_bytes = 0u64;
-            let mut merged_latency = LatencyStorage::from_policy(&self.sampling_policy);
+
+            // Use this group's specific sampling policy
+            let group_policy = self.get_group_policy(group_id);
+            let mut merged_latency = LatencyStorage::from_policy(group_policy);
+            let should_merge_latency = !matches!(group_policy, SamplingPolicy::None);
 
             for (key, entry) in &self.entries {
-                if key.group_id == group_id {
-                    total_requests += entry.request_count;
-                    total_tx_bytes += entry.tx_bytes;
-                    total_rx_bytes += entry.rx_bytes;
+                if key.group_id != group_id {
+                    continue;
+                }
+
+                total_requests += entry.request_count;
+                total_tx_bytes += entry.tx_bytes;
+                total_rx_bytes += entry.rx_bytes;
+
+                // Only merge latency if this group's policy is not None
+                if should_merge_latency {
                     merged_latency.merge_ref(&entry.latency);
                 }
             }
@@ -756,6 +819,7 @@ impl TupleStatsCollector {
         let mut merged = Self {
             entries: HashMap::new(),
             sampling_policy: first.sampling_policy.clone(),
+            group_sampling_policies: HashMap::new(),
             bucket_duration_ns: first.bucket_duration_ns,
             experiment_start_ns: first.experiment_start_ns,
             current_bucket: 0,
@@ -763,7 +827,14 @@ impl TupleStatsCollector {
             retention_buckets: u64::MAX,
         };
 
+        // Merge entries from all collectors
         for collector in collectors {
+            // Merge per-group sampling policies (first collector's policy wins for each group)
+            for (group_id, policy) in collector.group_sampling_policies {
+                merged.group_sampling_policies.entry(group_id).or_insert(policy);
+            }
+
+            // Merge stats entries
             for (key, entry) in collector.entries {
                 merged.entries.entry(key).and_modify(|e| e.merge_from(&entry)).or_insert(entry);
             }

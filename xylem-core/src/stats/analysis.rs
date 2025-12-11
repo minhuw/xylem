@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use statrs::distribution::{ContinuousCDF, StudentsT};
 
-use super::{AggregatedStats, GroupStatsCollector, StatsCollector};
+use super::{AggregatedStats, GroupStatsCollector, SamplingMode, StatsCollector};
 use std::collections::HashMap;
 
 /// Calculate percentile from sorted samples
@@ -114,6 +114,38 @@ pub fn aggregate_stats(
     duration: Duration,
     confidence_level: f64,
 ) -> AggregatedStats {
+    // If latency sampling is disabled, return zeros for latency fields but keep throughput
+    if matches!(collector.sampling_mode(), SamplingMode::None) {
+        let duration_secs = duration.as_secs_f64();
+        let total_requests = collector.tx_requests();
+        let throughput_rps = if duration_secs > 0.0 {
+            total_requests as f64 / duration_secs
+        } else {
+            0.0
+        };
+
+        let total_bytes = (collector.tx_bytes() + collector.rx_bytes()) as f64;
+        let throughput_mbps = if duration_secs > 0.0 {
+            (total_bytes * 8.0) / (duration_secs * 1_000_000.0)
+        } else {
+            0.0
+        };
+
+        return AggregatedStats {
+            latency_p50: Duration::ZERO,
+            latency_p95: Duration::ZERO,
+            latency_p99: Duration::ZERO,
+            latency_p999: Duration::ZERO,
+            latency_p9999: Duration::ZERO,
+            latency_p99999: Duration::ZERO,
+            mean_latency: Duration::ZERO,
+            std_dev: Duration::ZERO,
+            confidence_interval: Duration::ZERO,
+            throughput_rps,
+            throughput_mbps,
+            total_requests,
+        };
+    }
     // Check if we're using DDSketch mode
     if let Some(sketch) = collector.ddsketch() {
         // Use DDSketch for percentile calculations

@@ -28,6 +28,15 @@ impl GroupStatsCollector {
         }
     }
 
+    /// Create with an explicit global sampling policy (e.g., None to disable latency)
+    pub fn with_global_policy(global_policy: &SamplingPolicy) -> Self {
+        Self {
+            group_collectors: HashMap::new(),
+            global_collector: StatsCollector::from_policy(global_policy),
+            metadata_collector: GroupMetadataCollector::new(),
+        }
+    }
+
     /// Register a traffic group with a sampling policy
     pub fn register_group(&mut self, group_id: usize, policy: &SamplingPolicy) {
         self.group_collectors.insert(group_id, StatsCollector::from_policy(policy));

@@ -163,6 +163,11 @@ pub struct StatsConfig {
     /// Include per-second per-connection records in JSON output
     #[serde(default)]
     pub include_records: bool,
+    /// Global latency sampling policy for the aggregated collector.
+    /// If unset, the first traffic group's policy is used (current behavior).
+    /// Set to "none" to disable global latency recording.
+    #[serde(default)]
+    pub sampling_policy: Option<xylem_core::stats::collector::SamplingPolicy>,
     /// Streaming configuration for writing stats to Parquet files
     #[serde(default)]
     pub streaming: Option<StreamingStatsConfig>,
@@ -173,6 +178,7 @@ impl Default for StatsConfig {
         Self {
             bucket_duration: default_bucket_duration(),
             include_records: false,
+            sampling_policy: None,
             streaming: None,
         }
     }

@@ -5,6 +5,7 @@
 
 use std::process::Command;
 use std::time::Duration;
+use xylem_core::stats::collector::SamplingPolicy;
 use xylem_core::stats::GroupStatsCollector;
 use xylem_core::threading::{ThreadingRuntime, Worker, WorkerConfig};
 
@@ -183,6 +184,71 @@ fn test_redis_single_thread() {
         "Mean latency should be < 10ms for local Redis, got {:?}",
         basic_stats.mean
     );
+}
+
+#[test]
+fn test_global_sampling_none_disables_latency() {
+    // Start Redis server (will auto-cleanup on drop)
+    let _redis = common::redis::RedisGuard::new().expect("Failed to start Redis");
+
+    println!("Testing SamplingPolicy::None (no latency tracking)...");
+
+    let target_addr = "127.0.0.1:6379".parse().unwrap();
+    let duration = Duration::from_secs(2);
+
+    // Create Redis protocol with GET operations
+    let protocol = xylem_protocols::redis::RedisProtocol::new(Box::new(
+        xylem_protocols::FixedCommandSelector::new(xylem_protocols::redis::RedisOp::Get),
+    ));
+    let protocol = ProtocolAdapter::new(protocol);
+
+    // Create stats collector with SamplingPolicy::None
+    let mut stats = GroupStatsCollector::new();
+    stats.register_group(0, &SamplingPolicy::None);
+
+    let worker_config = WorkerConfig {
+        target: target_addr,
+        duration,
+        conn_count: 1,
+        max_pending_per_conn: 1,
+    };
+
+    let mut worker =
+        Worker::with_closed_loop(&TcpTransportFactory::default(), protocol, stats, worker_config)
+            .expect("Failed to create worker");
+
+    // Run the worker
+    println!("Starting test with SamplingPolicy::None...");
+    let result = worker.run();
+
+    assert!(
+        result.is_ok(),
+        "Worker should complete successfully even with SamplingPolicy::None: {:?}",
+        result.err()
+    );
+
+    // Check stats
+    let stats = worker.into_stats();
+
+    println!("Results:");
+    println!("  Total requests: {}", stats.global().tx_requests());
+    println!(
+        "  Throughput: {:.2} req/s",
+        stats.global().tx_requests() as f64 / duration.as_secs_f64()
+    );
+    println!("  Latency samples collected: {}", stats.global().samples().len());
+
+    // Verify we got some requests through
+    assert!(stats.global().tx_requests() > 0, "Should have sent some requests");
+    assert!(stats.global().rx_requests() > 0, "Should have received some responses");
+
+    // With SamplingPolicy::None, no latency samples should be collected
+    assert!(
+        stats.global().samples().is_empty(),
+        "SamplingPolicy::None should not collect any latency samples"
+    );
+
+    println!("✓ SamplingPolicy::None validation passed - no latency samples collected as expected");
 }
 
 #[test]

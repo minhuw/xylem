@@ -635,31 +635,28 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
             protocols.insert(*group_id, protocol_adapted);
         }
 
-        // Initialize tuple stats collector (use sampling policy from first group)
-        // Note: All groups on the same thread share a single sampling policy for the stats collector.
-        // If groups have different sampling policies, the first group's policy is used.
+    // Initialize tuple stats collector
+    // Global sampling policy: used for global aggregation (can be "none" to skip global latency)
+    // Per-group sampling policies: each group aggregates using its own policy
         let first_group_id = groups_for_thread.first().map(|(gid, _)| *gid).unwrap_or(0);
-        let sampling_policy = config_for_worker.traffic_groups[first_group_id].sampling_policy.clone();
 
-        // Warn if multiple groups on this thread have different sampling policies
-        for (group_id, _) in groups_for_thread.iter().skip(1) {
-            let other_policy = &config_for_worker.traffic_groups[*group_id].sampling_policy;
-            if std::mem::discriminant(other_policy) != std::mem::discriminant(&sampling_policy) {
-                tracing::warn!(
-                    "Thread {}: Group {} uses a different sampling policy than group {}. \
-                     All groups on this thread will use the sampling policy from group {}.",
-                    thread_idx,
-                    group_id,
-                    first_group_id,
-                    first_group_id
-                );
-            }
-        }
+        // Determine global sampling policy: prefer explicit global override; else use first group's policy
+        let global_sampling_policy = config_for_worker
+            .stats
+            .sampling_policy
+            .clone()
+            .unwrap_or_else(|| config_for_worker.traffic_groups[first_group_id].sampling_policy.clone());
 
-        let stats = xylem_core::stats::TupleStatsCollector::new(
-            sampling_policy,
+        let mut stats = xylem_core::stats::TupleStatsCollector::new(
+            global_sampling_policy.clone(),
             config_for_worker.stats.bucket_duration,
         );
+
+        // Register per-group sampling policies for independent aggregation
+        for (group_id, _) in groups_for_thread.iter() {
+            let group_policy = &config_for_worker.traffic_groups[*group_id].sampling_policy;
+            stats.register_group_policy(*group_id, group_policy.clone());
+        }
 
         // Build group configurations for multi-group worker
         let mut groups_config = Vec::new();

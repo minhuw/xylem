@@ -9,6 +9,9 @@
     "experiment": {
       "$ref": "#/$defs/ExperimentConfig"
     },
+    "stats": {
+      "$ref": "#/$defs/StatsConfig"
+    },
     "output": {
       "$ref": "#/$defs/OutputConfig"
     },
@@ -77,6 +80,34 @@
           "default": "light"
         }
       }
+    },
+    "StatsConfig": {
+      "description": "Statistics collection configuration",
+      "type": "object",
+      "properties": {
+        "bucket_duration": {
+          "description": "Time bucket duration for per-connection records",
+          "type": "string"
+        },
+        "include_records": {
+          "description": "Include per-second per-connection records in JSON output",
+          "type": "boolean",
+          "default": false
+        },
+        "sampling_policy": {
+          "description": "Global latency sampling policy for the aggregated collector (optional)",
+          "$ref": "#/$defs/SamplingPolicy",
+          "default": null
+        },
+        "streaming": {
+          "description": "Streaming configuration for writing stats to Parquet files",
+          "$ref": "#/$defs/StreamingStatsConfig",
+          "default": null
+        }
+      },
+      "required": [
+        "bucket_duration"
+      ]
     },
     "OutputConfig": {
       "description": "Output configuration",
@@ -369,6 +400,19 @@
     "SamplingPolicy": {
       "description": "Sampling policy configuration for latency measurement",
       "oneOf": [
+        {
+          "description": "Disable latency sampling entirely (still counts bytes/requests)",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "none"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
         {
           "description": "Limited sampling with fixed rate and max samples",
           "type": "object",

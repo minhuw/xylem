@@ -15,6 +15,8 @@ use tdigest::TDigest;
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum SamplingPolicy {
+    /// Disable latency sampling entirely (still counts bytes/requests)
+    None,
     /// Limited sampling with fixed rate and max samples
     Limited {
         /// Maximum number of samples to store
@@ -123,6 +125,8 @@ impl Default for SamplingPolicy {
 /// Sampling mode for statistics collection
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SamplingMode {
+    /// Latency sampling disabled
+    None,
     /// Limited sampling: store up to max_samples with given sampling rate
     Limited { max_samples: usize, rate: f64 },
     /// Zero sampling: store every single latency (no limit)
@@ -206,6 +210,7 @@ impl StatsCollector {
                     SamplingMode::Unlimited => true,
                     SamplingMode::Limited { max_samples, .. } => merged.samples.len() < max_samples,
                     SamplingMode::Sketch => false,
+                    SamplingMode::None => false,
                 };
                 if should_add {
                     merged.samples.push(sample);
@@ -228,6 +233,7 @@ impl StatsCollector {
     /// Create a new statistics collector from a sampling policy
     pub fn from_policy(policy: &SamplingPolicy) -> Self {
         match policy {
+            SamplingPolicy::None => Self::new_none(),
             SamplingPolicy::Limited { max_samples, rate } => Self::new(*max_samples, *rate),
             SamplingPolicy::Unlimited => Self::new_unlimited(),
             SamplingPolicy::Adaptive {
@@ -264,6 +270,27 @@ impl StatsCollector {
                 rate: sampling_rate.clamp(0.0, 1.0),
             },
             sampling_rate: sampling_rate.clamp(0.0, 1.0),
+            tx_bytes: 0,
+            rx_bytes: 0,
+            tx_requests: 0,
+            rx_requests: 0,
+            sample_count: 0,
+            rng: SmallRng::from_os_rng(),
+            adaptive_sampler: None,
+            ddsketch: None,
+            ddsketch_config: None,
+            tdigest: None,
+            tdigest_compression: None,
+            hdrhistogram: None,
+        }
+    }
+
+    /// Create a statistics collector that skips latency recording
+    pub fn new_none() -> Self {
+        Self {
+            samples: Vec::new(),
+            mode: SamplingMode::None,
+            sampling_rate: 0.0,
             tx_bytes: 0,
             rx_bytes: 0,
             tx_requests: 0,
@@ -398,9 +425,14 @@ impl StatsCollector {
 
     /// Record a latency sample
     pub fn record_latency(&mut self, latency: Duration) {
+        // Always count requests/bytes even if latency sampling is disabled
         self.tx_requests += 1;
         self.rx_requests += 1;
-        self.sample_count += 1;
+
+        // Skip latency storage when sampling is disabled
+        if matches!(self.mode, SamplingMode::None) {
+            return;
+        }
 
         // Check if adaptive sampler wants to adjust rate
         if let Some(ref mut adaptive_sampler) = self.adaptive_sampler {
@@ -408,6 +440,8 @@ impl StatsCollector {
                 self.sampling_rate = new_rate;
             }
         }
+
+        self.sample_count += 1;
 
         // Determine if we should store this sample
         match self.mode {
@@ -424,6 +458,9 @@ impl StatsCollector {
                     let mut hdr = hdr_mutex.lock().unwrap();
                     let _ = hdr.record(latency.as_nanos() as u64);
                 }
+            }
+            SamplingMode::None => {
+                // Already handled by early return
             }
             SamplingMode::Unlimited => {
                 // Zero sampling: always record
@@ -483,6 +520,11 @@ impl StatsCollector {
     /// Get total received requests
     pub fn rx_requests(&self) -> u64 {
         self.rx_requests
+    }
+
+    /// Sampling mode accessor
+    pub fn sampling_mode(&self) -> SamplingMode {
+        self.mode
     }
 
     /// Get total sample count (including those not stored due to sampling)

@@ -191,6 +191,8 @@ rate = 50.0  # Mean 50 req/s per connection
 - `type` (string, required):
   - `"unlimited"`: Sample every request (100% sampling)
   - `"limited"`: Sample a fraction of requests
+  - `"adaptive"`, `"dd-sketch"`, `"t-digest"`, `"hdr-histogram"`: advanced samplers
+  - `"none"`: Disable latency sampling (throughput/bytes still recorded)
 - `rate` (float, required for limited): Sampling rate (0.0 to 1.0)
 - `max_samples` (integer, optional): Maximum samples to store
 
@@ -205,6 +207,21 @@ type = "limited"
 rate = 0.01      # 1% sampling
 max_samples = 10000
 ```
+
+```toml
+# Disable latency sampling for this group
+[traffic_groups.sampling_policy]
+type = "none"
+```
+
+### Stats Config
+
+Top-level stats configuration (`[stats]`).
+
+- `bucket_duration` (string, required): time bucket for per-connection records
+- `include_records` (bool, default false)
+- `sampling_policy` (optional): global latency sampling policy; set to `type = "none"` to disable global latency recording; if omitted, the first traffic group’s policy is used
+- `streaming` (optional): Parquet streaming config
 
 ## Output Section
 
