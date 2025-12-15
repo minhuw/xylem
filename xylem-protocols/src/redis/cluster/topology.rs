@@ -73,6 +73,10 @@ impl ClusterTopology {
     ///
     /// * `ranges` - Slot ranges returned from CLUSTER SLOTS command
     ///
+    /// # Panics
+    ///
+    /// Panics if ranges overlap (indicates configuration error)
+    ///
     /// # Example
     ///
     /// ```
@@ -104,9 +108,29 @@ impl ClusterTopology {
     pub fn from_slot_ranges(ranges: Vec<SlotRange>) -> Self {
         let mut topology = Self::new();
 
+        // Track which slots have been assigned to detect overlaps
+        let mut slot_assigned = vec![false; 16384];
+
         // Build slot map from ranges
         for range in &ranges {
+            // Validate slot range bounds
+            assert!(range.start < 16384, "Invalid start slot {} in range", range.start);
+            assert!(range.end < 16384, "Invalid end slot {} in range", range.end);
+            assert!(
+                range.start <= range.end,
+                "Invalid range: start {} > end {}",
+                range.start,
+                range.end
+            );
+
+            // Check for overlaps
             for slot in range.start..=range.end {
+                assert!(
+                    !slot_assigned[slot as usize],
+                    "Overlapping slot ranges detected: slot {} assigned multiple times",
+                    slot
+                );
+                slot_assigned[slot as usize] = true;
                 topology.slot_map[slot as usize] = range.master;
             }
 
@@ -144,8 +168,9 @@ impl ClusterTopology {
     ///
     /// # Panics
     ///
-    /// Panics if slot >= 16384 (should never happen if using calculate_slot())
+    /// Panics if slot >= 16384
     pub fn get_node_for_slot(&self, slot: u16) -> SocketAddr {
+        assert!(slot < 16384, "Invalid slot {}: must be < 16384", slot);
         self.slot_map[slot as usize]
     }
 
@@ -159,7 +184,12 @@ impl ClusterTopology {
     ///
     /// * `slot` - Hash slot number (0-16383)
     /// * `addr` - New owner address
+    ///
+    /// # Panics
+    ///
+    /// Panics if slot >= 16384
     pub fn update_slot(&mut self, slot: u16, addr: SocketAddr) {
+        assert!(slot < 16384, "Invalid slot {}: must be < 16384", slot);
         self.slot_map[slot as usize] = addr;
 
         // Register node if not known
@@ -432,8 +462,9 @@ mod tests {
     }
 
     #[test]
-    fn test_overlapping_slots_last_wins() {
-        // Test behavior when ranges overlap (shouldn't happen in real Redis)
+    #[should_panic(expected = "Overlapping slot ranges detected")]
+    fn test_overlapping_slots_rejected() {
+        // Test that overlapping ranges are now rejected (fixed bug)
         let master1: SocketAddr = "127.0.0.1:7000".parse().unwrap();
         let master2: SocketAddr = "127.0.0.1:7001".parse().unwrap();
 
@@ -452,10 +483,8 @@ mod tests {
             },
         ];
 
-        let topology = ClusterTopology::from_slot_ranges(ranges);
-
-        // Slot 50 should be owned by master2 (last range wins)
-        assert_eq!(topology.get_node_for_slot(50), master2);
+        // This should panic due to overlapping ranges
+        let _topology = ClusterTopology::from_slot_ranges(ranges);
     }
 
     #[test]

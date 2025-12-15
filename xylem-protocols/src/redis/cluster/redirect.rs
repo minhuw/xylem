@@ -89,6 +89,11 @@ fn parse_moved(msg: &str) -> Result<Option<RedirectType>> {
         .parse()
         .map_err(|e| anyhow!("Invalid slot number in MOVED '{}': {}", parts[0], e))?;
 
+    // Validate slot is in valid range (0-16383)
+    if slot >= 16384 {
+        return Err(anyhow!("Slot {} out of range in MOVED (must be < 16384)", slot));
+    }
+
     let addr: SocketAddr = parts[1]
         .parse()
         .map_err(|e| anyhow!("Invalid address in MOVED '{}': {}", parts[1], e))?;
@@ -116,6 +121,11 @@ fn parse_ask(msg: &str) -> Result<Option<RedirectType>> {
     let slot: u16 = parts[0]
         .parse()
         .map_err(|e| anyhow!("Invalid slot number in ASK '{}': {}", parts[0], e))?;
+
+    // Validate slot is in valid range (0-16383)
+    if slot >= 16384 {
+        return Err(anyhow!("Slot {} out of range in ASK (must be < 16384)", slot));
+    }
 
     let addr: SocketAddr = parts[1]
         .parse()
@@ -353,16 +363,13 @@ mod tests {
     #[test]
     fn test_parse_moved_out_of_range_slot() {
         // Slot number too large (valid range is 0-16383)
-        // The parser doesn't validate slot range, just parses the number
+        // Parser now validates slot range and returns error
         let error = b"-MOVED 16384 127.0.0.1:6381\r\n";
         let result = parse_redirect(error);
-        assert!(result.is_ok());
-        match result.unwrap() {
-            Some(RedirectType::Moved { slot, .. }) => assert_eq!(slot, 16384),
-            _ => panic!("Expected MOVED redirect"),
-        }
+        // Should now return error because slot >= 16384
+        assert!(result.is_err(), "Expected error for slot >= 16384");
 
-        // Slot number exceeds u16::MAX should fail
+        // Slot number exceeds u16::MAX should also fail
         let error = b"-MOVED 99999 127.0.0.1:6381\r\n";
         let result = parse_redirect(error);
         // Should fail to parse because 99999 > u16::MAX (65535)

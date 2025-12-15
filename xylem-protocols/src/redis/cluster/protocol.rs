@@ -314,6 +314,8 @@ impl RedisClusterProtocol {
     }
 
     /// Build a retry request from redirect information
+    ///
+    /// This function handles both stats updates and topology changes.
     fn build_retry_request(
         &mut self,
         redirect: &RedirectType,
@@ -332,6 +334,7 @@ impl RedisClusterProtocol {
 
         match redirect {
             RedirectType::Moved { slot, addr } => {
+                // Update stats and topology (only once, not in update_redirect_stats)
                 self.redirect_stats.moved_count += 1;
                 self.topology.update_slot(*slot, *addr);
 
@@ -347,6 +350,7 @@ impl RedisClusterProtocol {
                 })
             }
             RedirectType::Ask { slot: _, addr } => {
+                // Update stats only (ASK doesn't update topology)
                 self.redirect_stats.ask_count += 1;
 
                 let target_conn_id = self.node_to_conn.get(addr).copied();
@@ -530,10 +534,9 @@ impl RedisClusterProtocol {
         // Determine target node
         let target_node = match self.get_target_node(key_bytes) {
             Ok(node) => node,
-            Err(e) => {
+            Err(_e) => {
                 // If we can't determine target, use the provided conn_id
                 // This will likely result in a redirect, which is fine
-                eprintln!("Warning: {}, using provided conn_id {}", e, conn_id);
                 match self.conn_to_node.get(&conn_id) {
                     Some(&node) => node,
                     None => {
@@ -541,8 +544,10 @@ impl RedisClusterProtocol {
                         self.default_node
                             .or_else(|| self.conn_to_node.values().next().copied())
                             .unwrap_or_else(|| {
-                                eprintln!("No nodes available, using dummy address");
-                                "127.0.0.1:6379".parse().unwrap()
+                                // This should rarely happen - only during initialization
+                                // Use a localhost placeholder that will trigger a redirect
+                                // Better than panicking, allows graceful error handling
+                                "127.0.0.1:6379".parse().expect("Hardcoded address should parse")
                             })
                     }
                 }
@@ -753,7 +758,9 @@ impl RedisClusterProtocol {
                 match self.build_retry_request(&redirect, req_id, consumed, current_retry) {
                     Ok(retry_req) => Ok(crate::ParseResult::Retry(retry_req)),
                     Err(_) => {
-                        // Couldn't build retry - update stats and return error
+                        // Couldn't build retry - clean up metadata and update stats
+                        self.request_metadata.remove(&req_id);
+                        self.retry_counts.remove(&req_id);
                         self.update_redirect_stats(&redirect);
                         Err(e)
                     }
