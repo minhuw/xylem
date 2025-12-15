@@ -215,8 +215,8 @@ pub struct RedisProtocol {
     /// RESP protocol version (2 or 3)
     #[allow(dead_code)] // Reserved for future RESP3-specific features
     resp_version: u8,
-    /// Track transaction state per connection
-    conn_in_transaction: std::collections::HashMap<usize, bool>,
+    /// Track connections currently in a transaction
+    conn_in_transaction: std::collections::HashSet<usize>,
     /// Buffer pool for request generation
     pool: BufferPool,
     /// Command execution statistics
@@ -245,7 +245,7 @@ impl RedisProtocol {
             moved_redirects: 0,
             ask_redirects: 0,
             resp_version: 2, // Default to RESP2
-            conn_in_transaction: std::collections::HashMap::new(),
+            conn_in_transaction: std::collections::HashSet::new(),
             pool: BufferPool::new(),
             command_stats: std::collections::HashMap::new(),
             key_gen: None,
@@ -300,7 +300,7 @@ impl RedisProtocol {
             moved_redirects: 0,
             ask_redirects: 0,
             resp_version: 2,
-            conn_in_transaction: std::collections::HashMap::new(),
+            conn_in_transaction: std::collections::HashSet::new(),
             pool: BufferPool::new(),
             command_stats: std::collections::HashMap::new(),
             key_gen: Some(key_gen),
@@ -388,7 +388,8 @@ impl RedisProtocol {
     fn next_send_seq(&mut self, conn_id: usize) -> u64 {
         let seq = self.conn_send_seq.entry(conn_id).or_insert(0);
         let result = *seq;
-        *seq += 1;
+        // Use saturating_add to prevent overflow - will stick at u64::MAX
+        *seq = seq.saturating_add(1);
         result
     }
 
@@ -396,7 +397,8 @@ impl RedisProtocol {
     fn next_recv_seq(&mut self, conn_id: usize) -> u64 {
         let seq = self.conn_recv_seq.entry(conn_id).or_insert(0);
         let result = *seq;
-        *seq += 1;
+        // Use saturating_add to prevent overflow - will stick at u64::MAX
+        *seq = seq.saturating_add(1);
         result
     }
 
@@ -459,12 +461,24 @@ impl RedisProtocol {
 
     /// Check if a connection is in a transaction
     pub fn is_in_transaction(&self, conn_id: usize) -> bool {
-        self.conn_in_transaction.get(&conn_id).copied().unwrap_or(false)
+        self.conn_in_transaction.contains(&conn_id)
     }
 
     /// Mark a connection as being in a transaction
     fn set_transaction_state(&mut self, conn_id: usize, in_transaction: bool) {
-        self.conn_in_transaction.insert(conn_id, in_transaction);
+        if in_transaction {
+            self.conn_in_transaction.insert(conn_id);
+        } else {
+            self.conn_in_transaction.remove(&conn_id);
+        }
+    }
+
+    /// Clean up connection state when connection closes
+    /// This prevents HashMap leak with dead connection IDs
+    pub fn cleanup_connection(&mut self, conn_id: usize) {
+        self.conn_send_seq.remove(&conn_id);
+        self.conn_recv_seq.remove(&conn_id);
+        self.conn_in_transaction.remove(&conn_id);
     }
 }
 
@@ -540,7 +554,8 @@ impl RedisProtocol {
         request.extend_from_slice(key.as_bytes());
         request.extend_from_slice(b"\r\n");
 
-        crate::Request::measurement(request.to_vec(), id)
+        // Move the buffer (don't clone) to avoid memory leak
+        crate::Request::measurement(request, id)
     }
 
     /// Generate a request with specific key and value size
@@ -615,7 +630,8 @@ impl RedisProtocol {
             RedisOp::MGet { count } => {
                 let mut request = format!("*{}\r\n$4\r\nMGET\r\n", count + 1);
                 for i in 0..*count {
-                    let curr_key = key.wrapping_add(i as u64);
+                    // Use saturating_add to prevent overflow - keys wrap to max value
+                    let curr_key = key.saturating_add(i as u64);
                     let key_str = self.format_key(curr_key);
                     request.push_str(&format!("${}\r\n{}\r\n", key_str.len(), key_str));
                 }
@@ -742,7 +758,8 @@ impl RedisProtocol {
                 let value = self.generate_value(value_size);
                 let mut request = format!("*{}\r\n$4\r\nMSET\r\n", count * 2 + 1);
                 for i in 0..*count {
-                    let curr_key = key.wrapping_add(i as u64);
+                    // Use saturating_add to prevent overflow - keys wrap to max value
+                    let curr_key = key.saturating_add(i as u64);
                     let key_str = self.format_key(curr_key);
                     request.push_str(&format!(
                         "${}\r\n{}\r\n${}\r\n{}\r\n",
@@ -1100,7 +1117,7 @@ impl Protocol for RedisProtocol {
         // Validate response
         match data[0] {
             b'+' | b':' | b'$' | b'*' | b'_' | b',' | b'#' | b'(' | b'%' | b'~' | b'|' | b'!'
-            | b'=' => {
+            | b'=' | b'>' => {
                 // Valid response (RESP2 and RESP3 types) - return the next expected ID for this connection
                 // (Redis guarantees FIFO ordering per connection)
                 let seq = self.next_recv_seq(conn_id);
@@ -1156,11 +1173,42 @@ impl Protocol for RedisProtocol {
 }
 
 impl RedisProtocol {
+    /// Maximum recursion depth for nested RESP structures
+    const MAX_RESP_DEPTH: usize = 32;
+
+    /// Maximum array/map size to prevent DoS
+    const MAX_ARRAY_SIZE: i64 = 10_000_000;
+
+    /// Maximum bulk string size (1GB)
+    const MAX_BULK_STRING_SIZE: i64 = 1_073_741_824;
+
+    /// Maximum total message size (10MB) to prevent scanning huge buffers
+    const MAX_MESSAGE_SIZE: usize = 10_485_760;
+
     /// Find the end of a complete RESP message, returns bytes consumed
     /// Supports both RESP2 and RESP3 types
     fn find_resp_message_end(data: &[u8]) -> Result<usize> {
+        Self::find_resp_message_end_with_depth(data, 0)
+    }
+
+    /// Internal implementation with depth tracking
+    fn find_resp_message_end_with_depth(data: &[u8], depth: usize) -> Result<usize> {
         if data.is_empty() {
             return Ok(0);
+        }
+
+        // Check message size to prevent excessive scanning
+        if data.len() > Self::MAX_MESSAGE_SIZE {
+            return Err(anyhow!(
+                "RESP message too large: {} bytes (max: {})",
+                data.len(),
+                Self::MAX_MESSAGE_SIZE
+            ));
+        }
+
+        // Check recursion depth to prevent stack overflow
+        if depth > Self::MAX_RESP_DEPTH {
+            return Err(anyhow!("RESP message nesting too deep (max: {})", Self::MAX_RESP_DEPTH));
         }
 
         match data[0] {
@@ -1187,7 +1235,27 @@ impl RedisProtocol {
                         return Ok(first_crlf + 2);
                     }
 
-                    let expected_total = first_crlf + 2 + length as usize + 2;
+                    // Validate length is non-negative and within limits
+                    if length < 0 {
+                        return Err(anyhow!("Invalid negative bulk string length: {}", length));
+                    }
+                    if length > Self::MAX_BULK_STRING_SIZE {
+                        return Err(anyhow!(
+                            "Bulk string too large: {} (max: {})",
+                            length,
+                            Self::MAX_BULK_STRING_SIZE
+                        ));
+                    }
+
+                    // Use checked arithmetic to prevent overflow
+                    let expected_total = first_crlf
+                        .checked_add(2)
+                        .and_then(|v| v.checked_add(length as usize))
+                        .and_then(|v| v.checked_add(2))
+                        .ok_or_else(|| {
+                            anyhow!("Integer overflow in bulk string size calculation")
+                        })?;
+
                     if data.len() >= expected_total {
                         Ok(expected_total)
                     } else {
@@ -1197,9 +1265,9 @@ impl RedisProtocol {
                     Ok(0) // Incomplete
                 }
             }
-            b'*' | b'%' | b'~' | b'|' => {
+            b'*' | b'%' | b'~' | b'|' | b'>' => {
                 // RESP2: Array (*)
-                // RESP3: Map (%), Set (~), Attribute (|)
+                // RESP3: Map (%), Set (~), Attribute (|), Push (>)
                 // Need to recursively parse all elements
                 let first_crlf = match data.windows(2).position(|w| w == b"\r\n") {
                     Some(pos) => pos,
@@ -1216,13 +1284,26 @@ impl RedisProtocol {
                     return Ok(first_crlf + 2);
                 }
 
+                // Validate count is non-negative and within limits
+                if count < -1 {
+                    return Err(anyhow!("Invalid array count: {} (must be >= -1)", count));
+                }
+                if count > Self::MAX_ARRAY_SIZE {
+                    return Err(anyhow!(
+                        "Array too large: {} (max: {})",
+                        count,
+                        Self::MAX_ARRAY_SIZE
+                    ));
+                }
+
                 let mut pos = first_crlf + 2;
-                // Parse each element in the array
+                // Parse each element in the array with incremented depth
                 for _ in 0..count {
                     if pos >= data.len() {
                         return Ok(0); // Incomplete
                     }
-                    let elem_size = Self::find_resp_message_end(&data[pos..])?;
+                    let elem_size =
+                        Self::find_resp_message_end_with_depth(&data[pos..], depth + 1)?;
                     if elem_size == 0 {
                         return Ok(0); // Incomplete element
                     }
@@ -1249,8 +1330,19 @@ impl RedisProtocol {
             }
             b'#' => {
                 // RESP3: Boolean (#t\r\n or #f\r\n)
-                if data.len() >= 4 && &data[2..4] == b"\r\n" {
-                    Ok(4)
+                if data.len() >= 4 {
+                    // Validate actual boolean value
+                    if data[1] != b't' && data[1] != b'f' {
+                        return Err(anyhow!(
+                            "Invalid RESP3 boolean value: must be 't' or 'f', got '{}'",
+                            data[1] as char
+                        ));
+                    }
+                    if &data[2..4] == b"\r\n" {
+                        Ok(4)
+                    } else {
+                        Ok(0) // Incomplete
+                    }
                 } else {
                     Ok(0) // Incomplete
                 }
