@@ -102,6 +102,18 @@ impl Distribution for ZipfianDistribution {
     }
 }
 
+impl Clone for ZipfianDistribution {
+    fn clone(&self) -> Self {
+        // Clone RNG state and recreate distribution with same parameters
+        Self {
+            n: self.n,
+            s: self.s,
+            rng: self.rng.clone(),
+            dist: Zipf::new(self.n as f64, self.s).expect("Zipf params validated in constructor"),
+        }
+    }
+}
+
 /// Exponential distribution (Poisson inter-arrival times)
 pub struct ExponentialDistribution {
     lambda: f64,
@@ -239,6 +251,19 @@ impl Distribution for NormalDistribution {
 
     fn name(&self) -> &'static str {
         "Normal"
+    }
+}
+
+impl Clone for NormalDistribution {
+    fn clone(&self) -> Self {
+        // Clone RNG state and recreate distribution with same parameters
+        Self {
+            mean: self.mean,
+            std_dev: self.std_dev,
+            rng: self.rng.clone(),
+            dist: Normal::new(self.mean, self.std_dev)
+                .expect("Normal params validated in constructor"),
+        }
     }
 }
 

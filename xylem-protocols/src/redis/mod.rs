@@ -1169,6 +1169,16 @@ impl Protocol for RedisProtocol {
         if let Some(ref mut key_gen) = self.key_gen {
             key_gen.reset();
         }
+        // Reset insert phase to allow re-running warmup
+        if let Some(ref mut insert_state) = self.insert_phase {
+            insert_state.inserted = 0;
+            if let Some(ref mut gen) = insert_state.key_gen {
+                gen.reset();
+            }
+        }
+        // Clear redirect statistics
+        self.moved_redirects = 0;
+        self.ask_redirects = 0;
     }
 }
 

@@ -79,24 +79,28 @@ impl Clone for KeyGeneration {
     fn clone(&self) -> Self {
         match self {
             Self::Sequential { start, current } => {
+                // Preserve current position so clone continues from same point
                 Self::Sequential { start: *start, current: *current }
             }
-            Self::Random { max, .. } => Self::Random { max: *max, rng: SmallRng::from_os_rng() },
-            Self::RoundRobin { max, current } => Self::RoundRobin { max: *max, current: *current },
-            Self::Zipfian(dist) => Self::Zipfian(
-                ZipfianDistribution::new(dist.n(), dist.exponent())
-                    .expect("Invalid Zipf parameters"),
-            ),
-            Self::Gaussian { mean_pct, std_dev_pct, max, .. } => {
-                let mean = (*max as f64) * mean_pct;
-                let std_dev = (*max as f64) * std_dev_pct;
-                let dist =
-                    NormalDistribution::new(mean, std_dev).expect("Invalid Gaussian parameters");
+            Self::Random { max, rng } => {
+                // Clone RNG state to produce same sequence
+                Self::Random { max: *max, rng: rng.clone() }
+            }
+            Self::RoundRobin { max, current } => {
+                // Preserve current position
+                Self::RoundRobin { max: *max, current: *current }
+            }
+            Self::Zipfian(dist) => {
+                // Clone distribution state to preserve sequence
+                Self::Zipfian(dist.clone())
+            }
+            Self::Gaussian { mean_pct, std_dev_pct, max, dist } => {
+                // Clone distribution state
                 Self::Gaussian {
                     mean_pct: *mean_pct,
                     std_dev_pct: *std_dev_pct,
                     max: *max,
-                    dist,
+                    dist: dist.clone(),
                 }
             }
         }
