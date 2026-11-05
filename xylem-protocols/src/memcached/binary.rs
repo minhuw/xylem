@@ -130,6 +130,7 @@ pub struct MemcachedBinaryProtocol {
     key_gen: Option<crate::workload::KeyGeneration>,
     /// Value size for next_request()
     value_size: usize,
+    key_prefix: String,
     /// Insert phase state (None = no insert phase, go straight to measurement)
     insert_phase: Option<InsertPhaseState>,
 }
@@ -143,6 +144,7 @@ impl MemcachedBinaryProtocol {
             pool: BufferPool::new(),
             key_gen: None,
             value_size: 64,
+            key_prefix: "key:".to_string(),
             insert_phase: None,
         }
     }
@@ -160,8 +162,15 @@ impl MemcachedBinaryProtocol {
             pool: BufferPool::new(),
             key_gen: Some(key_gen),
             value_size,
+            key_prefix: "key:".to_string(),
             insert_phase: None,
         }
+    }
+
+    /// Set the prefix used by all generated keys, including warmup requests.
+    pub fn with_key_prefix(mut self, prefix: String) -> Self {
+        self.key_prefix = prefix;
+        self
     }
 
     /// Set up insert phase for data population before measurement
@@ -198,7 +207,7 @@ impl MemcachedBinaryProtocol {
         value_size: usize,
     ) -> crate::Request<(usize, u64)> {
         let seq = self.next_send_seq(conn_id);
-        let key_str = format!("key:{key}");
+        let key_str = format!("{}{key}", self.key_prefix);
         let key_bytes = key_str.as_bytes();
         let key_len = key_bytes.len() as u16;
 
@@ -243,7 +252,7 @@ impl Protocol for MemcachedBinaryProtocol {
         // Phase 2: Normal measurement phase
         let key = self.key_gen.as_mut().map(|g| g.next_key()).unwrap_or(0);
         let seq = self.next_send_seq(conn_id);
-        let key_str = format!("key:{key}");
+        let key_str = format!("{}{key}", self.key_prefix);
         let key_bytes = key_str.as_bytes();
         let key_len = key_bytes.len() as u16;
 

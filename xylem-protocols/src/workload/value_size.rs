@@ -1,7 +1,12 @@
 //! Value size generation strategies
 
+use rand::{
+    distr::{Distribution as RandDistribution, Uniform},
+    rngs::SmallRng,
+    SeedableRng,
+};
 use std::collections::HashMap;
-use xylem_common::{Distribution, NormalDistribution, UniformDistribution};
+use xylem_common::{Distribution, NormalDistribution};
 
 /// Trait for value size generation
 pub trait ValueSizeGenerator: Send {
@@ -39,11 +44,8 @@ impl ValueSizeGenerator for FixedSize {
 
 /// Uniform random size generator - returns sizes in [min, max] range
 pub struct UniformSize {
-    #[allow(dead_code)]
-    min: usize,
-    #[allow(dead_code)]
-    max: usize,
-    dist: UniformDistribution,
+    dist: Uniform<usize>,
+    rng: SmallRng,
 }
 
 impl UniformSize {
@@ -58,14 +60,15 @@ impl UniformSize {
             anyhow::bail!("UniformSize min ({}) must be <= max ({})", min, max);
         }
 
-        let dist = UniformDistribution::with_seed(min as f64, max as f64, seed)?;
-        Ok(Self { min, max, dist })
+        let dist = Uniform::new_inclusive(min, max)?;
+        let rng = seed.map(SmallRng::seed_from_u64).unwrap_or_else(SmallRng::from_os_rng);
+        Ok(Self { dist, rng })
     }
 }
 
 impl ValueSizeGenerator for UniformSize {
     fn next_size(&mut self) -> usize {
-        self.dist.sample() as usize
+        self.dist.sample(&mut self.rng)
     }
 }
 
@@ -125,7 +128,13 @@ impl PerCommandSize {
         command_generators: HashMap<String, Box<dyn ValueSizeGenerator>>,
         default_generator: Box<dyn ValueSizeGenerator>,
     ) -> Self {
-        Self { command_generators, default_generator }
+        Self {
+            command_generators: command_generators
+                .into_iter()
+                .map(|(name, gen)| (name.to_ascii_uppercase(), gen))
+                .collect(),
+            default_generator,
+        }
     }
 }
 
@@ -136,7 +145,7 @@ impl ValueSizeGenerator for PerCommandSize {
 
     fn next_size_for_command(&mut self, command: &str) -> usize {
         self.command_generators
-            .get_mut(command)
+            .get_mut(&command.to_ascii_uppercase())
             .map(|gen| gen.next_size())
             .unwrap_or_else(|| self.default_generator.next_size())
     }
@@ -204,5 +213,31 @@ mod tests {
         assert_eq!(gen.next_size_for_command("set"), 256);
         assert_eq!(gen.next_size_for_command("incr"), 128); // Uses default
         assert_eq!(gen.next_size(), 128); // Uses default
+    }
+}
+
+#[cfg(test)]
+mod integer_uniform_tests {
+    use super::*;
+
+    #[test]
+    fn inclusive_integer_bounds_and_reproducibility() {
+        for (min, max) in [(0, 0), (42, 42), (0, 1), (usize::MAX - 1, usize::MAX), (0, usize::MAX)]
+        {
+            let mut first = UniformSize::with_seed(min, max, Some(42)).unwrap();
+            let mut second = UniformSize::with_seed(min, max, Some(42)).unwrap();
+            let mut seen = std::collections::HashSet::new();
+            for _ in 0..1000 {
+                let size = first.next_size();
+                assert_eq!(size, second.next_size());
+                assert!((min..=max).contains(&size));
+                seen.insert(size);
+            }
+            if max - min <= 1 {
+                assert!(seen.contains(&min));
+                assert!(seen.contains(&max));
+            }
+        }
+        assert!(UniformSize::new(2, 1).is_err());
     }
 }

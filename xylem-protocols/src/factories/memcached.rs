@@ -16,9 +16,8 @@ impl ProtocolFactory for MemcachedBinaryFactory {
         "memcached-binary"
     }
 
-    fn create(&self, config: Self::Config, _seed: Option<u64>) -> Result<Self::Protocol> {
-        let op = parse_memcached_op(&config.operation)?;
-        Ok(MemcachedBinaryProtocol::new(op))
+    fn create(&self, config: Self::Config, seed: Option<u64>) -> Result<Self::Protocol> {
+        MemcachedBinaryProtocol::from_config(&config, seed)
     }
 
     fn default_config(&self) -> Self::Config {
@@ -26,8 +25,7 @@ impl ProtocolFactory for MemcachedBinaryFactory {
     }
 
     fn validate(&self, config: &Self::Config) -> Result<()> {
-        parse_memcached_op(&config.operation)?;
-        Ok(())
+        MemcachedBinaryProtocol::from_config(config, Some(0)).map(|_| ())
     }
 }
 
@@ -42,9 +40,8 @@ impl ProtocolFactory for MemcachedAsciiFactory {
         "memcached-ascii"
     }
 
-    fn create(&self, config: Self::Config, _seed: Option<u64>) -> Result<Self::Protocol> {
-        let op = parse_memcached_ascii_op(&config.operation)?;
-        Ok(MemcachedAsciiProtocol::new(op))
+    fn create(&self, config: Self::Config, seed: Option<u64>) -> Result<Self::Protocol> {
+        MemcachedAsciiProtocol::from_config(&config, seed)
     }
 
     fn default_config(&self) -> Self::Config {
@@ -52,8 +49,7 @@ impl ProtocolFactory for MemcachedAsciiFactory {
     }
 
     fn validate(&self, config: &Self::Config) -> Result<()> {
-        parse_memcached_ascii_op(&config.operation)?;
-        Ok(())
+        MemcachedAsciiProtocol::from_config(config, Some(0)).map(|_| ())
     }
 }
 
@@ -68,10 +64,55 @@ fn parse_memcached_op(op: &str) -> Result<MemcachedOp> {
 
 /// Parse Memcached ASCII operation from string
 fn parse_memcached_ascii_op(op: &str) -> Result<crate::memcached::ascii::MemcachedOp> {
-    match op.to_uppercase().as_str() {
-        "GET" => Ok(crate::memcached::ascii::MemcachedOp::Get),
-        "SET" => Ok(crate::memcached::ascii::MemcachedOp::Set),
-        _ => anyhow::bail!("Unknown Memcached operation: {}. Supported: GET, SET", op),
+    Ok(match parse_memcached_op(op)? {
+        MemcachedOp::Get => crate::memcached::ascii::MemcachedOp::Get,
+        MemcachedOp::Set => crate::memcached::ascii::MemcachedOp::Set,
+    })
+}
+
+fn validate_keys(config: &MemcachedConfig) -> Result<()> {
+    config.keys.validate()?;
+    let prefix = config.keys.prefix();
+    anyhow::ensure!(
+        !prefix.bytes().any(|b| b.is_ascii_whitespace() || b.is_ascii_control()) && prefix.len() <= 230,
+        "Memcached key prefix must contain no whitespace/control bytes and leave room for a u64 key within 250 bytes"
+    );
+    Ok(())
+}
+
+impl MemcachedBinaryProtocol {
+    /// Construct a workload with configured keys, prefix, value size and insertion phase.
+    pub fn from_config(config: &MemcachedConfig, seed: Option<u64>) -> Result<Self> {
+        validate_keys(config)?;
+        let mut protocol = Self::with_workload(
+            parse_memcached_op(&config.operation)?,
+            config.keys.to_key_gen(seed)?,
+            config.keys.value_size(),
+        )
+        .with_key_prefix(config.keys.prefix().to_string());
+        if let Some(insert) = &config.insert_phase {
+            let (count, size) = insert.resolve(&config.keys)?;
+            protocol = protocol.with_insert_phase(count, size);
+        }
+        Ok(protocol)
+    }
+}
+
+impl MemcachedAsciiProtocol {
+    /// Construct a workload with configured keys, prefix, value size and insertion phase.
+    pub fn from_config(config: &MemcachedConfig, seed: Option<u64>) -> Result<Self> {
+        validate_keys(config)?;
+        let mut protocol = Self::with_workload(
+            parse_memcached_ascii_op(&config.operation)?,
+            config.keys.to_key_gen(seed)?,
+            config.keys.value_size(),
+        )
+        .with_key_prefix(config.keys.prefix().to_string());
+        if let Some(insert) = &config.insert_phase {
+            let (count, size) = insert.resolve(&config.keys)?;
+            protocol = protocol.with_insert_phase(count, size);
+        }
+        Ok(protocol)
     }
 }
 

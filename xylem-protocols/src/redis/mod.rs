@@ -154,6 +154,61 @@ pub enum RedisOp {
     Custom(CommandTemplate),
 }
 
+impl RedisOp {
+    /// Canonical command name used for statistics and per-command value sizing.
+    pub fn name(&self) -> &'static str {
+        match self {
+            RedisOp::Get => "GET",
+            RedisOp::Set => "SET",
+            RedisOp::Incr => "INCR",
+            RedisOp::Del => "DEL",
+            RedisOp::MGet { .. } => "MGET",
+            RedisOp::MSet { .. } => "MSET",
+            RedisOp::Wait { .. } => "WAIT",
+            RedisOp::Auth { .. } => "AUTH",
+            RedisOp::SelectDb { .. } => "SELECT",
+            RedisOp::Hello { .. } => "HELLO",
+            RedisOp::SetEx { .. } => "SETEX",
+            RedisOp::SetRange { .. } => "SETRANGE",
+            RedisOp::GetRange { .. } => "GETRANGE",
+            RedisOp::ClusterSlots => "CLUSTER_SLOTS",
+            RedisOp::Scan { .. } => "SCAN",
+            RedisOp::Multi => "MULTI",
+            RedisOp::Exec => "EXEC",
+            RedisOp::Discard => "DISCARD",
+            // List operations
+            RedisOp::LPush => "LPUSH",
+            RedisOp::RPush => "RPUSH",
+            RedisOp::LPop => "LPOP",
+            RedisOp::RPop => "RPOP",
+            RedisOp::LRange { .. } => "LRANGE",
+            RedisOp::LLen => "LLEN",
+            // Set operations
+            RedisOp::SAdd => "SADD",
+            RedisOp::SRem => "SREM",
+            RedisOp::SMembers => "SMEMBERS",
+            RedisOp::SIsMember => "SISMEMBER",
+            RedisOp::SPop { .. } => "SPOP",
+            RedisOp::SCard => "SCARD",
+            // Sorted set operations
+            RedisOp::ZAdd { .. } => "ZADD",
+            RedisOp::ZRem => "ZREM",
+            RedisOp::ZRange { .. } => "ZRANGE",
+            RedisOp::ZRangeByScore { .. } => "ZRANGEBYSCORE",
+            RedisOp::ZScore => "ZSCORE",
+            RedisOp::ZCard => "ZCARD",
+            // Hash operations
+            RedisOp::HSet { .. } => "HSET",
+            RedisOp::HGet { .. } => "HGET",
+            RedisOp::HMSet { .. } => "HMSET",
+            RedisOp::HMGet { .. } => "HMGET",
+            RedisOp::HGetAll => "HGETALL",
+            RedisOp::HDel { .. } => "HDEL",
+            RedisOp::Custom(_template) => "CUSTOM",
+        }
+    }
+}
+
 /// Insert phase state for data population before measurement
 #[derive(Debug)]
 pub struct InsertPhaseState {
@@ -225,6 +280,7 @@ pub struct RedisProtocol {
     key_gen: Option<crate::workload::KeyGeneration>,
     /// Value size for next_request()
     value_size: usize,
+    value_sizes: Option<Box<dyn crate::workload::ValueSizeGenerator>>,
     /// Key prefix for generated keys (default: "key:")
     key_prefix: String,
     /// Whether to use random data for values instead of repeated 'x'
@@ -250,6 +306,7 @@ impl RedisProtocol {
             command_stats: std::collections::HashMap::new(),
             key_gen: None,
             value_size: 64,
+            value_sizes: None,
             key_prefix: "key:".to_string(),
             random_data: false,
             rng: None,
@@ -305,11 +362,28 @@ impl RedisProtocol {
             command_stats: std::collections::HashMap::new(),
             key_gen: Some(key_gen),
             value_size,
+            value_sizes: None,
             key_prefix,
             random_data,
             rng,
             insert_phase: None,
         }
+    }
+
+    /// Use a variable or per-command value size distribution for measurement requests.
+    pub fn with_value_size_generator(
+        mut self,
+        generator: Box<dyn crate::workload::ValueSizeGenerator>,
+    ) -> Self {
+        self.value_sizes = Some(generator);
+        self
+    }
+
+    fn size_for_operation(&mut self, operation: &RedisOp, fallback: usize) -> usize {
+        self.value_sizes
+            .as_mut()
+            .map(|sizes| sizes.next_size_for_command(operation.name()))
+            .unwrap_or(fallback)
     }
 
     /// Set up insert phase for data population before measurement
@@ -327,55 +401,7 @@ impl RedisProtocol {
 
     /// Record a command execution
     fn record_command(&mut self, op: &RedisOp) {
-        let cmd_name = match op {
-            RedisOp::Get => "GET",
-            RedisOp::Set => "SET",
-            RedisOp::Incr => "INCR",
-            RedisOp::Del => "DEL",
-            RedisOp::MGet { .. } => "MGET",
-            RedisOp::MSet { .. } => "MSET",
-            RedisOp::Wait { .. } => "WAIT",
-            RedisOp::Auth { .. } => "AUTH",
-            RedisOp::SelectDb { .. } => "SELECT",
-            RedisOp::Hello { .. } => "HELLO",
-            RedisOp::SetEx { .. } => "SETEX",
-            RedisOp::SetRange { .. } => "SETRANGE",
-            RedisOp::GetRange { .. } => "GETRANGE",
-            RedisOp::ClusterSlots => "CLUSTER_SLOTS",
-            RedisOp::Scan { .. } => "SCAN",
-            RedisOp::Multi => "MULTI",
-            RedisOp::Exec => "EXEC",
-            RedisOp::Discard => "DISCARD",
-            // List operations
-            RedisOp::LPush => "LPUSH",
-            RedisOp::RPush => "RPUSH",
-            RedisOp::LPop => "LPOP",
-            RedisOp::RPop => "RPOP",
-            RedisOp::LRange { .. } => "LRANGE",
-            RedisOp::LLen => "LLEN",
-            // Set operations
-            RedisOp::SAdd => "SADD",
-            RedisOp::SRem => "SREM",
-            RedisOp::SMembers => "SMEMBERS",
-            RedisOp::SIsMember => "SISMEMBER",
-            RedisOp::SPop { .. } => "SPOP",
-            RedisOp::SCard => "SCARD",
-            // Sorted set operations
-            RedisOp::ZAdd { .. } => "ZADD",
-            RedisOp::ZRem => "ZREM",
-            RedisOp::ZRange { .. } => "ZRANGE",
-            RedisOp::ZRangeByScore { .. } => "ZRANGEBYSCORE",
-            RedisOp::ZScore => "ZSCORE",
-            RedisOp::ZCard => "ZCARD",
-            // Hash operations
-            RedisOp::HSet { .. } => "HSET",
-            RedisOp::HGet { .. } => "HGET",
-            RedisOp::HMSet { .. } => "HMSET",
-            RedisOp::HMGet { .. } => "HMGET",
-            RedisOp::HGetAll => "HGETALL",
-            RedisOp::HDel { .. } => "HDEL",
-            RedisOp::Custom(_template) => "CUSTOM",
-        };
+        let cmd_name = op.name();
         *self.command_stats.entry(cmd_name.to_string()).or_insert(0) += 1;
     }
 
@@ -509,6 +535,7 @@ impl RedisProtocol {
             .generate_key_for_command(&operation)
             .expect("Per-command key generation should be available");
 
+        let value_size = self.size_for_operation(&operation, value_size);
         let request_data = self.format_command(&operation, key, value_size);
         crate::Request::measurement(request_data, id)
     }
@@ -581,6 +608,7 @@ impl RedisProtocol {
             _ => {}
         }
 
+        let value_size = self.size_for_operation(&operation, value_size);
         let request_data = self.format_command(&operation, key, value_size);
 
         crate::Request::measurement(request_data, id)
@@ -1103,56 +1131,24 @@ impl Protocol for RedisProtocol {
         conn_id: usize,
         data: &[u8],
     ) -> Result<(usize, Option<Self::RequestId>)> {
-        if data.is_empty() {
+        let Some(reply) = self.parse_framed_reply(conn_id, data)? else {
             return Ok((0, None));
-        }
-
-        // Parse RESP response and find complete message
-        let consumed = Self::find_resp_message_end(data)?;
-        if consumed == 0 {
-            // Incomplete response
-            return Ok((0, None));
-        }
-
-        // Validate response
-        match data[0] {
-            b'+' | b':' | b'$' | b'*' | b'_' | b',' | b'#' | b'(' | b'%' | b'~' | b'|' | b'!'
-            | b'=' | b'>' => {
-                // Valid response (RESP2 and RESP3 types) - return the next expected ID for this connection
-                // (Redis guarantees FIFO ordering per connection)
-                let seq = self.next_recv_seq(conn_id);
-                Ok((consumed, Some((conn_id, seq))))
-            }
-            b'-' => {
-                // Check if this is a cluster redirect (MOVED or ASK)
-                match parse_redirect(data) {
-                    Ok(Some(RedirectType::Moved { slot, addr })) => {
-                        // MOVED redirect - permanent slot reassignment
-                        self.moved_redirects += 1;
-                        Err(anyhow!(
-                            "MOVED redirect: slot {} moved to {} (total MOVED: {})",
-                            slot,
-                            addr,
-                            self.moved_redirects
-                        ))
-                    }
-                    Ok(Some(RedirectType::Ask { slot, addr })) => {
-                        // ASK redirect - temporary migration state
-                        self.ask_redirects += 1;
-                        Err(anyhow!(
-                            "ASK redirect: slot {} temporarily at {} (total ASK: {})",
-                            slot,
-                            addr,
-                            self.ask_redirects
-                        ))
-                    }
-                    Ok(None) | Err(_) => {
-                        // Regular Redis error (not a redirect)
-                        Err(anyhow!("Redis error: {}", String::from_utf8_lossy(&data[1..consumed])))
-                    }
-                }
-            }
-            _ => Err(anyhow!("Invalid RESP response")),
+        };
+        match reply.kind {
+            ReplyKind::Success => Ok((reply.consumed, Some(reply.id))),
+            ReplyKind::Redirect(RedirectType::Moved { slot, addr }) => Err(anyhow!(
+                "MOVED redirect: slot {} moved to {} (total MOVED: {})",
+                slot,
+                addr,
+                self.moved_redirects
+            )),
+            ReplyKind::Redirect(RedirectType::Ask { slot, addr }) => Err(anyhow!(
+                "ASK redirect: slot {} temporarily at {} (total ASK: {})",
+                slot,
+                addr,
+                self.ask_redirects
+            )),
+            ReplyKind::Error(error) => Err(anyhow!("Redis error: {}", error)),
         }
     }
 
@@ -1165,6 +1161,9 @@ impl Protocol for RedisProtocol {
         self.conn_recv_seq.clear();
         self.conn_in_transaction.clear();
         self.command_selector.reset();
+        if let Some(sizes) = &mut self.value_sizes {
+            sizes.reset();
+        }
         self.command_stats.clear();
         if let Some(ref mut key_gen) = self.key_gen {
             key_gen.reset();
@@ -1182,7 +1181,76 @@ impl Protocol for RedisProtocol {
     }
 }
 
+/// A complete reply, including attributes. Errors occupy one FIFO response slot too.
+pub(crate) struct FramedReply {
+    pub consumed: usize,
+    pub id: (usize, u64),
+    pub kind: ReplyKind,
+}
+
+pub(crate) enum ReplyKind {
+    Success,
+    Redirect(RedirectType),
+    Error(String),
+}
+
 impl RedisProtocol {
+    pub(crate) fn parse_framed_reply(
+        &mut self,
+        conn_id: usize,
+        data: &[u8],
+    ) -> Result<Option<FramedReply>> {
+        let consumed = Self::find_resp_message_end(data)?;
+        if consumed == 0 {
+            return Ok(None);
+        }
+        let mut payload = &data[..consumed];
+        while payload[0] == b'|' {
+            let offset = Self::attribute_payload_offset(payload, 0)?;
+            payload = &payload[offset..];
+        }
+        let kind = if payload[0] == b'-' {
+            match parse_redirect(payload) {
+                Ok(Some(redirect)) => {
+                    match redirect {
+                        RedirectType::Moved { .. } => self.moved_redirects += 1,
+                        RedirectType::Ask { .. } => self.ask_redirects += 1,
+                    }
+                    ReplyKind::Redirect(redirect)
+                }
+                Ok(None) | Err(_) => ReplyKind::Error(
+                    String::from_utf8_lossy(&payload[1..payload.len() - 2]).into_owned(),
+                ),
+            }
+        } else if payload[0] == b'!' {
+            ReplyKind::Error(String::from_utf8_lossy(payload).into_owned())
+        } else {
+            ReplyKind::Success
+        };
+        let id = (conn_id, self.next_recv_seq(conn_id));
+        Ok(Some(FramedReply { consumed, id, kind }))
+    }
+
+    /// Locate the attached reply after an attribute's key/value pairs.
+    /// Zero means the attribute itself is incomplete.
+    fn attribute_payload_offset(data: &[u8], depth: usize) -> Result<usize> {
+        let Some(end) = data.windows(2).position(|w| w == b"\r\n") else {
+            return Ok(0);
+        };
+        let pairs: usize = std::str::from_utf8(&data[1..end])?.parse()?;
+        anyhow::ensure!(pairs <= Self::MAX_ARRAY_SIZE as usize, "Attribute too large");
+        let count = pairs.checked_mul(2).ok_or_else(|| anyhow!("Attribute count overflow"))?;
+        let mut pos = end + 2;
+        for _ in 0..count {
+            let size = Self::find_resp_message_end_with_depth(&data[pos..], depth + 1)?;
+            if size == 0 {
+                return Ok(0);
+            }
+            pos += size;
+        }
+        Ok(pos)
+    }
+
     /// Maximum recursion depth for nested RESP structures
     const MAX_RESP_DEPTH: usize = 32;
 
@@ -1198,22 +1266,21 @@ impl RedisProtocol {
     /// Find the end of a complete RESP message, returns bytes consumed
     /// Supports both RESP2 and RESP3 types
     fn find_resp_message_end(data: &[u8]) -> Result<usize> {
-        Self::find_resp_message_end_with_depth(data, 0)
+        // Limit a single frame, not the entire receive buffer (which may contain
+        // many complete pipelined responses).
+        let bounded = &data[..data.len().min(Self::MAX_MESSAGE_SIZE + 1)];
+        let end = Self::find_resp_message_end_with_depth(bounded, 0)?;
+        anyhow::ensure!(
+            end <= Self::MAX_MESSAGE_SIZE && !(end == 0 && data.len() > Self::MAX_MESSAGE_SIZE),
+            "RESP message too large"
+        );
+        Ok(end)
     }
 
     /// Internal implementation with depth tracking
     fn find_resp_message_end_with_depth(data: &[u8], depth: usize) -> Result<usize> {
         if data.is_empty() {
             return Ok(0);
-        }
-
-        // Check message size to prevent excessive scanning
-        if data.len() > Self::MAX_MESSAGE_SIZE {
-            return Err(anyhow!(
-                "RESP message too large: {} bytes (max: {})",
-                data.len(),
-                Self::MAX_MESSAGE_SIZE
-            ));
         }
 
         // Check recursion depth to prevent stack overflow
@@ -1267,6 +1334,10 @@ impl RedisProtocol {
                         })?;
 
                     if data.len() >= expected_total {
+                        anyhow::ensure!(
+                            &data[expected_total - 2..expected_total] == b"\r\n",
+                            "Invalid bulk string terminator"
+                        );
                         Ok(expected_total)
                     } else {
                         Ok(0) // Incomplete
@@ -1275,7 +1346,19 @@ impl RedisProtocol {
                     Ok(0) // Incomplete
                 }
             }
-            b'*' | b'%' | b'~' | b'|' | b'>' => {
+            b'|' => {
+                let offset = Self::attribute_payload_offset(data, depth)?;
+                if offset == 0 {
+                    return Ok(0);
+                }
+                let size = Self::find_resp_message_end_with_depth(&data[offset..], depth + 1)?;
+                if size == 0 {
+                    Ok(0)
+                } else {
+                    Ok(offset + size)
+                }
+            }
+            b'*' | b'%' | b'~' | b'>' => {
                 // RESP2: Array (*)
                 // RESP3: Map (%), Set (~), Attribute (|), Push (>)
                 // Need to recursively parse all elements
@@ -1290,6 +1373,7 @@ impl RedisProtocol {
                     count_str.parse().map_err(|e| anyhow!("Failed to parse array count: {e}"))?;
 
                 if count == -1 {
+                    anyhow::ensure!(data[0] == b'*', "Only arrays support null aggregate counts");
                     // Null array
                     return Ok(first_crlf + 2);
                 }
@@ -1306,6 +1390,11 @@ impl RedisProtocol {
                     ));
                 }
 
+                let count = if data[0] == b'%' {
+                    count.checked_mul(2).ok_or_else(|| anyhow!("Map count overflow"))?
+                } else {
+                    count
+                };
                 let mut pos = first_crlf + 2;
                 // Parse each element in the array with incremented depth
                 for _ in 0..count {
@@ -2014,9 +2103,8 @@ mod tests {
         let response = b"!21\r\nSYNTAX invalid syntax\r\n";
         let result = protocol.parse_response(0, response);
 
-        assert!(result.is_ok());
-        let (consumed, _) = result.unwrap();
-        assert_eq!(consumed, 28);
+        assert!(result.unwrap_err().to_string().contains("SYNTAX invalid syntax"));
+        assert_eq!(protocol.parse_response(0, b"+OK\r\n").unwrap(), (5, Some((0, 1))));
     }
 
     #[test]
@@ -2037,13 +2125,13 @@ mod tests {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
         let mut protocol = RedisProtocol::new(selector);
 
-        // Map with count 2 (current impl treats as 2 elements, not 2 pairs)
-        let response = b"%2\r\n+k1\r\n+v1\r\n";
+        // Map counts key/value pairs.
+        let response = b"%2\r\n+k1\r\n+v1\r\n+k2\r\n+v2\r\n";
         let result = protocol.parse_response(0, response);
 
         assert!(result.is_ok());
         let (consumed, _) = result.unwrap();
-        assert_eq!(consumed, 14); // %2\r\n (4) + +k1\r\n (5) + +v1\r\n (5) = 14
+        assert_eq!(consumed, response.len());
     }
 
     #[test]
@@ -2065,13 +2153,13 @@ mod tests {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
         let mut protocol = RedisProtocol::new(selector);
 
-        // Attribute with count 1 (current impl treats as 1 element)
-        let response = b"|1\r\n+key\r\n";
+        // Attributes belong to the following response.
+        let response = b"|1\r\n+key\r\n+value\r\n+OK\r\n";
         let result = protocol.parse_response(0, response);
 
         assert!(result.is_ok());
         let (consumed, _) = result.unwrap();
-        assert_eq!(consumed, 10); // |1\r\n (4) + +key\r\n (6) = 10
+        assert_eq!(consumed, response.len());
     }
 
     #[test]

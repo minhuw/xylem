@@ -9,7 +9,7 @@ mod xylem_echo;
 
 pub use http::HttpFactory;
 pub use memcached::{MemcachedAsciiFactory, MemcachedBinaryFactory};
-pub use redis::RedisFactory;
+pub use redis::{parse_redis_operation, RedisFactory};
 pub use xylem_echo::XylemEchoFactory;
 
 use crate::factory::DynProtocolFactory;

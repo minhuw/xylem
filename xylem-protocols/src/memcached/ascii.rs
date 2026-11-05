@@ -67,6 +67,7 @@ pub struct MemcachedAsciiProtocol {
     key_gen: Option<crate::workload::KeyGeneration>,
     /// Value size for next_request()
     value_size: usize,
+    key_prefix: String,
     /// Insert phase state
     insert_phase: Option<InsertPhaseState>,
 }
@@ -80,6 +81,7 @@ impl MemcachedAsciiProtocol {
             pool: BufferPool::new(),
             key_gen: None,
             value_size: 64,
+            key_prefix: "key:".to_string(),
             insert_phase: None,
         }
     }
@@ -97,8 +99,15 @@ impl MemcachedAsciiProtocol {
             pool: BufferPool::new(),
             key_gen: Some(key_gen),
             value_size,
+            key_prefix: "key:".to_string(),
             insert_phase: None,
         }
+    }
+
+    /// Set the prefix used by all generated keys, including warmup requests.
+    pub fn with_key_prefix(mut self, prefix: String) -> Self {
+        self.key_prefix = prefix;
+        self
     }
 
     /// Set up insert phase for data population before measurement
@@ -137,7 +146,8 @@ impl MemcachedAsciiProtocol {
         let seq = self.next_send_seq(conn_id);
         let mut buf = self.pool.get(256 + value_size);
         buf.clear();
-        buf.extend_from_slice(b"set key:");
+        buf.extend_from_slice(b"set ");
+        buf.extend_from_slice(self.key_prefix.as_bytes());
         buf.extend_from_slice(key.to_string().as_bytes());
         buf.extend_from_slice(b" 0 0 ");
         buf.extend_from_slice(value_size.to_string().as_bytes());
@@ -175,7 +185,8 @@ impl Protocol for MemcachedAsciiProtocol {
                 // Format: get key:N\r\n
                 let mut buf = self.pool.get(64);
                 buf.clear();
-                buf.extend_from_slice(b"get key:");
+                buf.extend_from_slice(b"get ");
+                buf.extend_from_slice(self.key_prefix.as_bytes());
                 buf.extend_from_slice(key.to_string().as_bytes());
                 buf.extend_from_slice(b"\r\n");
                 buf.to_vec()
@@ -184,7 +195,8 @@ impl Protocol for MemcachedAsciiProtocol {
                 // Format: set key:N 0 0 <value_len>\r\n<value>\r\n
                 let mut buf = self.pool.get(256 + self.value_size);
                 buf.clear();
-                buf.extend_from_slice(b"set key:");
+                buf.extend_from_slice(b"set ");
+                buf.extend_from_slice(self.key_prefix.as_bytes());
                 buf.extend_from_slice(key.to_string().as_bytes());
                 buf.extend_from_slice(b" 0 0 ");
                 buf.extend_from_slice(self.value_size.to_string().as_bytes());
@@ -202,45 +214,41 @@ impl Protocol for MemcachedAsciiProtocol {
         conn_id: usize,
         data: &[u8],
     ) -> Result<(usize, Option<Self::RequestId>)> {
-        if data.is_empty() {
-            return Ok((0, None));
-        }
-
-        // Check for "END\r\n" (key not found) - 5 bytes
-        if data.len() >= 5 && &data[0..5] == b"END\r\n" {
-            let seq = self.next_recv_seq(conn_id);
-            return Ok((5, Some((conn_id, seq))));
-        }
-
-        // Check for "STORED\r\n" (successful set) - 8 bytes
-        if data.len() >= 8 && &data[0..8] == b"STORED\r\n" {
-            let seq = self.next_recv_seq(conn_id);
-            return Ok((8, Some((conn_id, seq))));
-        }
-
-        // Check for GET response: VALUE key flags length\r\n<data>\r\nEND\r\n
-        // We need to find the third newline
-        let mut newline_count = 0;
         let mut pos = 0;
-
-        for (i, &byte) in data.iter().enumerate() {
-            if byte == b'\n' {
-                newline_count += 1;
-                if newline_count == 3 {
-                    pos = i + 1;
-                    break;
-                }
+        loop {
+            let Some(line_end) = data[pos..].windows(2).position(|w| w == b"\r\n") else {
+                return Ok((0, None));
+            };
+            let line = &data[pos..pos + line_end];
+            pos += line_end + 2;
+            if line == b"END" || (pos == line_end + 2 && line == b"STORED") {
+                let seq = self.next_recv_seq(conn_id);
+                return Ok((pos, Some((conn_id, seq))));
             }
+            if line == b"ERROR"
+                || line.starts_with(b"CLIENT_ERROR ")
+                || line.starts_with(b"SERVER_ERROR ")
+            {
+                anyhow::bail!("Memcached error: {}", String::from_utf8_lossy(line));
+            }
+            let header = std::str::from_utf8(line)?;
+            let fields: Vec<_> = header.split_whitespace().collect();
+            anyhow::ensure!(
+                fields.len() == 4 || fields.len() == 5,
+                "Invalid Memcached VALUE header"
+            );
+            anyhow::ensure!(fields[0] == "VALUE", "Unexpected Memcached response: {header}");
+            let length: usize = fields[3].parse()?;
+            let end = pos
+                .checked_add(length)
+                .and_then(|n| n.checked_add(2))
+                .ok_or_else(|| anyhow::anyhow!("Memcached value length overflow"))?;
+            if data.len() < end {
+                return Ok((0, None));
+            }
+            anyhow::ensure!(&data[end - 2..end] == b"\r\n", "Missing Memcached value terminator");
+            pos = end;
         }
-
-        if newline_count == 3 {
-            // Found complete GET response
-            let seq = self.next_recv_seq(conn_id);
-            return Ok((pos, Some((conn_id, seq))));
-        }
-
-        // Incomplete response
-        Ok((0, None))
     }
 
     fn name(&self) -> &'static str {

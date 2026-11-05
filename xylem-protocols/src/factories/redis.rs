@@ -1,154 +1,212 @@
-//! Redis protocol factory
-
-use crate::configs::{KeysConfig, RedisConfig, RedisOperationsConfig};
+//! Config-aware Redis construction shared by factories and CLI callers.
+use crate::configs::{RedisConfig, RedisOperationsConfig};
 use crate::factory::ProtocolFactory;
 use crate::redis::{RedisOp, RedisProtocol};
 use crate::{CommandSelector, FixedCommandSelector, WeightedCommandSelector};
 use anyhow::Result;
 
-/// Factory for creating Redis protocol instances
 pub struct RedisFactory;
 
 impl ProtocolFactory for RedisFactory {
     type Config = RedisConfig;
     type Protocol = RedisProtocol;
-
     fn name(&self) -> &'static str {
         "redis"
     }
-
-    fn create(&self, config: Self::Config, seed: Option<u64>) -> Result<Self::Protocol> {
-        let command_selector: Box<dyn CommandSelector<RedisOp>> =
-            if let Some(ref ops) = config.operations {
-                match ops {
-                    RedisOperationsConfig::Fixed { operation } => {
-                        let op = parse_redis_op(operation)?;
-                        Box::new(FixedCommandSelector::new(op))
-                    }
-                    RedisOperationsConfig::Weighted { commands } => {
-                        let mut commands_weights = Vec::new();
-                        for cmd in commands {
-                            let op = parse_redis_op(&cmd.name)?;
-                            commands_weights.push((op, cmd.weight));
-                        }
-                        Box::new(WeightedCommandSelector::with_seed(commands_weights, seed)?)
-                    }
-                }
-            } else {
-                // Default to GET
-                Box::new(FixedCommandSelector::new(RedisOp::Get))
-            };
-
-        Ok(RedisProtocol::new(command_selector))
+    fn create(&self, config: RedisConfig, seed: Option<u64>) -> Result<RedisProtocol> {
+        RedisProtocol::from_config(&config, seed)
     }
-
-    fn default_config(&self) -> Self::Config {
+    fn default_config(&self) -> RedisConfig {
         RedisConfig::default()
     }
-
-    fn validate(&self, config: &Self::Config) -> Result<()> {
-        // Validate operations if present
-        if let Some(ref ops) = config.operations {
-            validate_operations(ops)?;
-        }
-
-        // Validate keys config
-        validate_keys_config(&config.keys)?;
-
-        Ok(())
+    fn validate(&self, config: &RedisConfig) -> Result<()> {
+        RedisProtocol::from_config(config, Some(0)).map(|_| ())
     }
 }
 
-/// Parse a Redis operation from string
-fn parse_redis_op(cmd: &str) -> Result<RedisOp> {
-    match cmd.to_uppercase().as_str() {
-        "GET" => Ok(RedisOp::Get),
-        "SET" => Ok(RedisOp::Set),
-        "INCR" => Ok(RedisOp::Incr),
-        _ => anyhow::bail!("Unknown Redis command: {}", cmd),
+impl RedisConfig {
+    /// Build a selector, honoring command parameters and per-command key distributions.
+    /// A per-command key override uses the protocol's prefix and value size settings.
+    pub fn command_selector(&self, seed: Option<u64>) -> Result<Box<dyn CommandSelector<RedisOp>>> {
+        self.keys.validate()?;
+        match &self.operations {
+            None => Ok(Box::new(FixedCommandSelector::new(RedisOp::Get))),
+            Some(RedisOperationsConfig::Fixed { operation }) => {
+                Ok(Box::new(FixedCommandSelector::new(parse_redis_operation(operation, None)?)))
+            }
+            Some(RedisOperationsConfig::Weighted { commands }) => {
+                let mut weighted = Vec::new();
+                let mut keys = Vec::new();
+                let per_command = commands.iter().any(|cmd| cmd.keys.is_some());
+                for cmd in commands {
+                    weighted
+                        .push((parse_redis_operation(&cmd.name, cmd.params.as_ref())?, cmd.weight));
+                    let config = cmd.keys.as_ref().unwrap_or(&self.keys);
+                    config.validate()?;
+                    anyhow::ensure!(
+                        config.prefix() == self.keys.prefix(),
+                        "Per-command key prefixes are unsupported"
+                    );
+                    anyhow::ensure!(
+                        config.value_size() == self.keys.value_size(),
+                        "Use value_size.per_command for per-command value sizes"
+                    );
+                    if per_command {
+                        keys.push(
+                            Box::new(config.to_key_gen(seed)?) as Box<dyn crate::KeyGenerator>
+                        );
+                    }
+                }
+                if per_command {
+                    Ok(Box::new(WeightedCommandSelector::with_per_command_keys(
+                        weighted, keys, seed,
+                    )?))
+                } else {
+                    Ok(Box::new(WeightedCommandSelector::with_seed(weighted, seed)?))
+                }
+            }
+        }
     }
 }
 
-/// Validate operations configuration
-fn validate_operations(ops: &RedisOperationsConfig) -> Result<()> {
-    match ops {
-        RedisOperationsConfig::Fixed { operation } => {
-            parse_redis_op(operation)?;
+impl RedisProtocol {
+    /// Construct a standalone Redis workload from all supported configuration fields.
+    /// Data import requires a separate imported-data driver; cluster configs use
+    /// `RedisClusterProtocol::from_config`.
+    pub fn from_config(config: &RedisConfig, seed: Option<u64>) -> Result<Self> {
+        anyhow::ensure!(
+            config.redis_cluster.is_none(),
+            "Use RedisClusterProtocol::from_config for cluster configuration"
+        );
+        Self::from_workload_config(config, seed)
+    }
+
+    pub(crate) fn from_workload_config(config: &RedisConfig, seed: Option<u64>) -> Result<Self> {
+        anyhow::ensure!(
+            config.data_import.is_none(),
+            "data_import requires an imported-data driver and is unsupported by this constructor"
+        );
+        let mut protocol = Self::with_workload_and_options(
+            config.command_selector(seed)?,
+            config.keys.to_key_gen(seed)?,
+            config.keys.value_size(),
+            config.keys.prefix().to_string(),
+            config.random_data,
+            seed,
+        );
+        if let Some(sizes) = &config.value_size {
+            protocol = protocol.with_value_size_generator(sizes.to_generator(seed)?);
         }
-        RedisOperationsConfig::Weighted { commands } => {
-            for cmd in commands {
-                parse_redis_op(&cmd.name)?;
+        if let Some(insert) = &config.insert_phase {
+            let (count, size) = insert.resolve(&config.keys)?;
+            protocol = protocol.with_insert_phase(count, size);
+        }
+        Ok(protocol)
+    }
+}
+
+impl crate::redis::cluster::RedisClusterProtocol {
+    /// Construct a cluster workload and optional static topology. Register actual
+    /// connection IDs separately with `register_connections`.
+    pub fn from_config(config: &RedisConfig, seed: Option<u64>) -> Result<Self> {
+        let mut protocol =
+            Self::from_base_protocol(RedisProtocol::from_workload_config(config, seed)?);
+        if let Some(cluster) = &config.redis_cluster {
+            let mut ranges = Vec::new();
+            for node in &cluster.nodes {
                 anyhow::ensure!(
-                    cmd.weight >= 0.0,
-                    "Command weight must be non-negative: {} = {}",
-                    cmd.name,
-                    cmd.weight
+                    node.slot_start <= node.slot_end && node.slot_end < 16384,
+                    "Invalid Redis slot range"
                 );
+                ranges.push(crate::redis::cluster::topology::SlotRange {
+                    start: node.slot_start,
+                    end: node.slot_end,
+                    master: node.address.parse()?,
+                    replicas: vec![],
+                });
             }
+            protocol
+                .update_topology(crate::redis::cluster::ClusterTopology::from_slot_ranges(ranges));
         }
+        Ok(protocol)
     }
-    Ok(())
 }
 
-/// Validate keys configuration
-fn validate_keys_config(keys: &KeysConfig) -> Result<()> {
-    match keys {
-        KeysConfig::Sequential { value_size, .. } => {
-            if *value_size == 0 {
-                anyhow::bail!("value_size must be > 0");
-            }
-        }
-        KeysConfig::Random { max, value_size, .. } => {
-            if *max == 0 {
-                anyhow::bail!("Random max must be > 0");
-            }
-            if *value_size == 0 {
-                anyhow::bail!("value_size must be > 0");
-            }
-        }
-        KeysConfig::RoundRobin { max, value_size, .. } => {
-            if *max == 0 {
-                anyhow::bail!("RoundRobin max must be > 0");
-            }
-            if *value_size == 0 {
-                anyhow::bail!("value_size must be > 0");
-            }
-        }
-        KeysConfig::Zipfian { n, theta, value_size, .. } => {
-            if *n == 0 {
-                anyhow::bail!("Zipfian n must be > 0");
-            }
-            if *theta <= 0.0 {
-                anyhow::bail!("Zipfian theta must be > 0");
-            }
-            if *value_size == 0 {
-                anyhow::bail!("value_size must be > 0");
-            }
-        }
-        KeysConfig::Gaussian {
-            mean_pct, std_dev_pct, max, value_size, ..
-        } => {
-            if *max == 0 {
-                anyhow::bail!("Gaussian max must be > 0");
-            }
-            if *value_size == 0 {
-                anyhow::bail!("value_size must be > 0");
-            }
-            if *mean_pct < 0.0 || *mean_pct > 1.0 {
-                anyhow::bail!("Gaussian mean_pct must be in [0.0, 1.0]");
-            }
-            if *std_dev_pct < 0.0 || *std_dev_pct > 1.0 {
-                anyhow::bail!("Gaussian std_dev_pct must be in [0.0, 1.0]");
-            }
-        }
+pub fn parse_redis_operation(
+    cmd: &str,
+    params: Option<&crate::RedisCommandParams>,
+) -> anyhow::Result<crate::RedisOp> {
+    if let Some(params) = params {
+        let matches = matches!(
+            (cmd.to_ascii_uppercase().as_str(), params),
+            ("MGET", crate::RedisCommandParams::MGet { .. })
+                | ("WAIT", crate::RedisCommandParams::Wait { .. })
+                | ("SCAN", crate::RedisCommandParams::Scan { .. })
+                | ("CUSTOM", crate::RedisCommandParams::Custom { .. })
+        );
+        anyhow::ensure!(matches, "Parameters do not match Redis command {cmd}");
     }
-    Ok(())
+    match cmd.to_uppercase().as_str() {
+        "GET" => Ok(crate::RedisOp::Get),
+        "SET" => Ok(crate::RedisOp::Set),
+        "INCR" => Ok(crate::RedisOp::Incr),
+        "MGET" => {
+            let count = match params {
+                Some(crate::RedisCommandParams::MGet { count }) => *count,
+                _ => 10, // Default to 10 keys if not specified
+            };
+            Ok(crate::RedisOp::MGet { count })
+        }
+        "WAIT" => {
+            let (num_replicas, timeout_ms) = match params {
+                Some(crate::RedisCommandParams::Wait { num_replicas, timeout_ms }) => {
+                    (*num_replicas, *timeout_ms)
+                }
+                _ => (1, 1000), // Default: 1 replica, 1000ms timeout
+            };
+            Ok(crate::RedisOp::Wait { num_replicas, timeout_ms })
+        }
+        "SETEX" => Ok(crate::RedisOp::SetEx { ttl_seconds: 3600 }),
+        "SETRANGE" => Ok(crate::RedisOp::SetRange { offset: 0 }),
+        "GETRANGE" => Ok(crate::RedisOp::GetRange { offset: 0, end: -1 }),
+        "SCAN" => {
+            let (cursor, count, pattern) = match params {
+                Some(crate::RedisCommandParams::Scan { cursor, count, pattern }) => {
+                    (*cursor, *count, pattern.clone())
+                }
+                _ => (0, None, None),
+            };
+            Ok(crate::RedisOp::Scan { cursor, count, pattern })
+        }
+        "MULTI" => Ok(crate::RedisOp::Multi),
+        "EXEC" => Ok(crate::RedisOp::Exec),
+        "DISCARD" => Ok(crate::RedisOp::Discard),
+        "CUSTOM" => {
+            // Custom command requires a template in params
+            let template_str = match params {
+                Some(crate::RedisCommandParams::Custom { template }) => template.clone(),
+                _ => {
+                    anyhow::bail!(
+                        "Custom command requires params.template. Example: \
+                         {{ name = \"custom\", params = {{ template = \"HSET myhash __key__ __data__\" }} }}"
+                    )
+                }
+            };
+            let template = crate::CommandTemplate::parse(&template_str)?;
+            Ok(crate::RedisOp::Custom(template))
+        }
+        _ => anyhow::bail!(
+            "Unknown Redis command: {}. Supported: GET, SET, INCR, MGET, WAIT, \
+             SETEX, SETRANGE, GETRANGE, SCAN, MULTI, EXEC, DISCARD, CUSTOM",
+            cmd
+        ),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::configs::RedisCommandWeight;
+    use crate::configs::{KeysConfig, RedisCommandWeight};
     use crate::Protocol;
 
     #[test]
@@ -213,7 +271,7 @@ mod tests {
             value_size: 64,
             prefix: "key:".to_string(),
         };
-        assert!(validate_keys_config(&keys).is_ok());
+        assert!(keys.validate().is_ok());
 
         // Invalid: zero max
         let keys = KeysConfig::Random {
@@ -221,7 +279,7 @@ mod tests {
             value_size: 64,
             prefix: "key:".to_string(),
         };
-        assert!(validate_keys_config(&keys).is_err());
+        assert!(keys.validate().is_err());
 
         // Invalid: zero value_size
         let keys = KeysConfig::Random {
@@ -229,6 +287,6 @@ mod tests {
             value_size: 0,
             prefix: "key:".to_string(),
         };
-        assert!(validate_keys_config(&keys).is_err());
+        assert!(keys.validate().is_err());
     }
 }

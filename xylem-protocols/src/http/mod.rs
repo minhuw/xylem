@@ -1,6 +1,8 @@
 //! HTTP/1.1 protocol implementation
 //!
-//! Supports GET, POST, PUT methods with proper HTTP parsing.
+//! Supports GET, POST, PUT with Content-Length or bodyless responses.
+//! Transfer-Encoding and close-delimited bodies are explicitly unsupported.
+//! Informational responses are consumed without completing a request.
 //! Uses httparse for zero-copy, fast HTTP response parsing.
 //!
 //! Request sequence tracking is done per-connection to support pipelining.
@@ -133,47 +135,65 @@ impl Protocol for HttpProtocol {
             return Ok((0, None));
         }
 
-        // Parse HTTP response headers
-        let mut headers = [httparse::EMPTY_HEADER; 64];
-        let mut response = httparse::Response::new(&mut headers);
+        let mut offset = 0;
+        loop {
+            let remaining = &data[offset..];
+            // Parse HTTP response headers
+            let mut headers = [httparse::EMPTY_HEADER; 64];
+            let mut response = httparse::Response::new(&mut headers);
 
-        match response.parse(data) {
-            Ok(httparse::Status::Complete(headers_len)) => {
-                // Successfully parsed headers
-                let status_code = response.code.unwrap_or(0);
-
-                if !(200..600).contains(&status_code) {
-                    return Err(anyhow!("Invalid HTTP status code: {}", status_code));
+            let headers_len = match response.parse(remaining) {
+                Ok(httparse::Status::Complete(length)) => length,
+                Ok(httparse::Status::Partial) => return Ok((0, None)),
+                Err(error) => return Err(anyhow!("HTTP parse error: {}", error)),
+            };
+            let status_code = response.code.unwrap_or(0);
+            anyhow::ensure!(
+                (100..600).contains(&status_code),
+                "Invalid HTTP status code: {}",
+                status_code
+            );
+            anyhow::ensure!(status_code != 101, "HTTP protocol upgrades are unsupported");
+            let mut content_length = None;
+            for header in response.headers.iter() {
+                anyhow::ensure!(
+                    !header.name.eq_ignore_ascii_case("transfer-encoding"),
+                    "HTTP Transfer-Encoding is unsupported"
+                );
+                if !header.name.eq_ignore_ascii_case("content-length") {
+                    continue;
                 }
-
-                // Find Content-Length header to determine body size
-                let content_length = response
-                    .headers
-                    .iter()
-                    .find(|h| h.name.eq_ignore_ascii_case("content-length"))
-                    .and_then(|h| std::str::from_utf8(h.value).ok())
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .unwrap_or(0);
-
-                // Check if we have the complete response (headers + body)
-                let total_len = headers_len + content_length;
-                if data.len() >= total_len {
-                    // Complete response received
-                    // HTTP/1.1 responses arrive in order (FIFO), so use sequential response tracking
-                    let response_seq = self.conn_response_seq.entry(conn_id).or_insert(0);
-                    let seq = *response_seq;
-                    *response_seq = response_seq.wrapping_add(1);
-                    Ok((total_len, Some((conn_id, seq))))
-                } else {
-                    // Incomplete response - need more data
-                    Ok((0, None))
-                }
+                let text = std::str::from_utf8(header.value)?.trim();
+                anyhow::ensure!(
+                    !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()),
+                    "Invalid HTTP Content-Length"
+                );
+                let length: usize = text.parse()?;
+                anyhow::ensure!(
+                    content_length.map_or(true, |old| old == length),
+                    "Conflicting HTTP Content-Length headers"
+                );
+                content_length = Some(length);
             }
-            Ok(httparse::Status::Partial) => {
-                // Need more data to complete header parsing
-                Ok((0, None))
+            if status_code < 200 {
+                offset += headers_len;
+                continue;
             }
-            Err(e) => Err(anyhow!("HTTP parse error: {}", e)),
+            let body_length = if status_code == 204 || status_code == 304 {
+                0
+            } else {
+                content_length.ok_or_else(|| anyhow!("HTTP response requires Content-Length; close-delimited bodies are unsupported"))?
+            };
+            let total_len = headers_len
+                .checked_add(body_length)
+                .ok_or_else(|| anyhow!("HTTP response length overflow"))?;
+            if remaining.len() < total_len {
+                return Ok((0, None));
+            }
+            let response_seq = self.conn_response_seq.entry(conn_id).or_insert(0);
+            let seq = *response_seq;
+            *response_seq = response_seq.wrapping_add(1);
+            return Ok((offset + total_len, Some((conn_id, seq))));
         }
     }
 

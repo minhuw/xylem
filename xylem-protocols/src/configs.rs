@@ -117,6 +117,7 @@ impl KeysConfig {
         &self,
         master_seed: Option<u64>,
     ) -> anyhow::Result<crate::workload::KeyGeneration> {
+        self.validate()?;
         use crate::workload::KeyGeneration;
         use xylem_core::seed::{components, derive_seed};
 
@@ -166,7 +167,7 @@ impl KeysConfig {
                 if *n == 0 {
                     anyhow::bail!("Zipfian n must be > 0");
                 }
-                if *theta <= 0.0 {
+                if !theta.is_finite() || *theta <= 0.0 {
                     anyhow::bail!("Zipfian theta must be > 0");
                 }
                 if *value_size == 0 {
@@ -182,10 +183,10 @@ impl KeysConfig {
                 if *value_size == 0 {
                     anyhow::bail!("value_size must be > 0");
                 }
-                if *mean_pct < 0.0 || *mean_pct > 1.0 {
+                if !mean_pct.is_finite() || !(0.0..=1.0).contains(mean_pct) {
                     anyhow::bail!("Gaussian mean_pct must be in [0.0, 1.0]");
                 }
-                if *std_dev_pct < 0.0 || *std_dev_pct > 1.0 {
+                if !std_dev_pct.is_finite() || !(0.0..=1.0).contains(std_dev_pct) {
                     anyhow::bail!("Gaussian std_dev_pct must be in [0.0, 1.0]");
                 }
             }
@@ -332,7 +333,7 @@ impl ValueSizeConfig {
     pub fn fixed_size(&self) -> usize {
         match self {
             Self::Fixed { size } => *size,
-            Self::Uniform { min, max } => (*min + *max) / 2,
+            Self::Uniform { min, max } => min / 2 + max / 2 + (min % 2 + max % 2) / 2,
             Self::Normal { mean, .. } => *mean as usize,
             Self::PerCommand { default, .. } => default.fixed_size(),
         }
@@ -601,6 +602,14 @@ pub struct InsertPhaseConfig {
 }
 
 impl InsertPhaseConfig {
+    /// Resolve insertion defaults; unbounded keyspaces require an explicit count.
+    pub fn resolve(&self, keys: &KeysConfig) -> anyhow::Result<(u64, usize)> {
+        let count = self.key_count.or_else(|| keys.keyspace_size()).ok_or_else(|| {
+            anyhow::anyhow!("insert_phase.key_count is required for sequential keys")
+        })?;
+        Ok((count, self.value_size.unwrap_or_else(|| keys.value_size())))
+    }
+
     /// Resolve key_count with fallback to provided default
     pub fn key_count_or(&self, default: u64) -> u64 {
         self.key_count.unwrap_or(default)

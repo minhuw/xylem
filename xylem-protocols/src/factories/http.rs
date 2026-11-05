@@ -17,10 +17,7 @@ impl ProtocolFactory for HttpFactory {
     }
 
     fn create(&self, config: Self::Config, _seed: Option<u64>) -> Result<Self::Protocol> {
-        let method = parse_http_method(&config.method)?;
-        let host = config.host.unwrap_or_else(|| "localhost".to_string());
-
-        Ok(HttpProtocol::new(method, config.path, host))
+        HttpProtocol::from_config(&config)
     }
 
     fn default_config(&self) -> Self::Config {
@@ -28,13 +25,7 @@ impl ProtocolFactory for HttpFactory {
     }
 
     fn validate(&self, config: &Self::Config) -> Result<()> {
-        parse_http_method(&config.method)?;
-
-        if config.path.is_empty() {
-            anyhow::bail!("HTTP path cannot be empty");
-        }
-
-        Ok(())
+        HttpProtocol::from_config(config).map(|_| ())
     }
 }
 
@@ -45,6 +36,21 @@ fn parse_http_method(method: &str) -> Result<HttpMethod> {
         "POST" => Ok(HttpMethod::Post),
         "PUT" => Ok(HttpMethod::Put),
         _ => anyhow::bail!("Unknown HTTP method: {}. Supported: GET, POST, PUT", method),
+    }
+}
+
+impl HttpProtocol {
+    /// Construct an HTTP workload, including the configured POST/PUT body size.
+    pub fn from_config(config: &HttpConfig) -> Result<Self> {
+        let method = parse_http_method(&config.method)?;
+        anyhow::ensure!(!config.path.is_empty(), "HTTP path cannot be empty");
+        let host = config.host.clone().unwrap_or_else(|| "localhost".to_string());
+        anyhow::ensure!(
+            !config.path.bytes().any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+                && !host.bytes().any(|b| b.is_ascii_whitespace() || b.is_ascii_control()),
+            "Invalid HTTP path or host"
+        );
+        Ok(Self::with_body_size(method, config.path.clone(), host, config.body_size))
     }
 }
 
