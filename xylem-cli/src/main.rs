@@ -436,6 +436,9 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                 tracing::info!("Waiting for evalsync start signal...");
                 evalsync::wait_for_start().expect("Failed to wait for evalsync start");
                 tracing::info!("Received evalsync start signal");
+                // xylem has no warmup phase, so measurement starts with the workload;
+                // end() below closes the measurement window together with the workload.
+                evalsync::measure_start().expect("Failed to signal evalsync measurement start");
                 true
             }
             Err(e) => {
