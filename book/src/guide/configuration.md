@@ -8,23 +8,25 @@ A profile is a TOML document with the following top-level sections:
 
 ```toml
 [experiment]
+name = "redis-benchmark"
 duration = "60s"
 seed = 123
 
-[target]
-transport = "tcp"
-
 [[traffic_groups]]
+transport = "tcp"
 name = "main"
 protocol = "redis"
 target = "127.0.0.1:6379"
 threads = [0, 1, 2, 3]
+connections_per_thread = 10
 
 [traffic_groups.protocol_config.keys]
-# Key distribution parameters
+strategy = "sequential"
+start = 0
+value_size = 64
 
 [traffic_groups.traffic_policy]
-# Rate control parameters
+type = "closed-loop"
 
 [output]
 format = "json"
@@ -43,16 +45,15 @@ The configuration is divided into several sections:
 
 ```toml
 [experiment]
+name = "redis-benchmark"
 duration = "60s"
 seed = 42
 
-[target]
-transport = "tcp"
-
 [[traffic_groups]]
+transport = "tcp"
 name = "main"
 protocol = "redis"
-target = "localhost:6379"
+target = "127.0.0.1:6379"
 threads = [0, 1, 2, 3]
 connections_per_thread = 10
 max_pending_per_connection = 1
@@ -77,6 +78,19 @@ type = "closed-loop"
 format = "json"
 file = "results.json"
 ```
+
+## Supported Output and Statistics Options
+
+`output.format` accepts `json`, `html`, `both`, and `human`. JSON includes global
+and per-group statistics; set `stats.include_records = true` for raw time-bucket
+records. HTML currently supports only `output.html.library = "chartjs"` and
+`output.html.theme = "light"`. `output.real_time` must be false, and
+`stats.streaming` must be omitted: the CLI rejects these unsupported settings
+instead of silently ignoring them.
+
+TCP and UDP targets require numeric IP addresses, such as `127.0.0.1:6379` or
+`[::1]:6379`. Set transport in each traffic group; there is no global `[target]`
+configuration section.
 
 ## Configuration Overrides
 

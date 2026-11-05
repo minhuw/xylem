@@ -4,7 +4,6 @@ on:
   push:
     branches: [main]
     paths-ignore:
-      - 'book/**'
       - 'docs/**'
       - '*.md'
       - 'LICENSE-*'
@@ -15,7 +14,6 @@ on:
   pull_request:
     branches: [main]
     paths-ignore:
-      - 'book/**'
       - 'docs/**'
       - '*.md'
       - 'LICENSE-*'
@@ -42,6 +40,12 @@ jobs:
 
       - name: Build
         run: nix develop --command cargo build --verbose
+
+      - name: Verify generated profile schema
+        run: |
+          nix develop --command cargo run --quiet --bin xylem -- schema > /tmp/profile.schema.json
+          python3 -m json.tool schema/profile.schema.json > /dev/null
+          diff -u schema/profile.schema.json /tmp/profile.schema.json
 
       - name: Install redis-cli for integration tests
         run: sudo apt-get update && sudo apt-get install -y redis-tools

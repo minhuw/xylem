@@ -6,11 +6,12 @@ Xylem uses TOML configuration files to define experiments. This reference docume
 
 A complete Xylem configuration file contains the following sections:
 
-```toml
+```text
 [experiment]       # Experiment metadata and duration
-[target]           # Global transport configuration
 [[traffic_groups]] # One or more traffic generation groups with protocol_config
 [output]           # Output format and destination
+[stats]            # Optional statistics settings
+[request_dump]     # Optional request CSV dump settings
 ```
 
 ## Experiment Section
@@ -32,23 +33,13 @@ seed = 42
 - `duration` (string, required): Duration in format "Ns", "Nm", "Nh" (seconds, minutes, hours)
 - `seed` (integer, optional): Random seed for reproducibility
 
-## Target Section
+## Transport and Target
 
-The `[target]` section specifies global transport settings shared across all traffic groups.
-
-```toml
-[target]
-transport = "tcp"
-```
-
-### Fields
-
-- `transport` (string, required): Transport layer. Supported values:
-  - `"tcp"`
-  - `"udp"`
-  - `"unix"`
-
-Note: The `protocol` and target `address` are now specified per-traffic-group, not globally.
+Each traffic group specifies its own `transport` (`"tcp"`, `"udp"`, or `"unix"`)
+and `target`. Transport defaults to `"tcp"`; there is no global `[target]` section.
+Groups sharing a thread must use the same transport. TCP and UDP targets must be
+numeric socket addresses, such as `"127.0.0.1:6379"` or `"[::1]:6379"`; hostname
+resolution is not supported. Unix targets are filesystem paths.
 
 ## Traffic Groups
 
@@ -92,8 +83,9 @@ type = "unlimited"
   - `"memcached-ascii"`
   - `"xylem-echo"` (testing only)
 - `target` (string, required): Target address for this group. Format depends on transport:
-  - TCP/UDP: `"host:port"` or `"ip:port"`
+  - TCP/UDP: numeric `"ip:port"` or `"[ipv6]:port"`
   - Unix socket: `"/path/to/socket"`
+- `transport` (string, default `"tcp"`): `"tcp"`, `"udp"`, or `"unix"`
 - `threads` (array of integers, required): Thread IDs to use for this group
 - `connections_per_thread` (integer, required): Number of connections per thread
 - `max_pending_per_connection` (integer, required): Maximum pending requests per connection
@@ -218,10 +210,10 @@ type = "none"
 
 Top-level stats configuration (`[stats]`).
 
-- `bucket_duration` (string, required): time bucket for per-connection records
+- `bucket_duration` (string, default `"1s"`): time bucket for per-connection records
 - `include_records` (bool, default false)
 - `sampling_policy` (optional): global latency sampling policy; set to `type = "none"` to disable global latency recording; if omitted, the first traffic group’s policy is used
-- `streaming` (optional): Parquet streaming config
+- `streaming`: reserved for future CLI support. Profiles that configure this section are rejected; no Parquet files are currently written by the CLI.
 
 ## Output Section
 
@@ -236,14 +228,46 @@ real_time = false
 
 ### Fields
 
-- `format` (string, required): Output format
-  - `"json"`: Simple JSON format
+- `format` (string, default `"json"`): Output format
+  - `"json"`: Detailed JSON with experiment metadata, global and per-group statistics
   - `"human"`: Human-readable console output
-  - `"detailed-json"`: Detailed JSON with per-group statistics
   - `"html"`: HTML report with charts
   - `"both"`: Both JSON and HTML
 - `file` (string, required): Output file path
-- `real_time` (boolean, optional): Print real-time updates during experiment
+- `real_time` (boolean, default false): Must be false; real-time updates are not supported.
+- `html.library` (string, default `"chartjs"`): Only `"chartjs"` is supported.
+- `html.theme` (string, default `"light"`): Only `"light"` is supported.
+
+## Request Dump
+
+Use `[request_dump]` to record outgoing requests as CSV files:
+
+```toml
+[request_dump]
+directory = "/tmp/xylem-requests"
+prefix = "requests"
+rotation = "hourly"
+encoding = "hex"
+```
+
+The directory is required. Rotation defaults to `"never"`; other values are
+`"minutely"`, `"hourly"`, `"daily"`, or `{ size = 1048576 }` for a byte limit.
+Encoding defaults to `"hex"`; `"base64"`, `"utf8"`, `"escaped"`, and `"none"` are
+also available. `max_files` optionally limits retained dump files.
+
+## Generated JSON Schema
+
+The checked-in [profile schema](https://github.com/minhuw/xylem/blob/main/schema/profile.schema.json)
+is generated directly from the Rust configuration types. Regenerate it with:
+
+```bash
+cargo run --quiet --bin xylem -- schema > schema/profile.schema.json
+```
+
+Keep stdout separate from Cargo diagnostics on stderr. CI checks JSON validity
+and compares the committed schema to the command's output. The schema describes
+the configuration's shape; runtime validation also checks supported options,
+addresses, and protocol settings. `detailed-json` is obsolete; use `json`.
 
 ## Complete Example
 
@@ -254,11 +278,9 @@ description = "Redis benchmark with latency/throughput separation"
 duration = "30s"
 seed = 42
 
-[target]
-transport = "tcp"
-
 # Latency agent - accurate latency measurement
 [[traffic_groups]]
+transport = "tcp"
 name = "latency-agent"
 protocol = "redis"
 target = "127.0.0.1:6379"
@@ -320,7 +342,7 @@ max_samples = 10000
 [output]
 format = "json"
 file = "/tmp/redis-bench-results.json"
-real_time = true
+real_time = false
 ```
 
 ## See Also

@@ -8,9 +8,10 @@ use serde_json::Value as JsonValue;
 use std::fs::File;
 use std::io::Write;
 use std::time::Duration;
-use xylem_core::stats::{AggregatedStats, TupleStatsCollector};
+use xylem_core::stats::TupleStatsCollector;
 
-/// Experiment results
+/// Legacy flat experiment results. CLI JSON uses [`DetailedExperimentResults`].
+#[deprecated(note = "Use DetailedExperimentResults, the current CLI JSON format.")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExperimentResults {
     pub protocol: String,
@@ -55,43 +56,8 @@ pub struct StatsRecord {
     pub latency_mean_us: f64,
 }
 
-#[allow(dead_code)]
+#[allow(deprecated)]
 impl ExperimentResults {
-    /// Create results from aggregated stats
-    fn from_aggregated_stats(
-        protocol: String,
-        target: String,
-        duration: Duration,
-        stats: AggregatedStats,
-    ) -> Self {
-        let duration_secs = duration.as_secs_f64();
-
-        Self {
-            protocol,
-            target,
-            duration_secs,
-            total_requests: stats.total_requests,
-            total_tx_bytes: 0, // Not tracked in AggregatedStats currently
-            total_rx_bytes: 0, // Not tracked in AggregatedStats currently
-            throughput_rps: stats.throughput_rps,
-            throughput_mbps: stats.throughput_mbps,
-            latency: LatencyStats {
-                min_us: 0.0, // Could be tracked separately if needed
-                max_us: 0.0, // Could be tracked separately if needed
-                mean_us: stats.mean_latency.as_secs_f64() * 1_000_000.0,
-                p50_us: stats.latency_p50.as_secs_f64() * 1_000_000.0,
-                p95_us: stats.latency_p95.as_secs_f64() * 1_000_000.0,
-                p99_us: stats.latency_p99.as_secs_f64() * 1_000_000.0,
-                p999_us: stats.latency_p999.as_secs_f64() * 1_000_000.0,
-                p9999_us: stats.latency_p9999.as_secs_f64() * 1_000_000.0,
-                p99999_us: stats.latency_p99999.as_secs_f64() * 1_000_000.0,
-                std_dev_us: stats.std_dev.as_secs_f64() * 1_000_000.0,
-                confidence_interval_us: stats.confidence_interval.as_secs_f64() * 1_000_000.0,
-                sample_count: 0, // Not tracked in AggregatedStats currently
-            },
-        }
-    }
-
     /// Print results to stdout in human-readable format
     pub fn print_human(&self) {
         println!("\n{}", "=".repeat(60));
@@ -146,73 +112,6 @@ impl ExperimentResults {
         file.write_all(json.as_bytes())?;
         println!("Results written to: {path}");
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_experiment_results_creation() {
-        let aggregated_stats = AggregatedStats {
-            latency_p50: Duration::from_micros(100),
-            latency_p95: Duration::from_micros(200),
-            latency_p99: Duration::from_micros(300),
-            latency_p999: Duration::from_micros(400),
-            latency_p9999: Duration::from_micros(500),
-            latency_p99999: Duration::from_micros(600),
-            mean_latency: Duration::from_micros(100),
-            std_dev: Duration::from_micros(50),
-            confidence_interval: Duration::from_micros(10),
-            throughput_rps: 100.0,
-            throughput_mbps: 0.1,
-            total_requests: 1000,
-        };
-
-        let results = ExperimentResults::from_aggregated_stats(
-            "redis".to_string(),
-            "127.0.0.1:6379".to_string(),
-            Duration::from_secs(10),
-            aggregated_stats,
-        );
-
-        assert_eq!(results.protocol, "redis");
-        assert_eq!(results.total_requests, 1000);
-        assert_eq!(results.duration_secs, 10.0);
-        assert_eq!(results.throughput_rps, 100.0);
-        assert!((results.latency.mean_us - 100.0).abs() < 0.01);
-        assert!((results.latency.p50_us - 100.0).abs() < 0.01);
-        assert!((results.latency.p99_us - 300.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_json_serialization() {
-        let aggregated_stats = AggregatedStats {
-            latency_p50: Duration::from_micros(50),
-            latency_p95: Duration::from_micros(100),
-            latency_p99: Duration::from_micros(150),
-            latency_p999: Duration::from_micros(200),
-            latency_p9999: Duration::from_micros(250),
-            latency_p99999: Duration::from_micros(300),
-            mean_latency: Duration::from_micros(50),
-            std_dev: Duration::from_micros(20),
-            confidence_interval: Duration::from_micros(5),
-            throughput_rps: 100.0,
-            throughput_mbps: 0.1,
-            total_requests: 100,
-        };
-
-        let results = ExperimentResults::from_aggregated_stats(
-            "echo".to_string(),
-            "127.0.0.1:9999".to_string(),
-            Duration::from_secs(1),
-            aggregated_stats,
-        );
-
-        let json = serde_json::to_string(&results).unwrap();
-        assert!(json.contains("\"protocol\":\"echo\""));
-        assert!(json.contains("\"total_requests\":100"));
     }
 }
 

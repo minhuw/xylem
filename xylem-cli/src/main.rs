@@ -10,9 +10,7 @@ use xylem_common::Request;
 use xylem_core::threading::{CpuPinning, ThreadingRuntime, Worker, WorkerConfig};
 use xylem_transport::{TcpTransportFactory, UdpTransportFactory};
 
-mod completions;
-mod config;
-mod output;
+use xylem_cli::{completions, config, output};
 
 use config::ProfileConfig;
 

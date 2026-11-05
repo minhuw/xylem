@@ -16,7 +16,7 @@ Specify the protocol for each traffic group in your TOML profile configuration:
 [[traffic_groups]]
 name = "main"
 protocol = "redis"
-target = "localhost:6379"
+target = "127.0.0.1:6379"
 # ...
 ```
 

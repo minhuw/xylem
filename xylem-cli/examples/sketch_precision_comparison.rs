@@ -27,35 +27,11 @@
 //! This will run multiple benchmark experiments and compare the results,
 //! showing how different sampling policies affect latency measurements.
 
-use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ExperimentResults {
-    protocol: String,
-    target: String,
-    duration_secs: f64,
-    total_requests: u64,
-    throughput_rps: f64,
-    throughput_mbps: f64,
-    latency: LatencyStats,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct LatencyStats {
-    mean_us: f64,
-    p50_us: f64,
-    p95_us: f64,
-    p99_us: f64,
-    p999_us: f64,
-    p9999_us: f64,
-    p99999_us: f64,
-    std_dev_us: f64,
-    confidence_interval_us: f64,
-}
+use xylem_cli::output::DetailedExperimentResults;
 
 fn create_toml_config(name: &str, port: u16, sampling_policy: &str) -> PathBuf {
     let content = format!(
@@ -64,13 +40,11 @@ name = "{name}"
 seed = 42
 duration = "10s"
 
-[target]
-transport = "tcp"
-
 [[traffic_groups]]
 name = "main"
 protocol = "redis"
 target = "127.0.0.1:{port}"
+transport = "tcp"
 threads = [0]
 connections_per_thread = 64
 max_pending_per_connection = 1
@@ -99,7 +73,7 @@ file = "/tmp/xylem-example-{name}.json"
     path
 }
 
-fn run_experiment(config_path: &Path) -> ExperimentResults {
+fn run_experiment(config_path: &Path) -> DetailedExperimentResults {
     let output = Command::new("cargo")
         .args([
             "run",
@@ -195,49 +169,71 @@ fn main() -> anyhow::Result<()> {
     let zero_results = run_experiment(&zero_config);
     println!(
         "  → Throughput: {:.0} req/s, Total: {}",
-        zero_results.throughput_rps, zero_results.total_requests
+        zero_results.global.throughput_rps, zero_results.global.total_requests
     );
 
     println!("\n[2/5] DDSketch (α=0.01, 1024 bins)");
     println!("  ℹ️  Distributed sketch with relative error guarantees");
     let ddsketch_results = run_experiment(&ddsketch_config);
-    println!("  → Throughput: {:.0} req/s", ddsketch_results.throughput_rps);
+    println!("  → Throughput: {:.0} req/s", ddsketch_results.global.throughput_rps);
 
     println!("\n[3/5] T-Digest (compression=1000)");
     println!("  ℹ️  Adaptive histogram optimized for tail percentiles");
     let tdigest_results = run_experiment(&tdigest_config);
-    println!("  → Throughput: {:.0} req/s", tdigest_results.throughput_rps);
+    println!("  → Throughput: {:.0} req/s", tdigest_results.global.throughput_rps);
 
     println!("\n[4/5] HDR Histogram (3 significant figures)");
     println!("  ℹ️  High-dynamic-range histogram with fixed precision");
     let hdr_results = run_experiment(&hdr_config);
-    println!("  → Throughput: {:.0} req/s", hdr_results.throughput_rps);
+    println!("  → Throughput: {:.0} req/s", hdr_results.global.throughput_rps);
 
     println!("\n[5/5] Limited Sampling (5% of requests)");
     println!("  ℹ️  Random sampling with rate limiting - lower memory");
     let limited_results = run_experiment(&limited_config);
-    println!("  → Throughput: {:.0} req/s", limited_results.throughput_rps);
+    println!("  → Throughput: {:.0} req/s", limited_results.global.throughput_rps);
 
     // Calculate errors for all configs
-    let dd_p50 = calculate_error(ddsketch_results.latency.p50_us, zero_results.latency.p50_us);
-    let dd_p95 = calculate_error(ddsketch_results.latency.p95_us, zero_results.latency.p95_us);
-    let dd_p99 = calculate_error(ddsketch_results.latency.p99_us, zero_results.latency.p99_us);
-    let dd_p999 = calculate_error(ddsketch_results.latency.p999_us, zero_results.latency.p999_us);
+    let dd_p50 =
+        calculate_error(ddsketch_results.global.latency.p50_us, zero_results.global.latency.p50_us);
+    let dd_p95 =
+        calculate_error(ddsketch_results.global.latency.p95_us, zero_results.global.latency.p95_us);
+    let dd_p99 =
+        calculate_error(ddsketch_results.global.latency.p99_us, zero_results.global.latency.p99_us);
+    let dd_p999 = calculate_error(
+        ddsketch_results.global.latency.p999_us,
+        zero_results.global.latency.p999_us,
+    );
 
-    let td_p50 = calculate_error(tdigest_results.latency.p50_us, zero_results.latency.p50_us);
-    let td_p95 = calculate_error(tdigest_results.latency.p95_us, zero_results.latency.p95_us);
-    let td_p99 = calculate_error(tdigest_results.latency.p99_us, zero_results.latency.p99_us);
-    let td_p999 = calculate_error(tdigest_results.latency.p999_us, zero_results.latency.p999_us);
+    let td_p50 =
+        calculate_error(tdigest_results.global.latency.p50_us, zero_results.global.latency.p50_us);
+    let td_p95 =
+        calculate_error(tdigest_results.global.latency.p95_us, zero_results.global.latency.p95_us);
+    let td_p99 =
+        calculate_error(tdigest_results.global.latency.p99_us, zero_results.global.latency.p99_us);
+    let td_p999 = calculate_error(
+        tdigest_results.global.latency.p999_us,
+        zero_results.global.latency.p999_us,
+    );
 
-    let hdr_p50 = calculate_error(hdr_results.latency.p50_us, zero_results.latency.p50_us);
-    let hdr_p95 = calculate_error(hdr_results.latency.p95_us, zero_results.latency.p95_us);
-    let hdr_p99 = calculate_error(hdr_results.latency.p99_us, zero_results.latency.p99_us);
-    let hdr_p999 = calculate_error(hdr_results.latency.p999_us, zero_results.latency.p999_us);
+    let hdr_p50 =
+        calculate_error(hdr_results.global.latency.p50_us, zero_results.global.latency.p50_us);
+    let hdr_p95 =
+        calculate_error(hdr_results.global.latency.p95_us, zero_results.global.latency.p95_us);
+    let hdr_p99 =
+        calculate_error(hdr_results.global.latency.p99_us, zero_results.global.latency.p99_us);
+    let hdr_p999 =
+        calculate_error(hdr_results.global.latency.p999_us, zero_results.global.latency.p999_us);
 
-    let lim_p50 = calculate_error(limited_results.latency.p50_us, zero_results.latency.p50_us);
-    let lim_p95 = calculate_error(limited_results.latency.p95_us, zero_results.latency.p95_us);
-    let lim_p99 = calculate_error(limited_results.latency.p99_us, zero_results.latency.p99_us);
-    let lim_p999 = calculate_error(limited_results.latency.p999_us, zero_results.latency.p999_us);
+    let lim_p50 =
+        calculate_error(limited_results.global.latency.p50_us, zero_results.global.latency.p50_us);
+    let lim_p95 =
+        calculate_error(limited_results.global.latency.p95_us, zero_results.global.latency.p95_us);
+    let lim_p99 =
+        calculate_error(limited_results.global.latency.p99_us, zero_results.global.latency.p99_us);
+    let lim_p999 = calculate_error(
+        limited_results.global.latency.p999_us,
+        zero_results.global.latency.p999_us,
+    );
 
     // Print comparison table
     println!("\n╔═══════════════════════════════════════════════════════════════════════════════════════════════════════════╗");
@@ -252,61 +248,61 @@ fn main() -> anyhow::Result<()> {
     println!(
         "{:<30} {:>20.2} {:>20.2} {:>20.2} {:>20.2}",
         "Unlimited (ground truth)",
-        zero_results.latency.p50_us,
-        zero_results.latency.p95_us,
-        zero_results.latency.p99_us,
-        zero_results.latency.p999_us
+        zero_results.global.latency.p50_us,
+        zero_results.global.latency.p95_us,
+        zero_results.global.latency.p99_us,
+        zero_results.global.latency.p999_us
     );
 
     println!(
         "\n{:<30} {:>13.2} ({:>5.2}%) {:>13.2} ({:>5.2}%) {:>13.2} ({:>5.2}%) {:>13.2} ({:>5.2}%)",
         "DDSketch α=0.01/1024",
-        ddsketch_results.latency.p50_us,
+        ddsketch_results.global.latency.p50_us,
         dd_p50,
-        ddsketch_results.latency.p95_us,
+        ddsketch_results.global.latency.p95_us,
         dd_p95,
-        ddsketch_results.latency.p99_us,
+        ddsketch_results.global.latency.p99_us,
         dd_p99,
-        ddsketch_results.latency.p999_us,
+        ddsketch_results.global.latency.p999_us,
         dd_p999
     );
 
     println!(
         "{:<30} {:>13.2} ({:>5.2}%) {:>13.2} ({:>5.2}%) {:>13.2} ({:>5.2}%) {:>13.2} ({:>5.2}%)",
         "T-Digest comp=1000",
-        tdigest_results.latency.p50_us,
+        tdigest_results.global.latency.p50_us,
         td_p50,
-        tdigest_results.latency.p95_us,
+        tdigest_results.global.latency.p95_us,
         td_p95,
-        tdigest_results.latency.p99_us,
+        tdigest_results.global.latency.p99_us,
         td_p99,
-        tdigest_results.latency.p999_us,
+        tdigest_results.global.latency.p999_us,
         td_p999
     );
 
     println!(
         "{:<30} {:>13.2} ({:>5.2}%) {:>13.2} ({:>5.2}%) {:>13.2} ({:>5.2}%) {:>13.2} ({:>5.2}%)",
         "HDR sigfigs=3",
-        hdr_results.latency.p50_us,
+        hdr_results.global.latency.p50_us,
         hdr_p50,
-        hdr_results.latency.p95_us,
+        hdr_results.global.latency.p95_us,
         hdr_p95,
-        hdr_results.latency.p99_us,
+        hdr_results.global.latency.p99_us,
         hdr_p99,
-        hdr_results.latency.p999_us,
+        hdr_results.global.latency.p999_us,
         hdr_p999
     );
 
     println!(
         "{:<30} {:>13.2} ({:>5.2}%) {:>13.2} ({:>5.2}%) {:>13.2} ({:>5.2}%) {:>13.2} ({:>5.2}%)",
         "Limited 5%",
-        limited_results.latency.p50_us,
+        limited_results.global.latency.p50_us,
         lim_p50,
-        limited_results.latency.p95_us,
+        limited_results.global.latency.p95_us,
         lim_p95,
-        limited_results.latency.p99_us,
+        limited_results.global.latency.p99_us,
         lim_p99,
-        limited_results.latency.p999_us,
+        limited_results.global.latency.p999_us,
         lim_p999
     );
 

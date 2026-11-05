@@ -255,7 +255,7 @@ To test snapshot isolation, run concurrent readers and writers on the same keys:
 [[traffic_groups]]
 name = "mvcc-test"
 protocol = "masstree"
-target = "localhost:2117"
+target = "127.0.0.1:2117"
 threads = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
 connections_per_thread = 10
 max_pending_per_connection = 1

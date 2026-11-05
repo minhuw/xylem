@@ -2,6 +2,7 @@
 
 use super::DetailedExperimentResults;
 use anyhow::Result;
+use serde::Serialize;
 use std::fs::File;
 use std::io::Write;
 
@@ -13,7 +14,7 @@ pub fn generate_html_report(results: &DetailedExperimentResults, path: &str) -> 
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Xylem Report: {}</title>
+    <title>Xylem Report: {name}</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <style>
         body {{
@@ -108,32 +109,32 @@ pub fn generate_html_report(results: &DetailedExperimentResults, path: &str) -> 
 </head>
 <body>
     <div class="container">
-        <h1>Xylem Experiment Report: {}</h1>
+        <h1>Xylem Experiment Report: {name}</h1>
 
         <div class="metadata">
-            <p><strong>Duration:</strong> {:.2}s</p>
-            <p><strong>Target:</strong> {} ({})</p>
-            <p><strong>Transport:</strong> {}</p>
-            {}
+            <p><strong>Duration:</strong> {duration:.2}s</p>
+            <p><strong>Target:</strong> {address} ({protocol})</p>
+            <p><strong>Transport:</strong> {transport}</p>
+            {description}
         </div>
 
         <h2>Global Statistics</h2>
         <div class="stats-grid">
             <div class="stat-card">
                 <div class="stat-label">Total Requests</div>
-                <div class="stat-value">{}</div>
+                <div class="stat-value">{requests}</div>
             </div>
             <div class="stat-card">
                 <div class="stat-label">Throughput</div>
-                <div class="stat-value">{:.2} req/s</div>
+                <div class="stat-value">{throughput:.2} req/s</div>
             </div>
             <div class="stat-card">
                 <div class="stat-label">Bandwidth</div>
-                <div class="stat-value">{:.2} Mbps</div>
+                <div class="stat-value">{bandwidth:.2} Mbps</div>
             </div>
             <div class="stat-card">
                 <div class="stat-label">Median Latency</div>
-                <div class="stat-value">{:.2} μs</div>
+                <div class="stat-value">{median:.2} μs</div>
             </div>
         </div>
 
@@ -146,7 +147,7 @@ pub fn generate_html_report(results: &DetailedExperimentResults, path: &str) -> 
             <canvas id="throughputComparisonChart"></canvas>
         </div>
 
-        {}
+        {group_sections}
 
     </div>
 
@@ -158,7 +159,7 @@ pub fn generate_html_report(results: &DetailedExperimentResults, path: &str) -> 
                 labels: ['p50', 'p95', 'p99', 'p999', 'p9999'],
                 datasets: [{{
                     label: 'Global Latency (μs)',
-                    data: [{:.2}, {:.2}, {:.2}, {:.2}, {:.2}],
+                    data: {global_latencies},
                     backgroundColor: 'rgba(54, 162, 235, 0.8)'
                 }}]
             }},
@@ -181,10 +182,10 @@ pub fn generate_html_report(results: &DetailedExperimentResults, path: &str) -> 
         new Chart(document.getElementById('throughputComparisonChart'), {{
             type: 'bar',
             data: {{
-                labels: [{}],
+                labels: {group_labels},
                 datasets: [{{
                     label: 'Throughput (req/s)',
-                    data: [{}],
+                    data: {group_throughputs},
                     backgroundColor: 'rgba(75, 192, 192, 0.8)'
                 }}]
             }},
@@ -203,35 +204,43 @@ pub fn generate_html_report(results: &DetailedExperimentResults, path: &str) -> 
             }}
         }});
 
-        {}
+        {group_charts}
     </script>
 </body>
 </html>"#,
-        results.experiment.name,
-        results.experiment.name,
-        results.experiment.duration_secs,
-        results.target.address,
-        results.target.protocol,
-        results.target.transport,
-        results
+        name = escape_html(&results.experiment.name),
+        duration = results.experiment.duration_secs,
+        address = escape_html(&results.target.address),
+        protocol = escape_html(&results.target.protocol),
+        transport = escape_html(&results.target.transport),
+        description = results
             .experiment
             .description
             .as_ref()
-            .map(|d| format!("<p><strong>Description:</strong> {}</p>", d))
+            .map(|d| format!("<p><strong>Description:</strong> {}</p>", escape_html(d)))
             .unwrap_or_default(),
-        results.global.total_requests,
-        results.global.throughput_rps,
-        results.global.throughput_mbps,
-        results.global.latency.p50_us,
-        results.global.latency.p50_us,
-        results.global.latency.p95_us,
-        results.global.latency.p99_us,
-        results.global.latency.p999_us,
-        results.global.latency.p9999_us,
-        generate_group_sections(&results.traffic_groups),
-        generate_group_labels(&results.traffic_groups),
-        generate_group_throughputs(&results.traffic_groups),
-        generate_group_charts(&results.traffic_groups),
+        requests = results.global.total_requests,
+        throughput = results.global.throughput_rps,
+        bandwidth = results.global.throughput_mbps,
+        median = results.global.latency.p50_us,
+        group_sections = generate_group_sections(&results.traffic_groups),
+        global_latencies = script_json(&[
+            results.global.latency.p50_us,
+            results.global.latency.p95_us,
+            results.global.latency.p99_us,
+            results.global.latency.p999_us,
+            results.global.latency.p9999_us,
+        ])?,
+        group_labels =
+            script_json(&results.traffic_groups.iter().map(|g| &g.name).collect::<Vec<_>>())?,
+        group_throughputs = script_json(
+            &results
+                .traffic_groups
+                .iter()
+                .map(|g| g.stats.throughput_rps)
+                .collect::<Vec<_>>()
+        )?,
+        group_charts = generate_group_charts(&results.traffic_groups)?,
     );
 
     let mut file = File::create(path)?;
@@ -247,7 +256,7 @@ fn generate_group_sections(groups: &[super::TrafficGroupResults]) -> String {
             format!(
                 r#"<div class="group-section">
             <div class="group-header">
-                <h3 style="margin:0">Traffic Group {}: {}</h3>
+                <h3 style="margin:0">Traffic Group {id}: {name}</h3>
             </div>
             <table>
                 <tr>
@@ -256,82 +265,88 @@ fn generate_group_sections(groups: &[super::TrafficGroupResults]) -> String {
                 </tr>
                 <tr>
                     <td>Protocol</td>
-                    <td>{}</td>
+                    <td>{protocol}</td>
                 </tr>
                 <tr>
                     <td>Policy</td>
-                    <td>{}</td>
+                    <td>{policy}</td>
                 </tr>
                 <tr>
                     <td>Threads</td>
-                    <td>{:?}</td>
+                    <td>{threads:?}</td>
                 </tr>
                 <tr>
                     <td>Connections</td>
-                    <td>{}</td>
+                    <td>{connections}</td>
                 </tr>
                 <tr>
                     <td>Requests</td>
-                    <td>{}</td>
+                    <td>{requests}</td>
                 </tr>
                 <tr>
                     <td>Throughput</td>
-                    <td>{:.2} req/s</td>
+                    <td>{throughput:.2} req/s</td>
                 </tr>
                 <tr>
                     <td>p50 Latency</td>
-                    <td>{:.2} μs</td>
+                    <td>{median:.2} μs</td>
                 </tr>
                 <tr>
                     <td>p99 Latency</td>
-                    <td>{:.2} μs</td>
+                    <td>{tail:.2} μs</td>
                 </tr>
             </table>
             <div class="chart-container">
-                <canvas id="groupLatencyChart{}"></canvas>
+                <canvas id="groupLatencyChart{id}"></canvas>
             </div>
         </div>"#,
-                group.id,
-                group.name,
-                group.protocol,
-                group.policy,
-                group.threads,
-                group.connections,
-                group.stats.total_requests,
-                group.stats.throughput_rps,
-                group.stats.latency.p50_us,
-                group.stats.latency.p99_us,
-                group.id
+                id = group.id,
+                name = escape_html(&group.name),
+                protocol = escape_html(&group.protocol),
+                policy = escape_html(&group.policy),
+                threads = group.threads,
+                connections = group.connections,
+                requests = group.stats.total_requests,
+                throughput = group.stats.throughput_rps,
+                median = group.stats.latency.p50_us,
+                tail = group.stats.latency.p99_us,
             )
         })
         .collect::<Vec<_>>()
         .join("\n")
 }
 
-fn generate_group_labels(groups: &[super::TrafficGroupResults]) -> String {
-    groups.iter().map(|g| format!("'{}'", g.name)).collect::<Vec<_>>().join(", ")
+/// Escape text nodes, including quotes so this also remains safe in attributes.
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
-fn generate_group_throughputs(groups: &[super::TrafficGroupResults]) -> String {
-    groups
-        .iter()
-        .map(|g| format!("{:.2}", g.stats.throughput_rps))
-        .collect::<Vec<_>>()
-        .join(", ")
+/// JSON is valid JavaScript; escaping `<` prevents the HTML parser from ending
+/// an inline script when a string contains `</script>` (in any letter case).
+fn script_json(value: &impl Serialize) -> Result<String> {
+    Ok(serde_json::to_string(value)?
+        .replace('<', "\\u003c")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029"))
 }
 
-fn generate_group_charts(groups: &[super::TrafficGroupResults]) -> String {
-    groups
+fn generate_group_charts(groups: &[super::TrafficGroupResults]) -> Result<String> {
+    Ok(groups
         .iter()
         .map(|group| {
-            format!(
-                r#"new Chart(document.getElementById('groupLatencyChart{}'), {{
+            Ok(format!(
+                r#"new Chart(document.getElementById('groupLatencyChart{id}'), {{
             type: 'bar',
             data: {{
                 labels: ['p50', 'p95', 'p99', 'p999'],
                 datasets: [{{
-                    label: '{}  Latency (μs)',
-                    data: [{:.2}, {:.2}, {:.2}, {:.2}],
+                    label: {label},
+                    data: {latencies},
                     backgroundColor: 'rgba(255, 159, 64, 0.8)'
                 }}]
             }},
@@ -349,14 +364,16 @@ fn generate_group_charts(groups: &[super::TrafficGroupResults]) -> String {
                 }}
             }}
         }});"#,
-                group.id,
-                group.name,
-                group.stats.latency.p50_us,
-                group.stats.latency.p95_us,
-                group.stats.latency.p99_us,
-                group.stats.latency.p999_us,
-            )
+                id = group.id,
+                label = script_json(&format!("{}  Latency (μs)", group.name))?,
+                latencies = script_json(&[
+                    group.stats.latency.p50_us,
+                    group.stats.latency.p95_us,
+                    group.stats.latency.p99_us,
+                    group.stats.latency.p999_us,
+                ])?,
+            ))
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect::<Result<Vec<_>>>()?
+        .join("\n"))
 }

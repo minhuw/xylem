@@ -2500,7 +2500,6 @@ dependencies = [
  "clap",
  "clap_complete",
  "evalsync",
- "humantime",
  "humantime-serde",
  "schemars",
  "serde",

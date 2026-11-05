@@ -10,7 +10,7 @@ Each traffic group must specify its own `protocol` and `target`:
 [[traffic_groups]]
 name = "main"
 protocol = "redis"  # or "http", "memcached-binary", "memcached-ascii", "xylem-echo"
-target = "localhost:6379"
+target = "127.0.0.1:6379"
 threads = [0, 1, 2, 3]
 connections_per_thread = 10
 max_pending_per_connection = 1
@@ -24,14 +24,14 @@ You can run different protocols in separate traffic groups:
 [[traffic_groups]]
 name = "redis-load"
 protocol = "redis"
-target = "localhost:6379"
+target = "127.0.0.1:6379"
 threads = [0, 1]
 # ...
 
 [[traffic_groups]]
 name = "memcached-load"
 protocol = "memcached-binary"
-target = "localhost:11211"
+target = "127.0.0.1:11211"
 threads = [2, 3]
 # ...
 ```

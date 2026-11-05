@@ -103,16 +103,15 @@ Create your own TOML profile file:
 # my-benchmark.toml
 
 [experiment]
+name = "redis-benchmark"
 duration = "30s"
 seed = 123
 
-[target]
-transport = "tcp"
-
 [[traffic_groups]]
+transport = "tcp"
 name = "main"
 protocol = "redis"
-target = "localhost:6379"
+target = "127.0.0.1:6379"
 threads = [0, 1, 2, 3]
 connections_per_thread = 10
 max_pending_per_connection = 1
@@ -150,15 +149,13 @@ A typical profile file includes:
 ```toml
 # Experiment configuration
 [experiment]
+name = "redis-benchmark"
 duration = "60s"
 seed = 123
 
-# Global target configuration (transport only)
-[target]
-transport = "tcp"
-
 # Traffic groups (each with its own protocol, target, and rate control)
 [[traffic_groups]]
+transport = "tcp"
 name = "group-1"
 protocol = "redis"
 target = "127.0.0.1:6379"

@@ -1,6 +1,6 @@
 # Transport Configuration
 
-The transport is specified in the `[target]` section and applies to all traffic groups. Each traffic group specifies its own target address.
+Each `[[traffic_groups]]` section specifies its own `transport` and `target`. Transport defaults to `"tcp"`. Groups sharing a thread must use the same transport.
 
 ## Available Transports
 
@@ -10,44 +10,38 @@ The transport is specified in the `[target]` section and applies to all traffic 
 
 ## Configuration
 
-### TCP (hostname:port)
+### TCP (IP:port)
 
 ```toml
-[target]
-transport = "tcp"
-
 [[traffic_groups]]
+transport = "tcp"
 name = "main"
 protocol = "redis"
-target = "localhost:6379"
+target = "127.0.0.1:6379"
 # ...
 ```
 
 ### Unix Domain Socket (filesystem path)
 
 ```toml
-[target]
-transport = "unix"
-
 [[traffic_groups]]
+transport = "unix"
 name = "main"
 protocol = "redis"
 target = "/var/run/redis/redis.sock"
 # ...
 ```
 
-### UDP (hostname:port)
+### UDP (IP:port)
 
 UDP support depends on the protocol implementation.
 
 ```toml
-[target]
-transport = "udp"
-
 [[traffic_groups]]
+transport = "udp"
 name = "main"
 protocol = "memcached-binary"
-target = "localhost:11211"
+target = "127.0.0.1:11211"
 # ...
 ```
 

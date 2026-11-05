@@ -54,17 +54,17 @@ test-cleanup:
 # Run Redis-related integration tests
 test-redis: test-cleanup
     @echo "🎯 Running Redis integration tests..."
-    cargo nextest run --profile integration -E 'test(redis_integration) or test(redis_cluster) or test(pipelining)'
+    cargo nextest run --profile integration -E 'binary(redis_integration) or binary(redis_cluster_integration) or binary(redis_new_commands_integration) or binary(pipelining_integration)'
 
 # Run Memcached integration tests
 test-memcached: test-cleanup
     @echo "🎯 Running Memcached integration tests..."
-    cargo nextest run --profile integration -E 'test(memcached_integration)'
+    cargo nextest run --profile integration -E 'binary(memcached_integration)'
 
 # Run HTTP integration tests
 test-http: test-cleanup
     @echo "🌐 Running HTTP integration tests..."
-    cargo nextest run --profile integration -E 'test(http_integration)'
+    cargo nextest run --profile integration -E 'binary(http_integration)'
 
 # Run Masstree integration tests
 test-masstree: test-cleanup
@@ -290,7 +290,7 @@ demo-request-dump:
     # Run the benchmark
     echo "🔥 Running benchmark with request dump enabled..."
     echo ""
-    cargo run --release --bin xylem -- -P profiles/request-dump-demo.toml
+    cargo run --release --bin xylem -- -P profiles/request-dump-demo.toml --set output.real_time=false
 
     echo ""
     echo "📊 Request dump files:"
@@ -320,15 +320,15 @@ demo-request-dump:
     echo ""
     echo "✅ Demo complete! Dump files are in: $DUMP_DIR"
 
-# Run a quick benchmark (Redis, 10k requests, single connection)
+# Run a quick benchmark (Redis, 10 seconds, single connection)
 bench-quick:
     @echo "⚡ Running quick benchmark..."
-    cargo run --release --bin {{BINARY_NAME}} -- -z "127.0.0.1:6379" -n 10000 -c 1
+    cargo run --release --bin {{BINARY_NAME}} -- -P tests/redis/redis-get-zipfian.toml --set experiment.duration=10s --set 'traffic_groups.0.threads=[0]' --set traffic_groups.0.connections_per_thread=1 --set traffic_groups.0.max_pending_per_connection=1
 
-# Full benchmark (Redis, 100k requests, multiple connections, multiple threads)
+# Full benchmark (Redis, 60 seconds, four connections per thread, two threads)
 bench-full:
     @echo "⚡ Running full benchmark..."
-    cargo run --release --bin {{BINARY_NAME}} -- -z "127.0.0.1:6379" -n 100000 -c 4 -t 2
+    cargo run --release --bin {{BINARY_NAME}} -- -P tests/redis/redis-get-zipfian.toml --set experiment.duration=60s --set 'traffic_groups.0.threads=[0,1]' --set traffic_groups.0.connections_per_thread=4
 
 # Start Redis server using Docker
 redis-start:
@@ -406,7 +406,7 @@ install: build-release
 # Generate/update JSON Schema for configuration files
 schema:
     @echo "📋 Generating JSON Schema..."
-    cargo run --bin {{BINARY_NAME}} -- schema > schema/profile.schema.json
+    cargo run --quiet --bin {{BINARY_NAME}} -- schema > schema/profile.schema.json
     @echo "✅ Schema written to schema/profile.schema.json"
 
 # Generate shell completion scripts
@@ -449,8 +449,8 @@ help:
     @echo ""
     @echo "🔥 Performance:"
     @echo "  just flamegraph-echo     - Generate flamegraph with echo benchmark (30s)"
-    @echo "  just bench-quick         - Quick benchmark"
-    @echo "  just bench-full          - Full benchmark"
+    @echo "  just bench-quick         - Redis benchmark (10 seconds, one connection)"
+    @echo "  just bench-full          - Redis benchmark (60 seconds, two threads)"
     @echo ""
     @echo "📝 Demos:"
     @echo "  just demo-request-dump   - Demo request dump feature (records to CSV)"

@@ -11,6 +11,9 @@ fn test_detailed_json_output_generation() {
     let policy = SamplingPolicy::Limited { max_samples: 1000, rate: 1.0 };
     let mut stats = TupleStatsCollector::new(policy.clone(), Duration::from_secs(1));
 
+    stats.register_group_policy(0, policy.clone());
+    stats.register_group_policy(1, policy.clone());
+
     // Add latency samples for group 0
     for i in 0..500 {
         stats.record_latency(0, i % 10, Duration::from_micros(100));
@@ -115,6 +118,8 @@ fn test_json_serialization_deserialization() {
     let policy = SamplingPolicy::Limited { max_samples: 1000, rate: 1.0 };
     let mut stats = TupleStatsCollector::new(policy.clone(), Duration::from_secs(1));
 
+    stats.register_group_policy(0, policy.clone());
+
     for i in 0..100 {
         stats.record_latency(0, i % 5, Duration::from_micros(100));
     }
@@ -166,6 +171,8 @@ fn test_json_serialization_deserialization() {
 fn test_html_report_generation() {
     let policy = SamplingPolicy::Limited { max_samples: 1000, rate: 1.0 };
     let mut stats = TupleStatsCollector::new(policy.clone(), Duration::from_secs(1));
+
+    stats.register_group_policy(0, policy.clone());
 
     for i in 0..100 {
         stats.record_latency(0, i % 5, Duration::from_micros(150));
@@ -231,6 +238,9 @@ fn test_html_report_generation() {
 fn test_per_group_statistics_isolation() {
     let policy = SamplingPolicy::Limited { max_samples: 1000, rate: 1.0 };
     let mut stats = TupleStatsCollector::new(policy.clone(), Duration::from_secs(1));
+
+    stats.register_group_policy(0, policy.clone());
+    stats.register_group_policy(1, policy.clone());
 
     // Group 0: Fast responses
     for i in 0..1000 {

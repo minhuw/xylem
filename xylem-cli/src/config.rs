@@ -45,59 +45,21 @@ pub struct ExperimentConfig {
 /// Re-export KeysConfig from xylem-protocols for use in config files
 pub use xylem_protocols::KeysConfig;
 
-/// Operations configuration (command selection)
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-#[serde(tag = "strategy", rename_all = "lowercase")]
-pub enum OperationsConfig {
-    /// Fixed operation (backward compatible)
-    Fixed { operation: String },
-    /// Weighted random selection
-    Weighted { commands: Vec<CommandWeightConfig> },
-}
-
-/// Command weight configuration
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct CommandWeightConfig {
-    /// Command name: "get", "set", "incr", "mget", "wait", or "custom"
-    pub name: String,
-    /// Weight (probability) for this command
-    pub weight: f64,
-    /// Additional parameters for specific commands
-    #[serde(flatten)]
-    pub params: Option<CommandParams>,
-    /// Optional per-command key distribution (overrides protocol_config.keys for this command)
-    #[serde(default)]
-    pub keys: Option<KeysConfig>,
-}
-
-/// Additional parameters for specific command types
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-#[serde(untagged)]
-pub enum CommandParams {
-    /// MGET parameters
-    MGet { count: usize },
-    /// WAIT parameters
-    Wait { num_replicas: usize, timeout_ms: u64 },
-    /// SCAN parameters
-    Scan {
-        #[serde(default)]
-        cursor: u64,
-        count: Option<usize>,
-        pattern: Option<String>,
-    },
-    /// Custom command template
-    Custom { template: String },
-}
+// Keep the legacy wire format available to downstream callers during migration.
+#[allow(deprecated)]
+mod legacy;
+#[allow(deprecated)]
+pub use legacy::{CommandParams, CommandWeightConfig, OperationsConfig};
 
 /// Output configuration
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct OutputConfig {
-    /// Output format: json, html, both, or detailed-json
+    /// Output format: json, html, both, or human
     #[serde(default = "default_output_format")]
     pub format: OutputFormat,
     /// Output file path (for json/html, extensions will be added automatically)
     pub file: PathBuf,
-    /// Print real-time updates
+    /// Reserved for real-time updates; must be false (not supported by the CLI).
     #[serde(default)]
     pub real_time: bool,
     /// HTML chart configuration
@@ -128,10 +90,10 @@ fn default_output_format() -> OutputFormat {
 /// HTML output configuration
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct HtmlOutputConfig {
-    /// Chart library: chartjs or plotly
+    /// Chart library; only "chartjs" is currently supported.
     #[serde(default = "default_chart_library")]
     pub library: String,
-    /// Theme: light or dark
+    /// Theme; only "light" is currently supported.
     #[serde(default = "default_theme")]
     pub theme: String,
 }
@@ -168,7 +130,7 @@ pub struct StatsConfig {
     /// Set to "none" to disable global latency recording.
     #[serde(default)]
     pub sampling_policy: Option<xylem_core::stats::collector::SamplingPolicy>,
-    /// Streaming configuration for writing stats to Parquet files
+    /// Reserved Parquet streaming configuration; not supported by the CLI.
     #[serde(default)]
     pub streaming: Option<StreamingStatsConfig>,
 }
@@ -188,7 +150,7 @@ fn default_bucket_duration() -> Duration {
     Duration::from_secs(1)
 }
 
-/// Streaming stats configuration for writing to Parquet files
+/// Reserved streaming stats configuration. The CLI rejects profiles that set this.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct StreamingStatsConfig {
     /// Output path prefix for Parquet files
@@ -212,8 +174,7 @@ impl ProfileConfig {
         let config: ProfileConfig = toml::from_str(&content)
             .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
 
-        // Note: validation happens in with_overrides(), not here
-        // This allows config files without target to be loaded, then target set via CLI
+        // Validate explicitly or use from_file_with_overrides() to validate after overrides.
         Ok(config)
     }
 
@@ -248,6 +209,19 @@ impl ProfileConfig {
 
     /// Validate configuration
     pub fn validate(&self) -> Result<()> {
+        if self.stats.streaming.is_some() {
+            bail!("stats.streaming is not supported by the CLI; omit this section");
+        }
+        if self.output.real_time {
+            bail!("output.real_time is not supported by the CLI; use false");
+        }
+        if self.output.html.library != "chartjs" {
+            bail!("output.html.library only supports 'chartjs'");
+        }
+        if self.output.html.theme != "light" {
+            bail!("output.html.theme only supports 'light'");
+        }
+
         // Experiment validation
         if self.experiment.name.is_empty() {
             bail!("Experiment name cannot be empty");
@@ -650,128 +624,6 @@ fn parse_value(value_str: &str) -> Result<toml::Value> {
     Ok(toml::Value::String(string_val.to_string()))
 }
 
-#[allow(dead_code)]
-impl OperationsConfig {
-    /// Helper: Process a command with per-command keys
-    fn process_command_with_keys(
-        cmd_cfg: &CommandWeightConfig,
-        master_seed: Option<u64>,
-    ) -> anyhow::Result<(xylem_protocols::RedisOp, Box<dyn xylem_protocols::KeyGenerator>)> {
-        let op = Self::parse_redis_op(&cmd_cfg.name, cmd_cfg.params.as_ref())?;
-
-        if let Some(ref keys_config) = cmd_cfg.keys {
-            let key_gen = keys_config.to_key_gen(master_seed)?;
-            Ok((op, Box::new(key_gen) as Box<dyn xylem_protocols::KeyGenerator>))
-        } else {
-            anyhow::bail!(
-                "When using per-command keys, all commands must specify 'keys'. \
-                 Command '{}' is missing keys configuration.",
-                cmd_cfg.name
-            )
-        }
-    }
-
-    /// Convert to a Redis CommandSelector
-    pub fn to_redis_selector(
-        &self,
-        master_seed: Option<u64>,
-    ) -> anyhow::Result<Box<dyn xylem_protocols::CommandSelector<xylem_protocols::RedisOp>>> {
-        use xylem_core::seed::derive_seed;
-        use xylem_protocols::{FixedCommandSelector, WeightedCommandSelector};
-
-        match self {
-            Self::Fixed { operation } => {
-                let op = Self::parse_redis_op(operation, None)?;
-                Ok(Box::new(FixedCommandSelector::new(op)))
-            }
-            Self::Weighted { commands } => {
-                // Check if any command has per-command keys
-                let has_per_command_keys = commands.iter().any(|cmd| cmd.keys.is_some());
-
-                if has_per_command_keys {
-                    // Create selector with per-command key generators
-                    let mut weighted_ops = Vec::new();
-                    let mut key_generators: Vec<Box<dyn xylem_protocols::KeyGenerator>> =
-                        Vec::new();
-
-                    for cmd_cfg in commands {
-                        let (op, key_gen) = Self::process_command_with_keys(cmd_cfg, master_seed)?;
-                        weighted_ops.push((op, cmd_cfg.weight));
-                        key_generators.push(key_gen);
-                    }
-
-                    let seed = master_seed.map(|s| derive_seed(s, "command_selector"));
-                    Ok(Box::new(WeightedCommandSelector::with_per_command_keys(
-                        weighted_ops,
-                        key_generators,
-                        seed,
-                    )?))
-                } else {
-                    // Traditional mode: no per-command keys
-                    let mut weighted_ops = Vec::new();
-                    for cmd_cfg in commands {
-                        let op = Self::parse_redis_op(&cmd_cfg.name, cmd_cfg.params.as_ref())?;
-                        weighted_ops.push((op, cmd_cfg.weight));
-                    }
-                    let seed = master_seed.map(|s| derive_seed(s, "command_selector"));
-                    Ok(Box::new(WeightedCommandSelector::with_seed(weighted_ops, seed)?))
-                }
-            }
-        }
-    }
-
-    fn parse_redis_op(
-        name: &str,
-        params: Option<&CommandParams>,
-    ) -> anyhow::Result<xylem_protocols::RedisOp> {
-        use xylem_protocols::{CommandTemplate, RedisOp};
-
-        match name.to_lowercase().as_str() {
-            "get" => Ok(RedisOp::Get),
-            "set" => Ok(RedisOp::Set),
-            "incr" => Ok(RedisOp::Incr),
-            "mget" => {
-                if let Some(CommandParams::MGet { count }) = params {
-                    Ok(RedisOp::MGet { count: *count })
-                } else {
-                    anyhow::bail!("MGET requires 'count' parameter")
-                }
-            }
-            "wait" => {
-                if let Some(CommandParams::Wait { num_replicas, timeout_ms }) = params {
-                    Ok(RedisOp::Wait {
-                        num_replicas: *num_replicas,
-                        timeout_ms: *timeout_ms,
-                    })
-                } else {
-                    anyhow::bail!("WAIT requires 'num_replicas' and 'timeout_ms' parameters")
-                }
-            }
-            "scan" => {
-                if let Some(CommandParams::Scan { cursor, count, pattern }) = params {
-                    Ok(RedisOp::Scan {
-                        cursor: *cursor,
-                        count: *count,
-                        pattern: pattern.clone(),
-                    })
-                } else {
-                    // Default SCAN with cursor=0, no count/pattern limits
-                    Ok(RedisOp::Scan { cursor: 0, count: None, pattern: None })
-                }
-            }
-            "custom" => {
-                if let Some(CommandParams::Custom { template }) = params {
-                    let cmd_template = CommandTemplate::parse(template)?;
-                    Ok(RedisOp::Custom(cmd_template))
-                } else {
-                    anyhow::bail!("Custom command requires 'template' parameter")
-                }
-            }
-            _ => anyhow::bail!("Unknown Redis operation: {}", name),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -786,6 +638,30 @@ mod tests {
             .protocol_config
             .as_ref()
             .and_then(|pc| pc.get("keys").and_then(|v| serde_json::from_value(v.clone()).ok()))
+    }
+
+    #[test]
+    fn unsupported_options_are_rejected_after_overrides() {
+        let path = "../tests/redis/redis-get-zipfian.toml";
+        for (option, expected) in [
+            ("stats.streaming.path=stats.parquet", "stats.streaming"),
+            ("output.real_time=true", "output.real_time"),
+            ("output.html.library=plotly", "output.html.library"),
+            ("output.html.theme=dark", "output.html.theme"),
+        ] {
+            let error =
+                ProfileConfig::from_file_with_overrides(path, &[option.into()]).expect_err(option);
+            assert!(error.to_string().contains(expected), "{option}: {error}");
+        }
+        ProfileConfig::from_file_with_overrides(
+            path,
+            &[
+                "output.real_time=false".into(),
+                "output.html.library=chartjs".into(),
+                "output.html.theme=light".into(),
+            ],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1480,10 +1356,10 @@ duration = "10s""#,
     fn test_set_type_inference_boolean() {
         let config = ProfileConfig::from_file_with_overrides(
             "../tests/redis/redis-get-zipfian.toml",
-            &["output.real_time=true".to_string()],
+            &["stats.include_records=true".to_string()],
         )
         .unwrap();
-        assert!(config.output.real_time);
+        assert!(config.stats.include_records);
     }
 
     #[test]

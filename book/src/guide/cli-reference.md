@@ -105,7 +105,7 @@ The `--set` flag uses dot notation to override any configuration value:
 
 ```bash
 # Override target address for a traffic group
-xylem -P profiles/redis.toml --set traffic_groups.0.target=localhost:6379
+xylem -P profiles/redis.toml --set traffic_groups.0.target=127.0.0.1:6379
 
 # Override protocol for a traffic group
 xylem -P profiles/redis.toml --set traffic_groups.0.protocol=memcached-binary
@@ -132,10 +132,8 @@ name = "redis-benchmark"
 duration = "60s"
 seed = 123
 
-[target]
-transport = "tcp"
-
 [[traffic_groups]]
+transport = "tcp"
 name = "main"
 protocol = "redis"
 target = "127.0.0.1:6379"

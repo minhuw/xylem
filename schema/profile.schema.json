@@ -1,5 +1,3 @@
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.14s
-     Running `target/debug/xylem schema`
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ProfileConfig",
@@ -9,11 +7,30 @@
     "experiment": {
       "$ref": "#/$defs/ExperimentConfig"
     },
-    "stats": {
-      "$ref": "#/$defs/StatsConfig"
-    },
     "output": {
       "$ref": "#/$defs/OutputConfig"
+    },
+    "request_dump": {
+      "description": "Optional request dump configuration for recording all requests",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/DumpConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "stats": {
+      "description": "Statistics collection configuration",
+      "$ref": "#/$defs/StatsConfig",
+      "default": {
+        "bucket_duration": "1s",
+        "include_records": false,
+        "sampling_policy": null,
+        "streaming": null
+      }
     },
     "traffic_groups": {
       "description": "Traffic groups configuration",
@@ -29,6 +46,74 @@
     "output"
   ],
   "$defs": {
+    "DataEncoding": {
+      "description": "Encoding method for request data in dump files",
+      "oneOf": [
+        {
+          "description": "Hexadecimal encoding (safe for all binary data)",
+          "type": "string",
+          "const": "hex"
+        },
+        {
+          "description": "Base64 encoding (more compact than hex)",
+          "type": "string",
+          "const": "base64"
+        },
+        {
+          "description": "UTF-8 with lossy conversion (replaces invalid bytes with replacement char)\nGood for text protocols like HTTP, Redis text commands",
+          "type": "string",
+          "const": "utf8"
+        },
+        {
+          "description": "Raw bytes as escaped string (e.g., \\x00\\x01)",
+          "type": "string",
+          "const": "escaped"
+        },
+        {
+          "description": "No data encoding - only record metadata (data_len, no data column)",
+          "type": "string",
+          "const": "none"
+        }
+      ]
+    },
+    "DumpConfig": {
+      "description": "Configuration for request dumping",
+      "type": "object",
+      "properties": {
+        "directory": {
+          "description": "Directory to store dump files",
+          "type": "string"
+        },
+        "encoding": {
+          "description": "Data encoding method",
+          "$ref": "#/$defs/DataEncoding",
+          "default": "hex"
+        },
+        "max_files": {
+          "description": "Maximum number of rotated files to keep (None = unlimited)",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "default": null,
+          "minimum": 0
+        },
+        "prefix": {
+          "description": "Prefix for dump file names",
+          "type": "string",
+          "default": "xylem_requests"
+        },
+        "rotation": {
+          "description": "Rotation policy",
+          "$ref": "#/$defs/RotationPolicy",
+          "default": "never"
+        }
+      },
+      "required": [
+        "directory"
+      ]
+    },
     "ExperimentConfig": {
       "description": "Experiment metadata",
       "type": "object",
@@ -70,44 +155,16 @@
       "type": "object",
       "properties": {
         "library": {
-          "description": "Chart library: chartjs or plotly",
+          "description": "Chart library; only \"chartjs\" is currently supported.",
           "type": "string",
           "default": "chartjs"
         },
         "theme": {
-          "description": "Theme: light or dark",
+          "description": "Theme; only \"light\" is currently supported.",
           "type": "string",
           "default": "light"
         }
       }
-    },
-    "StatsConfig": {
-      "description": "Statistics collection configuration",
-      "type": "object",
-      "properties": {
-        "bucket_duration": {
-          "description": "Time bucket duration for per-connection records",
-          "type": "string"
-        },
-        "include_records": {
-          "description": "Include per-second per-connection records in JSON output",
-          "type": "boolean",
-          "default": false
-        },
-        "sampling_policy": {
-          "description": "Global latency sampling policy for the aggregated collector (optional)",
-          "$ref": "#/$defs/SamplingPolicy",
-          "default": null
-        },
-        "streaming": {
-          "description": "Streaming configuration for writing stats to Parquet files",
-          "$ref": "#/$defs/StreamingStatsConfig",
-          "default": null
-        }
-      },
-      "required": [
-        "bucket_duration"
-      ]
     },
     "OutputConfig": {
       "description": "Output configuration",
@@ -118,7 +175,7 @@
           "type": "string"
         },
         "format": {
-          "description": "Output format: json, html, both, or detailed-json",
+          "description": "Output format: json, html, both, or human",
           "$ref": "#/$defs/OutputFormat",
           "default": "json"
         },
@@ -131,7 +188,7 @@
           }
         },
         "real_time": {
-          "description": "Print real-time updates",
+          "description": "Reserved for real-time updates; must be false (not supported by the CLI).",
           "type": "boolean",
           "default": false
         }
@@ -144,14 +201,9 @@
       "description": "Output format options",
       "oneOf": [
         {
-          "description": "Simple JSON format (backward compatible)",
+          "description": "JSON format with per-group breakdown.\nUse `[stats] include_records = true` to include per-second per-connection records.",
           "type": "string",
           "const": "json"
-        },
-        {
-          "description": "Detailed JSON with per-group breakdown",
-          "type": "string",
-          "const": "detailed-json"
         },
         {
           "description": "HTML report with visualizations",
@@ -159,7 +211,7 @@
           "const": "html"
         },
         {
-          "description": "Both detailed JSON and HTML",
+          "description": "Both JSON and HTML",
           "type": "string",
           "const": "both"
         },
@@ -397,6 +449,46 @@
         }
       ]
     },
+    "RotationPolicy": {
+      "description": "Rotation policy for request dump files",
+      "oneOf": [
+        {
+          "description": "Never rotate - single file",
+          "type": "string",
+          "const": "never"
+        },
+        {
+          "description": "Rotate every minute",
+          "type": "string",
+          "const": "minutely"
+        },
+        {
+          "description": "Rotate every hour",
+          "type": "string",
+          "const": "hourly"
+        },
+        {
+          "description": "Rotate every day",
+          "type": "string",
+          "const": "daily"
+        },
+        {
+          "description": "Rotate when file exceeds size (in bytes)",
+          "type": "object",
+          "properties": {
+            "size": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "size"
+          ]
+        }
+      ]
+    },
     "SamplingPolicy": {
       "description": "Sampling policy configuration for latency measurement",
       "oneOf": [
@@ -573,6 +665,66 @@
         }
       ]
     },
+    "StatsConfig": {
+      "description": "Statistics collection configuration",
+      "type": "object",
+      "properties": {
+        "bucket_duration": {
+          "description": "Time bucket duration for per-second per-connection records",
+          "type": "string",
+          "default": "1s"
+        },
+        "include_records": {
+          "description": "Include per-second per-connection records in JSON output",
+          "type": "boolean",
+          "default": false
+        },
+        "sampling_policy": {
+          "description": "Global latency sampling policy for the aggregated collector.\nIf unset, the first traffic group's policy is used (current behavior).\nSet to \"none\" to disable global latency recording.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SamplingPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "streaming": {
+          "description": "Reserved Parquet streaming configuration; not supported by the CLI.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StreamingStatsConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      }
+    },
+    "StreamingStatsConfig": {
+      "description": "Reserved streaming stats configuration. The CLI rejects profiles that set this.",
+      "type": "object",
+      "properties": {
+        "path": {
+          "description": "Output path prefix for Parquet files",
+          "type": "string"
+        },
+        "retention_buckets": {
+          "description": "Number of time buckets to retain in memory before flushing",
+          "type": "integer",
+          "format": "uint",
+          "default": 60,
+          "minimum": 0
+        }
+      },
+      "required": [
+        "path"
+      ]
+    },
     "TrafficGroupConfig": {
       "description": "Traffic group configuration",
       "type": "object",
@@ -599,7 +751,7 @@
           "type": "string"
         },
         "protocol_config": {
-          "description": "Protocol-specific configuration as a JSON value.\nEach protocol factory interprets this according to its own schema.\nFor Redis/Memcached: contains keys configuration (strategy, max, value_size, etc.)\nFor HTTP: contains path, host, method configuration\nFor redis-cluster: contains keys, operations, and redis_cluster node configuration\nFor custom protocols: defined by the protocol factory",
+          "description": "Protocol-specific configuration as a JSON value.\nEach protocol factory interprets this according to its own schema.\nThe core is protocol-agnostic - this value is passed directly to the protocol factory.",
           "default": null
         },
         "sampling_policy": {
