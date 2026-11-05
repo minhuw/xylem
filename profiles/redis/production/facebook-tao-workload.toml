@@ -81,7 +81,7 @@ max_samples = 100000
 [output]
 format = "json"
 file = "/tmp/facebook-tao-workload.json"
-real_time = true
+real_time = false
 
 # ============================================================================
 # NOTES ON TAO CHARACTERISTICS

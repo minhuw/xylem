@@ -7,6 +7,7 @@
 //! poll syscall checks all connections in the pool.
 
 use crate::scheduler::{Policy, ReadyHeap};
+use crate::threading::worker::{ParseResult, RetryRequest};
 use crate::Result;
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
@@ -52,15 +53,34 @@ pub type UnixTrafficGroupConfig =
 /// Entries older than this are cleaned up to prevent memory leaks from lost packets
 const TX_QUEUE_STALE_TIMEOUT_NS: u64 = 60_000_000_000;
 
-/// Pending request tracking
+/// Measurement context belongs to the logical request, including time spent
+/// queued for retries. Once transferred, later attempts must not replace it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RequestTiming {
+    pub(crate) send_ts: Timestamp,
+    pub(crate) is_warmup: bool,
+    pub(crate) origin_connection_id: usize,
+}
+
+#[derive(Debug)]
+pub(crate) enum ReceivedResponse<ReqId> {
+    Complete {
+        request_id: ReqId,
+        latency: Duration,
+        timing: RequestTiming,
+        bytes_consumed: usize,
+    },
+    Retry {
+        request: RetryRequest<ReqId>,
+        timing: RequestTiming,
+    },
+}
+
+/// Pending attempt tracking. Only the original attempt correlates TX timestamps.
 #[derive(Debug)]
 struct PendingRequest {
-    /// Software timestamp when request was sent
-    send_ts: Timestamp,
-    /// Hardware TX timestamp (filled in later when received from error queue)
+    timing: RequestTiming,
     tx_hw_ts: Option<Timestamp>,
-    /// Whether this is a warmup request (stats should not be collected)
-    is_warmup: bool,
 }
 
 /// Per-connection application state (no transport - I/O goes through ConnectionGroup)
@@ -221,8 +241,17 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         let now_ns = crate::timing::time_ns();
         // Push to queue for TX timestamp correlation (tx_end increases monotonically)
         self.tx_pending_queue.push_back((tx_end, req_id.clone(), now_ns));
-        self.pending_map
-            .insert(req_id, PendingRequest { send_ts, tx_hw_ts: None, is_warmup });
+        self.pending_map.insert(
+            req_id,
+            PendingRequest {
+                timing: RequestTiming {
+                    send_ts,
+                    is_warmup,
+                    origin_connection_id: self.connection_id,
+                },
+                tx_hw_ts: None,
+            },
+        );
     }
 
     /// Clean up queue entry for a completed request that didn't receive its TX timestamp
@@ -311,9 +340,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         updated_count
     }
 
-    /// Process received data and extract latencies
-    ///
-    /// Returns a vector of (request_id, latency, is_warmup, bytes_consumed) tuples for each completed response.
+    #[cfg(test)]
     fn process_recv<F>(
         &mut self,
         data: &[u8],
@@ -323,6 +350,20 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
     where
         F: FnMut(&[u8]) -> Result<(usize, Option<ReqId>)>,
     {
+        self.process_recv_extended(data, recv_ts, |data| legacy_parse_result(process_fn(data)?))
+            .map(completion_tuples)
+    }
+
+    /// Process received data and transfer pending timing into each response outcome.
+    fn process_recv_extended<F>(
+        &mut self,
+        data: &[u8],
+        recv_ts: Timestamp,
+        mut process_fn: F,
+    ) -> Result<Vec<ReceivedResponse<ReqId>>>
+    where
+        F: FnMut(&[u8]) -> Result<ParseResult<ReqId>>,
+    {
         if data.is_empty() {
             return Ok(Vec::new());
         }
@@ -330,11 +371,20 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         // A read can finish a near-limit frame and contain subsequent frames.
         // Limit individual frames, not the sum of buffered and newly read bytes.
         self.recv_buffer.extend_from_slice(data);
-        let mut latencies = Vec::new();
+        let mut responses = Vec::new();
         let mut cursor = 0;
         while cursor < self.recv_buffer.len() {
             let available = self.recv_buffer.len() - cursor;
-            let (consumed, req_id_opt) = process_fn(&self.recv_buffer[cursor..])?;
+            let parsed = process_fn(&self.recv_buffer[cursor..])?;
+            let (consumed, req_id) = match &parsed {
+                ParseResult::Incomplete => (0, None),
+                ParseResult::Complete { bytes_consumed, request_id } => {
+                    (*bytes_consumed, Some(request_id.clone()))
+                }
+                ParseResult::Retry(request) => {
+                    (request.bytes_consumed, Some(request.original_request_id.clone()))
+                }
+            };
             if consumed > available {
                 return Err(crate::Error::Protocol(
                     "Response parser consumed more bytes than available".to_string(),
@@ -348,7 +398,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
             if consumed == 0 {
                 break;
             }
-            let req_id = req_id_opt.ok_or_else(|| {
+            let req_id = req_id.ok_or_else(|| {
                 crate::Error::Protocol("Protocol returned None for request ID".to_string())
             })?;
             let pending = self.pending_map.remove(&req_id).ok_or_else(|| {
@@ -359,21 +409,60 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
             if pending.tx_hw_ts.is_none() {
                 self.cleanup_tx_queue_entry(&req_id);
             }
-            let send_ts = pending.tx_hw_ts.unwrap_or(pending.send_ts);
-            let latency = recv_ts.duration_since(&send_ts);
-            // Match statistics: handshake/warmup latency must not tune the workload.
-            if !pending.is_warmup {
-                self.policy.on_response(latency);
-            }
-            latencies.push((req_id, latency, pending.is_warmup, consumed));
+            let timing = RequestTiming {
+                send_ts: pending.tx_hw_ts.unwrap_or(pending.timing.send_ts),
+                ..pending.timing
+            };
+            responses.push(match parsed {
+                ParseResult::Complete { .. } => ReceivedResponse::Complete {
+                    request_id: req_id,
+                    latency: recv_ts.duration_since(&timing.send_ts),
+                    timing,
+                    bytes_consumed: consumed,
+                },
+                ParseResult::Retry(mut request) => {
+                    request.is_warmup = timing.is_warmup;
+                    ReceivedResponse::Retry { request, timing }
+                }
+                ParseResult::Incomplete => unreachable!(),
+            });
             cursor += consumed;
         }
         // Compact the remaining partial frame once, regardless of response count.
         self.recv_buffer.copy_within(cursor.., 0);
         self.recv_buffer.truncate(self.recv_buffer.len() - cursor);
 
-        Ok(latencies)
+        Ok(responses)
     }
+}
+
+// The public tuple parser cannot express redirects; preserve its completion-only API.
+fn legacy_parse_result<ReqId>(
+    (bytes_consumed, request_id): (usize, Option<ReqId>),
+) -> Result<ParseResult<ReqId>> {
+    if bytes_consumed == 0 {
+        return Ok(ParseResult::Incomplete);
+    }
+    let request_id = request_id
+        .ok_or_else(|| crate::Error::Protocol("Protocol returned None for request ID".into()))?;
+    Ok(ParseResult::Complete { bytes_consumed, request_id })
+}
+
+fn completion_tuples<ReqId>(
+    responses: Vec<ReceivedResponse<ReqId>>,
+) -> Vec<(ReqId, Duration, bool, usize)> {
+    responses
+        .into_iter()
+        .map(|response| match response {
+            ReceivedResponse::Complete {
+                request_id,
+                latency,
+                timing,
+                bytes_consumed,
+            } => (request_id, latency, timing.is_warmup, bytes_consumed),
+            ReceivedResponse::Retry { .. } => unreachable!("legacy parser cannot produce retries"),
+        })
+        .collect()
 }
 
 /// Connection pool managing multiple connections with per-connection policies
@@ -538,6 +627,27 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         req_id: ReqId,
         is_warmup: bool,
     ) -> Result<()> {
+        self.send_attempt(connection_id, data, req_id, is_warmup, None)
+    }
+
+    pub(crate) fn send_retry(
+        &mut self,
+        connection_id: usize,
+        data: &[u8],
+        req_id: ReqId,
+        timing: RequestTiming,
+    ) -> Result<()> {
+        self.send_attempt(connection_id, data, req_id, timing.is_warmup, Some(timing))
+    }
+
+    fn send_attempt(
+        &mut self,
+        connection_id: usize,
+        data: &[u8],
+        req_id: ReqId,
+        is_warmup: bool,
+        original_timing: Option<RequestTiming>,
+    ) -> Result<()> {
         let state = self
             .connection_states
             .get_mut(&connection_id)
@@ -557,7 +667,13 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         let (send_ts, tx_start, tx_end) = connection.send(data)?;
 
         let state = self.connection_states.get_mut(&connection_id).unwrap();
-        state.record_send(req_id.clone(), send_ts, tx_start, tx_end, is_warmup);
+        if let Some(timing) = original_timing {
+            // No TX correlation entry: a later attempt's NIC timestamp must not
+            // overwrite the logical request's original measurement start.
+            state.pending_map.insert(req_id, PendingRequest { timing, tx_hw_ts: None });
+        } else {
+            state.record_send(req_id, send_ts, tx_start, tx_end, is_warmup);
+        }
 
         Ok(())
     }
@@ -590,10 +706,22 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
     pub fn recv_responses<F>(
         &mut self,
         connection_id: usize,
-        process_fn: F,
+        mut process_fn: F,
     ) -> Result<Vec<(ReqId, Duration, bool, usize)>>
     where
         F: FnMut(&[u8]) -> Result<(usize, Option<ReqId>)>,
+    {
+        self.recv_responses_extended(connection_id, |data| legacy_parse_result(process_fn(data)?))
+            .map(completion_tuples)
+    }
+
+    pub(crate) fn recv_responses_extended<F>(
+        &mut self,
+        connection_id: usize,
+        process_fn: F,
+    ) -> Result<Vec<ReceivedResponse<ReqId>>>
+    where
+        F: FnMut(&[u8]) -> Result<ParseResult<ReqId>>,
     {
         let connection = self
             .group
@@ -607,7 +735,19 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
             .get_mut(&connection_id)
             .ok_or_else(|| crate::Error::Connection("Connection state not found".to_string()))?;
 
-        state.process_recv(&data, recv_ts, process_fn)
+        let responses = state.process_recv_extended(&data, recv_ts, process_fn)?;
+        for response in &responses {
+            let ReceivedResponse::Complete { latency, timing, .. } = response else {
+                continue;
+            };
+            if timing.is_warmup {
+                continue;
+            }
+            if let Some(origin) = self.connection_states.get_mut(&timing.origin_connection_id) {
+                origin.policy.on_response(*latency);
+            }
+        }
+        Ok(responses)
     }
 
     /// Poll for and process TX timestamps from the transport layer
@@ -705,6 +845,20 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
     where
         P: crate::threading::worker::Protocol,
     {
+        self.try_schedule_connection_after(connection_id, protocol, 0)
+    }
+
+    /// Schedule a connection no earlier than the supplied wakeup, allowing workers
+    /// to briefly defer traffic blocked on retry capacity without spinning.
+    pub(crate) fn try_schedule_connection_after<P>(
+        &mut self,
+        connection_id: usize,
+        protocol: &P,
+        earliest_ns: u64,
+    ) -> bool
+    where
+        P: crate::threading::worker::Protocol,
+    {
         let current_time_ns = crate::timing::time_ns();
 
         if let Some(state) = self.connection_states.get_mut(&connection_id) {
@@ -727,6 +881,11 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
             // - Closed-loop (None): ready immediately
             // - Rate-limited (Some(future)): will be popped when time arrives
             let next_send_time = state.next_send_time(current_time_ns);
+            let next_send_time = if earliest_ns > current_time_ns {
+                Some(next_send_time.unwrap_or(earliest_ns).max(earliest_ns))
+            } else {
+                next_send_time
+            };
             state.set_on_heap(true);
             self.ready_heap.push(connection_id, next_send_time);
             return true;
@@ -990,6 +1149,55 @@ mod tests {
     }
 
     #[test]
+    fn retry_preserves_software_start_without_tx_timestamp() {
+        let mut state = state();
+        let start = Timestamp::now();
+        state.record_send(1, start, 0, 1, true);
+        let responses = state
+            .process_recv_extended(&[0], Timestamp::now(), |_| {
+                Ok(ParseResult::Retry(RetryRequest {
+                    bytes_consumed: 1,
+                    original_request_id: 1,
+                    is_warmup: false,
+                    target_conn_id: Some(0),
+                    prepare_commands: vec![],
+                    attempt: 0,
+                }))
+            })
+            .unwrap();
+        let ReceivedResponse::Retry { request, timing } = &responses[0] else {
+            panic!("expected retry")
+        };
+        assert_eq!(timing.send_ts.cycles(), start.cycles());
+        assert!(timing.is_warmup);
+        assert!(request.is_warmup);
+        assert_eq!(timing.origin_connection_id, 0);
+        assert_eq!(state.pending_count(), 0);
+        assert!(state.tx_pending_queue.is_empty());
+    }
+
+    #[test]
+    fn public_receive_adapter_keeps_completion_tuple_contract() {
+        let factory = test_support::FakeFactory::default();
+        let mut pool = ConnectionPool::new(
+            &factory,
+            "127.0.0.1:1".parse().unwrap(),
+            1,
+            1,
+            Box::new(crate::scheduler::UniformPolicyScheduler::closed_loop()),
+            0,
+        )
+        .unwrap();
+        pool.send(0, &[0], 7u64, true).unwrap();
+        factory.0.lock().unwrap().responses.push_back(Ok(vec![0]));
+        assert_eq!(
+            pool.recv_responses(0, |_| Ok((1, Some(7)))).unwrap(),
+            vec![(7, Duration::ZERO, true, 1)]
+        );
+        assert_eq!(pool.get_state(0).unwrap().pending_count(), 0);
+    }
+
+    #[test]
     fn stale_tx_cleanup_preserves_expiry_boundary() {
         let mut state = state();
         state.tx_pending_queue.extend([(1, 1, 10), (2, 2, 11), (3, 3, 12)]);
@@ -1096,10 +1304,13 @@ pub(crate) mod test_support {
     pub struct FakeIo {
         pub responses: VecDeque<xylem_transport::Result<Vec<u8>>>,
         pub sent: Vec<Vec<u8>>,
+        pub fail_send: bool,
         pub timeouts: Vec<Option<Duration>>,
         pub tx_polls: usize,
         pub closed: bool,
-        timestamp: Timestamp,
+        pub timestamp: Timestamp,
+        pub response_connection_id: usize,
+        pub tx_timestamps: Vec<xylem_transport::TxTimestampInfo>,
     }
 
     impl Default for FakeIo {
@@ -1107,10 +1318,13 @@ pub(crate) mod test_support {
             Self {
                 responses: VecDeque::new(),
                 sent: Vec::new(),
+                fail_send: false,
                 timeouts: Vec::new(),
                 tx_polls: 0,
                 closed: false,
                 timestamp: Timestamp::now(),
+                response_connection_id: 0,
+                tx_timestamps: Vec::new(),
             }
         }
     }
@@ -1123,6 +1337,9 @@ pub(crate) mod test_support {
     impl GroupConnection for FakeConnection {
         fn send(&mut self, data: &[u8]) -> xylem_transport::Result<(Timestamp, u32, u32)> {
             let mut io = self.0.lock().unwrap();
+            if io.fail_send {
+                return Err(xylem_transport::Error::Io(std::io::Error::other("send failed")));
+            }
             io.sent.push(data.to_vec());
             Ok((io.timestamp, 0, io.sent.len() as u32))
         }
@@ -1166,15 +1383,16 @@ pub(crate) mod test_support {
             Ok(if io.responses.is_empty() {
                 vec![]
             } else {
-                vec![0]
+                vec![io.response_connection_id]
             })
         }
 
         fn poll_tx_timestamps(
             &mut self,
         ) -> xylem_transport::Result<Vec<xylem_transport::TxTimestampInfo>> {
-            self.io.lock().unwrap().tx_polls += 1;
-            Ok(Vec::new())
+            let mut io = self.io.lock().unwrap();
+            io.tx_polls += 1;
+            Ok(std::mem::take(&mut io.tx_timestamps))
         }
 
         fn len(&self) -> usize {

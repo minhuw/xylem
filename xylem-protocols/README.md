@@ -22,6 +22,11 @@ a different per-command prefix or legacy `keys.value_size` is rejected; use
 `value_size` for per-command sizing. Imported-data workloads require a separate
 driver and are rejected by these constructors. Register actual connection IDs
 on cluster protocols after construction using `register_connections`.
+The CLI uses `next_request_on_connection` because its worker chooses the socket;
+MOVED/ASK retries then use the registered target. Routing-aware callers can keep
+using `next_request` or `generate_request_with_key` and send to the target in
+`ClusterRequestId.2.0`. Tuple-ID adapters must retain that target connection as
+well as its sequence; sequences alone are not unique across targets.
 
 HTTP supports Content-Length framing and bodyless 204/304 responses.
 Informational responses are retained until the final response arrives, which
@@ -37,8 +42,11 @@ redirects as errors. Retry regeneration requires an outstanding original request
 ID and retains its exact bytes and warmup metadata. ASKING preparation replies
 are consumed with the retry response so they do not occupy an application
 request ID. The caller must successfully send preparation commands before the
-regenerated request. Retry metadata holds one copy of each outstanding cluster
-request's payload until completion.
+regenerated request. The worker propagates preparation-send failures and defers
+retries when the target pipeline is full, before sending any preparation bytes.
+A fragmented ASKING acknowledgement is buffered with the following response;
+it never completes a pending request on its own. Retry metadata holds one copy
+of each outstanding cluster request's payload until completion.
 
 Memcached ASCII GET responses use the VALUE byte length and CRLF terminator,
 followed by END. Payload newlines and embedded END text do not terminate a

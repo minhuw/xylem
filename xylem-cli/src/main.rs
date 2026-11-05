@@ -80,17 +80,6 @@ impl ParsedProtocolConfig {
             other => anyhow::bail!("Unknown protocol: {}", other),
         }
     }
-
-    /// Get the keys configuration (for protocols that support keys)
-    fn keys_config(&self) -> Option<xylem_protocols::KeysConfig> {
-        match self {
-            Self::Redis(c) => Some(c.keys.clone()),
-            Self::Memcached(c) => Some(c.keys.clone()),
-            Self::Masstree(c) => Some(c.keys.clone()),
-            // HTTP and XylemEcho don't use key-based workloads
-            Self::Http(_) | Self::XylemEcho(_) => None,
-        }
-    }
 }
 
 /// Xylem: Reproducible latency measurement tool
@@ -461,6 +450,14 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
         None
     };
 
+    // All workers must use the same policy so their global collectors can merge.
+    // Validation guarantees there is at least one traffic group.
+    let global_sampling_policy = config
+        .stats
+        .sampling_policy
+        .clone()
+        .unwrap_or_else(|| config.traffic_groups[0].sampling_policy.clone());
+
     // Clone config for use in worker closure
     let config_for_worker = config.clone();
 
@@ -524,92 +521,43 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
             // Create protocol using multi_protocol factory
             let protocol_adapted = match (&parsed_config, protocol_name.as_str()) {
                 (ParsedProtocolConfig::Http(http_config), "http") => {
-                    let method = parse_http_method(&http_config.method)?;
-                    // Use explicit host from config, or fall back to group's target address
-                    let host =
-                        http_config.host.clone().unwrap_or_else(|| group_target_for_host.clone());
-
-                    let p = xylem_cli::multi_protocol::create_http_protocol_full(
-                        method,
-                        &http_config.path,
-                        &host,
-                    );
-                    ProtocolAdapter::new(p)
+                    let mut http_config = http_config.clone();
+                    http_config.host.get_or_insert_with(|| group_target_for_host.clone());
+                    ProtocolAdapter::new(xylem_cli::multi_protocol::MultiProtocol::Http(
+                        xylem_protocols::HttpProtocol::from_config(&http_config)?,
+                    ))
                 }
                 (ParsedProtocolConfig::Redis(redis_config), "redis") => {
-                    let selector =
-                        create_redis_selector(redis_config, config_for_worker.experiment.seed)?;
-                    // Get key generator and value size for embedded workload
-                    let keys_config = parsed_config.keys_config().ok_or_else(|| {
-                        anyhow::anyhow!("Redis protocol requires keys configuration")
-                    })?;
-                    let key_gen = keys_config.to_key_gen(config_for_worker.experiment.seed)?;
-                    let p = xylem_cli::multi_protocol::create_redis_protocol_from_config(
-                        redis_config,
-                        selector,
-                        key_gen,
-                        config_for_worker.experiment.seed,
-                    )?;
-                    ProtocolAdapter::new(p)
+                    ProtocolAdapter::new(xylem_cli::multi_protocol::MultiProtocol::Redis(
+                        xylem_protocols::RedisProtocol::from_config(
+                            redis_config,
+                            config_for_worker.experiment.seed,
+                        )?,
+                    ))
                 }
                 (ParsedProtocolConfig::Redis(redis_config), "redis-cluster") => {
-                    let selector =
-                        create_redis_selector(redis_config, config_for_worker.experiment.seed)?;
-
-                    // Get cluster config from protocol_config.redis_cluster
-                    let cluster_config =
-                        redis_config.redis_cluster.as_ref().ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "redis-cluster protocol requires protocol_config.redis_cluster configuration"
-                            )
-                        })?;
-
-                    // Convert config to multi_protocol format
-                    let cluster_proto_config = xylem_cli::multi_protocol::RedisClusterConfig {
-                        nodes: cluster_config
-                            .nodes
-                            .iter()
-                            .map(|n| xylem_cli::multi_protocol::RedisClusterNode {
-                                address: n.address.clone(),
-                                slot_start: n.slot_start,
-                                slot_end: n.slot_end,
-                            })
-                            .collect(),
-                    };
-
-                    // Get key generator and value size for embedded workload
-                    let keys_config = parsed_config.keys_config().ok_or_else(|| {
-                        anyhow::anyhow!("Redis-cluster protocol requires keys configuration")
-                    })?;
-                    let key_gen = keys_config.to_key_gen(config_for_worker.experiment.seed)?;
-                    let p = xylem_cli::multi_protocol::create_redis_cluster_protocol_from_config(
-                        redis_config,
-                        selector,
-                        cluster_proto_config,
-                        key_gen,
-                        config_for_worker.experiment.seed,
-                    )?;
-                    ProtocolAdapter::new(p)
+                    ProtocolAdapter::new(xylem_cli::multi_protocol::MultiProtocol::redis_cluster(
+                        xylem_protocols::RedisClusterProtocol::from_config(
+                            redis_config,
+                            config_for_worker.experiment.seed,
+                        )?,
+                    ))
                 }
                 (ParsedProtocolConfig::Memcached(mc_config), "memcached-binary") => {
-                    let operation = parse_memcached_op_binary(&mc_config.operation)?;
-                    let key_gen = mc_config.keys.to_key_gen(config_for_worker.experiment.seed)?;
-                    let p = xylem_cli::multi_protocol::create_memcached_binary_protocol_from_config(
-                        mc_config,
-                        operation,
-                        key_gen,
-                    )?;
-                    ProtocolAdapter::new(p)
+                    ProtocolAdapter::new(xylem_cli::multi_protocol::MultiProtocol::MemcachedBinary(
+                        xylem_protocols::memcached::MemcachedBinaryProtocol::from_config(
+                            mc_config,
+                            config_for_worker.experiment.seed,
+                        )?,
+                    ))
                 }
                 (ParsedProtocolConfig::Memcached(mc_config), "memcached-ascii") => {
-                    let operation = parse_memcached_op_ascii(&mc_config.operation)?;
-                    let key_gen = mc_config.keys.to_key_gen(config_for_worker.experiment.seed)?;
-                    let p = xylem_cli::multi_protocol::create_memcached_ascii_protocol_from_config(
-                        mc_config,
-                        operation,
-                        key_gen,
-                    )?;
-                    ProtocolAdapter::new(p)
+                    ProtocolAdapter::new(xylem_cli::multi_protocol::MultiProtocol::MemcachedAscii(
+                        xylem_protocols::memcached::MemcachedAsciiProtocol::from_config(
+                            mc_config,
+                            config_for_worker.experiment.seed,
+                        )?,
+                    ))
                 }
                 (ParsedProtocolConfig::XylemEcho(_echo_config), "xylem-echo") => {
                     // XylemEcho message_size is handled via the value_size in the generator
@@ -633,18 +581,9 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
             protocols.insert(*group_id, protocol_adapted);
         }
 
-    // Initialize tuple stats collector
-    // Global sampling policy: used for global aggregation (can be "none" to skip global latency)
-    // Per-group sampling policies: each group aggregates using its own policy
-        let first_group_id = groups_for_thread.first().map(|(gid, _)| *gid).unwrap_or(0);
-
-        // Determine global sampling policy: prefer explicit global override; else use first group's policy
-        let global_sampling_policy = config_for_worker
-            .stats
-            .sampling_policy
-            .clone()
-            .unwrap_or_else(|| config_for_worker.traffic_groups[first_group_id].sampling_policy.clone());
-
+        // Initialize tuple stats collector
+        // Global sampling policy: used for global aggregation (can be "none" to skip global latency)
+        // Per-group sampling policies: each group aggregates using its own policy
         let mut stats = xylem_core::stats::TupleStatsCollector::new(
             global_sampling_policy.clone(),
             config_for_worker.stats.bucket_duration,
@@ -679,7 +618,8 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
             // Non-cluster protocol: single target
             if group_config.protocol != "redis-cluster" {
                 // Calculate total connections for rate distribution
-                let total_connections = group_config.connections_per_thread * group_config.threads.len();
+                let total_connections =
+                    group_config.connections_per_thread * group_config.threads.len();
                 let policy_scheduler: Box<dyn xylem_core::scheduler::PolicyScheduler> =
                     group_config.traffic_policy.create_scheduler(total_connections)?;
 
@@ -710,15 +650,16 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                 .as_ref()
                 .map(|pc| serde_json::from_value(pc.clone()))
                 .transpose()
-                .map_err(|e| anyhow::anyhow!("Failed to parse redis-cluster protocol_config: {}", e))?
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to parse redis-cluster protocol_config: {}", e)
+                })?
                 .unwrap_or_default();
 
-            let cluster_config =
-                redis_config.redis_cluster.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "redis-cluster protocol requires protocol_config.redis_cluster configuration"
-                    )
-                })?;
+            let cluster_config = redis_config.redis_cluster.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "redis-cluster protocol requires protocol_config.redis_cluster configuration"
+                )
+            })?;
 
             // Distribute connections across cluster nodes round-robin
             let num_nodes = cluster_config.nodes.len();
@@ -740,7 +681,8 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                 }
 
                 // Calculate total connections for rate distribution (across all cluster nodes)
-                let total_connections = group_config.connections_per_thread * group_config.threads.len();
+                let total_connections =
+                    group_config.connections_per_thread * group_config.threads.len();
                 let policy_scheduler: Box<dyn xylem_core::scheduler::PolicyScheduler> =
                     group_config.traffic_policy.create_scheduler(total_connections)?;
 
@@ -850,8 +792,10 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                 for (group_id, group_meta) in groups_for_thread.iter() {
                     let group_config = &config_for_worker.traffic_groups[*group_id];
                     // Calculate total connections for rate distribution
-                    let total_connections = group_config.connections_per_thread * group_config.threads.len();
-                    let policy_scheduler = group_config.traffic_policy.create_scheduler(total_connections)?;
+                    let total_connections =
+                        group_config.connections_per_thread * group_config.threads.len();
+                    let policy_scheduler =
+                        group_config.traffic_policy.create_scheduler(total_connections)?;
                     unix_groups_config.push((
                         *group_id,
                         group_config.target.clone(),
@@ -1002,172 +946,6 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
     }
 
     Ok(())
-}
-
-/// Create a Redis command selector from a typed RedisConfig
-///
-/// When weighted commands have per-command key overrides, commands without explicit
-/// keys will use the group's main key distribution (from `config.keys`).
-fn create_redis_selector(
-    config: &xylem_protocols::RedisConfig,
-    seed: Option<u64>,
-) -> anyhow::Result<Box<dyn xylem_protocols::CommandSelector<xylem_protocols::RedisOp>>> {
-    if let Some(ref ops) = config.operations {
-        match ops {
-            xylem_protocols::RedisOperationsConfig::Fixed { operation } => {
-                let op = parse_redis_op(operation, None)?;
-                Ok(Box::new(xylem_protocols::FixedCommandSelector::new(op)))
-            }
-            xylem_protocols::RedisOperationsConfig::Weighted { commands } => {
-                let mut commands_weights = Vec::new();
-                let mut per_command_keys: Vec<Option<Box<dyn xylem_protocols::KeyGenerator>>> =
-                    Vec::new();
-                let mut has_any_per_command_keys = false;
-
-                for cmd in commands {
-                    let op = parse_redis_op(&cmd.name, cmd.params.as_ref())?;
-                    commands_weights.push((op, cmd.weight));
-
-                    // Check if this command has per-command key distribution
-                    if let Some(ref keys_config) = cmd.keys {
-                        let key_gen = keys_config.to_key_gen(seed)?;
-                        per_command_keys.push(Some(
-                            Box::new(key_gen) as Box<dyn xylem_protocols::KeyGenerator>
-                        ));
-                        has_any_per_command_keys = true;
-                    } else {
-                        per_command_keys.push(None);
-                    }
-                }
-
-                if has_any_per_command_keys {
-                    // Build per-command key generators
-                    // Commands without explicit keys config use the group's main key distribution
-                    let default_keys = &config.keys;
-                    let key_gens: Vec<Box<dyn xylem_protocols::KeyGenerator>> = per_command_keys
-                        .into_iter()
-                        .map(|opt| match opt {
-                            Some(kg) => kg,
-                            None => {
-                                let kg = default_keys.to_key_gen(seed).unwrap();
-                                Box::new(kg) as Box<dyn xylem_protocols::KeyGenerator>
-                            }
-                        })
-                        .collect();
-
-                    Ok(Box::new(xylem_protocols::WeightedCommandSelector::with_per_command_keys(
-                        commands_weights,
-                        key_gens,
-                        seed,
-                    )?))
-                } else {
-                    Ok(Box::new(xylem_protocols::WeightedCommandSelector::with_seed(
-                        commands_weights,
-                        seed,
-                    )?))
-                }
-            }
-        }
-    } else {
-        // Default to GET
-        Ok(Box::new(xylem_protocols::FixedCommandSelector::new(
-            xylem_protocols::RedisOp::Get,
-        )))
-    }
-}
-
-/// Parse HTTP method string to HttpMethod enum
-fn parse_http_method(method: &str) -> anyhow::Result<xylem_protocols::HttpMethod> {
-    match method.to_uppercase().as_str() {
-        "GET" => Ok(xylem_protocols::HttpMethod::Get),
-        "POST" => Ok(xylem_protocols::HttpMethod::Post),
-        "PUT" => Ok(xylem_protocols::HttpMethod::Put),
-        other => anyhow::bail!("Unknown HTTP method: {}. Supported: GET, POST, PUT", other),
-    }
-}
-
-/// Parse Memcached operation string to binary protocol MemcachedOp enum
-fn parse_memcached_op_binary(
-    operation: &str,
-) -> anyhow::Result<xylem_protocols::memcached::MemcachedOp> {
-    match operation.to_uppercase().as_str() {
-        "GET" => Ok(xylem_protocols::memcached::MemcachedOp::Get),
-        "SET" => Ok(xylem_protocols::memcached::MemcachedOp::Set),
-        other => anyhow::bail!("Unknown Memcached operation: {}. Supported: GET, SET", other),
-    }
-}
-
-/// Parse Memcached operation string to ASCII protocol MemcachedOp enum
-fn parse_memcached_op_ascii(
-    operation: &str,
-) -> anyhow::Result<xylem_protocols::memcached::ascii::MemcachedOp> {
-    match operation.to_uppercase().as_str() {
-        "GET" => Ok(xylem_protocols::memcached::ascii::MemcachedOp::Get),
-        "SET" => Ok(xylem_protocols::memcached::ascii::MemcachedOp::Set),
-        other => anyhow::bail!("Unknown Memcached operation: {}. Supported: GET, SET", other),
-    }
-}
-
-/// Parse a Redis operation from string with optional parameters
-fn parse_redis_op(
-    cmd: &str,
-    params: Option<&xylem_protocols::RedisCommandParams>,
-) -> anyhow::Result<xylem_protocols::RedisOp> {
-    match cmd.to_uppercase().as_str() {
-        "GET" => Ok(xylem_protocols::RedisOp::Get),
-        "SET" => Ok(xylem_protocols::RedisOp::Set),
-        "INCR" => Ok(xylem_protocols::RedisOp::Incr),
-        "MGET" => {
-            let count = match params {
-                Some(xylem_protocols::RedisCommandParams::MGet { count }) => *count,
-                _ => 10, // Default to 10 keys if not specified
-            };
-            Ok(xylem_protocols::RedisOp::MGet { count })
-        }
-        "WAIT" => {
-            let (num_replicas, timeout_ms) = match params {
-                Some(xylem_protocols::RedisCommandParams::Wait { num_replicas, timeout_ms }) => {
-                    (*num_replicas, *timeout_ms)
-                }
-                _ => (1, 1000), // Default: 1 replica, 1000ms timeout
-            };
-            Ok(xylem_protocols::RedisOp::Wait { num_replicas, timeout_ms })
-        }
-        "SETEX" => Ok(xylem_protocols::RedisOp::SetEx { ttl_seconds: 3600 }),
-        "SETRANGE" => Ok(xylem_protocols::RedisOp::SetRange { offset: 0 }),
-        "GETRANGE" => Ok(xylem_protocols::RedisOp::GetRange { offset: 0, end: -1 }),
-        "SCAN" => {
-            let (cursor, count, pattern) = match params {
-                Some(xylem_protocols::RedisCommandParams::Scan { cursor, count, pattern }) => {
-                    (*cursor, *count, pattern.clone())
-                }
-                _ => (0, None, None),
-            };
-            Ok(xylem_protocols::RedisOp::Scan { cursor, count, pattern })
-        }
-        "MULTI" => Ok(xylem_protocols::RedisOp::Multi),
-        "EXEC" => Ok(xylem_protocols::RedisOp::Exec),
-        "DISCARD" => Ok(xylem_protocols::RedisOp::Discard),
-        "CUSTOM" => {
-            // Custom command requires a template in params
-            let template_str = match params {
-                Some(xylem_protocols::RedisCommandParams::Custom { template }) => template.clone(),
-                _ => {
-                    anyhow::bail!(
-                        "Custom command requires params.template. Example: \
-                         {{ name = \"custom\", params = {{ template = \"HSET myhash __key__ __data__\" }} }}"
-                    )
-                }
-            };
-            let template = xylem_protocols::CommandTemplate::parse(&template_str)?;
-            Ok(xylem_protocols::RedisOp::Custom(template))
-        }
-        _ => anyhow::bail!(
-            "Unknown Redis command: {}. Supported: GET, SET, INCR, MGET, WAIT, \
-             SETEX, SETRANGE, GETRANGE, SCAN, MULTI, EXEC, DISCARD, CUSTOM",
-            cmd
-        ),
-    }
 }
 
 /// Parse Masstree operation from config

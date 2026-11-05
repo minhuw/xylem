@@ -269,8 +269,10 @@ fn test_http_rate_limited() {
         max_pending_per_conn: 1,
     };
 
+    let scheduler =
+        Box::new(xylem_core::scheduler::UniformPolicyScheduler::fixed_rate(target_rate));
     let mut worker =
-        Worker::with_closed_loop(&TcpTransportFactory::default(), protocol, stats, worker_config)
+        Worker::new(&TcpTransportFactory::default(), protocol, stats, worker_config, scheduler)
             .expect("Failed to create worker");
 
     println!("Starting rate-limited test (target: {target_rate} req/s)...");

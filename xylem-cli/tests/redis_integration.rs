@@ -203,7 +203,7 @@ fn test_global_sampling_none_disables_latency() {
     let protocol = ProtocolAdapter::new(protocol);
 
     // Create stats collector with SamplingPolicy::None
-    let mut stats = GroupStatsCollector::new();
+    let mut stats = GroupStatsCollector::with_global_policy(&SamplingPolicy::None);
     stats.register_group(0, &SamplingPolicy::None);
 
     let worker_config = WorkerConfig {

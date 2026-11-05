@@ -344,7 +344,7 @@ impl RedisClusterProtocol {
                 (addr, vec![super::redirect::generate_asking_command()])
             }
         };
-        let target_conn_id = self.node_to_conn.get(addr).copied();
+        let target_conn_id = Some(self.get_conn_id_for_node(*addr)?);
         self.update_redirect_stats(redirect);
         Ok(crate::RetryRequest {
             bytes_consumed: consumed,
@@ -361,41 +361,7 @@ impl Protocol for RedisClusterProtocol {
     type RequestId = ClusterRequestId;
 
     fn next_request(&mut self, conn_id: usize) -> crate::Request<Self::RequestId> {
-        // Phase 1: Insert phase (warmup) - populate data before measurement
-        if let Some(ref mut insert_state) = self.base_protocol.insert_phase {
-            if let Some(key) = insert_state.next_key() {
-                let value_size = insert_state.value_size;
-                let mut request = self.generate_request_with_key_and_operation(
-                    conn_id,
-                    key,
-                    value_size,
-                    &RedisOp::Set,
-                );
-                self.mark_request_warmup(request.request_id);
-                request.metadata.is_warmup = true;
-                return request;
-            }
-        }
-
-        // Phase 2: Normal measurement phase
-        let value_size = self.base_protocol.value_size();
-
-        let request = if self.base_protocol.command_selector.has_per_command_keys() {
-            let operation = self.base_protocol.command_selector.next_command();
-            let key = self
-                .base_protocol
-                .command_selector
-                .generate_key_for_command(&operation)
-                .expect("Per-command key generation should be available");
-
-            let value_size = self.base_protocol.size_for_operation(&operation, value_size);
-            self.generate_request_with_key_and_operation(conn_id, key, value_size, &operation)
-        } else {
-            let key = self.base_protocol.key_gen_mut().map(|g| g.next_key()).unwrap_or(0);
-            self.generate_request_with_key(conn_id, key, value_size)
-        };
-
-        request
+        self.next_request_impl(conn_id, true)
     }
 
     fn regenerate_request(
@@ -458,11 +424,71 @@ impl Protocol for RedisClusterProtocol {
 }
 
 impl RedisClusterProtocol {
+    /// Generate for a connection chosen by a worker that sends on that exact
+    /// socket. MOVED/ASK responses still resolve to registered retry targets.
+    /// The routing helpers and Protocol::next_request retain slot-based routing.
+    pub fn next_request_on_connection(
+        &mut self,
+        conn_id: usize,
+    ) -> crate::Request<ClusterRequestId> {
+        self.next_request_impl(conn_id, false)
+    }
+
+    fn next_request_impl(
+        &mut self,
+        conn_id: usize,
+        route_by_slot: bool,
+    ) -> crate::Request<ClusterRequestId> {
+        // Phase 1: Insert phase (warmup) - populate data before measurement
+        if let Some(ref mut insert_state) = self.base_protocol.insert_phase {
+            if let Some(key) = insert_state.next_key() {
+                let value_size = insert_state.value_size;
+                let mut request = self.generate_request_with_key_and_operation_impl(
+                    conn_id,
+                    key,
+                    value_size,
+                    &RedisOp::Set,
+                    route_by_slot,
+                );
+                self.mark_request_warmup(request.request_id);
+                request.metadata.is_warmup = true;
+                return request;
+            }
+        }
+
+        // Phase 2: Normal measurement phase
+        let value_size = self.base_protocol.value_size();
+
+        let request = if self.base_protocol.command_selector.has_per_command_keys() {
+            let operation = self.base_protocol.command_selector.next_command();
+            let key = self
+                .base_protocol
+                .command_selector
+                .generate_key_for_command(&operation)
+                .expect("Per-command key generation should be available");
+
+            let value_size = self.base_protocol.size_for_operation(&operation, value_size);
+            self.generate_request_with_key_and_operation_impl(
+                conn_id,
+                key,
+                value_size,
+                &operation,
+                route_by_slot,
+            )
+        } else {
+            let key = self.base_protocol.key_gen_mut().map(|g| g.next_key()).unwrap_or(0);
+            self.generate_request_with_key_impl(conn_id, key, value_size, route_by_slot)
+        };
+
+        request
+    }
+
     fn build_cluster_request<F>(
         &mut self,
         conn_id: usize,
         key: u64,
         value_size: usize,
+        route_by_slot: bool,
         build_request: F,
     ) -> (Vec<u8>, ClusterRequestId)
     where
@@ -474,36 +500,14 @@ impl RedisClusterProtocol {
         // Calculate slot for this key
         let slot = calculate_slot(key_bytes);
 
-        // Determine target node
-        let target_node = match self.get_target_node(key_bytes) {
-            Ok(node) => node,
-            Err(_e) => {
-                // If we can't determine target, use the provided conn_id
-                // This will likely result in a redirect, which is fine
-                match self.conn_to_node.get(&conn_id) {
-                    Some(&node) => node,
-                    None => {
-                        // Last resort: use default node or first available
-                        self.default_node
-                            .or_else(|| self.conn_to_node.values().next().copied())
-                            .unwrap_or_else(|| {
-                                // This should rarely happen - only during initialization
-                                // Use a localhost placeholder that will trigger a redirect
-                                // Better than panicking, allows graceful error handling
-                                "127.0.0.1:6379".parse().expect("Hardcoded address should parse")
-                            })
-                    }
-                }
-            }
-        };
-
-        // Get connection ID for target node
-        let target_conn_id = match self.get_conn_id_for_node(target_node) {
-            Ok(id) => id,
-            Err(_) => {
-                // Fallback to provided conn_id
-                conn_id
-            }
+        // Generic workers send on the socket they selected. Routing-aware
+        // callers may instead use the target encoded in the request ID.
+        let target_conn_id = if route_by_slot {
+            self.get_target_node(key_bytes)
+                .and_then(|node| self.get_conn_id_for_node(node))
+                .unwrap_or(conn_id)
+        } else {
+            conn_id
         };
 
         // Generate request using provided builder
@@ -542,10 +546,21 @@ impl RedisClusterProtocol {
         key: u64,
         value_size: usize,
     ) -> crate::Request<ClusterRequestId> {
+        self.generate_request_with_key_impl(conn_id, key, value_size, true)
+    }
+
+    fn generate_request_with_key_impl(
+        &mut self,
+        conn_id: usize,
+        key: u64,
+        value_size: usize,
+        route_by_slot: bool,
+    ) -> crate::Request<ClusterRequestId> {
         let request = self.build_cluster_request(
             conn_id,
             key,
             value_size,
+            route_by_slot,
             |protocol, target_conn_id, key, value_size| {
                 let req = protocol.generate_request_with_key(target_conn_id, key, value_size);
                 (req.data, req.request_id)
@@ -554,18 +569,19 @@ impl RedisClusterProtocol {
         crate::Request::measurement(request.0, request.1)
     }
 
-    /// Generate a request for a specific operation with known key/value size
-    fn generate_request_with_key_and_operation(
+    fn generate_request_with_key_and_operation_impl(
         &mut self,
         conn_id: usize,
         key: u64,
         value_size: usize,
         operation: &RedisOp,
+        route_by_slot: bool,
     ) -> crate::Request<ClusterRequestId> {
         let request = self.build_cluster_request(
             conn_id,
             key,
             value_size,
+            route_by_slot,
             |protocol, target_conn_id, key, value_size| {
                 let req =
                     protocol.generate_request_for_op(target_conn_id, key, value_size, operation);
@@ -696,6 +712,25 @@ mod tests {
             },
         ];
         ClusterTopology::from_slot_ranges(ranges)
+    }
+
+    #[test]
+    fn retry_to_unregistered_target_releases_metadata() {
+        for response in [b"-MOVED 1 127.0.0.1:7999\r\n".as_slice(), b"-ASK 1 127.0.0.1:7999\r\n"] {
+            let mut protocol = create_test_protocol();
+            protocol.register_connection("127.0.0.1:7000".parse().unwrap(), 0);
+            protocol.next_request(0);
+            let error = protocol.parse_response_extended(0, response).unwrap_err();
+            assert!(error.to_string().contains("127.0.0.1:7999"));
+            assert_eq!(
+                protocol.redirect_stats.moved_count,
+                u64::from(response.starts_with(b"-MOVED"))
+            );
+            assert_eq!(protocol.redirect_stats.ask_count, u64::from(response.starts_with(b"-ASK")));
+            assert!(protocol.request_metadata.is_empty());
+            assert!(protocol.retry_counts.is_empty());
+            assert!(protocol.asking_replies.is_empty());
+        }
     }
 
     #[test]

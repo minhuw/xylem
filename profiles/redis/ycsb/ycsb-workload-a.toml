@@ -62,4 +62,4 @@ max_samples = 100000 # Limit stored samples
 [output]
 format = "json"
 file = "/tmp/ycsb-workload-a.json"
-real_time = true
+real_time = false

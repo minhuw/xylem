@@ -43,8 +43,9 @@ jobs:
 
       - name: Verify generated profile schema
         run: |
-          nix develop --command cargo run --quiet --bin xylem -- schema > /tmp/profile.schema.json
+          nix develop --command bash -c 'cargo run --quiet --bin xylem -- schema > /tmp/profile.schema.json'
           python3 -m json.tool schema/profile.schema.json > /dev/null
+          python3 -m json.tool /tmp/profile.schema.json > /dev/null
           diff -u schema/profile.schema.json /tmp/profile.schema.json
 
       - name: Install redis-cli for integration tests

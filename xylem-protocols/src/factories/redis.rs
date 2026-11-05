@@ -105,6 +105,41 @@ impl RedisProtocol {
     }
 }
 
+impl crate::configs::RedisClusterConfig {
+    /// Build a static topology, rejecting invalid or overlapping inclusive slot ranges.
+    pub fn to_topology(&self) -> Result<crate::redis::cluster::ClusterTopology> {
+        let mut ranges = Vec::<crate::redis::cluster::topology::SlotRange>::new();
+        for node in &self.nodes {
+            anyhow::ensure!(
+                node.slot_start <= node.slot_end && node.slot_end < 16384,
+                "Invalid Redis slot range {}..={} for {}",
+                node.slot_start,
+                node.slot_end,
+                node.address
+            );
+            for previous in &ranges {
+                anyhow::ensure!(
+                    node.slot_end < previous.start || node.slot_start > previous.end,
+                    "Redis slot range {}..={} for {} overlaps {}..={} for {}",
+                    node.slot_start,
+                    node.slot_end,
+                    node.address,
+                    previous.start,
+                    previous.end,
+                    previous.master
+                );
+            }
+            ranges.push(crate::redis::cluster::topology::SlotRange {
+                start: node.slot_start,
+                end: node.slot_end,
+                master: node.address.parse()?,
+                replicas: vec![],
+            });
+        }
+        Ok(crate::redis::cluster::ClusterTopology::from_slot_ranges(ranges))
+    }
+}
+
 impl crate::redis::cluster::RedisClusterProtocol {
     /// Construct a cluster workload and optional static topology. Register actual
     /// connection IDs separately with `register_connections`.
@@ -112,21 +147,7 @@ impl crate::redis::cluster::RedisClusterProtocol {
         let mut protocol =
             Self::from_base_protocol(RedisProtocol::from_workload_config(config, seed)?);
         if let Some(cluster) = &config.redis_cluster {
-            let mut ranges = Vec::new();
-            for node in &cluster.nodes {
-                anyhow::ensure!(
-                    node.slot_start <= node.slot_end && node.slot_end < 16384,
-                    "Invalid Redis slot range"
-                );
-                ranges.push(crate::redis::cluster::topology::SlotRange {
-                    start: node.slot_start,
-                    end: node.slot_end,
-                    master: node.address.parse()?,
-                    replicas: vec![],
-                });
-            }
-            protocol
-                .update_topology(crate::redis::cluster::ClusterTopology::from_slot_ranges(ranges));
+            protocol.update_topology(cluster.to_topology()?);
         }
         Ok(protocol)
     }
@@ -208,6 +229,54 @@ mod tests {
     use super::*;
     use crate::configs::{KeysConfig, RedisCommandWeight};
     use crate::Protocol;
+
+    fn cluster_config(ranges: &[(u16, u16)]) -> RedisConfig {
+        RedisConfig {
+            redis_cluster: Some(crate::configs::RedisClusterConfig {
+                nodes: ranges
+                    .iter()
+                    .enumerate()
+                    .map(|(index, &(slot_start, slot_end))| {
+                        crate::configs::RedisClusterNodeConfig {
+                            address: format!("127.0.0.1:{}", 7000 + index),
+                            slot_start,
+                            slot_end,
+                        }
+                    })
+                    .collect(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cluster_config_rejects_inclusive_overlaps_without_panicking() {
+        for ranges in [vec![(0, 100), (100, 200)], vec![(50, 100), (0, 200)]] {
+            let result = crate::RedisClusterProtocol::from_config(&cluster_config(&ranges), None);
+            let error = result.err().expect("overlapping ranges must return an error").to_string();
+            assert!(error.contains("overlaps"), "{error}");
+            assert!(error.contains("127.0.0.1:7000"), "{error}");
+            assert!(error.contains("127.0.0.1:7001"), "{error}");
+        }
+    }
+
+    #[test]
+    fn cluster_config_accepts_disjoint_ranges_in_any_order() {
+        for ranges in [vec![(0, 100), (101, 16383)], vec![(101, 16383), (0, 100)]] {
+            assert!(
+                crate::RedisClusterProtocol::from_config(&cluster_config(&ranges), None).is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn cluster_config_rejects_invalid_bounds() {
+        for range in [(100, 99), (0, 16384), (16384, 16384)] {
+            let result = crate::RedisClusterProtocol::from_config(&cluster_config(&[range]), None);
+            let error = result.err().expect("invalid range must return an error").to_string();
+            assert!(error.contains("Invalid Redis slot range"), "{error}");
+        }
+    }
 
     #[test]
     fn test_create_default() {

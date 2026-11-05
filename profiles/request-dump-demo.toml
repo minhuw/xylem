@@ -52,7 +52,7 @@ type = "unlimited"               # Sample all for latency
 [output]
 format = "json"
 file = "/tmp/request-dump-demo-results.json"
-real_time = true
+real_time = false
 
 # Request dump configuration
 # All requests will be recorded to CSV files in the specified directory

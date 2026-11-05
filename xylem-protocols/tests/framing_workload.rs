@@ -497,3 +497,28 @@ fn retry_does_not_advance_command_or_payload_generators() {
         );
     }
 }
+
+#[test]
+fn asking_error_is_never_counted_as_a_retry_completion() {
+    let mut protocol = cluster();
+    let original = protocol.next_request(0);
+    let redirect = format!("-ASK {} 127.0.0.1:7001\r\n", original.request_id.1);
+    let ParseResult::Retry(retry) =
+        protocol.parse_response_extended(0, redirect.as_bytes()).unwrap()
+    else {
+        panic!("expected ASK redirect");
+    };
+    protocol.regenerate_request(1, retry.original_request_id);
+    let error = b"-ERR ASKING denied\r\n";
+    for end in 0..error.len() {
+        assert!(matches!(
+            protocol.parse_response_extended(1, &error[..end]).unwrap(),
+            ParseResult::Incomplete
+        ));
+    }
+    assert!(protocol
+        .parse_response_extended(1, &[error.as_slice(), b"+OK\r\n"].concat())
+        .unwrap_err()
+        .to_string()
+        .contains("ASKING failed"));
+}

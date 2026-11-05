@@ -90,7 +90,7 @@
           "default": "hex"
         },
         "max_files": {
-          "description": "Maximum number of rotated files to keep (None = unlimited)",
+          "description": "Maximum number of closed rotated files to keep (None = unlimited).\nActive files (one per worker) are additional and never removed by retention.",
           "type": [
             "integer",
             "null"
