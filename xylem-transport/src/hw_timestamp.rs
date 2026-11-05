@@ -425,108 +425,81 @@ fn configure_nic_timestamping(
 /// Buffer size for control messages (ancillary data)
 pub const CMSG_BUFFER_SIZE: usize = 256;
 
-/// Extract timestamp from recvmsg control messages
-///
-/// Parses the ancillary data from a recvmsg call to find SCM_TIMESTAMPING.
-pub fn extract_rx_timestamp(cmsg_buf: &[u8], cmsg_len: usize) -> Option<Timestamp> {
-    if cmsg_len == 0 {
-        return None;
-    }
-
-    // Parse control messages
-    let mut offset = 0;
-    while offset + mem::size_of::<libc::cmsghdr>() <= cmsg_len {
-        let cmsg_ptr = cmsg_buf.as_ptr().wrapping_add(offset) as *const libc::cmsghdr;
-        let cmsg = unsafe { &*cmsg_ptr };
-
-        if cmsg.cmsg_len == 0 {
-            break;
-        }
-
-        // Check for SCM_TIMESTAMPING
-        if cmsg.cmsg_level == libc::SOL_SOCKET && cmsg.cmsg_type == cmsg::SCM_TIMESTAMPING {
-            // Data starts after cmsghdr
-            let data_offset = offset + mem::size_of::<libc::cmsghdr>();
-            if data_offset + mem::size_of::<ScmTimestamping>() <= cmsg_len {
-                let ts_ptr = cmsg_buf.as_ptr().wrapping_add(data_offset) as *const ScmTimestamping;
-                let scm_ts = unsafe { &*ts_ptr };
-
-                if let Some((tv_sec, tv_nsec)) = scm_ts.best_timestamp() {
-                    return Some(Timestamp::from_hardware(tv_sec, tv_nsec));
-                }
-            }
-        }
-
-        // Move to next cmsg (aligned)
-        let aligned_len =
-            (cmsg.cmsg_len + mem::size_of::<usize>() - 1) & !(mem::size_of::<usize>() - 1);
-        offset += aligned_len;
-    }
-
-    None
+/// Align a control-message length without overflowing.
+fn cmsg_align(len: usize) -> Option<usize> {
+    let mask = mem::size_of::<usize>() - 1;
+    Some(len.checked_add(mask)? & !mask)
 }
 
-/// Extract TX timestamp and opt_id from error queue message
-///
-/// TX timestamps arrive on the socket's error queue (MSG_ERRQUEUE).
-/// Returns (timestamp, opt_id) if found.
-pub fn extract_tx_timestamp(cmsg_buf: &[u8], cmsg_len: usize) -> Option<(Timestamp, u32)> {
-    if cmsg_len == 0 {
-        return None;
-    }
+/// Parse the complete ancillary buffer, rejecting malformed messages even after
+/// a timestamp has been found. Input bytes need not be aligned.
+fn parse_timestamps(
+    cmsg_buf: &[u8],
+    cmsg_len: usize,
+    keep_first_timestamp: bool,
+) -> Option<(Option<Timestamp>, Option<u32>)> {
+    let buf = cmsg_buf.get(..cmsg_len)?;
+    let header_len = mem::size_of::<libc::cmsghdr>();
+    let data_start = cmsg_align(header_len)?;
+    let mut offset: usize = 0;
+    let mut timestamp = None;
+    let mut opt_id = None;
 
-    let mut timestamp: Option<Timestamp> = None;
-    let mut opt_id: Option<u32> = None;
-
-    // Parse control messages
-    let mut offset = 0;
-    while offset + mem::size_of::<libc::cmsghdr>() <= cmsg_len {
-        let cmsg_ptr = cmsg_buf.as_ptr().wrapping_add(offset) as *const libc::cmsghdr;
-        let cmsg = unsafe { &*cmsg_ptr };
-
-        if cmsg.cmsg_len == 0 {
-            break;
+    while offset < buf.len() {
+        let header = buf.get(offset..offset.checked_add(header_len)?)?;
+        // SAFETY: the full header is in bounds; cmsghdr contains only integers.
+        // read_unaligned does not require alignment of the caller's byte slice.
+        let cmsg = unsafe { header.as_ptr().cast::<libc::cmsghdr>().read_unaligned() };
+        if cmsg.cmsg_len < data_start {
+            return None;
         }
-
-        let data_offset = offset + mem::size_of::<libc::cmsghdr>();
+        let end = offset.checked_add(cmsg.cmsg_len)?;
+        let payload = buf.get(offset.checked_add(data_start)?..end)?;
 
         if cmsg.cmsg_level == libc::SOL_SOCKET && cmsg.cmsg_type == cmsg::SCM_TIMESTAMPING {
-            if data_offset + mem::size_of::<ScmTimestamping>() <= cmsg_len {
-                let ts_ptr = cmsg_buf.as_ptr().wrapping_add(data_offset) as *const ScmTimestamping;
-                let scm_ts = unsafe { &*ts_ptr };
-
-                if let Some((tv_sec, tv_nsec)) = scm_ts.best_timestamp() {
-                    timestamp = Some(Timestamp::from_hardware(tv_sec, tv_nsec));
+            let bytes = payload.get(..mem::size_of::<ScmTimestamping>())?;
+            // SAFETY: a complete integer-only timestamp triplet is in this message.
+            let scm_ts = unsafe { bytes.as_ptr().cast::<ScmTimestamping>().read_unaligned() };
+            if let Some((sec, nsec)) = scm_ts.best_timestamp() {
+                if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+                    return None;
+                }
+                (sec as u64).checked_mul(1_000_000_000)?.checked_add(nsec as u64)?;
+                if timestamp.is_none() || !keep_first_timestamp {
+                    timestamp = Some(Timestamp::from_hardware(sec, nsec));
                 }
             }
         } else if (cmsg.cmsg_level == libc::SOL_IP && cmsg.cmsg_type == libc::IP_RECVERR)
             || (cmsg.cmsg_level == libc::SOL_IPV6 && cmsg.cmsg_type == libc::IPV6_RECVERR)
         {
-            // Extract sock_extended_err for opt_id (works for both IPv4 and IPv6)
-            if data_offset + mem::size_of::<libc::sock_extended_err>() <= cmsg_len {
-                let se_ptr =
-                    cmsg_buf.as_ptr().wrapping_add(data_offset) as *const libc::sock_extended_err;
-                let se = unsafe { &*se_ptr };
-
-                if se.ee_errno == libc::ENOMSG as u32
-                    && se.ee_origin == sock_err::SO_EE_ORIGIN_TIMESTAMPING
-                {
-                    opt_id = Some(se.ee_data);
-                }
+            let bytes = payload.get(..mem::size_of::<libc::sock_extended_err>())?;
+            // SAFETY: the complete integer-only error structure is in this message.
+            let err = unsafe { bytes.as_ptr().cast::<libc::sock_extended_err>().read_unaligned() };
+            if err.ee_errno == libc::ENOMSG as u32
+                && err.ee_origin == sock_err::SO_EE_ORIGIN_TIMESTAMPING
+            {
+                opt_id = Some(err.ee_data);
             }
         }
 
-        // Move to next cmsg (aligned)
-        let aligned_len =
-            (cmsg.cmsg_len + mem::size_of::<usize>() - 1) & !(mem::size_of::<usize>() - 1);
-        offset += aligned_len;
+        // The final message may omit some or all of its trailing alignment padding.
+        offset = offset.checked_add(cmsg_align(cmsg.cmsg_len)?)?.min(buf.len());
     }
+    Some((timestamp, opt_id))
+}
 
-    match (timestamp, opt_id) {
-        (Some(ts), Some(id)) => Some((ts, id)),
-        (Some(ts), None) => Some((ts, 0)), // UDP case: no opt_id needed
-        _ => None,
-    }
+/// Extract a timestamp from recvmsg control messages.
+/// Returns None for missing timestamps or malformed ancillary data.
+pub fn extract_rx_timestamp(cmsg_buf: &[u8], cmsg_len: usize) -> Option<Timestamp> {
+    parse_timestamps(cmsg_buf, cmsg_len, true)?.0
+}
+
+/// Extract a TX timestamp and opt_id from an error queue message.
+/// Returns None for missing timestamps or malformed ancillary data.
+/// When no opt_id is supplied (e.g. UDP), the ID defaults to zero.
+pub fn extract_tx_timestamp(cmsg_buf: &[u8], cmsg_len: usize) -> Option<(Timestamp, u32)> {
+    let (timestamp, opt_id) = parse_timestamps(cmsg_buf, cmsg_len, false)?;
+    Some((timestamp?, opt_id.unwrap_or(0)))
 }
 
 /// Receive data with timestamps via recvmsg
@@ -593,6 +566,152 @@ pub fn recv_tx_timestamp(fd: RawFd) -> io::Result<Option<(Timestamp, u32)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn put(buf: &mut [u8], offset: usize, bytes: &[u8]) {
+        buf[offset..offset + bytes.len()].copy_from_slice(bytes);
+    }
+
+    fn message(level: i32, kind: i32, payload: &[u8]) -> Vec<u8> {
+        let header_len = cmsg_align(mem::size_of::<libc::cmsghdr>()).unwrap();
+        let len = header_len + payload.len();
+        let mut buf = vec![0; cmsg_align(len).unwrap()];
+        put(&mut buf, mem::offset_of!(libc::cmsghdr, cmsg_len), &len.to_ne_bytes());
+        put(&mut buf, mem::offset_of!(libc::cmsghdr, cmsg_level), &level.to_ne_bytes());
+        put(&mut buf, mem::offset_of!(libc::cmsghdr, cmsg_type), &kind.to_ne_bytes());
+        put(&mut buf, header_len, payload);
+        buf
+    }
+
+    fn timestamp_message() -> Vec<u8> {
+        let mut payload = vec![0; mem::size_of::<ScmTimestamping>()];
+        put(&mut payload, mem::offset_of!(libc::timespec, tv_sec), &1234i64.to_ne_bytes());
+        put(&mut payload, mem::offset_of!(libc::timespec, tv_nsec), &567i64.to_ne_bytes());
+        message(libc::SOL_SOCKET, cmsg::SCM_TIMESTAMPING, &payload)
+    }
+
+    fn assert_rejected(buf: &[u8], len: usize) {
+        assert!(extract_rx_timestamp(buf, len).is_none());
+        assert!(extract_tx_timestamp(buf, len).is_none());
+    }
+
+    #[test]
+    fn ancillary_rejects_invalid_lengths() {
+        assert_rejected(&[], 0);
+        assert_rejected(&[], 1);
+        assert_rejected(&[0; 3], 3);
+        let valid = timestamp_message();
+        assert_rejected(&valid, valid.len() + 1);
+        assert_rejected(&valid, usize::MAX);
+        for len in [0, 1, mem::size_of::<libc::cmsghdr>() - 1, valid.len() + 1, usize::MAX] {
+            let mut buf = valid.clone();
+            put(&mut buf, mem::offset_of!(libc::cmsghdr, cmsg_len), &len.to_ne_bytes());
+            assert_rejected(&buf, buf.len());
+        }
+        assert_eq!(cmsg_align(usize::MAX), None);
+    }
+
+    #[test]
+    fn ancillary_valid_unaligned_ipv4_and_ipv6() {
+        for (level, kind) in
+            [(libc::SOL_IP, libc::IP_RECVERR), (libc::SOL_IPV6, libc::IPV6_RECVERR)]
+        {
+            let mut error = vec![0; mem::size_of::<libc::sock_extended_err>()];
+            put(
+                &mut error,
+                mem::offset_of!(libc::sock_extended_err, ee_errno),
+                &(libc::ENOMSG as u32).to_ne_bytes(),
+            );
+            error[mem::offset_of!(libc::sock_extended_err, ee_origin)] =
+                sock_err::SO_EE_ORIGIN_TIMESTAMPING;
+            put(
+                &mut error,
+                mem::offset_of!(libc::sock_extended_err, ee_data),
+                &42u32.to_ne_bytes(),
+            );
+            // Exercise every possible alignment of the caller's slice.
+            for prefix in 0..mem::align_of::<libc::cmsghdr>() {
+                let mut buf = vec![0; prefix];
+                buf.extend(timestamp_message());
+                buf.extend(message(level, kind, &error));
+                let buf = &buf[prefix..];
+                assert_eq!(
+                    extract_rx_timestamp(buf, buf.len()).unwrap().hw_nanos(),
+                    Some(1_234_000_000_567)
+                );
+                let (ts, id) = extract_tx_timestamp(buf, buf.len()).unwrap();
+                assert_eq!(ts.hw_nanos(), Some(1_234_000_000_567));
+                assert_eq!(id, 42);
+            }
+        }
+        let buf = timestamp_message();
+        assert_eq!(extract_tx_timestamp(&buf, buf.len()).unwrap().1, 0);
+    }
+
+    #[test]
+    fn ancillary_rejects_truncation_even_after_valid_timestamp() {
+        let valid = timestamp_message();
+        for len in 1..valid.len() {
+            assert_rejected(&valid[..len], len);
+        }
+        let mut buf = valid;
+        buf.extend([0; 3]); // Truncated next header
+        assert_rejected(&buf, buf.len());
+    }
+
+    #[test]
+    fn ancillary_payload_must_fit_current_message() {
+        for (level, kind, size) in [
+            (libc::SOL_SOCKET, cmsg::SCM_TIMESTAMPING, mem::size_of::<ScmTimestamping>()),
+            (libc::SOL_IP, libc::IP_RECVERR, mem::size_of::<libc::sock_extended_err>()),
+            (libc::SOL_IPV6, libc::IPV6_RECVERR, mem::size_of::<libc::sock_extended_err>()),
+        ] {
+            let mut buf = timestamp_message();
+            buf.extend(message(level, kind, &vec![0; size - 1]));
+            // There are enough bytes in the overall buffer, but not in this cmsg.
+            buf.extend(timestamp_message());
+            assert_rejected(&buf, buf.len());
+        }
+    }
+
+    #[test]
+    fn ancillary_preserves_rx_first_and_tx_last_timestamp_selection() {
+        let mut buf = timestamp_message();
+        let mut second = timestamp_message();
+        let offset = cmsg_align(mem::size_of::<libc::cmsghdr>()).unwrap()
+            + mem::offset_of!(libc::timespec, tv_sec);
+        put(&mut second, offset, &2345i64.to_ne_bytes());
+        buf.extend(second);
+        assert_eq!(
+            extract_rx_timestamp(&buf, buf.len()).unwrap().hw_nanos(),
+            Some(1_234_000_000_567)
+        );
+        assert_eq!(
+            extract_tx_timestamp(&buf, buf.len()).unwrap().0.hw_nanos(),
+            Some(2_345_000_000_567)
+        );
+    }
+
+    #[test]
+    fn ancillary_rejects_invalid_or_overflowing_timestamp_values() {
+        for (sec, nsec) in [(-1i64, 0i64), (1, -1), (1, 1_000_000_000), (i64::MAX, 0)] {
+            let mut buf = timestamp_message();
+            let data = cmsg_align(mem::size_of::<libc::cmsghdr>()).unwrap();
+            put(&mut buf, data + mem::offset_of!(libc::timespec, tv_sec), &sec.to_ne_bytes());
+            put(&mut buf, data + mem::offset_of!(libc::timespec, tv_nsec), &nsec.to_ne_bytes());
+            assert_rejected(&buf, buf.len());
+        }
+    }
+
+    #[test]
+    fn ancillary_accepts_unknown_message_and_final_padding() {
+        let mut buf = message(123, 456, &[1]);
+        buf.extend(timestamp_message());
+        assert!(extract_rx_timestamp(&buf, buf.len()).is_some());
+        buf.extend(message(123, 456, &[1]));
+        // Omit final alignment padding, as recvmsg is permitted to do.
+        buf.truncate(buf.len() - (mem::size_of::<usize>() - 1));
+        assert!(extract_rx_timestamp(&buf, buf.len()).is_some());
+    }
 
     #[test]
     fn test_pending_tx_timestamps() {

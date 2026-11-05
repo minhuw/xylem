@@ -9,9 +9,9 @@
 //!
 //! Supports both TCP and Unix domain sockets.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
@@ -141,19 +141,24 @@ fn main() -> Result<()> {
     runtime.block_on(run_server(args))
 }
 
+/// Binding itself atomically refuses any existing filesystem entry, including
+/// dangling symlinks and stale sockets. Never unlink a path supplied by a caller.
+fn bind_unix_listener(path: &Path) -> Result<UnixListener> {
+    UnixListener::bind(path).with_context(|| {
+        format!(
+            "Failed to bind Unix socket at {}. If the path exists, stop its owner and remove it manually only after confirming it is a stale socket, or choose another --unix path",
+            path.display()
+        )
+    })
+}
+
 async fn run_server(args: Args) -> Result<()> {
     let num_threads = args
         .threads
         .unwrap_or_else(|| std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1));
 
     if let Some(ref unix_path) = args.unix {
-        // Unix socket mode
-        // Remove existing socket file if it exists
-        if unix_path.exists() {
-            std::fs::remove_file(unix_path)?;
-        }
-
-        let listener = UnixListener::bind(unix_path)?;
+        let listener = bind_unix_listener(unix_path)?;
 
         println!("Xylem Echo Server listening on {}", unix_path.display());
         println!("Worker threads: {num_threads}");
@@ -198,5 +203,73 @@ async fn run_server(args: Args) -> Result<()> {
                 let _ = handle_tcp_client(socket, max_delay_us, verbose).await;
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::{symlink, MetadataExt};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "xylem-echo-test-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn unix_bind_preserves_existing_paths() {
+        let dir = TestDir::new();
+        let file = dir.0.join("regular");
+        std::fs::write(&file, "keep me").unwrap();
+        let link = dir.0.join("link");
+        symlink(&file, &link).unwrap();
+        let dangling = dir.0.join("dangling");
+        symlink(dir.0.join("missing"), &dangling).unwrap();
+        let live = dir.0.join("live");
+        let listener = bind_unix_listener(&live).unwrap();
+        let stale = dir.0.join("stale");
+        drop(bind_unix_listener(&stale).unwrap());
+
+        for path in [&file, &link, &dangling, &live, &stale] {
+            let before = std::fs::symlink_metadata(path).unwrap();
+            let error = bind_unix_listener(path).unwrap_err();
+            assert!(error.to_string().contains("choose another --unix path"));
+            let after = std::fs::symlink_metadata(path).unwrap();
+            assert_eq!(before.ino(), after.ino());
+            assert_eq!(before.file_type(), after.file_type());
+        }
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "keep me");
+        assert_eq!(std::fs::read_link(&link).unwrap(), file);
+        assert_eq!(std::fs::read_link(&dangling).unwrap(), dir.0.join("missing"));
+        // Refusal must leave the original listener reachable.
+        let client = UnixStream::connect(&live).await.unwrap();
+        let (_accepted, _) = listener.accept().await.unwrap();
+        drop(client);
+    }
+
+    #[tokio::test]
+    async fn unix_bind_accepts_absent_path() {
+        let dir = TestDir::new();
+        let path = dir.0.join("new");
+        let listener = bind_unix_listener(&path).unwrap();
+        let _client = UnixStream::connect(&path).await.unwrap();
+        assert!(listener.accept().await.is_ok());
     }
 }

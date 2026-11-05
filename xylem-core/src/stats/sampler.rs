@@ -14,7 +14,7 @@
 use std::time::Duration;
 
 /// Adaptive sampling configuration
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AdaptiveSamplerConfig {
     /// Initial sampling rate (0.0-1.0)
     pub initial_rate: f64,
@@ -49,7 +49,6 @@ pub struct AdaptiveSampler {
     config: AdaptiveSamplerConfig,
     current_rate: f64,
     samples_since_check: usize,
-    total_samples: usize,
 }
 
 impl AdaptiveSampler {
@@ -60,8 +59,11 @@ impl AdaptiveSampler {
             config,
             current_rate,
             samples_since_check: 0,
-            total_samples: 0,
         }
+    }
+
+    pub(super) fn config(&self) -> &AdaptiveSamplerConfig {
+        &self.config
     }
 
     /// Get current sampling rate
@@ -74,7 +76,6 @@ impl AdaptiveSampler {
     /// Returns the updated sampling rate if it changed, None otherwise
     pub fn record_sample(&mut self, samples: &[Duration]) -> Option<f64> {
         self.samples_since_check += 1;
-        self.total_samples += 1;
 
         // Only check periodically
         if self.samples_since_check < self.config.check_interval {
@@ -119,19 +120,14 @@ impl AdaptiveSampler {
             return f64::MAX; // Not enough samples
         }
 
-        let mut sorted = samples.to_vec();
-        sorted.sort();
+        let (min, max) = samples.iter().fold((samples[0], samples[0]), |(min, max), &sample| {
+            (min.min(sample), max.max(sample))
+        });
+        let n = samples.len();
 
-        let n = sorted.len();
-        let p99_idx = ((n as f64) * 0.99) as usize;
-
-        // Get P99 value (currently unused, but kept for potential future enhancements)
-        let _p99 = sorted[p99_idx.min(n - 1)];
-
-        // Estimate standard error for P99 using binomial approximation
         // SE(p99) ≈ sqrt(p * (1-p) / n) * range
         let p = 0.99;
-        let range_ns = (sorted[n - 1] - sorted[0]).as_nanos() as f64;
+        let range_ns = (max - min).as_nanos() as f64;
         let se = ((p * (1.0 - p)) / (n as f64)).sqrt() * range_ns;
 
         // 95% CI width ≈ 2 * 1.96 * SE
@@ -142,13 +138,41 @@ impl AdaptiveSampler {
     pub fn reset(&mut self) {
         self.current_rate = self.config.initial_rate;
         self.samples_since_check = 0;
-        self.total_samples = 0;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ci_width_uses_range_regardless_of_order() {
+        let sampler = AdaptiveSampler::new(AdaptiveSamplerConfig::default());
+        let mut samples: Vec<_> = (0..30).map(Duration::from_nanos).collect();
+        let expected = 2.0 * 1.96 * ((0.99_f64 * 0.01) / 30.0).sqrt() * 29.0;
+        assert!((sampler.estimate_ci_width(&samples) - expected).abs() < 1e-12);
+        samples.reverse();
+        samples.rotate_left(7);
+        assert!((sampler.estimate_ci_width(&samples) - expected).abs() < 1e-12);
+        assert_eq!(sampler.estimate_ci_width(&samples[..29]), f64::MAX);
+        assert_eq!(sampler.estimate_ci_width(&[Duration::MAX; 30]), 0.0);
+        assert_eq!(sampler.estimate_ci_width(&[]), f64::MAX);
+    }
+
+    #[test]
+    fn ci_adjustment_boundaries_leave_rate_unchanged() {
+        let samples: Vec<_> = (0..30).map(Duration::from_nanos).collect();
+        let width =
+            AdaptiveSampler::new(AdaptiveSamplerConfig::default()).estimate_ci_width(&samples);
+        for target_ci_width_ns in [width, width * 2.0] {
+            let mut sampler = AdaptiveSampler::new(AdaptiveSamplerConfig {
+                check_interval: 1,
+                target_ci_width_ns,
+                ..Default::default()
+            });
+            assert_eq!(sampler.record_sample(&samples), None);
+        }
+    }
 
     #[test]
     fn test_new_sampler() {
@@ -238,14 +262,12 @@ mod tests {
 
         // Simulate some samples
         sampler.samples_since_check = 50;
-        sampler.total_samples = 1000;
         sampler.current_rate = 0.5;
 
         sampler.reset();
 
         assert_eq!(sampler.current_rate, config.initial_rate);
         assert_eq!(sampler.samples_since_check, 0);
-        assert_eq!(sampler.total_samples, 0);
     }
 
     #[test]

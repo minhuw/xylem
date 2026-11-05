@@ -158,7 +158,8 @@ pub struct DumpConfig {
     /// Rotation policy
     #[serde(default)]
     pub rotation: RotationPolicy,
-    /// Maximum number of rotated files to keep (None = unlimited)
+    /// Maximum number of closed rotated files to keep (None = unlimited).
+    /// Active files (one per worker) are additional and never removed by retention.
     #[serde(default)]
     pub max_files: Option<usize>,
     /// Data encoding method
@@ -185,7 +186,6 @@ impl Default for DumpConfig {
 /// Internal state for a single dump file writer
 struct DumpWriter {
     writer: BufWriter<File>,
-    #[allow(dead_code)] // Kept for debugging/logging purposes
     file_path: PathBuf,
     bytes_written: u64,
     rotation_key: String, // For time-based rotation (e.g., "2024-01-15-14" for hourly)
@@ -324,10 +324,8 @@ impl RequestDumper {
         if needs_rotation {
             // Remove old writer to trigger rotation
             if let Some(mut old_writer) = writers.remove(&thread_id) {
-                let _ = old_writer.flush();
+                old_writer.flush()?;
             }
-            // Clean up old files if max_files is set
-            self.cleanup_old_files()?;
         }
 
         // Get or create writer for this thread
@@ -353,6 +351,12 @@ impl RequestDumper {
         )?;
 
         self.total_records.fetch_add(1, Ordering::Relaxed);
+
+        // Rotation is complete: the new writer and all other workers' writers
+        // must be excluded from retention while we hold the writers lock.
+        if needs_rotation {
+            self.cleanup_old_files(&writers)?;
+        }
 
         Ok(())
     }
@@ -438,7 +442,10 @@ impl RequestDumper {
     }
 
     /// Clean up old rotated files
-    fn cleanup_old_files(&self) -> Result<()> {
+    fn cleanup_old_files(
+        &self,
+        writers: &std::collections::HashMap<usize, DumpWriter>,
+    ) -> Result<()> {
         let max_files = match self.config.max_files {
             Some(n) => n,
             None => return Ok(()),
@@ -448,6 +455,7 @@ impl RequestDumper {
         let mut files: Vec<_> = fs::read_dir(&self.config.directory)?
             .filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().starts_with(&pattern))
+            .filter(|e| !writers.values().any(|writer| writer.file_path == e.path()))
             .collect();
 
         if files.len() <= max_files {
@@ -528,6 +536,54 @@ mod tests {
     use super::*;
     use std::thread;
     use tempfile::TempDir;
+
+    #[test]
+    fn retention_preserves_other_workers_active_files() {
+        for max_files in [0, 1, 2] {
+            let temp_dir = TempDir::new().unwrap();
+            let dumper = RequestDumper::new(
+                DumpConfigBuilder::new()
+                    .directory(temp_dir.path())
+                    .rotation(RotationPolicy::Size(500))
+                    .max_files(max_files)
+                    .build(),
+            )
+            .unwrap();
+            // The low-volume worker stays open throughout another worker's rotations.
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            let low = Arc::clone(&dumper);
+            let worker = thread::spawn(move || {
+                low.record(1, 0, 0, b"first", "low-first").unwrap();
+                low.flush().unwrap();
+                ready_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+                low.record(1, 0, 0, b"last", "low-last").unwrap();
+                low.flush().unwrap();
+            });
+            ready_rx.recv().unwrap();
+            let active = dumper.writers.lock().unwrap()[&1].file_path.clone();
+            let high = Arc::clone(&dumper);
+            thread::spawn(move || {
+                for i in 0..20 {
+                    high.record(2, 0, 0, &[b'x'; 600], &format!("high-{i}")).unwrap();
+                }
+                high.flush().unwrap();
+            })
+            .join()
+            .unwrap();
+            assert!(active.exists());
+            assert!(fs::read_to_string(&active).unwrap().contains("low-first"));
+            resume_tx.send(()).unwrap();
+            worker.join().unwrap();
+            let content = fs::read_to_string(&active).unwrap();
+            assert!(content.contains("low-first"));
+            assert!(content.contains("low-last"));
+            // max_files counts closed files, plus the two active worker files.
+            assert_eq!(fs::read_dir(temp_dir.path()).unwrap().count(), max_files + 2);
+            assert_eq!(dumper.total_records(), 22);
+        }
+    }
 
     #[test]
     fn test_basic_dump() {

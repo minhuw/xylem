@@ -101,73 +101,56 @@ impl LatencyStorage {
         }
     }
 
-    /// Merge another storage into this one (consumes other)
+    /// Merge another storage into this one (consumes other).
+    ///
+    /// # Panics
+    /// Panics if storage configurations are incompatible. See [`Self::try_merge_ref`].
     pub fn merge(&mut self, other: Self) {
-        match (self, other) {
-            (LatencyStorage::None, _) => {
-                // Remain none; ignore other
-            }
-            (_, LatencyStorage::None) => {
-                // Nothing to merge
-            }
-            (
-                LatencyStorage::Samples { samples, max_samples, .. },
-                LatencyStorage::Samples { samples: other_samples, .. },
-            ) => {
-                for sample in other_samples {
-                    if samples.len() < *max_samples {
-                        samples.push(sample);
-                    }
-                }
-            }
-            (LatencyStorage::DdSketch(sketch), LatencyStorage::DdSketch(other)) => {
-                let _ = sketch.merge(&other);
-            }
-            (LatencyStorage::TDigest(digest), LatencyStorage::TDigest(other)) => {
-                *digest = TDigest::merge_digests(vec![digest.clone(), other]);
-            }
-            (LatencyStorage::HdrHistogram(hist), LatencyStorage::HdrHistogram(other)) => {
-                let _ = hist.add(&other);
-            }
-            _ => {
-                // Mismatched types - this shouldn't happen in practice
-                tracing::warn!("Attempted to merge incompatible latency storage types");
-            }
-        }
+        self.merge_ref(&other);
     }
 
-    /// Merge from a reference (for aggregation without consuming)
+    /// Merge from a reference, retaining this storage's sample capacity.
+    ///
+    /// # Panics
+    /// Panics if storage configurations are incompatible or a sketch merge fails.
     pub fn merge_ref(&mut self, other: &Self) {
+        self.try_merge_ref(other).expect("Cannot merge incompatible latency storage");
+    }
+
+    /// Merge compatible storage, returning an error instead of dropping samples
+    /// when policies differ. Limited samples are retained in input order up to
+    /// the configured capacity. None can only merge with None.
+    pub fn try_merge_ref(&mut self, other: &Self) -> Result<(), &'static str> {
         match (self, other) {
-            (LatencyStorage::None, _) => {
-                // Remain none
-            }
-            (_, LatencyStorage::None) => {
-                // Nothing to merge
-            }
+            (LatencyStorage::None, LatencyStorage::None) => {}
             (
-                LatencyStorage::Samples { samples, max_samples, .. },
-                LatencyStorage::Samples { samples: other_samples, .. },
-            ) => {
-                for sample in other_samples {
-                    if samples.len() < *max_samples {
-                        samples.push(*sample);
-                    }
-                }
+                LatencyStorage::Samples { samples, max_samples, sampling_rate },
+                LatencyStorage::Samples {
+                    samples: other_samples,
+                    max_samples: other_max,
+                    sampling_rate: other_rate,
+                },
+            ) if max_samples == other_max && sampling_rate == other_rate => {
+                samples
+                    .extend(other_samples.iter().take(max_samples.saturating_sub(samples.len())));
             }
             (LatencyStorage::DdSketch(sketch), LatencyStorage::DdSketch(other)) => {
-                let _ = sketch.merge(other);
+                sketch.merge(other).map_err(|_| "DDSketch configurations differ")?;
             }
-            (LatencyStorage::TDigest(digest), LatencyStorage::TDigest(other)) => {
+            (LatencyStorage::TDigest(digest), LatencyStorage::TDigest(other))
+                if digest.max_size() == other.max_size() =>
+            {
                 *digest = TDigest::merge_digests(vec![digest.clone(), other.clone()]);
             }
-            (LatencyStorage::HdrHistogram(hist), LatencyStorage::HdrHistogram(other)) => {
-                let _ = hist.add(other);
+            (LatencyStorage::HdrHistogram(hist), LatencyStorage::HdrHistogram(other))
+                if (hist.low(), hist.high(), hist.sigfig())
+                    == (other.low(), other.high(), other.sigfig()) =>
+            {
+                hist.add(other).map_err(|_| "HDR histogram merge failed")?;
             }
-            _ => {
-                tracing::warn!("Attempted to merge incompatible latency storage types");
-            }
+            _ => return Err("latency storage configurations differ"),
         }
+        Ok(())
     }
 
     /// Get sample count
@@ -338,7 +321,10 @@ pub struct ConnectionStats {
 /// Tuple-keyed statistics collector
 ///
 /// Stores statistics keyed by (time_bucket, group_id, connection_id) for flexible
-/// on-demand aggregation by any dimension.
+/// on-demand aggregation by any dimension. Global latency storage is independent
+/// of group storage: each recorded latency is sampled once under each policy.
+/// This requires additional storage per retained bucket and allows heterogeneous
+/// groups without converting or discarding their sketches.
 ///
 /// Supports two modes:
 /// - **In-memory**: All entries kept in memory (default)
@@ -346,6 +332,9 @@ pub struct ConnectionStats {
 pub struct TupleStatsCollector {
     /// Statistics entries keyed by (time_bucket, group_id, connection_id)
     entries: HashMap<StatsKey, StatsEntry>,
+    /// Independent global storage per bucket, recorded with the global policy.
+    /// This avoids trying to convert incompatible group sketches during aggregation.
+    global_entries: HashMap<u64, StatsEntry>,
     /// Global sampling policy for latency storage (used for global aggregation)
     sampling_policy: SamplingPolicy,
     /// Per-group sampling policies (used for per-group aggregation)
@@ -368,6 +357,7 @@ impl TupleStatsCollector {
     pub fn new(sampling_policy: SamplingPolicy, bucket_duration: Duration) -> Self {
         Self {
             entries: HashMap::new(),
+            global_entries: HashMap::new(),
             sampling_policy,
             group_sampling_policies: HashMap::new(),
             bucket_duration_ns: bucket_duration.as_nanos() as u64,
@@ -386,6 +376,7 @@ impl TupleStatsCollector {
     ) -> Self {
         Self {
             entries: HashMap::new(),
+            global_entries: HashMap::new(),
             sampling_policy,
             group_sampling_policies: HashMap::new(),
             bucket_duration_ns: bucket_duration.as_nanos() as u64,
@@ -413,6 +404,7 @@ impl TupleStatsCollector {
     ) -> Self {
         Self {
             entries: HashMap::new(),
+            global_entries: HashMap::new(),
             sampling_policy,
             group_sampling_policies: HashMap::new(),
             bucket_duration_ns: bucket_duration.as_nanos() as u64,
@@ -423,21 +415,20 @@ impl TupleStatsCollector {
         }
     }
 
-    /// Register a per-group sampling policy
-    ///
-    /// This allows different traffic groups to have independent sampling policies.
-    /// When aggregating per-group stats, the registered policy for each group is used.
+    /// Register a per-group sampling policy before recording that group's data.
+    /// Unregistered groups use the global policy. Replacing a policy while that
+    /// group has data in memory is a programmer error and panics.
     pub fn register_group_policy(&mut self, group_id: usize, policy: SamplingPolicy) {
+        assert!(
+            !self.entries.keys().any(|key| key.group_id == group_id)
+                || self.get_group_policy(group_id) == &policy,
+            "Cannot change a group's sampling policy after recording data"
+        );
         self.group_sampling_policies.insert(group_id, policy);
     }
 
-    /// Get the sampling policy for a specific group
-    ///
-    /// Panics if the group was not registered (this is a programmer error)
     fn get_group_policy(&self, group_id: usize) -> &SamplingPolicy {
-        self.group_sampling_policies
-            .get(&group_id)
-            .unwrap_or_else(|| panic!("Group {} sampling policy not registered", group_id))
+        self.group_sampling_policies.get(&group_id).unwrap_or(&self.sampling_policy)
     }
 
     /// Compute time bucket for the current time
@@ -445,61 +436,46 @@ impl TupleStatsCollector {
         now_ns.saturating_sub(self.experiment_start_ns) / self.bucket_duration_ns
     }
 
-    /// Record a latency sample
-    pub fn record_latency(&mut self, group_id: usize, connection_id: usize, latency: Duration) {
-        let now_ns = crate::timing::time_ns();
-        let time_bucket = self.compute_bucket(now_ns);
-
-        // Flush old buckets if streaming and bucket changed
+    /// Create both entries through one path, including when bytes arrive before latency.
+    fn recording_entries(
+        &mut self,
+        group_id: usize,
+        connection_id: usize,
+    ) -> (&mut StatsEntry, &mut StatsEntry) {
+        let time_bucket = self.compute_bucket(crate::timing::time_ns());
         if time_bucket > self.current_bucket && self.dumper.is_some() {
             self.flush_old_buckets(time_bucket);
         }
         self.current_bucket = time_bucket;
-
+        let policy = self.group_sampling_policies.get(&group_id).unwrap_or(&self.sampling_policy);
         let key = StatsKey { time_bucket, group_id, connection_id };
-        let entry = self
-            .entries
-            .entry(key)
+        let entry = self.entries.entry(key).or_insert_with(|| StatsEntry::new(policy));
+        let global = self
+            .global_entries
+            .entry(time_bucket)
             .or_insert_with(|| StatsEntry::new(&self.sampling_policy));
+        (entry, global)
+    }
+
+    /// Record latency independently under the group and global sampling policies.
+    pub fn record_latency(&mut self, group_id: usize, connection_id: usize, latency: Duration) {
+        let (entry, global) = self.recording_entries(group_id, connection_id);
         entry.record_latency(latency);
+        global.record_latency(latency);
     }
 
     /// Record transmitted bytes
     pub fn record_tx_bytes(&mut self, group_id: usize, connection_id: usize, bytes: usize) {
-        let now_ns = crate::timing::time_ns();
-        let time_bucket = self.compute_bucket(now_ns);
-
-        // Flush old buckets if streaming and bucket changed
-        if time_bucket > self.current_bucket && self.dumper.is_some() {
-            self.flush_old_buckets(time_bucket);
-        }
-        self.current_bucket = time_bucket;
-
-        let key = StatsKey { time_bucket, group_id, connection_id };
-        let entry = self
-            .entries
-            .entry(key)
-            .or_insert_with(|| StatsEntry::new(&self.sampling_policy));
+        let (entry, global) = self.recording_entries(group_id, connection_id);
         entry.record_tx_bytes(bytes);
+        global.record_tx_bytes(bytes);
     }
 
     /// Record received bytes
     pub fn record_rx_bytes(&mut self, group_id: usize, connection_id: usize, bytes: usize) {
-        let now_ns = crate::timing::time_ns();
-        let time_bucket = self.compute_bucket(now_ns);
-
-        // Flush old buckets if streaming and bucket changed
-        if time_bucket > self.current_bucket && self.dumper.is_some() {
-            self.flush_old_buckets(time_bucket);
-        }
-        self.current_bucket = time_bucket;
-
-        let key = StatsKey { time_bucket, group_id, connection_id };
-        let entry = self
-            .entries
-            .entry(key)
-            .or_insert_with(|| StatsEntry::new(&self.sampling_policy));
+        let (entry, global) = self.recording_entries(group_id, connection_id);
         entry.record_rx_bytes(bytes);
+        global.record_rx_bytes(bytes);
     }
 
     /// Flush old buckets to disk (streaming mode only)
@@ -509,6 +485,7 @@ impl TupleStatsCollector {
         };
 
         let cutoff = current_bucket.saturating_sub(self.retention_buckets);
+        self.global_entries.retain(|bucket, _| *bucket >= cutoff);
 
         // Collect keys to flush
         let old_keys: Vec<StatsKey> =
@@ -582,7 +559,10 @@ impl TupleStatsCollector {
         buckets
     }
 
-    /// Aggregate all entries into global statistics
+    /// Aggregate retained buckets using the independently recorded global policy.
+    /// Global sampling is independent of group sampling, including when groups
+    /// disable sampling or use different sketch types. Streaming evicts global
+    /// buckets alongside group entries; Parquet output contains group entries only.
     pub fn aggregate_global(&self, duration: Duration) -> AggregatedStats {
         let mut total_requests = 0u64;
         let mut total_tx_bytes = 0u64;
@@ -592,7 +572,7 @@ impl TupleStatsCollector {
         // If policy is None, we skip latency aggregation but still count requests/bytes
         let mut merged_latency = LatencyStorage::from_policy(&self.sampling_policy);
 
-        for entry in self.entries.values() {
+        for entry in self.global_entries.values() {
             total_requests += entry.request_count;
             total_tx_bytes += entry.tx_bytes;
             total_rx_bytes += entry.rx_bytes;
@@ -666,7 +646,7 @@ impl TupleStatsCollector {
             let mut total_requests = 0u64;
             let mut total_tx_bytes = 0u64;
             let mut total_rx_bytes = 0u64;
-            let mut merged_latency = LatencyStorage::from_policy(&self.sampling_policy);
+            let mut merged_latency = LatencyStorage::from_policy(self.get_group_policy(group_id));
 
             for (key, entry) in &self.entries {
                 if key.group_id == group_id && key.connection_id == conn_id {
@@ -704,31 +684,20 @@ impl TupleStatsCollector {
     /// Get time series for global statistics (collapse group and connection)
     pub fn time_series_global(&self) -> Vec<TimeSeriesPoint> {
         let bucket_duration_secs = self.bucket_duration_ns as f64 / 1_000_000_000.0;
-        let mut bucket_data: HashMap<u64, (u64, u64, u64, LatencyStorage)> = HashMap::new();
-
-        for (key, entry) in &self.entries {
-            let data = bucket_data
-                .entry(key.time_bucket)
-                .or_insert_with(|| (0, 0, 0, LatencyStorage::from_policy(&self.sampling_policy)));
-            data.0 += entry.request_count;
-            data.1 += entry.tx_bytes;
-            data.2 += entry.rx_bytes;
-            data.3.merge_ref(&entry.latency);
-        }
-
-        let mut points: Vec<TimeSeriesPoint> = bucket_data
-            .into_iter()
-            .map(|(bucket, (requests, tx, rx, latency))| {
-                let total_bytes = (tx + rx) as f64;
+        let mut points: Vec<TimeSeriesPoint> = self
+            .global_entries
+            .iter()
+            .map(|(&bucket, entry)| {
+                let total_bytes = (entry.tx_bytes + entry.rx_bytes) as f64;
                 TimeSeriesPoint {
                     time_bucket: bucket,
-                    request_count: requests,
-                    throughput_rps: requests as f64 / bucket_duration_secs,
+                    request_count: entry.request_count,
+                    throughput_rps: entry.request_count as f64 / bucket_duration_secs,
                     throughput_mbps: (total_bytes * 8.0) / (bucket_duration_secs * 1_000_000.0),
-                    latency_p50_ns: latency.percentile(0.5),
-                    latency_p99_ns: latency.percentile(0.99),
-                    latency_p999_ns: latency.percentile(0.999),
-                    latency_mean_ns: latency.mean(),
+                    latency_p50_ns: entry.latency.percentile(0.5),
+                    latency_p99_ns: entry.latency.percentile(0.99),
+                    latency_p999_ns: entry.latency.percentile(0.999),
+                    latency_mean_ns: entry.latency.mean(),
                 }
             })
             .collect();
@@ -745,7 +714,7 @@ impl TupleStatsCollector {
         for (key, entry) in &self.entries {
             if key.group_id == group_id {
                 let data = bucket_data.entry(key.time_bucket).or_insert_with(|| {
-                    (0, 0, 0, LatencyStorage::from_policy(&self.sampling_policy))
+                    (0, 0, 0, LatencyStorage::from_policy(self.get_group_policy(group_id)))
                 });
                 data.0 += entry.request_count;
                 data.1 += entry.tx_bytes;
@@ -806,7 +775,11 @@ impl TupleStatsCollector {
         points
     }
 
-    /// Merge multiple collectors (from different threads)
+    /// Merge multiple collectors (from different threads).
+    ///
+    /// # Panics
+    /// Panics if global/group policies differ. As before, bucket coordinates are
+    /// interpreted relative to the first collector's start time and bucket duration.
     ///
     /// Note: Streaming dumpers are not merged - each thread should finalize
     /// its own dumper before merging in-memory entries.
@@ -818,6 +791,7 @@ impl TupleStatsCollector {
         let first = &collectors[0];
         let mut merged = Self {
             entries: HashMap::new(),
+            global_entries: HashMap::new(),
             sampling_policy: first.sampling_policy.clone(),
             group_sampling_policies: HashMap::new(),
             bucket_duration_ns: first.bucket_duration_ns,
@@ -827,16 +801,39 @@ impl TupleStatsCollector {
             retention_buckets: u64::MAX,
         };
 
-        // Merge entries from all collectors
-        for collector in collectors {
-            // Merge per-group sampling policies (first collector's policy wins for each group)
-            for (group_id, policy) in collector.group_sampling_policies {
-                merged.group_sampling_policies.entry(group_id).or_insert(policy);
+        // Validate policies before merging any entries.
+        for collector in &collectors {
+            assert_eq!(
+                merged.sampling_policy, collector.sampling_policy,
+                "Global sampling policies differ"
+            );
+            for (&group_id, policy) in &collector.group_sampling_policies {
+                if let Some(existing) = merged.group_sampling_policies.get(&group_id) {
+                    assert_eq!(existing, policy, "Group sampling policies differ");
+                } else {
+                    merged.group_sampling_policies.insert(group_id, policy.clone());
+                }
             }
-
-            // Merge stats entries
+        }
+        for collector in &collectors {
+            for key in collector.entries.keys() {
+                assert_eq!(
+                    merged.get_group_policy(key.group_id),
+                    collector.get_group_policy(key.group_id),
+                    "Group sampling policies differ"
+                );
+            }
+        }
+        for collector in collectors {
             for (key, entry) in collector.entries {
                 merged.entries.entry(key).and_modify(|e| e.merge_from(&entry)).or_insert(entry);
+            }
+            for (bucket, entry) in collector.global_entries {
+                merged
+                    .global_entries
+                    .entry(bucket)
+                    .and_modify(|e| e.merge_from(&entry))
+                    .or_insert(entry);
             }
         }
 
@@ -919,6 +916,172 @@ impl Default for TupleStatsCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mixed_collector(global: SamplingPolicy, start: u64) -> TupleStatsCollector {
+        let mut collector =
+            TupleStatsCollector::with_start_time(global, Duration::from_secs(3600), start);
+        collector
+            .register_group_policy(0, SamplingPolicy::DdSketch { alpha: 0.01, max_bins: 1024 });
+        collector.register_group_policy(1, SamplingPolicy::TDigest { compression: 100 });
+        collector.register_group_policy(
+            2,
+            SamplingPolicy::HdrHistogram { sigfigs: 3, max_value_us: 10_000 },
+        );
+        for group in 0..3 {
+            // Both byte APIs can create an entry before the first latency arrives.
+            if group % 2 == 0 {
+                collector.record_tx_bytes(group, 0, 100);
+                collector.record_rx_bytes(group, 0, 200);
+            } else {
+                collector.record_rx_bytes(group, 0, 200);
+                collector.record_tx_bytes(group, 0, 100);
+            }
+            for _ in 0..100 {
+                collector.record_latency(group, 0, Duration::from_micros(10 + group as u64 * 10));
+            }
+        }
+        collector
+    }
+
+    #[test]
+    fn heterogeneous_groups_preserve_all_output_dimensions() {
+        for global in [
+            SamplingPolicy::None,
+            SamplingPolicy::Unlimited,
+            SamplingPolicy::Limited { max_samples: 1000, rate: 1.0 },
+            SamplingPolicy::DdSketch { alpha: 0.02, max_bins: 2048 },
+        ] {
+            let collector = mixed_collector(global.clone(), crate::timing::time_ns());
+            let duration = Duration::from_secs(1);
+            let stats = collector.aggregate_global(duration);
+            assert_eq!(stats.total_requests, 300);
+            assert_eq!(stats.throughput_rps, 300.0);
+            assert_eq!(stats.throughput_mbps, 0.0072);
+            if global == SamplingPolicy::None {
+                assert_eq!(stats.latency_p99, Duration::ZERO);
+                assert_eq!(collector.time_series_global()[0].latency_p99_ns, 0);
+            } else {
+                assert!((29_000..=31_000).contains(&(stats.latency_p99.as_nanos() as u64)));
+                assert!(
+                    (29_000..=31_000).contains(&collector.time_series_global()[0].latency_p99_ns)
+                );
+            }
+            let groups = collector.aggregate_by_group(duration);
+            for group in 0..3 {
+                let expected = 10_000 + group as u64 * 10_000;
+                let close =
+                    |value: u64| assert!(value.abs_diff(expected) <= 500, "group {group}: {value}");
+                let stats = &groups[&group];
+                assert_eq!(stats.total_requests, 100);
+                assert_eq!(stats.throughput_mbps, 0.0024);
+                close(stats.latency_p99.as_nanos() as u64);
+                let connection = &collector.aggregate_by_connection(group, duration)[&0];
+                assert_eq!((connection.tx_bytes, connection.rx_bytes), (100, 200));
+                close(connection.latency.latency_p99.as_nanos() as u64);
+                close(collector.time_series_by_group(group)[0].latency_p99_ns);
+                close(collector.time_series_by_connection(group, 0)[0].latency_p99_ns);
+            }
+            assert!(collector.entries.values().all(|entry| entry.latency.count() == 100));
+        }
+    }
+
+    #[test]
+    fn unregistered_group_uses_global_policy() {
+        let mut collector =
+            TupleStatsCollector::new(SamplingPolicy::Unlimited, Duration::from_secs(3600));
+        collector.record_tx_bytes(9, 1, 100);
+        collector.record_latency(9, 1, Duration::from_micros(42));
+        assert_eq!(
+            collector.aggregate_by_group(Duration::from_secs(1))[&9].latency_p99,
+            Duration::from_micros(42)
+        );
+    }
+
+    #[test]
+    fn heterogeneous_collectors_merge_global_and_group_storage() {
+        let start = crate::timing::time_ns();
+        let merged = TupleStatsCollector::merge(vec![
+            mixed_collector(SamplingPolicy::Unlimited, start),
+            mixed_collector(SamplingPolicy::Unlimited, start),
+        ]);
+        let duration = Duration::from_secs(1);
+        let global = merged.aggregate_global(duration);
+        assert_eq!(global.total_requests, 600);
+        assert_eq!(global.latency_p99, Duration::from_micros(30));
+        assert_eq!(merged.time_series_global()[0].request_count, 600);
+        for stats in merged.aggregate_by_group(duration).values() {
+            assert_eq!(stats.total_requests, 200);
+            assert!(stats.latency_p99 > Duration::ZERO);
+        }
+    }
+
+    #[test]
+    fn streaming_evicts_global_storage_alongside_group_entries() {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stats.parquet");
+        let dumper = super::super::StatsDumper::new(path.clone(), None).unwrap();
+        let mut collector = TupleStatsCollector::with_streaming(
+            SamplingPolicy::Unlimited,
+            Duration::from_secs(3600),
+            crate::timing::time_ns(),
+            dumper,
+            1,
+        );
+        collector
+            .register_group_policy(0, SamplingPolicy::DdSketch { alpha: 0.01, max_bins: 1024 });
+        collector.record_tx_bytes(0, 0, 100);
+        collector.record_latency(0, 0, Duration::from_micros(10));
+        assert_eq!(collector.global_entries.len(), 1);
+        collector.flush_old_buckets(2);
+        assert!(collector.entries.is_empty());
+        assert!(collector.global_entries.is_empty());
+        assert_eq!(collector.aggregate_global(Duration::from_secs(1)).total_requests, 0);
+        assert_eq!(collector.finalize(), Some(path.clone()));
+        let reader = SerializedFileReader::new(std::fs::File::open(path).unwrap()).unwrap();
+        // Only group entries are written; no synthetic global rows enter Parquet.
+        assert_eq!(reader.metadata().file_metadata().num_rows(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "Global sampling policies differ")]
+    fn tuple_merge_rejects_global_policy_mismatch() {
+        TupleStatsCollector::merge(vec![
+            TupleStatsCollector::new(SamplingPolicy::None, Duration::from_secs(1)),
+            TupleStatsCollector::new(SamplingPolicy::Unlimited, Duration::from_secs(1)),
+        ]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Group sampling policies differ")]
+    fn tuple_merge_rejects_group_policy_mismatch() {
+        let mut a = TupleStatsCollector::new(SamplingPolicy::Unlimited, Duration::from_secs(1));
+        let mut b = TupleStatsCollector::new(SamplingPolicy::Unlimited, Duration::from_secs(1));
+        a.record_latency(0, 0, Duration::from_micros(1));
+        b.register_group_policy(0, SamplingPolicy::None);
+        b.record_latency(0, 1, Duration::from_micros(1));
+        TupleStatsCollector::merge(vec![a, b]);
+    }
+
+    #[test]
+    fn latency_merge_rejects_incompatible_storage() {
+        let mut samples = LatencyStorage::from_policy(&SamplingPolicy::Unlimited);
+        let sketch =
+            LatencyStorage::from_policy(&SamplingPolicy::DdSketch { alpha: 0.01, max_bins: 1024 });
+        assert!(samples.try_merge_ref(&sketch).is_err());
+        let mut other_sketch =
+            LatencyStorage::from_policy(&SamplingPolicy::DdSketch { alpha: 0.02, max_bins: 1024 });
+        assert!(other_sketch.try_merge_ref(&sketch).is_err());
+        assert!(LatencyStorage::None.try_merge_ref(&samples).is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "Cannot change a group's sampling policy")]
+    fn policy_change_after_recording_is_rejected() {
+        let mut collector = TupleStatsCollector::default();
+        collector.record_tx_bytes(0, 0, 10);
+        collector.register_group_policy(0, SamplingPolicy::None);
+    }
 
     #[test]
     fn test_stats_key_equality() {

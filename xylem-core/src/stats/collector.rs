@@ -156,78 +156,84 @@ pub struct StatsCollector {
 }
 
 impl StatsCollector {
-    /// Merge multiple stats collectors into one
+    /// Merge collectors with identical storage configurations.
+    ///
+    /// Retains the first collector's mode, capacity, sketch configuration, and
+    /// adaptive sampler state. Limited sampling keeps at most its configured
+    /// capacity, in input order; Unlimited keeps every stored sample. Empty input
+    /// produces the default collector.
+    ///
+    /// # Panics
+    /// Panics on incompatible configurations or a sketch merge error. Use
+    /// [`Self::try_merge`] to handle incompatible inputs explicitly.
     pub fn merge(collectors: Vec<StatsCollector>) -> Self {
-        let mut merged = StatsCollector::default();
+        Self::try_merge(collectors).expect("Cannot merge incompatible statistics collectors")
+    }
+
+    /// Fallible version of [`Self::merge`]. Inputs must have the same sampling
+    /// mode and storage settings; heterogeneous sketches cannot be converted
+    /// back into their original samples without losing information.
+    pub fn try_merge(collectors: Vec<StatsCollector>) -> Result<Self, &'static str> {
+        let mut collectors = collectors.into_iter();
+        let Some(mut merged) = collectors.next() else {
+            return Ok(Self::default());
+        };
 
         for collector in collectors {
-            // Merge DDSketch if present
-            if let Some(sketch) = collector.ddsketch {
-                if let Some(ref mut merged_sketch) = merged.ddsketch {
-                    // Merge sketches
-                    let _ = merged_sketch.merge(&sketch);
-                } else {
-                    // First sketch - initialize merged
-                    merged.ddsketch = Some(sketch);
-                    merged.mode = SamplingMode::Sketch;
+            if merged.mode != collector.mode
+                || merged.ddsketch_config != collector.ddsketch_config
+                || merged.tdigest_compression != collector.tdigest_compression
+                || merged.adaptive_sampler.as_ref().map(AdaptiveSampler::config)
+                    != collector.adaptive_sampler.as_ref().map(AdaptiveSampler::config)
+            {
+                return Err("sampling configurations differ");
+            }
+            match (&mut merged.ddsketch, collector.ddsketch) {
+                (Some(target), Some(source)) => {
+                    target.merge(&source).map_err(|_| "DDSketch merge failed")?;
                 }
+                (None, None) => {}
+                _ => return Err("sketch types differ"),
+            }
+            match (&mut merged.tdigest, collector.tdigest) {
+                (Some(target), Some(source)) => {
+                    let target = target.get_mut().unwrap();
+                    *target =
+                        TDigest::merge_digests(vec![target.clone(), source.into_inner().unwrap()]);
+                }
+                (None, None) => {}
+                _ => return Err("sketch types differ"),
+            }
+            match (&mut merged.hdrhistogram, collector.hdrhistogram) {
+                (Some(target), Some(source)) => {
+                    let target = target.get_mut().unwrap();
+                    let source = source.into_inner().unwrap();
+                    if (target.low(), target.high(), target.sigfig())
+                        != (source.low(), source.high(), source.sigfig())
+                    {
+                        return Err("HDR histogram configurations differ");
+                    }
+                    target.add(&source).map_err(|_| "HDR histogram merge failed")?;
+                }
+                (None, None) => {}
+                _ => return Err("sketch types differ"),
             }
 
-            // Merge T-Digest if present
-            if let Some(tdigest_mutex) = collector.tdigest {
-                let tdigest = tdigest_mutex.into_inner().unwrap();
-                if let Some(ref merged_tdigest_mutex) = merged.tdigest {
-                    // Merge into existing - extract both digests and merge
-                    let existing = merged_tdigest_mutex.lock().unwrap();
-                    let new_merged = TDigest::merge_digests(vec![existing.clone(), tdigest]);
-                    drop(existing);
-                    *merged_tdigest_mutex.lock().unwrap() = new_merged;
-                } else {
-                    // First T-Digest - initialize merged
-                    merged.tdigest = Some(Mutex::new(tdigest));
-                    merged.tdigest_compression = collector.tdigest_compression;
-                    merged.mode = SamplingMode::Sketch;
+            let available = match merged.mode {
+                SamplingMode::Unlimited => usize::MAX,
+                SamplingMode::Limited { max_samples, .. } => {
+                    max_samples.saturating_sub(merged.samples.len())
                 }
-            }
-
-            // Merge HDR Histogram if present
-            if let Some(hdr_mutex) = collector.hdrhistogram {
-                let hdr = hdr_mutex.into_inner().unwrap();
-                if let Some(ref merged_hdr_mutex) = merged.hdrhistogram {
-                    // Merge into existing
-                    let mut merged_hdr = merged_hdr_mutex.lock().unwrap();
-                    let _ = merged_hdr.add(&hdr);
-                } else {
-                    // First HDR - initialize merged
-                    merged.hdrhistogram = Some(Mutex::new(hdr));
-                    merged.mode = SamplingMode::Sketch;
-                }
-            }
-
-            // Merge samples
-            for sample in collector.samples {
-                let should_add = match merged.mode {
-                    SamplingMode::Unlimited => true,
-                    SamplingMode::Limited { max_samples, .. } => merged.samples.len() < max_samples,
-                    SamplingMode::Sketch => false,
-                    SamplingMode::None => false,
-                };
-                if should_add {
-                    merged.samples.push(sample);
-                }
-            }
-
-            // Aggregate counters
+                SamplingMode::Sketch | SamplingMode::None => 0,
+            };
+            merged.samples.extend(collector.samples.into_iter().take(available));
             merged.tx_bytes += collector.tx_bytes;
             merged.rx_bytes += collector.rx_bytes;
             merged.tx_requests += collector.tx_requests;
             merged.rx_requests += collector.rx_requests;
             merged.sample_count += collector.sample_count;
         }
-
-        // Note: Adaptive sampler state is not merged (each thread has independent sampler)
-
-        merged
+        Ok(merged)
     }
 
     /// Create a new statistics collector from a sampling policy
@@ -623,6 +629,151 @@ pub struct BasicStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_unlimited_keeps_large_distinct_distributions() {
+        let mut low = StatsCollector::new_unlimited();
+        let mut high = StatsCollector::new_unlimited();
+        for _ in 0..70_000 {
+            low.record_latency(Duration::from_micros(10));
+            high.record_latency(Duration::from_micros(100));
+        }
+        let merged = StatsCollector::merge(vec![low, high]);
+        assert_eq!(merged.sampling_mode(), SamplingMode::Unlimited);
+        assert_eq!(merged.samples().len(), 140_000);
+        assert_eq!(merged.sample_count(), 140_000);
+        assert_eq!(merged.tx_requests(), 140_000);
+        assert_eq!(merged.calculate_basic_stats().mean, Duration::from_micros(55));
+        assert_eq!(merged.samples()[139_999], Duration::from_micros(100));
+    }
+
+    #[test]
+    fn merge_none_preserves_throughput() {
+        let collectors = (0..2)
+            .map(|_| {
+                let mut c = StatsCollector::new_none();
+                c.record_latency(Duration::from_micros(10));
+                c.record_tx_bytes(100);
+                c.record_rx_bytes(200);
+                c
+            })
+            .collect();
+        let merged = StatsCollector::merge(collectors);
+        assert_eq!(merged.sampling_mode(), SamplingMode::None);
+        assert_eq!(merged.tx_requests(), 2);
+        assert_eq!(merged.rx_requests(), 2);
+        assert_eq!((merged.tx_bytes(), merged.rx_bytes()), (200, 400));
+        let stats = crate::stats::aggregate_stats(&merged, Duration::from_secs(2), 0.95);
+        assert_eq!(stats.total_requests, 2);
+        assert_eq!(stats.throughput_rps, 1.0);
+        assert_eq!(stats.throughput_mbps, 0.0024);
+        assert_eq!(stats.latency_p99, Duration::ZERO);
+    }
+
+    #[test]
+    fn merge_preserves_custom_capacity_and_adaptive_settings() {
+        let mut first = StatsCollector::new(3, 1.0);
+        let mut second = StatsCollector::new(3, 1.0);
+        for i in 0..2 {
+            first.record_latency(Duration::from_micros(i));
+            second.record_latency(Duration::from_micros(i + 10));
+        }
+        let merged = StatsCollector::merge(vec![first, second]);
+        assert_eq!(merged.sampling_mode(), SamplingMode::Limited { max_samples: 3, rate: 1.0 });
+        assert_eq!(merged.samples().len(), 3);
+        assert_eq!(merged.sample_count(), 4);
+        assert_eq!(merged.samples()[2], Duration::from_micros(10));
+        let config = AdaptiveSamplerConfig { initial_rate: 0.7, ..Default::default() };
+        let merged = StatsCollector::merge(vec![
+            StatsCollector::with_adaptive_sampling(19, config.clone()),
+            StatsCollector::with_adaptive_sampling(19, config.clone()),
+        ]);
+        assert_eq!(merged.sampling_mode(), SamplingMode::Limited { max_samples: 19, rate: 0.7 });
+        assert_eq!(merged.adaptive_sampler.as_ref().unwrap().config(), &config);
+    }
+
+    #[test]
+    fn merge_preserves_sketch_settings_and_distributions() {
+        for policy in [
+            SamplingPolicy::DdSketch { alpha: 0.02, max_bins: 2048 },
+            SamplingPolicy::TDigest { compression: 123 },
+            SamplingPolicy::HdrHistogram { sigfigs: 4, max_value_us: 100_000 },
+        ] {
+            let mut low = StatsCollector::from_policy(&policy);
+            let mut high = StatsCollector::from_policy(&policy);
+            for _ in 0..10 {
+                low.record_latency(Duration::from_micros(10));
+                high.record_latency(Duration::from_micros(100));
+            }
+            let mut merged = StatsCollector::merge(vec![low, high]);
+            assert_eq!(merged.sampling_mode(), SamplingMode::Sketch);
+            assert_eq!(merged.sample_count(), 20);
+            let stats = crate::stats::aggregate_stats(&merged, Duration::from_secs(1), 0.95);
+            assert!((98_000..=102_000).contains(&(stats.latency_p99.as_nanos() as u64)));
+            match policy {
+                SamplingPolicy::DdSketch { alpha, max_bins } => {
+                    assert_eq!(
+                        merged.ddsketch_config,
+                        Some(DDSketchConfig::new(alpha, max_bins, 1.0))
+                    );
+                    assert_eq!(merged.ddsketch().unwrap().count(), 20);
+                    merged.reset();
+                    assert_eq!(merged.ddsketch().unwrap().count(), 0);
+                }
+                SamplingPolicy::TDigest { compression } => {
+                    assert_eq!(merged.tdigest_compression, Some(compression));
+                    assert_eq!(merged.tdigest().unwrap().lock().unwrap().count(), 20.0);
+                }
+                SamplingPolicy::HdrHistogram { sigfigs, max_value_us } => {
+                    let hist = merged.hdrhistogram().unwrap().lock().unwrap();
+                    assert_eq!(hist.sigfig(), sigfigs);
+                    assert_eq!(hist.high(), max_value_us * 1000);
+                    assert_eq!(hist.len(), 20);
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn merge_reports_incompatible_policies() {
+        let pairs = [
+            (SamplingPolicy::None, SamplingPolicy::Unlimited),
+            (
+                SamplingPolicy::Limited { max_samples: 2, rate: 1.0 },
+                SamplingPolicy::Limited { max_samples: 3, rate: 1.0 },
+            ),
+            (
+                SamplingPolicy::DdSketch { alpha: 0.01, max_bins: 1024 },
+                SamplingPolicy::DdSketch { alpha: 0.02, max_bins: 1024 },
+            ),
+            (
+                SamplingPolicy::DdSketch { alpha: 0.01, max_bins: 1024 },
+                SamplingPolicy::TDigest { compression: 100 },
+            ),
+            (
+                SamplingPolicy::TDigest { compression: 100 },
+                SamplingPolicy::TDigest { compression: 200 },
+            ),
+            (
+                SamplingPolicy::HdrHistogram { sigfigs: 2, max_value_us: 1000 },
+                SamplingPolicy::HdrHistogram { sigfigs: 3, max_value_us: 1000 },
+            ),
+        ];
+        for (a, b) in pairs {
+            assert!(StatsCollector::try_merge(vec![
+                StatsCollector::from_policy(&a),
+                StatsCollector::from_policy(&b)
+            ])
+            .is_err());
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "Cannot merge incompatible statistics collectors")]
+    fn infallible_merge_panics_instead_of_dropping_incompatible_samples() {
+        StatsCollector::merge(vec![StatsCollector::new_none(), StatsCollector::new_unlimited()]);
+    }
 
     #[test]
     fn test_new_collector() {
