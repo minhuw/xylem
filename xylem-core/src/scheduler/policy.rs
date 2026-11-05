@@ -21,15 +21,26 @@ use xylem_common::ExponentialDistribution;
 /// Think of this like a coroutine in an async runtime - each connection is independent,
 /// and the scheduler just picks whichever connection's next request is ready.
 pub trait Policy: Send {
-    /// Get the absolute time (in nanoseconds) when this connection should send next
+    /// Get the absolute time (in nanoseconds) when this connection should next wake
     ///
     /// # Parameters
     /// - `current_time_ns`: Current time in nanoseconds (from `timing::time_ns()`)
     ///
     /// # Returns
-    /// - `Some(time_ns)`: Send at this absolute time (may be in past = send now!)
+    /// - `Some(time_ns)`: Wake at this absolute time, then check `ready_to_send`.
     /// - `None`: Send immediately (closed-loop, always ready)
     fn next_send_time(&mut self, current_time_ns: u64) -> Option<u64>;
+
+    /// Check whether a scheduled wakeup permits sending. Dynamic policies may
+    /// wake up just to refresh their rate; the pool reschedules them when false.
+    /// After returning false, `next_send_time` must return a future wakeup.
+    /// The default preserves the already sampled deadline of fixed/Poisson policies.
+    fn ready_to_send(&mut self, _current_time_ns: u64) -> bool {
+        true
+    }
+
+    /// Feedback from a completed measurement response. Warmup responses are excluded.
+    fn on_response(&mut self, _latency: Duration) {}
 
     /// Notify policy that a request was sent on this connection
     ///
@@ -287,6 +298,10 @@ impl AdaptivePolicy {
 }
 
 impl Policy for AdaptivePolicy {
+    fn on_response(&mut self, latency: Duration) {
+        self.add_latency_sample(latency);
+    }
+
     fn next_send_time(&mut self, _current_time_ns: u64) -> Option<u64> {
         // Check if we should adjust rate (every 100 requests)
         if self.sample_count >= 100 {
@@ -564,69 +579,60 @@ impl PolicyScheduler for FactoryPolicyScheduler {
 pub struct PatternAwarePolicy {
     pattern: std::sync::Arc<dyn crate::workload::LoadPattern>,
     start_time_ns: u64,
-    current_rate: f64,
-    inter_arrival_ns: u64,
+    /// None means paused, not an infinite interval to add to a timestamp.
+    inter_arrival_ns: Option<u64>,
     last_send_time_ns: Option<u64>,
     last_rate_update_ns: u64,
 }
 
+const PATTERN_REFRESH_NS: u64 = 10_000_000;
+
 impl PatternAwarePolicy {
-    /// Create a new pattern-aware policy
-    ///
-    /// # Parameters
-    /// - `pattern`: The load pattern that determines rate over time
-    /// - `start_time_ns`: The experiment start time in nanoseconds
+    /// Create a policy whose pattern starts at the given absolute time.
     pub fn new(
         pattern: std::sync::Arc<dyn crate::workload::LoadPattern>,
         start_time_ns: u64,
     ) -> Self {
-        let initial_rate = pattern.rate_at(Duration::ZERO);
-        let inter_arrival_ns = if initial_rate > 0.0 {
-            (1_000_000_000.0 / initial_rate) as u64
-        } else {
-            u64::MAX
-        };
+        let inter_arrival_ns = Self::interval(pattern.rate_at(Duration::ZERO));
         Self {
             pattern,
             start_time_ns,
-            current_rate: initial_rate,
             inter_arrival_ns,
             last_send_time_ns: None,
             last_rate_update_ns: start_time_ns,
         }
     }
 
-    /// Update the rate based on current elapsed time
+    fn interval(rate: f64) -> Option<u64> {
+        (rate > 0.0).then(|| (1_000_000_000.0 / rate) as u64)
+    }
+
     fn update_rate(&mut self, current_time_ns: u64) {
-        // Only update rate every 10ms to avoid excessive computation
-        if current_time_ns.saturating_sub(self.last_rate_update_ns) < 10_000_000 {
+        if current_time_ns.saturating_sub(self.last_rate_update_ns) < PATTERN_REFRESH_NS {
             return;
         }
-
         let elapsed = Duration::from_nanos(current_time_ns.saturating_sub(self.start_time_ns));
-        let new_rate = self.pattern.rate_at(elapsed);
-
-        if (new_rate - self.current_rate).abs() > 0.01 {
-            self.current_rate = new_rate;
-            self.inter_arrival_ns = if new_rate > 0.0 {
-                (1_000_000_000.0 / new_rate) as u64
-            } else {
-                u64::MAX
-            };
-        }
+        self.inter_arrival_ns = Self::interval(self.pattern.rate_at(elapsed));
         self.last_rate_update_ns = current_time_ns;
+    }
+
+    fn send_deadline(&self) -> Option<u64> {
+        self.inter_arrival_ns
+            .map(|interval| self.last_send_time_ns.map_or(0, |last| last.saturating_add(interval)))
     }
 }
 
 impl Policy for PatternAwarePolicy {
     fn next_send_time(&mut self, current_time_ns: u64) -> Option<u64> {
-        // Update rate based on current time
         self.update_rate(current_time_ns);
+        let refresh = self.last_rate_update_ns.saturating_add(PATTERN_REFRESH_NS);
+        // A refresh wakeup is not permission to send, including during idle phases.
+        Some(self.send_deadline().map_or(refresh, |send| send.min(refresh)))
+    }
 
-        match self.last_send_time_ns {
-            Some(last_time) => Some(last_time + self.inter_arrival_ns),
-            None => Some(0), // First request: send immediately
-        }
+    fn ready_to_send(&mut self, current_time_ns: u64) -> bool {
+        self.update_rate(current_time_ns);
+        self.send_deadline().is_some_and(|send| send <= current_time_ns)
     }
 
     fn on_request_sent(&mut self, sent_time_ns: u64) {
@@ -636,12 +642,7 @@ impl Policy for PatternAwarePolicy {
     fn reset(&mut self) {
         self.last_send_time_ns = None;
         self.last_rate_update_ns = self.start_time_ns;
-        self.current_rate = self.pattern.rate_at(Duration::ZERO);
-        self.inter_arrival_ns = if self.current_rate > 0.0 {
-            (1_000_000_000.0 / self.current_rate) as u64
-        } else {
-            u64::MAX
-        };
+        self.inter_arrival_ns = Self::interval(self.pattern.rate_at(Duration::ZERO));
     }
 
     fn name(&self) -> &'static str {
@@ -649,13 +650,7 @@ impl Policy for PatternAwarePolicy {
     }
 
     fn set_target_rate(&mut self, rate: f64) {
-        // Override pattern rate temporarily (used by external rate controllers)
-        self.current_rate = rate;
-        self.inter_arrival_ns = if rate > 0.0 {
-            (1_000_000_000.0 / rate) as u64
-        } else {
-            u64::MAX
-        };
+        self.inter_arrival_ns = Self::interval(rate);
     }
 }
 

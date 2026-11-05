@@ -185,6 +185,8 @@ pub struct Worker<G: ConnectionGroup, P: Protocol, S: StatsRecorder = GroupStats
     request_dumper: Option<Arc<RequestDumper>>,
     /// Thread ID for request dumping
     thread_id: usize,
+    /// Coarse maintenance deadline for stale TX timestamp correlation entries.
+    next_tx_cleanup_ns: u64,
 }
 
 impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
@@ -215,6 +217,7 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             config,
             request_dumper: None,
             thread_id: 0,
+            next_tx_cleanup_ns: timing::time_ns().saturating_add(1_000_000_000),
         })
     }
 
@@ -246,6 +249,7 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             config,
             request_dumper: None,
             thread_id: 0,
+            next_tx_cleanup_ns: timing::time_ns().saturating_add(1_000_000_000),
         })
     }
 
@@ -266,6 +270,7 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             config,
             request_dumper: None,
             thread_id: 0,
+            next_tx_cleanup_ns: timing::time_ns().saturating_add(1_000_000_000),
         })
     }
 
@@ -319,116 +324,24 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
     /// Run the pipelined measurement loop (Lancet symmetric_tcp_main style)
     pub fn run(&mut self) -> Result<()> {
         let start_ns = timing::time_ns();
-        let duration_ns = self.config.duration.as_nanos() as u64;
+        let duration_ns = self.config.duration.as_nanos().min(u64::MAX as u128) as u64;
+        let end_ns = start_ns.saturating_add(duration_ns);
 
         loop {
             let now_ns = timing::time_ns();
 
             // Check if duration exceeded
-            if now_ns >= start_ns + duration_ns {
+            if now_ns >= end_ns {
                 break;
             }
 
-            // SEND PHASE: Send requests to ready connections
-            // Rate limiting is handled by connection-level policies via pool's ready_heap
-            //
-            // Safety limit: Cap the number of consecutive sends to prevent infinite loops
-            // For closed-loop with pipelining, we want to fill all pipelines, but not spin forever
-            // With N connections and depth D, we should need at most N*D sends to fill all pipelines
-            let max_sends_per_iteration = self.pool.connection_count() * 16; // Allow generous headroom
-            let mut sends_this_iteration = 0;
-
-            while let Some(connection_id) = self.pool.pick_connection() {
-                let state = self.pool.get_state(connection_id).expect("Connection state not found");
-                let group_id = state.group_id();
-
-                let request = {
-                    let protocol =
-                        self.protocols.get_mut(&group_id).expect("Protocol not found for group_id");
-                    protocol.next_request(connection_id)
-                };
-
-                // Record request to dump file if enabled
-                if let Some(ref dumper) = self.request_dumper {
-                    let req_id_str = format!("{:?}", request.request_id);
-                    self.record_request(
-                        dumper,
-                        group_id,
-                        connection_id,
-                        &request.data,
-                        &req_id_str,
-                    );
-                }
-
-                // Send request (track warmup status for response handling)
-                let sent_time_ns = timing::time_ns();
-                self.pool.send(
-                    connection_id,
-                    &request.data,
-                    request.request_id,
-                    request.metadata.is_warmup,
-                )?;
-
-                // Notify policy and record stats (skip stats for warmup requests)
-                if let Some(state) = self.pool.get_state_mut(connection_id) {
-                    state.on_request_sent(sent_time_ns);
-                }
-                if !request.metadata.is_warmup {
-                    self.stats.record_tx_bytes(group_id, connection_id, request.data.len());
-                }
-
-                // Try to re-add connection to heap if it still has capacity
-                // This enables pipelining for both closed-loop and rate-limited policies
-                //
-                // - Closed-loop (next_send_time = None): will be picked immediately to fill pipeline
-                // - Rate-limited (next_send_time = future): stored on heap, popped when time arrives
-                //
-                // This maintains invariant: connection on heap ⟺ can send (pipeline not full AND protocol ready)
-                let protocol =
-                    self.protocols.get(&group_id).expect("Protocol not found for group_id");
-                self.pool.try_schedule_connection(connection_id, protocol);
-
-                sends_this_iteration += 1;
-                if sends_this_iteration >= max_sends_per_iteration {
-                    eprintln!(
-                        "[WARN] Hit send limit ({}) in one iteration - forcing receive phase",
-                        max_sends_per_iteration
-                    );
-                    break;
-                }
-            }
+            self.send_requests()?;
 
             // RECEIVE PHASE: Poll all connections for responses (single syscall)
             // Derive sleep duration from the ready heap (when next connection will be ready)
             let now_ns = timing::time_ns();
 
-            // Calculate wait time based on connection policies
-            let pool_wait_ns = match self.pool.peek_next_ready_time() {
-                Some(next_ready_ns) if next_ready_ns > now_ns => Some(next_ready_ns - now_ns),
-                Some(_) => Some(0), // Ready now
-                None => None,       // Heap empty (all pipelines full)
-            };
-
-            let poll_timeout = match pool_wait_ns {
-                Some(0) => Some(Duration::ZERO),
-                Some(ns) if ns <= 1_000_000 => {
-                    // Within 1ms: spin with non-blocking poll for precise timing
-                    Some(Duration::ZERO)
-                }
-                Some(ns) => {
-                    // Beyond 1ms: sleep until 1ms before, then spin for precision
-                    Some(Duration::from_nanos(ns - 1_000_000))
-                }
-                None => {
-                    // Heap empty - block on poll until responses arrive, bounded by experiment duration
-                    let remaining_ns = (start_ns + duration_ns).saturating_sub(now_ns);
-                    if remaining_ns > 0 {
-                        Some(Duration::from_nanos(remaining_ns))
-                    } else {
-                        Some(Duration::ZERO)
-                    }
-                }
-            };
+            let poll_timeout = Some(self.poll_timeout(now_ns, end_ns));
             self.process_responses(poll_timeout)?;
         }
 
@@ -439,6 +352,86 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         self.pool.close_all()?;
 
         Ok(())
+    }
+
+    fn send_requests(&mut self) -> Result<()> {
+        // SEND PHASE: Send requests to ready connections
+        // Rate limiting is handled by connection-level policies via pool's ready_heap
+        //
+        // Safety limit: Cap the number of consecutive sends to prevent infinite loops
+        // For closed-loop with pipelining, we want to fill all pipelines, but not spin forever
+        // With N connections and depth D, we should need at most N*D sends to fill all pipelines
+        let max_sends_per_iteration = self.pool.connection_count() * 16; // Allow generous headroom
+        let mut sends_this_iteration = 0;
+
+        while let Some(connection_id) = self.pool.pick_connection() {
+            let state = self.pool.get_state(connection_id).expect("Connection state not found");
+            let group_id = state.group_id();
+
+            let request = {
+                let protocol =
+                    self.protocols.get_mut(&group_id).expect("Protocol not found for group_id");
+                protocol.next_request(connection_id)
+            };
+
+            // Record request to dump file if enabled
+            if let Some(ref dumper) = self.request_dumper {
+                let req_id_str = format!("{:?}", request.request_id);
+                self.record_request(dumper, group_id, connection_id, &request.data, &req_id_str);
+            }
+
+            // Send request (track warmup status for response handling)
+            let sent_time_ns = timing::time_ns();
+            self.pool.send(
+                connection_id,
+                &request.data,
+                request.request_id,
+                request.metadata.is_warmup,
+            )?;
+
+            // Notify policy and record stats (skip stats for warmup requests)
+            if let Some(state) = self.pool.get_state_mut(connection_id) {
+                state.on_request_sent(sent_time_ns);
+            }
+            if !request.metadata.is_warmup {
+                self.stats.record_tx_bytes(group_id, connection_id, request.data.len());
+            }
+
+            // Try to re-add connection to heap if it still has capacity
+            // This enables pipelining for both closed-loop and rate-limited policies
+            //
+            // - Closed-loop (next_send_time = None): will be picked immediately to fill pipeline
+            // - Rate-limited (next_send_time = future): stored on heap, popped when time arrives
+            //
+            // This maintains invariant: connection on heap ⟺ can send (pipeline not full AND protocol ready)
+            let protocol = self.protocols.get(&group_id).expect("Protocol not found for group_id");
+            self.pool.try_schedule_connection(connection_id, protocol);
+
+            sends_this_iteration += 1;
+            if sends_this_iteration >= max_sends_per_iteration {
+                eprintln!(
+                    "[WARN] Hit send limit ({}) in one iteration - forcing receive phase",
+                    max_sends_per_iteration
+                );
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Bound every receive wait by the experiment deadline. A closed-loop
+    /// entry has no timestamp, so test readiness before interpreting an empty peek.
+    fn poll_timeout(&self, now_ns: u64, end_ns: u64) -> Duration {
+        let remaining_ns = end_ns.saturating_sub(now_ns);
+        let wait_ns = if self.pool.has_ready(now_ns) {
+            0
+        } else {
+            self.pool.peek_next_ready_time().map_or(remaining_ns, |next| {
+                // Spin during the final millisecond for precise scheduling.
+                next.saturating_sub(now_ns).saturating_sub(1_000_000)
+            })
+        };
+        Duration::from_nanos(wait_ns.min(remaining_ns))
     }
 
     /// Process responses from all connections
@@ -455,7 +448,7 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
 
         // Clean up stale TX queue entries (entries older than 1 minute)
         // This prevents memory leaks when TX timestamps are never received
-        self.pool.cleanup_stale_tx_queues();
+        self.maintain_tx_queues(timing::time_ns());
 
         // Collect retries to process after response handling
         let mut retries: Vec<(usize, RetryRequest<_>)> = Vec::new();
@@ -543,6 +536,13 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         Ok(())
     }
 
+    fn maintain_tx_queues(&mut self, now_ns: u64) {
+        if now_ns >= self.next_tx_cleanup_ns {
+            self.pool.cleanup_stale_tx_queues_at(now_ns);
+            self.next_tx_cleanup_ns = now_ns.saturating_add(1_000_000_000);
+        }
+    }
+
     /// Handle a retry request by sending preparation commands and retry request
     fn handle_retry(
         &mut self,
@@ -613,61 +613,22 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         Ok(())
     }
 
-    /// Single drain iteration - returns true if any connections have pending requests
+    /// Single drain iteration. Redirect retries remain enabled, using the same
+    /// extended parser and error handling as measurement. They can add pending
+    /// work, but the outer drain loop still bounds the number of poll iterations.
     fn drain_iteration(&mut self) -> Result<bool> {
-        let mut any_pending = false;
-
-        // Check if any connections have pending requests
-        for &connection_id in self.pool.connection_ids() {
-            if let Some(state) = self.pool.get_state(connection_id) {
-                if state.pending_count() > 0 {
-                    any_pending = true;
-                    break;
-                }
-            }
-        }
-
-        if !any_pending {
+        if !self.has_pending() {
             return Ok(false);
         }
+        self.process_responses(Some(Duration::from_millis(10)))?;
+        Ok(self.has_pending())
+    }
 
-        // Poll for ready connections
-        let ready_ids = self.pool.poll(Some(Duration::from_millis(10)))?;
-
-        for connection_id in ready_ids {
-            let state = match self.pool.get_state(connection_id) {
-                Some(s) => s,
-                None => continue,
-            };
-
-            if state.pending_count() == 0 {
-                continue;
-            }
-
-            let group_id = state.group_id();
-            let protocol =
-                self.protocols.get_mut(&group_id).expect("Protocol not found for group_id");
-
-            #[allow(clippy::excessive_nesting)]
-            if let Ok(responses) = self.pool.recv_responses(connection_id, |data| {
-                match protocol.parse_response(connection_id, data) {
-                    Ok((bytes_consumed, req_id_opt)) => Ok((bytes_consumed, req_id_opt)),
-                    Err(e) => Err(e.into()),
-                }
-            }) {
-                for (_req_id, latency, is_warmup, bytes_consumed) in responses {
-                    if is_warmup {
-                        continue;
-                    }
-                    if bytes_consumed > 0 {
-                        self.stats.record_rx_bytes(group_id, connection_id, bytes_consumed);
-                    }
-                    self.stats.record_latency(group_id, connection_id, latency);
-                }
-            }
-        }
-
-        Ok(any_pending)
+    fn has_pending(&self) -> bool {
+        self.pool
+            .connection_ids()
+            .iter()
+            .any(|&id| self.pool.get_state(id).is_some_and(|state| state.pending_count() > 0))
     }
 
     /// Get the stats collector
@@ -702,6 +663,7 @@ impl<P: Protocol, S: StatsRecorder> Worker<xylem_transport::UnixConnectionGroup,
             config,
             request_dumper: None,
             thread_id: 0,
+            next_tx_cleanup_ns: timing::time_ns().saturating_add(1_000_000_000),
         })
     }
 }
@@ -713,6 +675,233 @@ mod tests {
     use std::net::TcpListener;
     use std::thread;
     use xylem_transport::TcpTransportFactory;
+
+    use crate::connection::test_support::{FakeFactory, FakeGroup};
+    use crate::scheduler::{PolicyScheduler, UniformPolicyScheduler};
+
+    #[derive(Default)]
+    struct FakeProtocol {
+        next_id: u64,
+        retry: bool,
+        fail: bool,
+    }
+
+    impl Protocol for FakeProtocol {
+        type RequestId = u64;
+
+        fn next_request(&mut self, _: usize) -> Request<u64> {
+            let id = self.next_id;
+            self.next_id += 1;
+            Request::measurement(id.to_le_bytes().to_vec(), id)
+        }
+
+        fn parse_response(&mut self, _: usize, _: &[u8]) -> anyhow::Result<(usize, Option<u64>)> {
+            panic!("worker must use extended parsing, including during drain")
+        }
+
+        fn parse_response_extended(
+            &mut self,
+            _: usize,
+            data: &[u8],
+        ) -> anyhow::Result<ParseResult<u64>> {
+            if self.fail {
+                anyhow::bail!("invalid test response");
+            }
+            if data.len() < 8 {
+                return Ok(ParseResult::Incomplete);
+            }
+            let id = u64::from_le_bytes(data[..8].try_into().unwrap());
+            if std::mem::take(&mut self.retry) {
+                return Ok(ParseResult::Retry(RetryRequest {
+                    bytes_consumed: 8,
+                    original_request_id: id,
+                    is_warmup: false,
+                    target_conn_id: Some(0),
+                    prepare_commands: vec![],
+                    attempt: 0,
+                }));
+            }
+            Ok(ParseResult::Complete { bytes_consumed: 8, request_id: id })
+        }
+
+        fn name(&self) -> &'static str {
+            "Fake"
+        }
+        fn reset(&mut self) {}
+    }
+
+    fn fake_worker(
+        factory: &FakeFactory,
+        max_pending: usize,
+        scheduler: Box<dyn PolicyScheduler>,
+    ) -> Worker<FakeGroup, FakeProtocol> {
+        let mut stats = GroupStatsCollector::default();
+        stats.register_group_legacy(0, 1000, 1.0);
+        Worker::new(
+            factory,
+            FakeProtocol::default(),
+            stats,
+            WorkerConfig {
+                target: "127.0.0.1:1".parse().unwrap(),
+                duration: Duration::from_millis(100),
+                conn_count: 1,
+                max_pending_per_conn: max_pending,
+            },
+            scheduler,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ready_work_after_send_cap_polls_without_waiting() {
+        let factory = FakeFactory::default();
+        let mut worker = fake_worker(&factory, 32, Box::new(UniformPolicyScheduler::closed_loop()));
+        worker.send_requests().unwrap();
+        assert_eq!(factory.0.lock().unwrap().sent.len(), 16);
+        assert_eq!(worker.pool.peek_next_ready_time(), None);
+        let timeout = worker.poll_timeout(100, 100_000_100);
+        assert_eq!(timeout, Duration::ZERO);
+        worker.process_responses(Some(timeout)).unwrap();
+        assert_eq!(factory.0.lock().unwrap().timeouts, vec![Some(Duration::ZERO)]);
+    }
+
+    #[test]
+    fn future_policy_wait_is_clamped_to_experiment_end() {
+        let factory = FakeFactory::default();
+        let mut worker =
+            fake_worker(&factory, 2, Box::new(UniformPolicyScheduler::fixed_rate(0.001)));
+        assert_eq!(worker.pool.pick_connection_at(100), Some(0));
+        worker.pool.get_state_mut(0).unwrap().on_request_sent(100);
+        worker.pool.try_schedule_connection(0, &worker.protocols[&0]);
+        let timeout = worker.poll_timeout(100, 5_000_100);
+        assert_eq!(timeout, Duration::from_millis(5));
+        worker.process_responses(Some(timeout)).unwrap();
+        assert_eq!(factory.0.lock().unwrap().timeouts, vec![Some(Duration::from_millis(5))]);
+        assert_eq!(worker.poll_timeout(5_000_101, 5_000_100), Duration::ZERO);
+    }
+
+    #[test]
+    fn full_pipeline_wait_is_clamped_to_experiment_end() {
+        let factory = FakeFactory::default();
+        let mut worker = fake_worker(&factory, 1, Box::new(UniformPolicyScheduler::closed_loop()));
+        worker.send_requests().unwrap();
+        assert_eq!(worker.poll_timeout(100, 5_000_100), Duration::from_millis(5));
+    }
+
+    #[test]
+    fn drain_uses_extended_parser_records_response_and_polls_tx() {
+        let factory = FakeFactory::default();
+        let mut worker = fake_worker(&factory, 1, Box::new(UniformPolicyScheduler::closed_loop()));
+        worker.send_requests().unwrap();
+        factory.0.lock().unwrap().responses.push_back(Ok(0u64.to_le_bytes().to_vec()));
+        assert!(!worker.drain_iteration().unwrap());
+        assert_eq!(worker.stats.global().rx_requests(), 1);
+        assert_eq!(factory.0.lock().unwrap().tx_polls, 1);
+        // Already drained: no extra blocking poll.
+        assert!(!worker.drain_iteration().unwrap());
+        assert_eq!(factory.0.lock().unwrap().timeouts.len(), 1);
+    }
+
+    #[test]
+    fn drain_propagates_parse_and_io_errors() {
+        for parse_error in [true, false] {
+            let factory = FakeFactory::default();
+            let mut worker =
+                fake_worker(&factory, 1, Box::new(UniformPolicyScheduler::closed_loop()));
+            worker.send_requests().unwrap();
+            worker.protocols.get_mut(&0).unwrap().fail = parse_error;
+            factory.0.lock().unwrap().responses.push_back(if parse_error {
+                Ok(0u64.to_le_bytes().to_vec())
+            } else {
+                Err(xylem_transport::Error::Io(std::io::Error::other("test I/O error")))
+            });
+            assert!(worker.drain_iteration().is_err());
+            assert_eq!(worker.stats.global().rx_requests(), 0);
+        }
+    }
+
+    #[test]
+    fn drain_closes_disconnected_connection() {
+        let factory = FakeFactory::default();
+        let mut worker = fake_worker(&factory, 1, Box::new(UniformPolicyScheduler::closed_loop()));
+        worker.send_requests().unwrap();
+        factory
+            .0
+            .lock()
+            .unwrap()
+            .responses
+            .push_back(Err(xylem_transport::Error::Connection("closed".into())));
+        assert!(!worker.drain_iteration().unwrap());
+        assert!(factory.0.lock().unwrap().closed);
+        assert_eq!(worker.pool.get_state(0).unwrap().pending_count(), 0);
+    }
+
+    #[test]
+    fn drain_follows_redirect_and_waits_for_retry_response() {
+        let factory = FakeFactory::default();
+        let mut worker = fake_worker(&factory, 1, Box::new(UniformPolicyScheduler::closed_loop()));
+        worker.send_requests().unwrap();
+        worker.protocols.get_mut(&0).unwrap().retry = true;
+        factory.0.lock().unwrap().responses.push_back(Ok(0u64.to_le_bytes().to_vec()));
+        assert!(worker.drain_iteration().unwrap());
+        assert_eq!(factory.0.lock().unwrap().sent.len(), 2);
+        // FakeProtocol's default regenerate_request assigns the next ID.
+        factory.0.lock().unwrap().responses.push_back(Ok(1u64.to_le_bytes().to_vec()));
+        assert!(!worker.drain_iteration().unwrap());
+        assert_eq!(worker.stats.global().rx_requests(), 2);
+    }
+
+    #[test]
+    fn adaptive_policy_receives_measurement_feedback_through_worker() {
+        for warmup in [true, false] {
+            let factory = FakeFactory::default();
+            let mut worker = fake_worker(
+                &factory,
+                100,
+                Box::new(UniformPolicyScheduler::adaptive(
+                    100.0,
+                    Duration::from_millis(1),
+                    1.0,
+                    1000.0,
+                )),
+            );
+            // Remove the initial heap entry so response processing can reschedule.
+            assert_eq!(worker.pool.pick_connection_at(100), Some(0));
+            worker.pool.get_state_mut(0).unwrap().on_request_sent(100);
+            let mut responses = Vec::new();
+            for id in 0u64..100 {
+                worker.pool.send(0, &id.to_le_bytes(), id, warmup).unwrap();
+                responses.extend(id.to_le_bytes());
+            }
+            factory.0.lock().unwrap().responses.push_back(Ok(responses));
+            worker.process_responses(Some(Duration::ZERO)).unwrap();
+            // Inspect the actual deadline scheduled by response processing; do not
+            // call the adaptive policy directly to apply or simulate feedback.
+            let next = worker.pool.peek_next_ready_time().unwrap();
+            if warmup {
+                assert_eq!(next, 10_000_100, "warmup must not change the adaptive rate");
+                assert_eq!(worker.stats.global().rx_requests(), 0);
+            } else {
+                assert_eq!(next, 9_091_009, "100 zero-latency responses increase rate to 110/s");
+                assert_eq!(worker.stats.global().rx_requests(), 100);
+            }
+        }
+    }
+
+    #[test]
+    fn tx_queue_maintenance_runs_at_most_once_per_second() {
+        let factory = FakeFactory::default();
+        let mut worker = fake_worker(&factory, 1, Box::new(UniformPolicyScheduler::closed_loop()));
+        worker.next_tx_cleanup_ns = 100;
+        worker.maintain_tx_queues(99);
+        assert_eq!(worker.next_tx_cleanup_ns, 100);
+        worker.maintain_tx_queues(100);
+        assert_eq!(worker.next_tx_cleanup_ns, 1_000_000_100);
+        worker.maintain_tx_queues(101);
+        assert_eq!(worker.next_tx_cleanup_ns, 1_000_000_100);
+        worker.maintain_tx_queues(1_000_000_100);
+        assert_eq!(worker.next_tx_cleanup_ns, 2_000_000_100);
+    }
 
     // Protocol adapter
     struct ProtocolAdapter<P: xylem_protocols::Protocol> {

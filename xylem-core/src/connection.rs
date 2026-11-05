@@ -34,7 +34,7 @@ fn wrapping_le(a: u32, b: u32) -> bool {
     (a.wrapping_sub(b) as i32) <= 0
 }
 
-/// Maximum receive buffer size per connection
+/// Maximum size of an individual response or incomplete frame
 /// Increased to support large values (e.g., YCSB workloads with 10KB+ values)
 /// With RESP protocol overhead, 64KB supports ~50KB values
 const MAX_PAYLOAD: usize = 65536; // 64KB
@@ -107,16 +107,12 @@ pub struct ConnectionState<ReqId: Eq + Hash + Clone> {
     tx_pending_queue: VecDeque<(u32, ReqId, u64)>,
     /// Receive buffer for partial responses
     recv_buffer: Vec<u8>,
-    /// Current position in receive buffer
-    buffer_pos: usize,
     /// Whether connection is closed
     closed: bool,
     /// Traffic policy for this connection
     policy: Box<dyn Policy>,
     /// Traffic group ID this connection belongs to
     group_id: usize,
-    /// Timestamp (in nanoseconds) when this connection was last used for sending
-    last_active: u64,
     /// Whether this connection is currently in the ready heap
     /// Invariant: on_heap == true ⟺ connection can accept more requests
     on_heap: bool,
@@ -137,12 +133,10 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
             max_pending_requests,
             pending_map: HashMap::with_capacity(max_pending_requests),
             tx_pending_queue: VecDeque::with_capacity(max_pending_requests),
-            recv_buffer: vec![0u8; MAX_PAYLOAD],
-            buffer_pos: 0,
+            recv_buffer: Vec::with_capacity(MAX_PAYLOAD),
             closed: false,
             policy,
             group_id,
-            last_active: 0,
             on_heap: false,
         }
     }
@@ -182,7 +176,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         self.group_id
     }
 
-    /// Get the time (in nanoseconds) when this connection should send its next request
+    /// Get the next send or policy-refresh wakeup time (in nanoseconds)
     pub fn next_send_time(&mut self, current_time_ns: u64) -> Option<u64> {
         self.policy.next_send_time(current_time_ns)
     }
@@ -265,7 +259,10 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
     ///
     /// Returns the number of stale entries removed.
     pub fn cleanup_stale_tx_queue_entries(&mut self) -> usize {
-        let now_ns = crate::timing::time_ns();
+        self.cleanup_stale_tx_queue_entries_at(crate::timing::time_ns())
+    }
+
+    fn cleanup_stale_tx_queue_entries_at(&mut self, now_ns: u64) -> usize {
         let mut removed = 0;
 
         // Pop stale entries from front
@@ -330,62 +327,50 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
             return Ok(Vec::new());
         }
 
-        // Append to buffer
-        let data_len = data.len();
-        if self.buffer_pos + data_len > MAX_PAYLOAD {
-            return Err(crate::Error::Protocol(
-                "Response exceeds maximum payload size".to_string(),
-            ));
-        }
-
-        self.recv_buffer[self.buffer_pos..self.buffer_pos + data_len].copy_from_slice(data);
-        self.buffer_pos += data_len;
-
-        // Process complete responses in buffer
+        // A read can finish a near-limit frame and contain subsequent frames.
+        // Limit individual frames, not the sum of buffered and newly read bytes.
+        self.recv_buffer.extend_from_slice(data);
         let mut latencies = Vec::new();
-        loop {
-            let (consumed, req_id_opt) = process_fn(&self.recv_buffer[..self.buffer_pos])?;
-
-            if consumed == 0 {
-                break;
-            }
-
-            let req_id = req_id_opt.ok_or_else(|| {
-                crate::Error::Protocol("Protocol returned None for request ID".to_string())
-            })?;
-
-            if let Some(pending) = self.pending_map.remove(&req_id) {
-                // If TX timestamp wasn't received yet, clean up queue entry to prevent leak
-                // This happens when response arrives before TX timestamp (fast network/loopback)
-                // or when HW timestamps are not supported (Unix sockets)
-                if pending.tx_hw_ts.is_none() {
-                    self.cleanup_tx_queue_entry(&req_id);
-                }
-                // Use hardware TX timestamp if available, otherwise software timestamp
-                let send_ts = pending.tx_hw_ts.unwrap_or(pending.send_ts);
-                let latency = recv_ts.duration_since(&send_ts);
-                // Report the bytes consumed for THIS response (not cumulative)
-                latencies.push((req_id, latency, pending.is_warmup, consumed));
-            } else {
-                return Err(crate::Error::Protocol(format!(
-                    "Received response for unknown request ID: {req_id:?}"
-                )));
-            }
-
-            // Remove consumed bytes from buffer
-            if consumed == self.buffer_pos {
-                self.buffer_pos = 0;
-                break;
-            } else if consumed < self.buffer_pos {
-                let remaining = self.buffer_pos - consumed;
-                self.recv_buffer.copy_within(consumed..self.buffer_pos, 0);
-                self.buffer_pos = remaining;
-            } else {
+        let mut cursor = 0;
+        while cursor < self.recv_buffer.len() {
+            let available = self.recv_buffer.len() - cursor;
+            let (consumed, req_id_opt) = process_fn(&self.recv_buffer[cursor..])?;
+            if consumed > available {
                 return Err(crate::Error::Protocol(
                     "Response parser consumed more bytes than available".to_string(),
                 ));
             }
+            if consumed > MAX_PAYLOAD || (consumed == 0 && available > MAX_PAYLOAD) {
+                return Err(crate::Error::Protocol(
+                    "Response exceeds maximum payload size".to_string(),
+                ));
+            }
+            if consumed == 0 {
+                break;
+            }
+            let req_id = req_id_opt.ok_or_else(|| {
+                crate::Error::Protocol("Protocol returned None for request ID".to_string())
+            })?;
+            let pending = self.pending_map.remove(&req_id).ok_or_else(|| {
+                crate::Error::Protocol(format!(
+                    "Received response for unknown request ID: {req_id:?}"
+                ))
+            })?;
+            if pending.tx_hw_ts.is_none() {
+                self.cleanup_tx_queue_entry(&req_id);
+            }
+            let send_ts = pending.tx_hw_ts.unwrap_or(pending.send_ts);
+            let latency = recv_ts.duration_since(&send_ts);
+            // Match statistics: handshake/warmup latency must not tune the workload.
+            if !pending.is_warmup {
+                self.policy.on_response(latency);
+            }
+            latencies.push((req_id, latency, pending.is_warmup, consumed));
+            cursor += consumed;
         }
+        // Compact the remaining partial frame once, regardless of response count.
+        self.recv_buffer.copy_within(cursor.., 0);
+        self.recv_buffer.truncate(self.recv_buffer.len() - cursor);
 
         Ok(latencies)
     }
@@ -652,12 +637,16 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
     /// Removes TX queue entries older than 1 minute to prevent memory leaks
     /// when TX timestamps are never received (packet loss, unsupported NIC, etc.).
     ///
-    /// This should be called periodically (e.g., once per second or per poll cycle).
+    /// This should be called periodically (e.g., once per second).
     /// Returns the total number of stale entries removed across all connections.
     pub fn cleanup_stale_tx_queues(&mut self) -> usize {
+        self.cleanup_stale_tx_queues_at(crate::timing::time_ns())
+    }
+
+    pub(crate) fn cleanup_stale_tx_queues_at(&mut self, now_ns: u64) -> usize {
         let mut total_removed = 0;
         for state in self.connection_states.values_mut() {
-            total_removed += state.cleanup_stale_tx_queue_entries();
+            total_removed += state.cleanup_stale_tx_queue_entries_at(now_ns);
         }
         total_removed
     }
@@ -666,35 +655,30 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
     ///
     /// Pops the next ready connection from the heap and marks it as off-heap.
     ///
-    /// Note: With the new scheduling invariant, all connections on the heap
-    /// should be sendable. This method still checks `can_send()` defensively
-    /// but should never encounter a connection that can't send.
+    /// Policy-refresh entries are rescheduled if they do not yet permit a send.
+    /// Closed connections and full pipelines are skipped defensively.
     pub fn pick_connection(&mut self) -> Option<usize> {
-        let current_time_ns = crate::timing::time_ns();
+        self.pick_connection_at(crate::timing::time_ns())
+    }
 
-        if let Some(connection_id) = self.ready_heap.pop_ready(current_time_ns) {
-            if let Some(state) = self.connection_states.get_mut(&connection_id) {
-                if state.can_send() {
-                    state.set_on_heap(false);
-                    state.last_active = current_time_ns;
-                    return Some(connection_id);
-                } else {
-                    eprintln!(
-                        "[ERROR] INVARIANT VIOLATION: Connection {} popped from heap but can't send (pending={}, max={}, closed={})",
-                        connection_id,
-                        state.pending_count(),
-                        state.max_pending_requests,
-                        state.is_closed()
-                    );
-                }
-            } else {
-                eprintln!(
-                    "[ERROR] Connection {} popped from heap but state not found!",
-                    connection_id
-                );
+    pub(crate) fn pick_connection_at(&mut self, current_time_ns: u64) -> Option<usize> {
+        while let Some(connection_id) = self.ready_heap.pop_ready(current_time_ns) {
+            let Some(state) = self.connection_states.get_mut(&connection_id) else {
+                continue;
+            };
+            state.set_on_heap(false);
+            if !state.can_send() {
+                continue;
             }
+            if state.policy.ready_to_send(current_time_ns) {
+                return Some(connection_id);
+            }
+            // Dynamic policies wake at their refresh cadence even when paused or
+            // waiting for a much later send. Recalculate only those popped entries.
+            let next_wakeup = state.next_send_time(current_time_ns);
+            state.set_on_heap(true);
+            self.ready_heap.push(connection_id, next_wakeup);
         }
-
         None
     }
 
@@ -750,14 +734,18 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         false
     }
 
-    /// Get the next time when a connection will be ready to send
+    /// Get the next time when a connection is scheduled to send or refresh its policy
     ///
-    /// Returns `Some(time_ns)` for the earliest time a connection will be ready,
+    /// Returns `Some(time_ns)` for the earliest send or policy-refresh wakeup,
     /// or `None` if a connection is ready now (closed-loop) or heap is empty.
     ///
     /// Useful for determining how long to sleep in the worker loop.
     pub fn peek_next_ready_time(&self) -> Option<u64> {
         self.ready_heap.peek_next_time()
+    }
+
+    pub(crate) fn has_ready(&self, current_time_ns: u64) -> bool {
+        self.ready_heap.has_ready(current_time_ns)
     }
 
     /// Get connection state by ID
@@ -908,6 +896,167 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug>
 mod tests {
     use super::*;
 
+    fn state() -> ConnectionState<u64> {
+        ConnectionState::new(
+            0,
+            "127.0.0.1:1".parse().unwrap(),
+            1024,
+            Box::new(crate::scheduler::ClosedLoopPolicy),
+            0,
+        )
+    }
+
+    // Test frames encode their total size and request ID in an eight-byte header.
+    fn frame(id: u32, size: usize) -> Vec<u8> {
+        let mut data = vec![0; size];
+        data[..4].copy_from_slice(&(size as u32).to_le_bytes());
+        data[4..8].copy_from_slice(&id.to_le_bytes());
+        data
+    }
+
+    fn parse_frame(data: &[u8]) -> Result<(usize, Option<u64>)> {
+        if data.len() < 8 {
+            return Ok((0, None));
+        }
+        let size = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
+        let id = u32::from_le_bytes(data[4..8].try_into().unwrap()) as u64;
+        Ok(if data.len() < size {
+            (0, None)
+        } else {
+            (size, Some(id))
+        })
+    }
+
+    #[test]
+    fn fragmented_limit_frame_followed_by_coalesced_frame() {
+        let mut state = state();
+        let ts = Timestamp::now();
+        state.record_send(1, ts, 0, 1, false);
+        state.record_send(2, ts, 1, 2, false);
+        let first = frame(1, MAX_PAYLOAD);
+        assert!(state
+            .process_recv(&first[..MAX_PAYLOAD - 4], ts, parse_frame)
+            .unwrap()
+            .is_empty());
+        let tail = [&first[MAX_PAYLOAD - 4..], &frame(2, 16)].concat();
+        let responses = state.process_recv(&tail, ts, parse_frame).unwrap();
+        assert_eq!(
+            responses.iter().map(|r| (r.0, r.3)).collect::<Vec<_>>(),
+            vec![(1, MAX_PAYLOAD), (2, 16)]
+        );
+        assert!(state.recv_buffer.is_empty());
+        assert_eq!(state.pending_count(), 0);
+    }
+
+    #[test]
+    fn rejects_oversized_complete_and_incomplete_frames() {
+        for complete in [false, true] {
+            let mut state = state();
+            let ts = Timestamp::now();
+            state.record_send(1, ts, 0, 1, false);
+            let data = frame(1, MAX_PAYLOAD + 2);
+            let len = if complete { data.len() } else { data.len() - 1 };
+            let error = state.process_recv(&data[..len], ts, parse_frame).unwrap_err();
+            assert!(error.to_string().contains("maximum payload"));
+            assert_eq!(state.pending_count(), 1);
+        }
+    }
+
+    #[test]
+    fn coalesced_small_frames_preserve_partial_tail() {
+        let mut state = state();
+        let ts = Timestamp::now();
+        let mut data = Vec::new();
+        for id in 0..100 {
+            state.record_send(id, ts, 0, id as u32, false);
+            data.extend(frame(id as u32, 8));
+        }
+        let tail = frame(100, 12);
+        state.record_send(100, ts, 0, 100, false);
+        data.extend_from_slice(&tail[..6]);
+        assert_eq!(state.process_recv(&data, ts, parse_frame).unwrap().len(), 100);
+        assert_eq!(state.recv_buffer, tail[..6]);
+        assert_eq!(state.process_recv(&tail[6..], ts, parse_frame).unwrap()[0].0, 100);
+        assert!(state.recv_buffer.is_empty());
+    }
+
+    #[test]
+    fn invalid_parser_consumption_does_not_complete_request() {
+        let mut state = state();
+        let ts = Timestamp::now();
+        state.record_send(1, ts, 0, 1, false);
+        assert!(state.process_recv(&[0], ts, |_| Ok((2, Some(1)))).is_err());
+        assert_eq!(state.pending_count(), 1);
+    }
+
+    #[test]
+    fn stale_tx_cleanup_preserves_expiry_boundary() {
+        let mut state = state();
+        state.tx_pending_queue.extend([(1, 1, 10), (2, 2, 11), (3, 3, 12)]);
+        assert_eq!(state.cleanup_stale_tx_queue_entries_at(TX_QUEUE_STALE_TIMEOUT_NS + 11), 1);
+        assert_eq!(state.tx_pending_queue.front().unwrap().1, 2);
+        assert_eq!(state.cleanup_stale_tx_queue_entries_at(TX_QUEUE_STALE_TIMEOUT_NS + 13), 2);
+    }
+
+    fn pattern_pool(baseline: f64) -> ConnectionPool<test_support::FakeGroup, u64> {
+        use crate::scheduler::{PatternAwarePolicy, UniformPolicyScheduler};
+        use crate::workload::patterns::SpikePattern;
+        let factory = test_support::FakeFactory::default();
+        let mut pool = ConnectionPool::new(
+            &factory,
+            "127.0.0.1:1".parse().unwrap(),
+            1,
+            1,
+            Box::new(UniformPolicyScheduler::closed_loop()),
+            0,
+        )
+        .unwrap();
+        pool.connection_states.get_mut(&0).unwrap().policy = Box::new(PatternAwarePolicy::new(
+            std::sync::Arc::new(SpikePattern::new(
+                baseline,
+                1000.0,
+                Duration::from_millis(20),
+                Duration::from_millis(20),
+            )),
+            100,
+        ));
+        pool.ready_heap.clear();
+        let next = pool.connection_states.get_mut(&0).unwrap().next_send_time(100);
+        pool.ready_heap.push(0, next);
+        pool
+    }
+
+    #[test]
+    fn paused_pattern_refreshes_without_sending_and_resumes() {
+        let mut pool = pattern_pool(0.0);
+        assert_eq!(pool.pick_connection_at(100), None);
+        assert_eq!(pool.pick_connection_at(10_000_100), None);
+        assert_eq!(pool.peek_next_ready_time(), Some(20_000_100));
+        assert_eq!(pool.pick_connection_at(20_000_100), Some(0));
+        let state = pool.connection_states.get_mut(&0).unwrap();
+        state.on_request_sent(20_000_100);
+        let next = state.next_send_time(20_000_100);
+        state.set_on_heap(true);
+        pool.ready_heap.push(0, next);
+        // Even an overdue send must be revalidated if the pattern is now idle.
+        assert_eq!(pool.pick_connection_at(40_000_100), None);
+        assert_eq!(pool.peek_next_ready_time(), Some(50_000_100));
+        assert_eq!(pool.pick_connection_at(50_000_100), None);
+    }
+
+    #[test]
+    fn queued_low_rate_pattern_observes_short_spike() {
+        let mut pool = pattern_pool(0.1); // Ten seconds between baseline requests.
+        assert_eq!(pool.pick_connection_at(100), Some(0));
+        let state = pool.connection_states.get_mut(&0).unwrap();
+        state.on_request_sent(100);
+        let next = state.next_send_time(100);
+        state.set_on_heap(true);
+        pool.ready_heap.push(0, next);
+        assert_eq!(pool.pick_connection_at(10_000_100), None);
+        assert_eq!(pool.pick_connection_at(20_000_100), Some(0));
+    }
+
     #[test]
     fn test_wrapping_le() {
         // Normal cases
@@ -935,5 +1084,121 @@ mod tests {
         // Large gap within valid range (< 2^31)
         assert!(wrapping_le(0, i32::MAX as u32));
         assert!(wrapping_le(1000, 1000 + (i32::MAX as u32 - 1)));
+    }
+}
+
+/// Deterministic transport shared by execution tests; no sockets or timing waits.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    pub struct FakeIo {
+        pub responses: VecDeque<xylem_transport::Result<Vec<u8>>>,
+        pub sent: Vec<Vec<u8>>,
+        pub timeouts: Vec<Option<Duration>>,
+        pub tx_polls: usize,
+        pub closed: bool,
+        timestamp: Timestamp,
+    }
+
+    impl Default for FakeIo {
+        fn default() -> Self {
+            Self {
+                responses: VecDeque::new(),
+                sent: Vec::new(),
+                timeouts: Vec::new(),
+                tx_polls: 0,
+                closed: false,
+                timestamp: Timestamp::now(),
+            }
+        }
+    }
+
+    #[derive(Default)]
+    pub struct FakeFactory(pub Arc<Mutex<FakeIo>>);
+
+    pub struct FakeConnection(Arc<Mutex<FakeIo>>);
+
+    impl GroupConnection for FakeConnection {
+        fn send(&mut self, data: &[u8]) -> xylem_transport::Result<(Timestamp, u32, u32)> {
+            let mut io = self.0.lock().unwrap();
+            io.sent.push(data.to_vec());
+            Ok((io.timestamp, 0, io.sent.len() as u32))
+        }
+
+        fn recv(&mut self) -> xylem_transport::Result<(Vec<u8>, Timestamp)> {
+            let mut io = self.0.lock().unwrap();
+            let data = io.responses.pop_front().unwrap_or_else(|| Ok(Vec::new()))?;
+            Ok((data, io.timestamp))
+        }
+
+        fn is_connected(&self) -> bool {
+            !self.0.lock().unwrap().closed
+        }
+    }
+
+    pub struct FakeGroup {
+        io: Arc<Mutex<FakeIo>>,
+        connections: Vec<FakeConnection>,
+    }
+
+    impl ConnectionGroup for FakeGroup {
+        type Conn = FakeConnection;
+
+        fn add_connection(&mut self, _: &SocketAddr) -> xylem_transport::Result<usize> {
+            let id = self.connections.len();
+            self.connections.push(FakeConnection(self.io.clone()));
+            Ok(id)
+        }
+
+        fn get(&self, id: usize) -> Option<&Self::Conn> {
+            self.connections.get(id)
+        }
+
+        fn get_mut(&mut self, id: usize) -> Option<&mut Self::Conn> {
+            self.connections.get_mut(id)
+        }
+
+        fn poll(&mut self, timeout: Option<Duration>) -> xylem_transport::Result<Vec<usize>> {
+            let mut io = self.io.lock().unwrap();
+            io.timeouts.push(timeout);
+            Ok(if io.responses.is_empty() {
+                vec![]
+            } else {
+                vec![0]
+            })
+        }
+
+        fn poll_tx_timestamps(
+            &mut self,
+        ) -> xylem_transport::Result<Vec<xylem_transport::TxTimestampInfo>> {
+            self.io.lock().unwrap().tx_polls += 1;
+            Ok(Vec::new())
+        }
+
+        fn len(&self) -> usize {
+            self.connections.len()
+        }
+
+        fn close(&mut self, _: usize) -> xylem_transport::Result<()> {
+            self.io.lock().unwrap().closed = true;
+            Ok(())
+        }
+
+        fn close_all(&mut self) -> xylem_transport::Result<()> {
+            self.close(0)
+        }
+    }
+
+    impl TransportFactory for FakeFactory {
+        type Group = FakeGroup;
+
+        fn create_group(&self) -> xylem_transport::Result<Self::Group> {
+            Ok(FakeGroup {
+                io: self.0.clone(),
+                connections: Vec::new(),
+            })
+        }
     }
 }
