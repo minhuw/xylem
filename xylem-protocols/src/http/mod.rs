@@ -10,7 +10,6 @@
 use crate::Protocol;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
-use zeropool::BufferPool;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpMethod {
@@ -30,17 +29,12 @@ impl HttpMethod {
 }
 
 pub struct HttpProtocol {
-    method: HttpMethod,
-    path: String,
-    host: String,
-    /// Body size for POST/PUT requests
-    body_size: usize,
+    /// Request bytes, built once at construction and sent for every request
+    request: Vec<u8>,
     /// Per-connection sequence numbers for request tracking (TX side)
     conn_seq: HashMap<usize, u64>,
     /// Per-connection expected response sequence (RX side - responses are FIFO)
     conn_response_seq: HashMap<usize, u64>,
-    /// Buffer pool for request generation
-    pool: BufferPool,
 }
 
 impl HttpProtocol {
@@ -55,13 +49,9 @@ impl HttpProtocol {
         body_size: usize,
     ) -> Self {
         Self {
-            method,
-            path,
-            host,
-            body_size,
+            request: Self::build_request(method, &path, &host, body_size),
             conn_seq: HashMap::new(),
             conn_response_seq: HashMap::new(),
-            pool: BufferPool::new(),
         }
     }
 
@@ -72,28 +62,31 @@ impl HttpProtocol {
         result
     }
 
-    /// Generate HTTP request with optional body for POST/PUT
-    fn build_request(&self, body: Option<&[u8]>) -> Vec<u8> {
+    /// Generate HTTP request, with a body of `body_size` 'x' bytes for POST/PUT
+    fn build_request(method: HttpMethod, path: &str, host: &str, body_size: usize) -> Vec<u8> {
         let mut request = format!(
             "{} {} HTTP/1.1\r\n\
              Host: {}\r\n\
              Connection: keep-alive\r\n",
-            self.method.as_str(),
-            self.path,
-            self.host
+            method.as_str(),
+            path,
+            host
         );
 
-        if let Some(body_data) = body {
-            request.push_str(&format!("Content-Length: {}\r\n", body_data.len()));
-            request.push_str("Content-Type: application/octet-stream\r\n");
-            request.push_str("\r\n");
+        match method {
+            HttpMethod::Get => {
+                request.push_str("\r\n");
+                request.into_bytes()
+            }
+            HttpMethod::Post | HttpMethod::Put => {
+                request.push_str(&format!("Content-Length: {}\r\n", body_size));
+                request.push_str("Content-Type: application/octet-stream\r\n");
+                request.push_str("\r\n");
 
-            let mut bytes = request.into_bytes();
-            bytes.extend_from_slice(body_data);
-            bytes
-        } else {
-            request.push_str("\r\n");
-            request.into_bytes()
+                let mut bytes = request.into_bytes();
+                bytes.resize(bytes.len() + body_size, b'x');
+                bytes
+            }
         }
     }
 }
@@ -109,21 +102,8 @@ impl Protocol for HttpProtocol {
 
     fn next_request(&mut self, conn_id: usize) -> crate::Request<Self::RequestId> {
         let seq = self.next_seq(conn_id);
-
-        let body = match self.method {
-            HttpMethod::Get => None,
-            HttpMethod::Post | HttpMethod::Put => {
-                // Generate body filled with 'x' for POST/PUT using pool
-                let mut buf = self.pool.get(self.body_size);
-                buf.clear();
-                buf.resize(self.body_size, b'x');
-                Some(buf.to_vec())
-            }
-        };
-
-        let request = self.build_request(body.as_deref());
         // HTTP protocol doesn't have a warmup phase
-        crate::Request::measurement(request, (conn_id, seq))
+        crate::Request::measurement(self.request.clone(), (conn_id, seq))
     }
 
     fn parse_response(

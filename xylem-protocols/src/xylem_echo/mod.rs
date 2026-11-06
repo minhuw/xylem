@@ -20,15 +20,12 @@
 use crate::Protocol;
 use anyhow::Result;
 use std::collections::HashMap;
-use zeropool::BufferPool;
 
 const MESSAGE_SIZE: usize = 16; // 8 bytes request_id + 8 bytes delay_us
 
 pub struct XylemEchoProtocol {
     /// Default delay in microseconds if not specified
     default_delay_us: u64,
-    /// Buffer pool for request generation
-    pool: BufferPool,
     /// Per-connection sequence counter for generating unique request IDs
     conn_seq: HashMap<usize, u64>,
 }
@@ -37,7 +34,6 @@ impl XylemEchoProtocol {
     pub fn new(default_delay_us: u64) -> Self {
         Self {
             default_delay_us,
-            pool: BufferPool::new(),
             conn_seq: HashMap::new(),
         }
     }
@@ -69,8 +65,7 @@ impl Protocol for XylemEchoProtocol {
         // Encode conn_id and seq into 8 bytes: high 32 bits = conn_id, low 32 bits = seq
         let encoded_id = ((conn_id as u64) << 32) | (seq & 0xFFFFFFFF);
 
-        let mut buf = self.pool.get(MESSAGE_SIZE);
-        buf.clear();
+        let mut buf = Vec::with_capacity(MESSAGE_SIZE);
 
         // Write encoded request_id (8 bytes, little-endian)
         buf.extend_from_slice(&encoded_id.to_le_bytes());
@@ -79,7 +74,7 @@ impl Protocol for XylemEchoProtocol {
         buf.extend_from_slice(&self.default_delay_us.to_le_bytes());
 
         // Echo protocol doesn't have a warmup phase
-        crate::Request::measurement(buf.to_vec(), request_id)
+        crate::Request::measurement(buf, request_id)
     }
 
     fn parse_response(

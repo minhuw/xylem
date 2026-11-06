@@ -1,20 +1,19 @@
-//! Exact request bytes, request ids, and warmup tags for the memcached codecs.
+//! Exact request bytes, request ids, and warmup tags for the memcached, HTTP,
+//! xylem-echo, and masstree codecs.
 
-use xylem_protocols::configs::{InsertPhaseConfig, KeysConfig, MemcachedConfig};
+use xylem_protocols::configs::{HttpConfig, InsertPhaseConfig, KeysConfig, MemcachedConfig};
+use xylem_protocols::http::{HttpMethod, HttpProtocol};
+use xylem_protocols::masstree::{InsertPhaseState, MasstreeOp, MasstreeProtocol};
 use xylem_protocols::memcached::ascii::MemcachedOp as AsciiOp;
 use xylem_protocols::memcached::MemcachedOp as BinaryOp;
 use xylem_protocols::memcached::{MemcachedAsciiProtocol, MemcachedBinaryProtocol};
 use xylem_protocols::workload::KeyGeneration;
+use xylem_protocols::xylem_echo::XylemEchoProtocol;
 use xylem_protocols::{Protocol, Request};
-
-type RequestId = (usize, u64);
 
 /// Sends one request per entry on the entry's connection and compares the whole
 /// request with the expected one: bytes, request id, and warmup tag.
-fn assert_requests(
-    protocol: &mut impl Protocol<RequestId = RequestId>,
-    expected: Vec<(usize, Request<RequestId>)>,
-) {
+fn assert_requests<P: Protocol>(protocol: &mut P, expected: Vec<(usize, Request<P::RequestId>)>) {
     for (index, (conn_id, want)) in expected.into_iter().enumerate() {
         let got = protocol.next_request(conn_id);
         assert_eq!(got, want, "request {index} on connection {conn_id}");
@@ -553,4 +552,853 @@ fn memcached_binary_response_ids_count_per_connection() {
     assert_eq!(protocol.parse_response(1, &hit).unwrap(), (36, Some((1, 1))));
     protocol.reset();
     assert_eq!(protocol.parse_response(1, &stored).unwrap(), (24, Some((1, 0))));
+}
+
+/// HTTP/1.1 request with a `body_len`-byte body of b'x', as POST and PUT send it.
+fn http_with_body(method: &str, path: &str, host: &str, body_len: usize) -> Vec<u8> {
+    let head = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\n\
+         Content-Length: {body_len}\r\nContent-Type: application/octet-stream\r\n\r\n"
+    );
+    [head.into_bytes(), vec![b'x'; body_len]].concat()
+}
+
+#[test]
+fn http_new_and_with_body_size_get_send_no_body() {
+    let get = b"GET /api/test HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive\r\n\r\n";
+    for mut protocol in [
+        HttpProtocol::new(HttpMethod::Get, "/api/test".to_string(), "example.com".to_string()),
+        HttpProtocol::with_body_size(
+            HttpMethod::Get,
+            "/api/test".to_string(),
+            "example.com".to_string(),
+            32,
+        ),
+    ] {
+        assert_requests(
+            &mut protocol,
+            vec![
+                (0, Request::measurement(get.to_vec(), (0, 0))),
+                (1, Request::measurement(get.to_vec(), (1, 0))),
+                (0, Request::measurement(get.to_vec(), (0, 1))),
+                (1, Request::measurement(get.to_vec(), (1, 1))),
+                (1, Request::measurement(get.to_vec(), (1, 2))),
+            ],
+        );
+    }
+}
+
+#[test]
+fn http_default_and_default_config_get_root_from_localhost() {
+    let get = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n";
+    for mut protocol in [
+        HttpProtocol::default(),
+        HttpProtocol::from_config(&HttpConfig::default()).unwrap(),
+    ] {
+        assert_requests(
+            &mut protocol,
+            vec![
+                (1, Request::measurement(get.to_vec(), (1, 0))),
+                (0, Request::measurement(get.to_vec(), (0, 0))),
+                (1, Request::measurement(get.to_vec(), (1, 1))),
+            ],
+        );
+    }
+}
+
+#[test]
+fn http_post_with_body_size_sends_x_body() {
+    let post = [
+        b"POST /data HTTP/1.1\r\n".as_slice(),
+        b"Host: api.example.com\r\n",
+        b"Connection: keep-alive\r\n",
+        b"Content-Length: 5\r\n",
+        b"Content-Type: application/octet-stream\r\n",
+        b"\r\n",
+        b"xxxxx",
+    ]
+    .concat();
+    assert_eq!(http_with_body("POST", "/data", "api.example.com", 5), post);
+    let mut protocol = HttpProtocol::with_body_size(
+        HttpMethod::Post,
+        "/data".to_string(),
+        "api.example.com".to_string(),
+        5,
+    );
+    assert_requests(
+        &mut protocol,
+        vec![
+            (1, Request::measurement(post.clone(), (1, 0))),
+            (0, Request::measurement(post.clone(), (0, 0))),
+            (1, Request::measurement(post.clone(), (1, 1))),
+            (0, Request::measurement(post.clone(), (0, 1))),
+            (0, Request::measurement(post.clone(), (0, 2))),
+        ],
+    );
+}
+
+#[test]
+fn http_post_new_uses_64_byte_body() {
+    let post = http_with_body("POST", "/", "localhost", 64);
+    let mut protocol =
+        HttpProtocol::new(HttpMethod::Post, "/".to_string(), "localhost".to_string());
+    assert_requests(
+        &mut protocol,
+        vec![
+            (0, Request::measurement(post.clone(), (0, 0))),
+            (1, Request::measurement(post.clone(), (1, 0))),
+            (0, Request::measurement(post.clone(), (0, 1))),
+        ],
+    );
+}
+
+#[test]
+fn http_post_body_sizes_from_empty_to_large() {
+    let empty = b"POST /upload HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive\r\n\
+        Content-Length: 0\r\nContent-Type: application/octet-stream\r\n\r\n";
+    assert_eq!(http_with_body("POST", "/upload", "example.com", 0), empty.to_vec());
+    for body_size in [0, 1, 4096, 100_000] {
+        let post = http_with_body("POST", "/upload", "example.com", body_size);
+        let mut protocol = HttpProtocol::with_body_size(
+            HttpMethod::Post,
+            "/upload".to_string(),
+            "example.com".to_string(),
+            body_size,
+        );
+        assert_requests(
+            &mut protocol,
+            vec![
+                (0, Request::measurement(post.clone(), (0, 0))),
+                (1, Request::measurement(post.clone(), (1, 0))),
+                (0, Request::measurement(post.clone(), (0, 1))),
+            ],
+        );
+    }
+}
+
+#[test]
+fn http_put_with_body_size_sends_x_body() {
+    let put = b"PUT /k HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\
+        Content-Length: 3\r\nContent-Type: application/octet-stream\r\n\r\nxxx";
+    let mut protocol =
+        HttpProtocol::with_body_size(HttpMethod::Put, "/k".to_string(), "localhost".to_string(), 3);
+    assert_requests(
+        &mut protocol,
+        vec![
+            (0, Request::measurement(put.to_vec(), (0, 0))),
+            (1, Request::measurement(put.to_vec(), (1, 0))),
+            (1, Request::measurement(put.to_vec(), (1, 1))),
+        ],
+    );
+}
+
+#[test]
+fn http_from_config_post_uses_body_size_and_localhost() {
+    let config = HttpConfig {
+        method: "post".to_string(),
+        path: "/submit".to_string(),
+        host: None,
+        body_size: 2,
+    };
+    let post = b"POST /submit HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\
+        Content-Length: 2\r\nContent-Type: application/octet-stream\r\n\r\nxx";
+    let mut protocol = HttpProtocol::from_config(&config).unwrap();
+    assert_requests(
+        &mut protocol,
+        vec![
+            (1, Request::measurement(post.to_vec(), (1, 0))),
+            (0, Request::measurement(post.to_vec(), (0, 0))),
+            (1, Request::measurement(post.to_vec(), (1, 1))),
+        ],
+    );
+}
+
+#[test]
+fn http_reset_restarts_request_ids() {
+    let post = http_with_body("POST", "/", "localhost", 4);
+    let mut protocol =
+        HttpProtocol::with_body_size(HttpMethod::Post, "/".to_string(), "localhost".to_string(), 4);
+    assert_requests(
+        &mut protocol,
+        vec![
+            (0, Request::measurement(post.clone(), (0, 0))),
+            (1, Request::measurement(post.clone(), (1, 0))),
+            (0, Request::measurement(post.clone(), (0, 1))),
+        ],
+    );
+    protocol.reset();
+    assert_requests(
+        &mut protocol,
+        vec![
+            (0, Request::measurement(post.clone(), (0, 0))),
+            (1, Request::measurement(post.clone(), (1, 0))),
+        ],
+    );
+}
+
+/// 16-byte xylem-echo request: `conn_id << 32 | seq`, then the delay, both little-endian.
+fn echo_message(conn_id: u64, seq: u64, delay_us: u64) -> Vec<u8> {
+    let encoded_id = (conn_id << 32) | seq;
+    [encoded_id.to_le_bytes(), delay_us.to_le_bytes()].concat()
+}
+
+#[test]
+fn xylem_echo_new_encodes_connection_sequence_and_delay() {
+    #[rustfmt::skip]
+    let second_on_conn_1 = vec![
+        0x01, 0x00, 0x00, 0x00, // sequence 1
+        0x01, 0x00, 0x00, 0x00, // connection 1
+        0x64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // delay 100 us
+    ];
+    assert_eq!(echo_message(1, 1, 100), second_on_conn_1);
+    let mut protocol = XylemEchoProtocol::new(100);
+    assert_requests(
+        &mut protocol,
+        vec![
+            (0, Request::measurement(echo_message(0, 0, 100), (0, 0))),
+            (1, Request::measurement(echo_message(1, 0, 100), (1, 0))),
+            (1, Request::measurement(second_on_conn_1, (1, 1))),
+            (0, Request::measurement(echo_message(0, 1, 100), (0, 1))),
+            (0, Request::measurement(echo_message(0, 2, 100), (0, 2))),
+        ],
+    );
+}
+
+#[test]
+fn xylem_echo_default_has_zero_delay() {
+    let mut protocol = XylemEchoProtocol::default();
+    assert_requests(
+        &mut protocol,
+        vec![
+            (0, Request::measurement(vec![0x00; 16], (0, 0))),
+            (1, Request::measurement(echo_message(1, 0, 0), (1, 0))),
+            (0, Request::measurement(echo_message(0, 1, 0), (0, 1))),
+        ],
+    );
+}
+
+#[test]
+fn xylem_echo_largest_connection_id_and_delay() {
+    #[rustfmt::skip]
+    let first = vec![
+        0x00, 0x00, 0x00, 0x00, // sequence 0
+        0xff, 0xff, 0xff, 0xff, // connection 0xffff_ffff
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // delay u64::MAX
+    ];
+    let mut protocol = XylemEchoProtocol::new(u64::MAX);
+    assert_requests(
+        &mut protocol,
+        vec![
+            (0xffff_ffff, Request::measurement(first, (0xffff_ffff, 0))),
+            (2, Request::measurement(echo_message(2, 0, u64::MAX), (2, 0))),
+            (
+                0xffff_ffff,
+                Request::measurement(echo_message(0xffff_ffff, 1, u64::MAX), (0xffff_ffff, 1)),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn xylem_echo_reset_restarts_sequences() {
+    let mut protocol = XylemEchoProtocol::new(7);
+    assert_requests(
+        &mut protocol,
+        vec![
+            (0, Request::measurement(echo_message(0, 0, 7), (0, 0))),
+            (1, Request::measurement(echo_message(1, 0, 7), (1, 0))),
+            (1, Request::measurement(echo_message(1, 1, 7), (1, 1))),
+        ],
+    );
+    protocol.reset();
+    assert_requests(
+        &mut protocol,
+        vec![
+            (1, Request::measurement(echo_message(1, 0, 7), (1, 0))),
+            (0, Request::measurement(echo_message(0, 0, 7), (0, 0))),
+        ],
+    );
+}
+
+/// Masstree handshake request [0, 14, {"core": -1, "maxkeylen": 255}].
+#[rustfmt::skip]
+const MASSTREE_HANDSHAKE: &[u8] = &[
+    0x93, // array of 3
+    0xce, 0x00, 0x00, 0x00, 0x00, // u32 seq 0
+    0xcc, 0x0e, // u8 command 14 (handshake)
+    0x82, // map of 2
+    0xa4, b'c', b'o', b'r', b'e', 0xff, // "core": -1
+    0xa9, b'm', b'a', b'x', b'k', b'e', b'y', b'l', b'e', b'n', 0xcc, 0xff, // "maxkeylen": 255
+];
+
+/// Masstree handshake reply [0, 15, true, 0, "1.0"].
+const MASSTREE_HANDSHAKE_REPLY: &[u8] = &[0x95, 0x00, 0x0f, 0xc3, 0x00, 0xa3, b'1', b'.', b'0'];
+
+/// MessagePack u32 in its fixed five-byte form.
+fn msgpack_u32(value: u32) -> Vec<u8> {
+    [&[0xce][..], &value.to_be_bytes()].concat()
+}
+
+/// MessagePack string: the shortest str header for its length, then the bytes.
+fn msgpack_str(bytes: &[u8]) -> Vec<u8> {
+    let len = bytes.len();
+    let header = if len < 32 {
+        vec![0xa0 | len as u8]
+    } else if len < 256 {
+        vec![0xd9, len as u8]
+    } else if len < 65536 {
+        [&[0xda][..], &(len as u16).to_be_bytes()].concat()
+    } else {
+        [&[0xdb][..], &(len as u32).to_be_bytes()].concat()
+    };
+    [header, bytes.to_vec()].concat()
+}
+
+/// MessagePack array header for fewer than 16 elements.
+fn msgpack_fixarray(len: usize) -> Vec<u8> {
+    assert!(len < 16);
+    vec![0x90 | len as u8]
+}
+
+/// Masstree GET request [seq, 2, key].
+fn masstree_get(seq: u32, key: &str) -> Vec<u8> {
+    [
+        msgpack_fixarray(3),
+        msgpack_u32(seq),
+        vec![0xcc, 0x02],
+        msgpack_str(key.as_bytes()),
+    ]
+    .concat()
+}
+
+/// Masstree SET (replace) request [seq, 8, key, value].
+fn masstree_set(seq: u32, key: &str, value: &[u8]) -> Vec<u8> {
+    [
+        msgpack_fixarray(4),
+        msgpack_u32(seq),
+        vec![0xcc, 0x08],
+        msgpack_str(key.as_bytes()),
+        msgpack_str(value),
+    ]
+    .concat()
+}
+
+/// Masstree PUT request [seq, 6, key, col_idx, value, col_idx, value, ...].
+fn masstree_put(seq: u32, key: &str, columns: &[(u32, Vec<u8>)]) -> Vec<u8> {
+    let mut request = [
+        msgpack_fixarray(3 + 2 * columns.len()),
+        msgpack_u32(seq),
+        vec![0xcc, 0x06],
+        msgpack_str(key.as_bytes()),
+    ]
+    .concat();
+    for (col_idx, value) in columns {
+        request.extend_from_slice(&msgpack_u32(*col_idx));
+        request.extend_from_slice(&msgpack_str(value));
+    }
+    request
+}
+
+/// Masstree REMOVE request [seq, 10, key].
+fn masstree_remove(seq: u32, key: &str) -> Vec<u8> {
+    [
+        msgpack_fixarray(3),
+        msgpack_u32(seq),
+        vec![0xcc, 0x0a],
+        msgpack_str(key.as_bytes()),
+    ]
+    .concat()
+}
+
+/// Masstree SCAN request [seq, 4, firstkey, count, field, field, ...].
+fn masstree_scan(seq: u32, firstkey: &str, count: u32, fields: &[u32]) -> Vec<u8> {
+    let mut request = [
+        msgpack_fixarray(4 + fields.len()),
+        msgpack_u32(seq),
+        vec![0xcc, 0x04],
+        msgpack_str(firstkey.as_bytes()),
+        msgpack_u32(count),
+    ]
+    .concat();
+    for field in fields {
+        request.extend_from_slice(&msgpack_u32(*field));
+    }
+    request
+}
+
+/// Masstree CHECKPOINT request [seq, 12].
+fn masstree_checkpoint(seq: u32) -> Vec<u8> {
+    [msgpack_fixarray(2), msgpack_u32(seq), vec![0xcc, 0x0c]].concat()
+}
+
+/// Sends the masstree handshake on `conn_id` and feeds back the server's reply.
+fn complete_masstree_handshake(protocol: &mut MasstreeProtocol, conn_id: usize) {
+    assert!(protocol.can_send(conn_id));
+    assert_requests(
+        protocol,
+        vec![(conn_id, Request::warmup(MASSTREE_HANDSHAKE.to_vec(), (conn_id, 0)))],
+    );
+    assert!(!protocol.can_send(conn_id));
+    assert_eq!(
+        protocol.parse_response(conn_id, MASSTREE_HANDSHAKE_REPLY).unwrap(),
+        (MASSTREE_HANDSHAKE_REPLY.len(), Some((conn_id, 0)))
+    );
+    assert!(protocol.can_send(conn_id));
+}
+
+#[test]
+fn masstree_new_and_default_handshake_each_connection_before_key_zero_gets() {
+    #[rustfmt::skip]
+    let second_get = vec![
+        0x93, // array of 3
+        0xce, 0x00, 0x00, 0x00, 0x01, // u32 seq 1
+        0xcc, 0x02, // u8 command 2 (get)
+        0xa5, b'k', b'e', b'y', b':', b'0',
+    ];
+    assert_eq!(masstree_get(1, "key:0"), second_get);
+    for mut protocol in [MasstreeProtocol::new(MasstreeOp::Get), MasstreeProtocol::default()] {
+        assert!(!protocol.is_in_insert_phase());
+        assert!(protocol.can_send(0));
+        assert!(protocol.can_send(1));
+        assert_requests(
+            &mut protocol,
+            vec![
+                (0, Request::warmup(MASSTREE_HANDSHAKE.to_vec(), (0, 0))),
+                (1, Request::warmup(MASSTREE_HANDSHAKE.to_vec(), (1, 0))),
+            ],
+        );
+        assert!(!protocol.can_send(0));
+        assert!(!protocol.can_send(1));
+        assert_eq!(
+            protocol.parse_response(1, MASSTREE_HANDSHAKE_REPLY).unwrap(),
+            (9, Some((1, 0)))
+        );
+        assert!(!protocol.can_send(0));
+        assert!(protocol.can_send(1));
+        assert_requests(
+            &mut protocol,
+            vec![
+                (1, Request::measurement(masstree_get(0, "key:0"), (1, 0))),
+                (1, Request::measurement(second_get.clone(), (1, 1))),
+            ],
+        );
+        assert_eq!(
+            protocol.parse_response(0, MASSTREE_HANDSHAKE_REPLY).unwrap(),
+            (9, Some((0, 0)))
+        );
+        assert!(protocol.can_send(0));
+        assert_requests(
+            &mut protocol,
+            vec![
+                (0, Request::measurement(masstree_get(0, "key:0"), (0, 0))),
+                (1, Request::measurement(masstree_get(2, "key:0"), (1, 2))),
+                (0, Request::measurement(second_get.clone(), (0, 1))),
+            ],
+        );
+    }
+}
+
+#[test]
+fn masstree_new_set_uses_key_zero_and_64_byte_value() {
+    let mut protocol = MasstreeProtocol::new(MasstreeOp::Set);
+    complete_masstree_handshake(&mut protocol, 1);
+    complete_masstree_handshake(&mut protocol, 0);
+    assert_requests(
+        &mut protocol,
+        vec![
+            (1, Request::measurement(masstree_set(0, "key:0", &[b'x'; 64]), (1, 0))),
+            (0, Request::measurement(masstree_set(0, "key:0", &[b'x'; 64]), (0, 0))),
+            (1, Request::measurement(masstree_set(1, "key:0", &[b'x'; 64]), (1, 1))),
+        ],
+    );
+}
+
+#[test]
+fn masstree_new_put_writes_each_column() {
+    let columns = vec![(0, b"ab".to_vec()), (3, b"xyz".to_vec())];
+    #[rustfmt::skip]
+    let first_put = vec![
+        0x97, // array of 7
+        0xce, 0x00, 0x00, 0x00, 0x00, // u32 seq 0
+        0xcc, 0x06, // u8 command 6 (put)
+        0xa5, b'k', b'e', b'y', b':', b'0',
+        0xce, 0x00, 0x00, 0x00, 0x00, 0xa2, b'a', b'b', // column 0
+        0xce, 0x00, 0x00, 0x00, 0x03, 0xa3, b'x', b'y', b'z', // column 3
+    ];
+    assert_eq!(masstree_put(0, "key:0", &columns), first_put);
+    let mut protocol = MasstreeProtocol::new(MasstreeOp::Put { columns: columns.clone() });
+    complete_masstree_handshake(&mut protocol, 0);
+    complete_masstree_handshake(&mut protocol, 1);
+    assert_requests(
+        &mut protocol,
+        vec![
+            (0, Request::measurement(first_put.clone(), (0, 0))),
+            (1, Request::measurement(first_put.clone(), (1, 0))),
+            (0, Request::measurement(masstree_put(1, "key:0", &columns), (0, 1))),
+        ],
+    );
+
+    let mut protocol = MasstreeProtocol::new(MasstreeOp::Put { columns: vec![] });
+    complete_masstree_handshake(&mut protocol, 0);
+    complete_masstree_handshake(&mut protocol, 1);
+    #[rustfmt::skip]
+    let no_columns = vec![
+        0x93, 0xce, 0x00, 0x00, 0x00, 0x00, 0xcc, 0x06, 0xa5, b'k', b'e', b'y', b':', b'0',
+    ];
+    assert_requests(
+        &mut protocol,
+        vec![
+            (1, Request::measurement(no_columns.clone(), (1, 0))),
+            (0, Request::measurement(no_columns.clone(), (0, 0))),
+        ],
+    );
+}
+
+#[test]
+fn masstree_new_remove_and_checkpoint() {
+    #[rustfmt::skip]
+    let remove = vec![
+        0x93, 0xce, 0x00, 0x00, 0x00, 0x00, 0xcc, 0x0a, 0xa5, b'k', b'e', b'y', b':', b'0',
+    ];
+    assert_eq!(masstree_remove(0, "key:0"), remove);
+    let mut protocol = MasstreeProtocol::new(MasstreeOp::Remove);
+    complete_masstree_handshake(&mut protocol, 0);
+    complete_masstree_handshake(&mut protocol, 1);
+    assert_requests(
+        &mut protocol,
+        vec![
+            (0, Request::measurement(remove.clone(), (0, 0))),
+            (1, Request::measurement(remove.clone(), (1, 0))),
+            (1, Request::measurement(masstree_remove(1, "key:0"), (1, 1))),
+        ],
+    );
+
+    let checkpoint = vec![0x92, 0xce, 0x00, 0x00, 0x00, 0x00, 0xcc, 0x0c];
+    assert_eq!(masstree_checkpoint(0), checkpoint);
+    let mut protocol = MasstreeProtocol::new(MasstreeOp::Checkpoint);
+    complete_masstree_handshake(&mut protocol, 1);
+    complete_masstree_handshake(&mut protocol, 0);
+    assert_requests(
+        &mut protocol,
+        vec![
+            (1, Request::measurement(checkpoint.clone(), (1, 0))),
+            (0, Request::measurement(checkpoint.clone(), (0, 0))),
+            (0, Request::measurement(masstree_checkpoint(1), (0, 1))),
+        ],
+    );
+}
+
+#[test]
+fn masstree_new_scan_sends_first_key_count_and_fields() {
+    #[rustfmt::skip]
+    let first_scan = vec![
+        0x96, // array of 6
+        0xce, 0x00, 0x00, 0x00, 0x00, // u32 seq 0
+        0xcc, 0x04, // u8 command 4 (scan)
+        0xa5, b'k', b'e', b'y', b':', b'5', // first key
+        0xce, 0x00, 0x00, 0x00, 0x0a, // count 10
+        0xce, 0x00, 0x00, 0x00, 0x01, // field 1
+        0xce, 0x00, 0x00, 0x00, 0x02, // field 2
+    ];
+    assert_eq!(masstree_scan(0, "key:5", 10, &[1, 2]), first_scan);
+    let mut protocol = MasstreeProtocol::new(MasstreeOp::Scan {
+        firstkey: "key:5".to_string(),
+        count: 10,
+        fields: vec![1, 2],
+    });
+    complete_masstree_handshake(&mut protocol, 0);
+    complete_masstree_handshake(&mut protocol, 1);
+    assert_requests(
+        &mut protocol,
+        vec![
+            (0, Request::measurement(first_scan.clone(), (0, 0))),
+            (1, Request::measurement(first_scan.clone(), (1, 0))),
+            (0, Request::measurement(masstree_scan(1, "key:5", 10, &[1, 2]), (0, 1))),
+        ],
+    );
+
+    let mut protocol = MasstreeProtocol::new(MasstreeOp::Scan {
+        firstkey: "a".to_string(),
+        count: 1,
+        fields: vec![],
+    });
+    complete_masstree_handshake(&mut protocol, 0);
+    complete_masstree_handshake(&mut protocol, 1);
+    #[rustfmt::skip]
+    let no_fields = vec![
+        0x94, 0xce, 0x00, 0x00, 0x00, 0x00, 0xcc, 0x04, 0xa1, b'a', 0xce, 0x00, 0x00, 0x00, 0x01,
+    ];
+    assert_requests(
+        &mut protocol,
+        vec![
+            (1, Request::measurement(no_fields.clone(), (1, 0))),
+            (0, Request::measurement(no_fields.clone(), (0, 0))),
+        ],
+    );
+}
+
+#[test]
+fn masstree_with_workload_get_draws_keys_across_connections() {
+    let mut protocol =
+        MasstreeProtocol::with_workload(MasstreeOp::Get, KeyGeneration::sequential(7), 3);
+    assert!(!protocol.is_in_insert_phase());
+    complete_masstree_handshake(&mut protocol, 0);
+    complete_masstree_handshake(&mut protocol, 1);
+    assert_requests(
+        &mut protocol,
+        vec![
+            (0, Request::measurement(masstree_get(0, "key:7"), (0, 0))),
+            (1, Request::measurement(masstree_get(0, "key:8"), (1, 0))),
+            (1, Request::measurement(masstree_get(1, "key:9"), (1, 1))),
+            (0, Request::measurement(masstree_get(1, "key:10"), (0, 1))),
+        ],
+    );
+}
+
+#[test]
+fn masstree_with_workload_set_put_and_remove_use_generated_keys() {
+    let mut protocol =
+        MasstreeProtocol::with_workload(MasstreeOp::Set, KeyGeneration::round_robin(2), 3);
+    complete_masstree_handshake(&mut protocol, 1);
+    complete_masstree_handshake(&mut protocol, 0);
+    assert_requests(
+        &mut protocol,
+        vec![
+            (1, Request::measurement(masstree_set(0, "key:0", b"xxx"), (1, 0))),
+            (0, Request::measurement(masstree_set(0, "key:1", b"xxx"), (0, 0))),
+            (1, Request::measurement(masstree_set(1, "key:0", b"xxx"), (1, 1))),
+        ],
+    );
+
+    let columns = vec![(2, b"v".to_vec())];
+    let mut protocol = MasstreeProtocol::with_workload(
+        MasstreeOp::Put { columns: columns.clone() },
+        KeyGeneration::sequential(4),
+        3,
+    );
+    complete_masstree_handshake(&mut protocol, 0);
+    complete_masstree_handshake(&mut protocol, 1);
+    assert_requests(
+        &mut protocol,
+        vec![
+            (0, Request::measurement(masstree_put(0, "key:4", &columns), (0, 0))),
+            (1, Request::measurement(masstree_put(0, "key:5", &columns), (1, 0))),
+            (0, Request::measurement(masstree_put(1, "key:6", &columns), (0, 1))),
+        ],
+    );
+
+    let mut protocol =
+        MasstreeProtocol::with_workload(MasstreeOp::Remove, KeyGeneration::sequential(1), 3);
+    complete_masstree_handshake(&mut protocol, 0);
+    complete_masstree_handshake(&mut protocol, 1);
+    assert_requests(
+        &mut protocol,
+        vec![
+            (1, Request::measurement(masstree_remove(0, "key:1"), (1, 0))),
+            (1, Request::measurement(masstree_remove(1, "key:2"), (1, 1))),
+            (0, Request::measurement(masstree_remove(0, "key:3"), (0, 0))),
+        ],
+    );
+}
+
+#[test]
+fn masstree_set_value_sizes_cross_string_header_boundaries() {
+    #[rustfmt::skip]
+    let cases: [(usize, &[u8]); 8] = [
+        (0, &[0xa0]),
+        (31, &[0xbf]),
+        (32, &[0xd9, 0x20]),
+        (255, &[0xd9, 0xff]),
+        (256, &[0xda, 0x01, 0x00]),
+        (65_535, &[0xda, 0xff, 0xff]),
+        (65_536, &[0xdb, 0x00, 0x01, 0x00, 0x00]),
+        (100_000, &[0xdb, 0x00, 0x01, 0x86, 0xa0]),
+    ];
+    for (value_size, value_header) in cases {
+        let set = |seq: u8, key: u8| {
+            let head = [0x94, 0xce, 0x00, 0x00, 0x00, seq, 0xcc, 0x08, 0xa5];
+            [&head[..], b"key:", &[key], value_header, &vec![b'x'; value_size]].concat()
+        };
+        assert_eq!(masstree_set(1, "key:2", &vec![b'x'; value_size]), set(1, b'2'));
+        let mut protocol = MasstreeProtocol::with_workload(
+            MasstreeOp::Set,
+            KeyGeneration::sequential(0),
+            value_size,
+        );
+        complete_masstree_handshake(&mut protocol, 0);
+        complete_masstree_handshake(&mut protocol, 1);
+        assert_requests(
+            &mut protocol,
+            vec![
+                (0, Request::measurement(set(0, b'0'), (0, 0))),
+                (1, Request::measurement(set(0, b'1'), (1, 0))),
+                (0, Request::measurement(set(1, b'2'), (0, 1))),
+            ],
+        );
+    }
+}
+
+#[test]
+fn masstree_long_key_prefix_uses_str8_key_header() {
+    let prefix = "a-key-prefix-long-enough-for-str8:";
+    let mut protocol = MasstreeProtocol::with_workload_and_options(
+        MasstreeOp::Get,
+        KeyGeneration::sequential(0),
+        8,
+        prefix.to_string(),
+        false,
+        Some(42),
+        None,
+    );
+    #[rustfmt::skip]
+    let first_get = [
+        &[0x93, 0xce, 0x00, 0x00, 0x00, 0x00, 0xcc, 0x02, 0xd9, 0x23][..],
+        prefix.as_bytes(),
+        b"0",
+    ]
+    .concat();
+    complete_masstree_handshake(&mut protocol, 0);
+    complete_masstree_handshake(&mut protocol, 1);
+    assert_requests(
+        &mut protocol,
+        vec![
+            (0, Request::measurement(first_get, (0, 0))),
+            (1, Request::measurement(masstree_get(0, &format!("{prefix}1")), (1, 0))),
+        ],
+    );
+}
+
+#[test]
+fn masstree_with_workload_and_options_inserts_before_measuring() {
+    let mut protocol = MasstreeProtocol::with_workload_and_options(
+        MasstreeOp::Get,
+        KeyGeneration::round_robin(3),
+        8,
+        "mt:".to_string(),
+        false,
+        Some(42),
+        Some(InsertPhaseState::new(3, 2)),
+    );
+    assert!(protocol.is_in_insert_phase());
+    complete_masstree_handshake(&mut protocol, 0);
+    assert_requests(
+        &mut protocol,
+        vec![
+            (0, Request::warmup(masstree_set(0, "mt:0", b"xx"), (0, 0))),
+            (1, Request::warmup(MASSTREE_HANDSHAKE.to_vec(), (1, 0))),
+        ],
+    );
+    assert_eq!(protocol.parse_response(1, MASSTREE_HANDSHAKE_REPLY).unwrap(), (9, Some((1, 0))));
+    assert_requests(
+        &mut protocol,
+        vec![
+            (1, Request::warmup(masstree_set(0, "mt:1", b"xx"), (1, 0))),
+            (0, Request::warmup(masstree_set(1, "mt:2", b"xx"), (0, 1))),
+            (1, Request::measurement(masstree_get(1, "mt:0"), (1, 1))),
+            (1, Request::measurement(masstree_get(2, "mt:1"), (1, 2))),
+            (0, Request::measurement(masstree_get(2, "mt:2"), (0, 2))),
+            (0, Request::measurement(masstree_get(3, "mt:0"), (0, 3))),
+        ],
+    );
+    assert!(!protocol.is_in_insert_phase());
+}
+
+#[test]
+fn masstree_with_insert_phase_without_workload_counts_up_from_key_zero() {
+    let mut protocol = MasstreeProtocol::new(MasstreeOp::Get).with_insert_phase(2, 3);
+    assert!(protocol.is_in_insert_phase());
+    complete_masstree_handshake(&mut protocol, 0);
+    complete_masstree_handshake(&mut protocol, 1);
+    assert_requests(
+        &mut protocol,
+        vec![
+            (0, Request::warmup(masstree_set(0, "key:0", b"xxx"), (0, 0))),
+            (1, Request::warmup(masstree_set(0, "key:1", b"xxx"), (1, 0))),
+            (1, Request::measurement(masstree_get(1, "key:0"), (1, 1))),
+            (0, Request::measurement(masstree_get(1, "key:0"), (0, 1))),
+        ],
+    );
+    assert!(!protocol.is_in_insert_phase());
+}
+
+#[test]
+fn masstree_seeded_random_data_fills_insert_and_set_values() {
+    let mut protocol = MasstreeProtocol::with_workload_and_options(
+        MasstreeOp::Set,
+        KeyGeneration::sequential(5),
+        6,
+        "rd:".to_string(),
+        true,
+        Some(42),
+        Some(InsertPhaseState::new(1, 4)),
+    );
+    complete_masstree_handshake(&mut protocol, 0);
+    complete_masstree_handshake(&mut protocol, 1);
+    assert_requests(
+        &mut protocol,
+        vec![
+            (0, Request::warmup(masstree_set(0, "rd:0", b"m>}b"), (0, 0))),
+            (1, Request::measurement(masstree_set(0, "rd:5", b"kX,Y4x"), (1, 0))),
+            (0, Request::measurement(masstree_set(1, "rd:6", b"Up`'FT"), (0, 1))),
+            (1, Request::measurement(masstree_set(1, "rd:7", b"5%WL0r"), (1, 1))),
+        ],
+    );
+}
+
+#[test]
+fn masstree_request_ids_wrap_after_65535() {
+    let mut protocol = MasstreeProtocol::new(MasstreeOp::Remove);
+    complete_masstree_handshake(&mut protocol, 0);
+    complete_masstree_handshake(&mut protocol, 1);
+    for _ in 0..65_535 {
+        protocol.next_request(0);
+    }
+    #[rustfmt::skip]
+    let last_before_wrap = vec![
+        0x93, 0xce, 0x00, 0x00, 0xff, 0xff, 0xcc, 0x0a, 0xa5, b'k', b'e', b'y', b':', b'0',
+    ];
+    assert_requests(
+        &mut protocol,
+        vec![
+            (0, Request::measurement(last_before_wrap, (0, 65_535))),
+            (1, Request::measurement(masstree_remove(0, "key:0"), (1, 0))),
+            (0, Request::measurement(masstree_remove(0, "key:0"), (0, 0))),
+            (0, Request::measurement(masstree_remove(1, "key:0"), (0, 1))),
+        ],
+    );
+}
+
+#[test]
+fn masstree_reset_restarts_handshakes_ids_and_keys_but_not_insert_phase() {
+    let mut protocol =
+        MasstreeProtocol::with_workload(MasstreeOp::Get, KeyGeneration::sequential(10), 1)
+            .with_insert_phase(2, 1);
+    complete_masstree_handshake(&mut protocol, 0);
+    assert_requests(
+        &mut protocol,
+        vec![(0, Request::warmup(masstree_set(0, "key:0", b"x"), (0, 0)))],
+    );
+    protocol.reset();
+    assert!(protocol.is_in_insert_phase());
+    complete_masstree_handshake(&mut protocol, 0);
+    complete_masstree_handshake(&mut protocol, 1);
+    assert_requests(
+        &mut protocol,
+        vec![
+            (0, Request::warmup(masstree_set(0, "key:1", b"x"), (0, 0))),
+            (1, Request::measurement(masstree_get(0, "key:10"), (1, 0))),
+            (0, Request::measurement(masstree_get(1, "key:11"), (0, 1))),
+        ],
+    );
+    protocol.reset();
+    assert!(!protocol.is_in_insert_phase());
+    complete_masstree_handshake(&mut protocol, 1);
+    complete_masstree_handshake(&mut protocol, 0);
+    assert_requests(
+        &mut protocol,
+        vec![
+            (1, Request::measurement(masstree_get(0, "key:10"), (1, 0))),
+            (0, Request::measurement(masstree_get(0, "key:11"), (0, 0))),
+        ],
+    );
 }

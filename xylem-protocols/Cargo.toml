@@ -24,7 +24,6 @@ httparse = { workspace = true }
 rand = { workspace = true }
 rand_distr = { workspace = true }
 rmp = "0.8.14"
-zeropool = "0.2"
 csv = { workspace = true }
 
 [dev-dependencies]

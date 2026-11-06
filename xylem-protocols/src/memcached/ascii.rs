@@ -6,7 +6,6 @@ use super::{next_conn_seq, InsertPhaseState};
 use crate::Protocol;
 use anyhow::Result;
 use std::collections::HashMap;
-use zeropool::BufferPool;
 
 pub use super::MemcachedOp;
 
@@ -16,8 +15,6 @@ pub struct MemcachedAsciiProtocol {
     conn_send_seq: HashMap<usize, u64>,
     /// Per-connection sequence numbers for receive
     conn_recv_seq: HashMap<usize, u64>,
-    /// Buffer pool for request generation
-    pool: BufferPool,
     /// Key generator for next_request()
     key_gen: Option<crate::workload::KeyGeneration>,
     /// Value size for next_request()
@@ -33,7 +30,6 @@ impl MemcachedAsciiProtocol {
             operation,
             conn_send_seq: HashMap::new(),
             conn_recv_seq: HashMap::new(),
-            pool: BufferPool::new(),
             key_gen: None,
             value_size: 64,
             key_prefix: "key:".to_string(),
@@ -51,7 +47,6 @@ impl MemcachedAsciiProtocol {
             operation,
             conn_send_seq: HashMap::new(),
             conn_recv_seq: HashMap::new(),
-            pool: BufferPool::new(),
             key_gen: Some(key_gen),
             value_size,
             key_prefix: "key:".to_string(),
@@ -81,8 +76,7 @@ impl MemcachedAsciiProtocol {
     ///
     /// Format: set key:N 0 0 <value_len>\r\n<value>\r\n
     fn encode_set(&self, key: u64, value_size: usize) -> Vec<u8> {
-        let mut buf = self.pool.get(256 + value_size);
-        buf.clear();
+        let mut buf = Vec::with_capacity(256 + value_size);
         buf.extend_from_slice(b"set ");
         buf.extend_from_slice(self.key_prefix.as_bytes());
         buf.extend_from_slice(key.to_string().as_bytes());
@@ -91,7 +85,7 @@ impl MemcachedAsciiProtocol {
         buf.extend_from_slice(b"\r\n");
         buf.resize(buf.len() + value_size, b'x');
         buf.extend_from_slice(b"\r\n");
-        buf.to_vec()
+        buf
     }
 }
 
@@ -121,13 +115,12 @@ impl Protocol for MemcachedAsciiProtocol {
         let request_data = match self.operation {
             MemcachedOp::Get => {
                 // Format: get key:N\r\n
-                let mut buf = self.pool.get(64);
-                buf.clear();
+                let mut buf = Vec::with_capacity(64);
                 buf.extend_from_slice(b"get ");
                 buf.extend_from_slice(self.key_prefix.as_bytes());
                 buf.extend_from_slice(key.to_string().as_bytes());
                 buf.extend_from_slice(b"\r\n");
-                buf.to_vec()
+                buf
             }
             MemcachedOp::Set => self.encode_set(key, self.value_size),
         };

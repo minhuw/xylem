@@ -6,7 +6,6 @@ use super::{next_conn_seq, InsertPhaseState};
 use crate::Protocol;
 use anyhow::Result;
 use std::collections::HashMap;
-use zeropool::BufferPool;
 
 pub use super::MemcachedOp;
 
@@ -72,8 +71,6 @@ pub struct MemcachedBinaryProtocol {
     conn_send_seq: HashMap<usize, u64>,
     /// Per-connection sequence numbers for receive
     conn_recv_seq: HashMap<usize, u64>,
-    /// Buffer pool for request generation
-    pool: BufferPool,
     /// Key generator for next_request()
     key_gen: Option<crate::workload::KeyGeneration>,
     /// Value size for next_request()
@@ -89,7 +86,6 @@ impl MemcachedBinaryProtocol {
             operation,
             conn_send_seq: HashMap::new(),
             conn_recv_seq: HashMap::new(),
-            pool: BufferPool::new(),
             key_gen: None,
             value_size: 64,
             key_prefix: "key:".to_string(),
@@ -107,7 +103,6 @@ impl MemcachedBinaryProtocol {
             operation,
             conn_send_seq: HashMap::new(),
             conn_recv_seq: HashMap::new(),
-            pool: BufferPool::new(),
             key_gen: Some(key_gen),
             value_size,
             key_prefix: "key:".to_string(),
@@ -144,10 +139,9 @@ impl MemcachedBinaryProtocol {
         let body_len = extras_len as u32 + key_len as u32 + value_size as u32;
         let header = BmcHeader::new_request(CMD_SET, key_len, extras_len, body_len);
 
-        let mut buf = self
-            .pool
-            .get(BmcHeader::SIZE + extras_len as usize + key_len as usize + value_size);
-        buf.clear();
+        let mut buf = Vec::with_capacity(
+            BmcHeader::SIZE + extras_len as usize + key_len as usize + value_size,
+        );
         buf.extend_from_slice(&header.as_bytes());
 
         // Extras: 4 bytes flags (0) + 4 bytes expiration (0)
@@ -159,7 +153,7 @@ impl MemcachedBinaryProtocol {
         // Value
         buf.resize(buf.len() + value_size, b'x');
 
-        buf.to_vec()
+        buf
     }
 }
 
@@ -196,11 +190,10 @@ impl Protocol for MemcachedBinaryProtocol {
                 let body_len = key_len as u32;
                 let header = BmcHeader::new_request(CMD_GETK, key_len, 0, body_len);
 
-                let mut buf = self.pool.get(BmcHeader::SIZE + key_len as usize);
-                buf.clear();
+                let mut buf = Vec::with_capacity(BmcHeader::SIZE + key_len as usize);
                 buf.extend_from_slice(&header.as_bytes());
                 buf.extend_from_slice(key_bytes);
-                buf.to_vec()
+                buf
             }
             MemcachedOp::Set => self.encode_set(key, self.value_size),
         };

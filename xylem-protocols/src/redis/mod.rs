@@ -11,7 +11,6 @@ use anyhow::{anyhow, Result};
 use cluster::{parse_redirect, RedirectType};
 use command_selector::CommandSelector;
 use command_template::CommandTemplate;
-use zeropool::BufferPool;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RedisOp {
@@ -269,8 +268,6 @@ pub struct RedisProtocol {
     ask_redirects: u64,
     /// Track connections currently in a transaction
     conn_in_transaction: std::collections::HashSet<usize>,
-    /// Buffer pool for request generation
-    pool: BufferPool,
     /// Command execution statistics
     command_stats: std::collections::HashMap<String, u64>,
     /// Key generator for next_request() - None means use command_selector's per-command keys
@@ -298,7 +295,6 @@ impl RedisProtocol {
             moved_redirects: 0,
             ask_redirects: 0,
             conn_in_transaction: std::collections::HashSet::new(),
-            pool: BufferPool::new(),
             command_stats: std::collections::HashMap::new(),
             key_gen: None,
             value_size: 64,
@@ -353,7 +349,6 @@ impl RedisProtocol {
             moved_redirects: 0,
             ask_redirects: 0,
             conn_in_transaction: std::collections::HashSet::new(),
-            pool: BufferPool::new(),
             command_stats: std::collections::HashMap::new(),
             key_gen: Some(key_gen),
             value_size,
@@ -546,8 +541,7 @@ impl RedisProtocol {
         let id = (conn_id, seq);
 
         // Format: *3\r\n$3\r\nSET\r\n$<keylen>\r\n<key>\r\n$<vallen>\r\n<value>\r\n
-        let mut request = self.pool.get(256 + key.len() + value.len());
-        request.clear();
+        let mut request = Vec::with_capacity(256 + key.len() + value.len());
         request.extend_from_slice(b"*3\r\n$3\r\nSET\r\n");
         request.extend_from_slice(format!("${}\r\n", key.len()).as_bytes());
         request.extend_from_slice(key.as_bytes());
@@ -569,14 +563,12 @@ impl RedisProtocol {
         let id = (conn_id, seq);
 
         // Format: *2\r\n$3\r\nGET\r\n$<keylen>\r\n<key>\r\n
-        let mut request = self.pool.get(256 + key.len());
-        request.clear();
+        let mut request = Vec::with_capacity(256 + key.len());
         request.extend_from_slice(b"*2\r\n$3\r\nGET\r\n");
         request.extend_from_slice(format!("${}\r\n", key.len()).as_bytes());
         request.extend_from_slice(key.as_bytes());
         request.extend_from_slice(b"\r\n");
 
-        // Move the buffer (don't clone) to avoid memory leak
         crate::Request::measurement(request, id)
     }
 
