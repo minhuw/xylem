@@ -127,6 +127,13 @@
           # Skip tests that require external services (nginx) not available in sandbox
           doCheck = false;
 
+          # Move DWARF into a separate `debug` output for profile symbolization. separateDebugInfo
+          # appends `-g` to the rustc flags, so the level has to be appended after it.
+          separateDebugInfo = true;
+          preBuild = ''
+            export NIX_RUSTFLAGS+=" -C debuginfo=limited"
+          '';
+
           meta = with pkgs.lib; {
             description = "A simple, high-performance latency measurement tool for single-machine deployments";
             homepage = "https://github.com/minhuw/xylem";
