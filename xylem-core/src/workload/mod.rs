@@ -1,7 +1,7 @@
 //! Workload patterns and statistical distributions
 //!
 //! This module provides:
-//! - Load patterns for adaptive rate control (constant, ramp, spike, etc.)
+//! - Load patterns for adaptive rate control (ramp, spike, sinusoidal, sawtooth)
 //! - Statistical distributions re-exported from `xylem-common` for use by protocols
 
 pub mod patterns;
@@ -16,7 +16,4 @@ pub use xylem_common::{
 };
 
 // Re-export load patterns
-pub use patterns::{
-    ConstantPattern, LoadPattern, RampPattern, SawtoothPattern, SinusoidalPattern, SpikePattern,
-    StepPattern,
-};
+pub use patterns::{LoadPattern, RampPattern, SawtoothPattern, SinusoidalPattern, SpikePattern};

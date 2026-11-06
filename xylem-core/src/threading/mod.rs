@@ -8,7 +8,6 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 pub mod affinity;
-pub mod barrier;
 pub mod worker;
 
 // Re-export main types

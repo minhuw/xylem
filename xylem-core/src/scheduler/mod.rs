@@ -19,20 +19,6 @@
 //! // This scheduler can be used with ConnectionPool to create uniform traffic
 //! ```
 //!
-//! ## Example: Heterogeneous Traffic (10% at 100K, 90% at 1M)
-//!
-//! ```
-//! use xylem_core::scheduler::{FactoryPolicyScheduler, FixedRatePolicy};
-//!
-//! let policy_scheduler = FactoryPolicyScheduler::new(|conn_id| {
-//!     if conn_id % 10 == 0 {
-//!         Box::new(FixedRatePolicy::new(100_000.0))  // 10%: slow
-//!     } else {
-//!         Box::new(FixedRatePolicy::new(1_000_000.0))  // 90%: fast
-//!     }
-//! });
-//! ```
-//!
 //! ## Example: Time-Varying Traffic
 //!
 //! ```
@@ -57,9 +43,8 @@ pub mod ready_heap;
 
 // Re-export main types
 pub use policy::{
-    AdaptivePolicy, ClosedLoopPolicy, FactoryPolicyScheduler, FixedRatePolicy, PatternAwarePolicy,
-    PatternPolicyScheduler, PerConnectionPolicyScheduler, PoissonPolicy, Policy, PolicyScheduler,
-    UniformPolicyScheduler,
+    AdaptivePolicy, ClosedLoopPolicy, FixedRatePolicy, PatternAwarePolicy, PatternPolicyScheduler,
+    PoissonPolicy, Policy, PolicyScheduler, UniformPolicyScheduler,
 };
 
 pub use ready_heap::ReadyHeap;

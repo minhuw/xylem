@@ -46,8 +46,6 @@ pub mod flags {
     pub const SOF_TIMESTAMPING_RX_SOFTWARE: u32 = 1 << 3;
     /// Report software timestamps
     pub const SOF_TIMESTAMPING_SOFTWARE: u32 = 1 << 4;
-    /// Report SYS (transformed) hardware timestamps
-    pub const SOF_TIMESTAMPING_SYS_HARDWARE: u32 = 1 << 5;
     /// Report RAW hardware timestamps
     pub const SOF_TIMESTAMPING_RAW_HARDWARE: u32 = 1 << 6;
     /// Generate OPT_ID on TX for correlating TX timestamps
@@ -128,107 +126,6 @@ impl ScmTimestamping {
         } else {
             None
         }
-    }
-
-    /// Get raw hardware timestamp specifically
-    pub fn raw_hw_timestamp(&self) -> Option<(i64, i64)> {
-        if self.ts[2].tv_sec != 0 || self.ts[2].tv_nsec != 0 {
-            Some((self.ts[2].tv_sec, self.ts[2].tv_nsec))
-        } else {
-            None
-        }
-    }
-}
-
-/// TX timestamp information with byte counter for TCP correlation
-#[derive(Debug, Clone, Copy)]
-pub struct TxTimestampInfo {
-    /// Timestamp
-    pub timestamp: Timestamp,
-    /// Byte counter (OPT_ID) for matching with TX requests
-    pub opt_id: u32,
-}
-
-/// Pending TX timestamps queue (Lancet-style)
-///
-/// For TCP, TX timestamps arrive asynchronously and must be matched
-/// with the original send operation using byte counters.
-#[derive(Debug)]
-pub struct PendingTxTimestamps {
-    /// Current TX byte counter (incremented on each send)
-    pub tx_byte_counter: u32,
-    /// Queue of pending timestamps (waiting for NIC timestamp)
-    pending: Vec<PendingTxEntry>,
-    /// Queue of received timestamps (waiting to be consumed)
-    received: Vec<TxTimestampInfo>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct PendingTxEntry {
-    /// Expected byte counter value
-    opt_id: u32,
-}
-
-impl PendingTxTimestamps {
-    /// Create a new pending TX timestamps tracker
-    pub fn new() -> Self {
-        Self {
-            tx_byte_counter: 0,
-            pending: Vec::with_capacity(64),
-            received: Vec::with_capacity(64),
-        }
-    }
-
-    /// Record a TX operation (before sending)
-    ///
-    /// Returns the opt_id that will be used to match the TX timestamp.
-    pub fn record_tx(&mut self, bytes: u32) -> u32 {
-        self.tx_byte_counter = self.tx_byte_counter.wrapping_add(bytes);
-        let opt_id = self.tx_byte_counter;
-        self.pending.push(PendingTxEntry { opt_id });
-        opt_id
-    }
-
-    /// Add a received TX timestamp
-    pub fn add_received(&mut self, timestamp: Timestamp, opt_id: u32) {
-        // Find and remove matching pending entry, then store timestamp
-        if let Some(pos) = self.pending.iter().position(|e| e.opt_id == opt_id) {
-            self.pending.remove(pos);
-            self.received.push(TxTimestampInfo { timestamp, opt_id });
-        } else {
-            // Timestamp for unknown request - might be reordered, store anyway
-            self.received.push(TxTimestampInfo { timestamp, opt_id });
-        }
-    }
-
-    /// Pop the oldest received timestamp
-    pub fn pop_received(&mut self) -> Option<TxTimestampInfo> {
-        if self.received.is_empty() {
-            None
-        } else {
-            Some(self.received.remove(0))
-        }
-    }
-
-    /// Check if there are pending TX operations waiting for timestamps
-    pub fn has_pending(&self) -> bool {
-        !self.pending.is_empty()
-    }
-
-    /// Number of pending TX operations
-    pub fn pending_count(&self) -> usize {
-        self.pending.len()
-    }
-
-    /// Number of received timestamps ready to consume
-    pub fn received_count(&self) -> usize {
-        self.received.len()
-    }
-}
-
-impl Default for PendingTxTimestamps {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -711,37 +608,6 @@ mod tests {
         // Omit final alignment padding, as recvmsg is permitted to do.
         buf.truncate(buf.len() - (mem::size_of::<usize>() - 1));
         assert!(extract_rx_timestamp(&buf, buf.len()).is_some());
-    }
-
-    #[test]
-    fn test_pending_tx_timestamps() {
-        let mut pending = PendingTxTimestamps::new();
-
-        // Record some TX operations
-        let id1 = pending.record_tx(100);
-        let id2 = pending.record_tx(200);
-        let id3 = pending.record_tx(50);
-
-        assert_eq!(pending.pending_count(), 3);
-        assert_eq!(id1, 100);
-        assert_eq!(id2, 300);
-        assert_eq!(id3, 350);
-
-        // Add received timestamps (out of order)
-        pending.add_received(Timestamp::now(), id2);
-        pending.add_received(Timestamp::now(), id1);
-
-        assert_eq!(pending.pending_count(), 1); // Only id3 pending
-        assert_eq!(pending.received_count(), 2);
-
-        // Pop in order received
-        let ts1 = pending.pop_received();
-        assert!(ts1.is_some());
-        assert_eq!(ts1.unwrap().opt_id, id2);
-
-        let ts2 = pending.pop_received();
-        assert!(ts2.is_some());
-        assert_eq!(ts2.unwrap().opt_id, id1);
     }
 
     #[test]

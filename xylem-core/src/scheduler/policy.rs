@@ -53,14 +53,6 @@ pub trait Policy: Send {
 
     /// Get policy name for debugging
     fn name(&self) -> &'static str;
-
-    /// Set the target rate (for policies that support dynamic rate adjustment)
-    ///
-    /// This is used when combining with `LoadPattern` to support time-varying rates.
-    /// Policies that don't support dynamic rates can ignore this (default no-op).
-    fn set_target_rate(&mut self, _rate: f64) {
-        // Default: no-op for policies that don't support dynamic rates
-    }
 }
 
 /// Closed-loop policy (max throughput, send as fast as possible)
@@ -149,11 +141,6 @@ impl Policy for FixedRatePolicy {
     fn name(&self) -> &'static str {
         "FixedRate"
     }
-
-    fn set_target_rate(&mut self, rate: f64) {
-        self.rate = rate;
-        self.inter_arrival_ns = (1_000_000_000.0 / rate) as u64;
-    }
 }
 
 /// Poisson policy (exponentially distributed inter-arrivals)
@@ -219,13 +206,6 @@ impl Policy for PoissonPolicy {
 
     fn name(&self) -> &'static str {
         "Poisson"
-    }
-
-    fn set_target_rate(&mut self, rate: f64) {
-        // Recreate distribution with new lambda
-        if let Ok(new_dist) = ExponentialDistribution::new(rate) {
-            self.dist = new_dist;
-        }
     }
 }
 
@@ -332,10 +312,6 @@ impl Policy for AdaptivePolicy {
     fn name(&self) -> &'static str {
         "Adaptive"
     }
-
-    fn set_target_rate(&mut self, rate: f64) {
-        self.current_rate = rate.clamp(self.min_rate, self.max_rate);
-    }
 }
 
 /// PolicyScheduler trait for assigning policies to connections
@@ -346,8 +322,7 @@ impl Policy for AdaptivePolicy {
 ///
 /// Different implementations allow different assignment strategies:
 /// - Uniform: All connections use the same policy type (e.g., all Poisson at 1000 req/s)
-/// - Per-Connection: Each connection gets a specific pre-configured policy
-/// - Factory: Custom logic to assign policies based on connection ID
+/// - Pattern: All connections follow a time-varying `LoadPattern`
 pub trait PolicyScheduler: Send {
     /// Assign a policy to a newly created connection
     ///
@@ -434,143 +409,6 @@ impl PolicyScheduler for UniformPolicyScheduler {
     }
 }
 
-/// Per-connection policy scheduler (explicit policy for each connection)
-///
-/// Stores a pre-configured policy for each connection ID.
-/// Useful when you want fine-grained control over each connection's traffic pattern.
-///
-/// # Example
-/// ```
-/// use xylem_core::scheduler::{PerConnectionPolicyScheduler, FixedRatePolicy, PoissonPolicy};
-/// let mut scheduler = PerConnectionPolicyScheduler::new();
-/// // conn 0: FixedRate at 1000 req/s
-/// scheduler.add_policy(|| Box::new(FixedRatePolicy::new(1000.0)));
-/// // conn 1: Poisson at 500 req/s
-/// scheduler.add_policy(|| Box::new(PoissonPolicy::new(500.0).unwrap()));
-/// ```
-pub struct PerConnectionPolicyScheduler {
-    /// Policy factory functions, one per connection
-    factories: Vec<Box<dyn Fn() -> Box<dyn Policy> + Send>>,
-}
-
-impl PerConnectionPolicyScheduler {
-    /// Create a new per-connection scheduler
-    pub fn new() -> Self {
-        Self { factories: Vec::new() }
-    }
-
-    /// Add a policy factory for the next connection
-    ///
-    /// Policies are assigned in the order they're added:
-    /// - First add() → connection 0
-    /// - Second add() → connection 1
-    /// - etc.
-    pub fn add_policy<F>(&mut self, factory: F)
-    where
-        F: Fn() -> Box<dyn Policy> + Send + 'static,
-    {
-        self.factories.push(Box::new(factory));
-    }
-
-    /// Get the number of configured connections
-    pub fn num_connections(&self) -> usize {
-        self.factories.len()
-    }
-}
-
-impl Default for PerConnectionPolicyScheduler {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl PolicyScheduler for PerConnectionPolicyScheduler {
-    fn assign_policy(&mut self, conn_id: usize) -> Box<dyn Policy> {
-        if conn_id >= self.factories.len() {
-            panic!(
-                "No policy configured for connection {}. Only {} policies configured.",
-                conn_id,
-                self.factories.len()
-            );
-        }
-        (self.factories[conn_id])()
-    }
-
-    fn name(&self) -> &'static str {
-        "PerConnection"
-    }
-}
-
-/// Factory-based policy scheduler (custom assignment logic)
-///
-/// Uses a custom function to assign policies based on connection ID.
-/// Useful for patterns like:
-/// - Round-robin between policy types
-/// - Even connections get policy A, odd get policy B
-/// - Rate scaling based on connection ID
-///
-/// # Example
-/// ```
-/// use xylem_core::scheduler::{FactoryPolicyScheduler, FixedRatePolicy, PoissonPolicy};
-/// // Even connections: FixedRate, Odd connections: Poisson
-/// let scheduler = FactoryPolicyScheduler::new(|conn_id| {
-///     if conn_id % 2 == 0 {
-///         Box::new(FixedRatePolicy::new(1000.0))
-///     } else {
-///         Box::new(PoissonPolicy::new(1000.0).unwrap())
-///     }
-/// });
-/// ```
-pub struct FactoryPolicyScheduler {
-    factory: Box<dyn FnMut(usize) -> Box<dyn Policy> + Send>,
-}
-
-impl FactoryPolicyScheduler {
-    /// Create a new factory-based scheduler
-    ///
-    /// # Parameters
-    /// - `factory`: Function that takes connection ID and returns a policy
-    pub fn new<F>(factory: F) -> Self
-    where
-        F: FnMut(usize) -> Box<dyn Policy> + Send + 'static,
-    {
-        Self { factory: Box::new(factory) }
-    }
-
-    /// Create a round-robin scheduler cycling through multiple policy factories
-    ///
-    /// # Parameters
-    /// - `factories`: Vector of policy factory functions
-    ///
-    /// # Example
-    /// ```
-    /// use xylem_core::scheduler::{FactoryPolicyScheduler, FixedRatePolicy, PoissonPolicy};
-    /// let scheduler = FactoryPolicyScheduler::round_robin(vec![
-    ///     Box::new(|| Box::new(FixedRatePolicy::new(1000.0))),
-    ///     Box::new(|| Box::new(PoissonPolicy::new(500.0).unwrap())),
-    /// ]);
-    /// // conn 0: FixedRate, conn 1: Poisson, conn 2: FixedRate, ...
-    /// ```
-    pub fn round_robin(factories: Vec<Box<dyn Fn() -> Box<dyn Policy> + Send>>) -> Self {
-        let mut index = 0;
-        Self::new(move |_conn_id| {
-            let policy = factories[index % factories.len()]();
-            index += 1;
-            policy
-        })
-    }
-}
-
-impl PolicyScheduler for FactoryPolicyScheduler {
-    fn assign_policy(&mut self, conn_id: usize) -> Box<dyn Policy> {
-        (self.factory)(conn_id)
-    }
-
-    fn name(&self) -> &'static str {
-        "Factory"
-    }
-}
-
 /// Pattern-aware policy that dynamically adjusts rate based on elapsed time
 ///
 /// This policy wraps a `LoadPattern` and updates its target rate on each
@@ -648,10 +486,6 @@ impl Policy for PatternAwarePolicy {
     fn name(&self) -> &'static str {
         "PatternAware"
     }
-
-    fn set_target_rate(&mut self, rate: f64) {
-        self.inter_arrival_ns = Self::interval(rate);
-    }
 }
 
 /// Pattern-based policy scheduler for time-varying traffic
@@ -728,21 +562,6 @@ mod tests {
         assert_eq!(next2, Some(100_000 + 1_000_000)); // +1ms in nanoseconds
 
         assert_eq!(policy.name(), "FixedRate");
-    }
-
-    #[test]
-    fn test_fixed_rate_dynamic_rate() {
-        let mut policy = FixedRatePolicy::new(1000.0);
-
-        // Change rate to 500 req/s (2ms per request)
-        policy.set_target_rate(500.0);
-        assert_eq!(policy.rate(), 500.0);
-
-        policy.on_request_sent(0);
-
-        // Next request should be at 2ms
-        let next = policy.next_send_time(1_000_000);
-        assert_eq!(next, Some(2_000_000)); // 2ms in nanoseconds
     }
 
     #[test]
@@ -873,92 +692,13 @@ mod tests {
     }
 
     #[test]
-    fn test_per_connection_policy_scheduler() {
-        let mut scheduler = PerConnectionPolicyScheduler::new();
-
-        // Add different policies for each connection
-        scheduler.add_policy(|| Box::new(ClosedLoopPolicy::new()));
-        scheduler.add_policy(|| Box::new(FixedRatePolicy::new(1000.0)));
-        scheduler.add_policy(|| Box::new(PoissonPolicy::new(500.0).unwrap()));
-
-        assert_eq!(scheduler.num_connections(), 3);
-
-        let policy0 = scheduler.assign_policy(0);
-        let policy1 = scheduler.assign_policy(1);
-        let policy2 = scheduler.assign_policy(2);
-
-        assert_eq!(policy0.name(), "ClosedLoop");
-        assert_eq!(policy1.name(), "FixedRate");
-        assert_eq!(policy2.name(), "Poisson");
-        assert_eq!(scheduler.name(), "PerConnection");
-    }
-
-    #[test]
-    #[should_panic(expected = "No policy configured for connection 3")]
-    fn test_per_connection_policy_scheduler_out_of_bounds() {
-        let mut scheduler = PerConnectionPolicyScheduler::new();
-        scheduler.add_policy(|| Box::new(ClosedLoopPolicy::new()));
-
-        // This should panic - only 1 policy configured
-        scheduler.assign_policy(3);
-    }
-
-    #[test]
-    fn test_factory_policy_scheduler() {
-        let mut scheduler = FactoryPolicyScheduler::new(|conn_id| {
-            if conn_id % 2 == 0 {
-                Box::new(FixedRatePolicy::new(1000.0))
-            } else {
-                Box::new(PoissonPolicy::new(500.0).unwrap())
-            }
-        });
-
-        let policy0 = scheduler.assign_policy(0);
-        let policy1 = scheduler.assign_policy(1);
-        let policy2 = scheduler.assign_policy(2);
-        let policy3 = scheduler.assign_policy(3);
-
-        // Even connections: FixedRate, Odd: Poisson
-        assert_eq!(policy0.name(), "FixedRate");
-        assert_eq!(policy1.name(), "Poisson");
-        assert_eq!(policy2.name(), "FixedRate");
-        assert_eq!(policy3.name(), "Poisson");
-        assert_eq!(scheduler.name(), "Factory");
-    }
-
-    #[test]
-    fn test_factory_policy_scheduler_round_robin() {
-        let mut scheduler = FactoryPolicyScheduler::round_robin(vec![
-            Box::new(|| Box::new(ClosedLoopPolicy::new())),
-            Box::new(|| Box::new(FixedRatePolicy::new(1000.0))),
-            Box::new(|| Box::new(PoissonPolicy::new(500.0).unwrap())),
-        ]);
-
-        let policy0 = scheduler.assign_policy(0);
-        let policy1 = scheduler.assign_policy(1);
-        let policy2 = scheduler.assign_policy(2);
-        let policy3 = scheduler.assign_policy(3); // Wrap around
-
-        assert_eq!(policy0.name(), "ClosedLoop");
-        assert_eq!(policy1.name(), "FixedRate");
-        assert_eq!(policy2.name(), "Poisson");
-        assert_eq!(policy3.name(), "ClosedLoop"); // Back to first
-    }
-
-    #[test]
     fn test_policy_scheduler_trait() {
         let mut uniform: Box<dyn PolicyScheduler> =
             Box::new(UniformPolicyScheduler::fixed_rate(1000.0));
-        let per_conn: Box<dyn PolicyScheduler> = Box::new(PerConnectionPolicyScheduler::new());
-        let mut factory: Box<dyn PolicyScheduler> =
-            Box::new(FactoryPolicyScheduler::new(|_| Box::new(ClosedLoopPolicy::new())));
 
         assert_eq!(uniform.name(), "Uniform");
-        assert_eq!(per_conn.name(), "PerConnection");
-        assert_eq!(factory.name(), "Factory");
 
-        // All should be able to assign policies
+        // Should be able to assign policies through the trait object
         let _ = uniform.assign_policy(0);
-        let _ = factory.assign_policy(0);
     }
 }

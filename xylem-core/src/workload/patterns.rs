@@ -22,45 +22,6 @@ pub trait LoadPattern: Send + Sync {
 
     /// Get pattern name
     fn name(&self) -> &'static str;
-
-    /// Get the total duration of this pattern (if finite)
-    ///
-    /// Returns `None` for infinite patterns (like Constant)
-    fn duration(&self) -> Option<Duration> {
-        None
-    }
-}
-
-/// Constant rate (no variation)
-///
-/// Simplest pattern - maintains the same rate throughout the entire duration.
-pub struct ConstantPattern {
-    rate: f64,
-}
-
-impl ConstantPattern {
-    /// Create a new constant pattern
-    ///
-    /// # Parameters
-    /// - `rate`: Target rate in requests per second
-    pub fn new(rate: f64) -> Self {
-        Self { rate }
-    }
-
-    /// Get the rate
-    pub fn rate(&self) -> f64 {
-        self.rate
-    }
-}
-
-impl LoadPattern for ConstantPattern {
-    fn rate_at(&self, _elapsed: Duration) -> f64 {
-        self.rate
-    }
-
-    fn name(&self) -> &'static str {
-        "Constant"
-    }
 }
 
 /// Ramp pattern (linearly increase/decrease)
@@ -103,10 +64,6 @@ impl LoadPattern for RampPattern {
 
     fn name(&self) -> &'static str {
         "Ramp"
-    }
-
-    fn duration(&self) -> Option<Duration> {
-        Some(self.duration)
     }
 }
 
@@ -167,10 +124,6 @@ impl LoadPattern for SpikePattern {
 
     fn name(&self) -> &'static str {
         "Spike"
-    }
-
-    fn duration(&self) -> Option<Duration> {
-        Some(self.spike_start + self.spike_duration)
     }
 }
 
@@ -242,52 +195,6 @@ impl LoadPattern for SinusoidalPattern {
     }
 }
 
-/// Step function pattern (discrete level changes)
-///
-/// Changes rate in discrete steps at specified times.
-/// Useful for simulating different load levels (light, medium, heavy).
-pub struct StepPattern {
-    steps: Vec<(Duration, f64)>, // (time, rate)
-}
-
-impl StepPattern {
-    /// Create a new step pattern
-    ///
-    /// # Parameters
-    /// - `steps`: Vector of (time, rate) tuples. Must be sorted by time.
-    ///
-    /// The pattern will maintain each rate until the next step time.
-    /// Before the first step, the rate is 0.0.
-    pub fn new(steps: Vec<(Duration, f64)>) -> Self {
-        Self { steps }
-    }
-
-    /// Get the steps
-    pub fn steps(&self) -> &[(Duration, f64)] {
-        &self.steps
-    }
-}
-
-impl LoadPattern for StepPattern {
-    fn rate_at(&self, elapsed: Duration) -> f64 {
-        // Find the last step that has occurred
-        self.steps
-            .iter()
-            .rev()
-            .find(|(time, _)| elapsed >= *time)
-            .map(|(_, rate)| *rate)
-            .unwrap_or(0.0)
-    }
-
-    fn name(&self) -> &'static str {
-        "Step"
-    }
-
-    fn duration(&self) -> Option<Duration> {
-        self.steps.last().map(|(time, _)| *time)
-    }
-}
-
 /// Sawtooth pattern (repeated ramps)
 ///
 /// Ramps up from min_rate to max_rate, then instantly drops back to min_rate.
@@ -345,16 +252,6 @@ impl LoadPattern for SawtoothPattern {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_constant_pattern() {
-        let pattern = ConstantPattern::new(1000.0);
-
-        assert_eq!(pattern.rate_at(Duration::ZERO), 1000.0);
-        assert_eq!(pattern.rate_at(Duration::from_secs(10)), 1000.0);
-        assert_eq!(pattern.rate_at(Duration::from_secs(100)), 1000.0);
-        assert_eq!(pattern.name(), "Constant");
-    }
 
     #[test]
     fn test_ramp_pattern() {
@@ -456,31 +353,6 @@ mod tests {
     }
 
     #[test]
-    fn test_step_pattern() {
-        let pattern = StepPattern::new(vec![
-            (Duration::from_secs(0), 1000.0),
-            (Duration::from_secs(10), 5000.0),
-            (Duration::from_secs(20), 10000.0),
-        ]);
-
-        // At t=0-9s
-        assert_eq!(pattern.rate_at(Duration::from_secs(0)), 1000.0);
-        assert_eq!(pattern.rate_at(Duration::from_secs(5)), 1000.0);
-        assert_eq!(pattern.rate_at(Duration::from_secs(9)), 1000.0);
-
-        // At t=10-19s
-        assert_eq!(pattern.rate_at(Duration::from_secs(10)), 5000.0);
-        assert_eq!(pattern.rate_at(Duration::from_secs(15)), 5000.0);
-        assert_eq!(pattern.rate_at(Duration::from_secs(19)), 5000.0);
-
-        // At t=20s+
-        assert_eq!(pattern.rate_at(Duration::from_secs(20)), 10000.0);
-        assert_eq!(pattern.rate_at(Duration::from_secs(30)), 10000.0);
-
-        assert_eq!(pattern.name(), "Step");
-    }
-
-    #[test]
     fn test_sawtooth_pattern() {
         let pattern = SawtoothPattern::new(1000.0, 10000.0, Duration::from_secs(10));
 
@@ -512,7 +384,6 @@ mod tests {
 
     #[test]
     fn test_load_pattern_trait() {
-        let constant: Box<dyn LoadPattern> = Box::new(ConstantPattern::new(1000.0));
         let ramp: Box<dyn LoadPattern> =
             Box::new(RampPattern::new(100.0, 1000.0, Duration::from_secs(10)));
         let spike: Box<dyn LoadPattern> = Box::new(SpikePattern::new(
@@ -523,12 +394,10 @@ mod tests {
         ));
 
         // All should implement the trait
-        assert_eq!(constant.name(), "Constant");
         assert_eq!(ramp.name(), "Ramp");
         assert_eq!(spike.name(), "Spike");
 
         // All should be able to compute rate
-        let _ = constant.rate_at(Duration::from_secs(5));
         let _ = ramp.rate_at(Duration::from_secs(5));
         let _ = spike.rate_at(Duration::from_secs(5));
     }
