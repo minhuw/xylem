@@ -49,12 +49,9 @@ impl<T: Clone + Send> CommandSelector<T> for FixedCommandSelector<T> {
     }
 }
 
-/// Key generator trait re-exported from xylem_core
+/// Key generator trait, re-exported from `crate::workload::KeyGeneratorTrait`
 /// We use a trait object to avoid tight coupling to KeyGeneration enum
-pub trait KeyGenerator: Send {
-    fn next_key(&mut self) -> u64;
-    fn reset(&mut self);
-}
+pub use crate::workload::KeyGeneratorTrait as KeyGenerator;
 
 /// Weighted command selector - selects commands with specified probabilities
 pub struct WeightedCommandSelector<T> {

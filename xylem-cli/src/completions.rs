@@ -234,9 +234,6 @@ fn add_protocol_config_paths(paths: &mut BTreeSet<String>) {
 
     // Memcached configuration
     paths.insert(format!("{}.operation", base));
-
-    // Echo configuration
-    paths.insert(format!("{}.message_size", base));
 }
 
 /// Recursively extract all valid paths from a JSON schema value

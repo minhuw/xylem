@@ -74,10 +74,6 @@ impl ValueSizeGenerator for UniformSize {
 
 /// Normal (Gaussian) size generator - returns sizes following a bell curve
 pub struct NormalSize {
-    #[allow(dead_code)]
-    mean: f64,
-    #[allow(dead_code)]
-    std_dev: f64,
     min: usize,
     max: usize,
     dist: NormalDistribution,
@@ -102,7 +98,7 @@ impl NormalSize {
         }
 
         let dist = NormalDistribution::with_seed(mean, std_dev, seed)?;
-        Ok(Self { mean, std_dev, min, max, dist })
+        Ok(Self { min, max, dist })
     }
 }
 

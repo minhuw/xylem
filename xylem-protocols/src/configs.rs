@@ -523,17 +523,11 @@ impl Default for HttpConfig {
 }
 
 /// Xylem Echo protocol configuration (for testing)
+///
+/// The echo protocol has no options: its messages are always 16 bytes.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct XylemEchoConfig {
-    /// Message size in bytes
-    #[serde(default = "default_echo_size")]
-    pub message_size: usize,
-}
-
-fn default_echo_size() -> usize {
-    64
-}
+pub struct XylemEchoConfig {}
 
 /// Masstree protocol configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]

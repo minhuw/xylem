@@ -75,9 +75,6 @@ pub struct RedisClusterProtocol {
     /// Redirect statistics for monitoring
     redirect_stats: RedirectStats,
 
-    /// Map connection ID to node address
-    conn_to_node: HashMap<usize, SocketAddr>,
-
     /// Map node address to connection ID
     node_to_conn: HashMap<SocketAddr, usize>,
 
@@ -122,7 +119,6 @@ impl RedisClusterProtocol {
             topology: ClusterTopology::new(),
             max_redirects: 5,
             redirect_stats: RedirectStats::default(),
-            conn_to_node: HashMap::new(),
             node_to_conn: HashMap::new(),
             default_node: None,
             request_metadata: HashMap::new(),
@@ -168,7 +164,6 @@ impl RedisClusterProtocol {
             topology: ClusterTopology::new(),
             max_redirects: 5,
             redirect_stats: RedirectStats::default(),
-            conn_to_node: HashMap::new(),
             node_to_conn: HashMap::new(),
             default_node: None,
             request_metadata: HashMap::new(),
@@ -199,7 +194,6 @@ impl RedisClusterProtocol {
     /// protocol.register_connection("127.0.0.1:7001".parse()?, 1);
     /// ```
     pub fn register_connection(&mut self, node: SocketAddr, conn_id: usize) {
-        self.conn_to_node.insert(conn_id, node);
         self.node_to_conn.insert(node, conn_id);
 
         // Set first registered node as default
@@ -212,7 +206,6 @@ impl RedisClusterProtocol {
     ///
     /// Used when re-wiring connections after pool creation.
     pub fn clear_connections(&mut self) {
-        self.conn_to_node.clear();
         self.node_to_conn.clear();
         self.default_node = None;
     }
@@ -780,10 +773,9 @@ mod tests {
         protocol.register_connection(node1, 0);
         protocol.register_connection(node2, 1);
 
-        assert_eq!(protocol.conn_to_node.len(), 2);
         assert_eq!(protocol.node_to_conn.len(), 2);
-        assert_eq!(protocol.conn_to_node[&0], node1);
         assert_eq!(protocol.node_to_conn[&node1], 0);
+        assert_eq!(protocol.node_to_conn[&node2], 1);
     }
 
     #[test]

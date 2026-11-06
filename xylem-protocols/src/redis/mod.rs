@@ -267,9 +267,6 @@ pub struct RedisProtocol {
     /// Track redirect statistics (for cluster support)
     moved_redirects: u64,
     ask_redirects: u64,
-    /// RESP protocol version (2 or 3)
-    #[allow(dead_code)] // Reserved for future RESP3-specific features
-    resp_version: u8,
     /// Track connections currently in a transaction
     conn_in_transaction: std::collections::HashSet<usize>,
     /// Buffer pool for request generation
@@ -300,7 +297,6 @@ impl RedisProtocol {
             conn_recv_seq: std::collections::HashMap::new(),
             moved_redirects: 0,
             ask_redirects: 0,
-            resp_version: 2, // Default to RESP2
             conn_in_transaction: std::collections::HashSet::new(),
             pool: BufferPool::new(),
             command_stats: std::collections::HashMap::new(),
@@ -356,7 +352,6 @@ impl RedisProtocol {
             conn_recv_seq: std::collections::HashMap::new(),
             moved_redirects: 0,
             ask_redirects: 0,
-            resp_version: 2,
             conn_in_transaction: std::collections::HashSet::new(),
             pool: BufferPool::new(),
             command_stats: std::collections::HashMap::new(),
@@ -2188,14 +2183,6 @@ mod tests {
         let (consumed, id) = result.unwrap();
         assert_eq!(consumed, 0); // Incomplete
         assert_eq!(id, None);
-    }
-
-    #[test]
-    fn test_resp_version_default() {
-        let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
-        let protocol = RedisProtocol::new(selector);
-
-        assert_eq!(protocol.resp_version, 2); // Default to RESP2
     }
 
     #[test]

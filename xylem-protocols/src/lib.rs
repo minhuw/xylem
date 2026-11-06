@@ -173,7 +173,6 @@ pub mod configs;
 pub mod factories;
 pub mod factory;
 pub mod http;
-pub mod key_generation_adapter;
 pub mod masstree;
 pub mod memcached;
 pub mod protocol;

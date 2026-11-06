@@ -8,6 +8,7 @@ use rand::{Rng, SeedableRng};
 use xylem_common::{Distribution, NormalDistribution, ZipfianDistribution};
 
 /// Trait for key generation (to enable per-command key generators)
+/// Also exported as `KeyGenerator` from `crate::redis::command_selector`
 pub trait KeyGeneratorTrait: Send {
     fn next_key(&mut self) -> u64;
     fn reset(&mut self);

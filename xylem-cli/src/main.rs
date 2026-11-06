@@ -560,7 +560,6 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                     ))
                 }
                 (ParsedProtocolConfig::XylemEcho(_echo_config), "xylem-echo") => {
-                    // XylemEcho message_size is handled via the value_size in the generator
                     let p = xylem_cli::multi_protocol::create_xylem_echo_protocol();
                     ProtocolAdapter::new(p)
                 }
