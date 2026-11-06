@@ -6,8 +6,9 @@
 use super::redirect::RedirectType;
 use super::topology::ClusterTopology;
 use crate::redis::command_selector::CommandSelector;
+use crate::redis::resp::{self, ReplyKind};
 use crate::redis::slot::calculate_slot;
-use crate::redis::{RedisOp, RedisProtocol, ReplyKind};
+use crate::redis::{RedisOp, RedisProtocol};
 use crate::Protocol;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
@@ -591,11 +592,11 @@ impl RedisClusterProtocol {
     ) -> Result<crate::ParseResult<ClusterRequestId>> {
         // ASKING's reply has no request ID. Consume it together with the retry's
         // response so the public ParseResult needs no new variant.
-        let expected = (conn_id, *self.base_protocol.conn_recv_seq.get(&conn_id).unwrap_or(&0));
+        let expected = self.base_protocol.expected_reply_id(conn_id);
         let asking_pending =
             self.in_flight.get(&expected).is_some_and(|tracked| tracked.asking_pending);
         let prefix = if asking_pending {
-            let size = RedisProtocol::find_resp_message_end(data)?;
+            let size = resp::find_resp_message_end(data)?;
             if size == 0 {
                 return Ok(crate::ParseResult::Incomplete);
             }

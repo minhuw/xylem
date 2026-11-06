@@ -3,6 +3,7 @@
 //! This module handles MOVED and ASK redirects, which are used by Redis Cluster
 //! to inform clients about slot ownership and migration.
 
+use crate::redis::resp::encode_command;
 use anyhow::{anyhow, Result};
 use std::net::SocketAddr;
 
@@ -152,8 +153,7 @@ fn parse_ask(msg: &str) -> Result<Option<RedirectType>> {
 /// assert_eq!(cmd, b"*1\r\n$6\r\nASKING\r\n");
 /// ```
 pub fn generate_asking_command() -> Vec<u8> {
-    // *1\r\n$6\r\nASKING\r\n
-    b"*1\r\n$6\r\nASKING\r\n".to_vec()
+    encode_command(&["ASKING"])
 }
 
 /// Generate CLUSTER SLOTS command for topology discovery
@@ -162,8 +162,7 @@ pub fn generate_asking_command() -> Vec<u8> {
 ///
 /// RESP-encoded CLUSTER SLOTS command: `*2\r\n$7\r\nCLUSTER\r\n$5\r\nSLOTS\r\n`
 pub fn generate_cluster_slots_command() -> Vec<u8> {
-    // *2\r\n$7\r\nCLUSTER\r\n$5\r\nSLOTS\r\n
-    b"*2\r\n$7\r\nCLUSTER\r\n$5\r\nSLOTS\r\n".to_vec()
+    encode_command(&["CLUSTER", "SLOTS"])
 }
 
 #[cfg(test)]

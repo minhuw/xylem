@@ -5,6 +5,7 @@
 //! - `__data__` - Replaced with generated value data
 //! - `__value_size__` - Replaced with the value size
 
+use super::resp::encode_command;
 use anyhow::{anyhow, Result};
 
 /// A parsed command template that can generate RESP requests
@@ -130,21 +131,24 @@ impl CommandTemplate {
         key_prefix: &str,
         value_data: &str,
     ) -> Vec<u8> {
+        let key_str = format!("{}{}", key_prefix, key);
+        let value_size_str = value_size.to_string();
+
         // First pass: substitute variables to get command parts
-        let mut command_parts = Vec::new();
+        let mut command_parts: Vec<&str> = Vec::new();
 
         for part in &self.parts {
             match part {
                 TemplatePart::Literal(lit) => {
                     // Split literal by whitespace to get individual arguments
                     // split_whitespace() already skips empty strings
-                    command_parts.extend(lit.split_whitespace().map(String::from));
+                    command_parts.extend(lit.split_whitespace());
                 }
                 TemplatePart::Variable(var) => {
                     let value = match var {
-                        Variable::Key => format!("{}{}", key_prefix, key),
-                        Variable::Data => value_data.to_string(),
-                        Variable::ValueSize => value_size.to_string(),
+                        Variable::Key => key_str.as_str(),
+                        Variable::Data => value_data,
+                        Variable::ValueSize => value_size_str.as_str(),
                     };
                     command_parts.push(value);
                 }
@@ -152,12 +156,7 @@ impl CommandTemplate {
         }
 
         // Second pass: encode as RESP array
-        let mut request = format!("*{}\r\n", command_parts.len());
-        for part in command_parts {
-            request.push_str(&format!("${}\r\n{}\r\n", part.len(), part));
-        }
-
-        request.into_bytes()
+        encode_command(&command_parts)
     }
 
     /// Get the original template string
