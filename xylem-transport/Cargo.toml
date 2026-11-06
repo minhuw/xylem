@@ -11,7 +11,6 @@ description = "Transport layer implementations for Xylem latency measurement too
 # Networking
 socket2 = { workspace = true }
 libc = { workspace = true }
-opool = "0.1.1"
 
 # Linux-only: I/O multiplexing via nix (epoll, poll, select)
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -21,17 +20,11 @@ nix = { workspace = true }
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 mio = { workspace = true }
 
-[dependencies.anyhow]
-workspace = true
-
-[dependencies.thiserror]
-workspace = true
-
 [dependencies.tracing]
 workspace = true
 
 [dev-dependencies]
-tempfile = "3.8"
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

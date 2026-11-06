@@ -16,20 +16,17 @@ xylem-transport = { path = "../xylem-transport" }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-schemars = { version = "1.1.0", optional = true }
+schemars = { workspace = true, optional = true }
 tracing = { workspace = true }
 rand = { workspace = true }
-rand_distr = { workspace = true }
 statrs = { workspace = true }
 core_affinity = { workspace = true }
 humantime-serde = { workspace = true }
-csv = { workspace = true }
 sha2 = "0.10"
 hex = "0.4"
 sketches-ddsketch = "0.3.0"
 tdigest = "0.2"
 hdrhistogram = "7.5"
-zeropool = "0.2"
 parquet = { workspace = true }
 arrow = { workspace = true }
 
@@ -38,5 +35,4 @@ schema = ["schemars"]
 
 [dev-dependencies]
 xylem-protocols = { path = "../xylem-protocols" }
-tokio = { version = "1.0", features = ["full"] }
 tempfile = { workspace = true }
