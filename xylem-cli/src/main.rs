@@ -603,9 +603,6 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
     tracing::info!("Experiment completed successfully");
     let stats = xylem_core::stats::TupleStatsCollector::merge(results);
 
-    // Write output file if configured
-    use config::OutputFormat;
-
     // Get transport summary from traffic groups
     let unique_transports: std::collections::HashSet<_> =
         config.traffic_groups.iter().map(|g| g.transport.as_str()).collect();
@@ -635,76 +632,6 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
         config.output.file.display()
     );
 
-    match config.output.format {
-        OutputFormat::Human => {
-            // Human format - console output only, no file
-            detailed_results.print_human();
-            tracing::debug!("Human format selected - output printed to console");
-        }
-        OutputFormat::Json => {
-            detailed_results.print_human();
-
-            let json_path = config.output.file.with_extension("json");
-            let path_str =
-                json_path.to_str().ok_or_else(|| anyhow::anyhow!("Invalid output file path"))?;
-            tracing::debug!("Writing JSON results to {}", json_path.display());
-            match detailed_results.write_json(path_str) {
-                Ok(_) => tracing::info!("Results written to: {}", json_path.display()),
-                Err(e) => {
-                    tracing::error!(
-                        "Failed to write JSON results to {}: {}",
-                        json_path.display(),
-                        e
-                    );
-                    return Err(e);
-                }
-            }
-        }
-        OutputFormat::Html => {
-            detailed_results.print_human();
-
-            let html_path = config.output.file.with_extension("html");
-            let path_str =
-                html_path.to_str().ok_or_else(|| anyhow::anyhow!("Invalid output file path"))?;
-            tracing::debug!("Writing HTML report to {}", html_path.display());
-            if let Err(e) = output::html::generate_html_report(&detailed_results, path_str) {
-                tracing::error!("Failed to write HTML report to {}: {}", html_path.display(), e);
-                return Err(e);
-            }
-            tracing::info!("HTML report written to: {}", html_path.display());
-        }
-        OutputFormat::Both => {
-            detailed_results.print_human();
-
-            let base_path = config.output.file.with_extension("");
-            let json_path = base_path.with_extension("json");
-            let html_path = base_path.with_extension("html");
-
-            let json_str =
-                json_path.to_str().ok_or_else(|| anyhow::anyhow!("Invalid JSON path"))?;
-            let html_str =
-                html_path.to_str().ok_or_else(|| anyhow::anyhow!("Invalid HTML path"))?;
-
-            tracing::debug!(
-                "Writing JSON and HTML results to {} and {}",
-                json_path.display(),
-                html_path.display()
-            );
-            if let Err(e) = detailed_results.write_json(json_str) {
-                tracing::error!("Failed to write JSON results to {}: {}", json_path.display(), e);
-                return Err(e);
-            }
-            if let Err(e) = output::html::generate_html_report(&detailed_results, html_str) {
-                tracing::error!("Failed to write HTML report to {}: {}", html_path.display(), e);
-                return Err(e);
-            }
-            tracing::info!(
-                "Results written to: {} and {}",
-                json_path.display(),
-                html_path.display()
-            );
-        }
-    }
-
-    Ok(())
+    // Print the summary and write output files if configured
+    output::write_results(&detailed_results, &config.output.format, &config.output.file)
 }

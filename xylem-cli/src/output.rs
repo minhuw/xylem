@@ -2,13 +2,15 @@
 
 pub mod html;
 
+use crate::config::OutputFormat;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::fs::File;
 use std::io::Write;
+use std::path::Path;
 use std::time::Duration;
-use xylem_core::stats::TupleStatsCollector;
+use xylem_core::stats::{AggregatedStats, TupleStatsCollector};
 
 /// Legacy flat experiment results. CLI JSON uses [`DetailedExperimentResults`].
 #[deprecated(note = "Use DetailedExperimentResults, the current CLI JSON format.")]
@@ -58,61 +60,20 @@ pub struct StatsRecord {
 
 #[allow(deprecated)]
 impl ExperimentResults {
-    /// Print results to stdout in human-readable format
-    pub fn print_human(&self) {
-        println!("\n{}", "=".repeat(60));
-        println!("Xylem Latency Measurement Results");
-        println!("{}", "=".repeat(60));
-        println!();
-        println!("Configuration:");
-        println!("  Protocol:        {}", self.protocol);
-        println!("  Target:          {}", self.target);
-        println!("  Duration:        {:.2}s", self.duration_secs);
-        println!();
-        println!("Throughput:");
-        println!("  Requests:        {} total", self.total_requests);
-        println!("  Rate:            {:.2} req/s", self.throughput_rps);
-        println!("  Bandwidth:       {:.2} MB/s", self.throughput_mbps);
-        if self.total_tx_bytes > 0 || self.total_rx_bytes > 0 {
-            println!("  TX Bytes:        {}", self.total_tx_bytes);
-            println!("  RX Bytes:        {}", self.total_rx_bytes);
-        }
-        println!();
-        println!("Latency (microseconds):");
-        if self.latency.sample_count > 0 {
-            println!("  Samples:         {}", self.latency.sample_count);
-        }
-        if self.latency.min_us > 0.0 {
-            println!("  Min:             {:.2} μs", self.latency.min_us);
-        }
-        println!("  Mean:            {:.2} μs", self.latency.mean_us);
-        if self.latency.max_us > 0.0 {
-            println!("  Max:             {:.2} μs", self.latency.max_us);
-        }
-        if self.latency.p50_us > 0.0 {
-            println!("  p50:             {:.2} μs", self.latency.p50_us);
-            println!("  p95:             {:.2} μs", self.latency.p95_us);
-            println!("  p99:             {:.2} μs", self.latency.p99_us);
-            println!("  p999:            {:.2} μs", self.latency.p999_us);
-        }
-        if self.latency.std_dev_us > 0.0 {
-            println!("  Std Dev:         {:.2} μs", self.latency.std_dev_us);
-        }
-        if self.latency.confidence_interval_us > 0.0 {
-            println!("  95% CI:          ±{:.2} μs", self.latency.confidence_interval_us);
-        }
-        println!();
-        println!("{}", "=".repeat(60));
-    }
-
     /// Write results to JSON file
     pub fn write_json(&self, path: &str) -> Result<()> {
-        let json = serde_json::to_string_pretty(self)?;
-        let mut file = File::create(path)?;
-        file.write_all(json.as_bytes())?;
-        println!("Results written to: {path}");
-        Ok(())
+        write_pretty_json(self, path, "Results written to")
     }
+}
+
+/// Write `results` to `path` as pretty-printed JSON, then print `message`
+/// followed by the path.
+fn write_pretty_json<T: Serialize>(results: &T, path: &str, message: &str) -> Result<()> {
+    let json = serde_json::to_string_pretty(results)?;
+    let mut file = File::create(path)?;
+    file.write_all(json.as_bytes())?;
+    println!("{message}: {path}");
+    Ok(())
 }
 
 /// Detailed experiment results with per-group breakdown
@@ -248,21 +209,7 @@ impl DetailedExperimentResults {
             total_requests: global_aggregated.total_requests,
             throughput_rps: global_aggregated.throughput_rps,
             throughput_mbps: global_aggregated.throughput_mbps,
-            latency: LatencyStats {
-                min_us: 0.0,
-                max_us: 0.0,
-                mean_us: global_aggregated.mean_latency.as_secs_f64() * 1_000_000.0,
-                p50_us: global_aggregated.latency_p50.as_secs_f64() * 1_000_000.0,
-                p95_us: global_aggregated.latency_p95.as_secs_f64() * 1_000_000.0,
-                p99_us: global_aggregated.latency_p99.as_secs_f64() * 1_000_000.0,
-                p999_us: global_aggregated.latency_p999.as_secs_f64() * 1_000_000.0,
-                p9999_us: global_aggregated.latency_p9999.as_secs_f64() * 1_000_000.0,
-                p99999_us: global_aggregated.latency_p99999.as_secs_f64() * 1_000_000.0,
-                std_dev_us: global_aggregated.std_dev.as_secs_f64() * 1_000_000.0,
-                confidence_interval_us: global_aggregated.confidence_interval.as_secs_f64()
-                    * 1_000_000.0,
-                sample_count: 0,
-            },
+            latency: Self::latency_stats(&global_aggregated),
         };
 
         // Build per-group results
@@ -285,21 +232,7 @@ impl DetailedExperimentResults {
                         total_requests: aggregated.total_requests,
                         throughput_rps: aggregated.throughput_rps,
                         throughput_mbps: aggregated.throughput_mbps,
-                        latency: LatencyStats {
-                            min_us: 0.0,
-                            max_us: 0.0,
-                            mean_us: aggregated.mean_latency.as_secs_f64() * 1_000_000.0,
-                            p50_us: aggregated.latency_p50.as_secs_f64() * 1_000_000.0,
-                            p95_us: aggregated.latency_p95.as_secs_f64() * 1_000_000.0,
-                            p99_us: aggregated.latency_p99.as_secs_f64() * 1_000_000.0,
-                            p999_us: aggregated.latency_p999.as_secs_f64() * 1_000_000.0,
-                            p9999_us: aggregated.latency_p9999.as_secs_f64() * 1_000_000.0,
-                            p99999_us: aggregated.latency_p99999.as_secs_f64() * 1_000_000.0,
-                            std_dev_us: aggregated.std_dev.as_secs_f64() * 1_000_000.0,
-                            confidence_interval_us: aggregated.confidence_interval.as_secs_f64()
-                                * 1_000_000.0,
-                            sample_count: 0,
-                        },
+                        latency: Self::latency_stats(aggregated),
                     },
                     protocol_metadata: None,
                 };
@@ -323,6 +256,26 @@ impl DetailedExperimentResults {
             global,
             traffic_groups,
             records,
+        }
+    }
+
+    /// Convert aggregated latencies to microseconds.
+    ///
+    /// Aggregated stats have no min, max, or sample count, so those are zero.
+    fn latency_stats(aggregated: &AggregatedStats) -> LatencyStats {
+        LatencyStats {
+            min_us: 0.0,
+            max_us: 0.0,
+            mean_us: aggregated.mean_latency.as_secs_f64() * 1_000_000.0,
+            p50_us: aggregated.latency_p50.as_secs_f64() * 1_000_000.0,
+            p95_us: aggregated.latency_p95.as_secs_f64() * 1_000_000.0,
+            p99_us: aggregated.latency_p99.as_secs_f64() * 1_000_000.0,
+            p999_us: aggregated.latency_p999.as_secs_f64() * 1_000_000.0,
+            p9999_us: aggregated.latency_p9999.as_secs_f64() * 1_000_000.0,
+            p99999_us: aggregated.latency_p99999.as_secs_f64() * 1_000_000.0,
+            std_dev_us: aggregated.std_dev.as_secs_f64() * 1_000_000.0,
+            confidence_interval_us: aggregated.confidence_interval.as_secs_f64() * 1_000_000.0,
+            sample_count: 0,
         }
     }
 
@@ -477,10 +430,78 @@ impl DetailedExperimentResults {
 
     /// Write results to JSON file
     pub fn write_json(&self, path: &str) -> Result<()> {
-        let json = serde_json::to_string_pretty(self)?;
-        let mut file = File::create(path)?;
-        file.write_all(json.as_bytes())?;
-        println!("Detailed results written to: {path}");
-        Ok(())
+        write_pretty_json(self, path, "Detailed results written to")
     }
+}
+
+/// Print the human-readable summary, then write the result files for `format`.
+///
+/// `json` and `html` replace the extension of `file`. `both` removes the
+/// extension of `file` and then sets one, so a dotted stem loses its last
+/// part: `results.v1.txt` becomes `results.json` and `results.html`. `human`
+/// writes no file.
+pub fn write_results(
+    results: &DetailedExperimentResults,
+    format: &OutputFormat,
+    file: &Path,
+) -> Result<()> {
+    results.print_human();
+
+    match format {
+        OutputFormat::Human => {
+            // Human format - console output only, no file
+            tracing::debug!("Human format selected - output printed to console");
+        }
+        OutputFormat::Json => {
+            let json_path = file.with_extension("json");
+            tracing::debug!("Writing JSON results to {}", json_path.display());
+            write_json_file(results, &json_path)?;
+            tracing::info!("Results written to: {}", json_path.display());
+        }
+        OutputFormat::Html => {
+            let html_path = file.with_extension("html");
+            tracing::debug!("Writing HTML report to {}", html_path.display());
+            write_html_file(results, &html_path)?;
+            tracing::info!("HTML report written to: {}", html_path.display());
+        }
+        OutputFormat::Both => {
+            let base_path = file.with_extension("");
+            let json_path = base_path.with_extension("json");
+            let html_path = base_path.with_extension("html");
+            tracing::debug!(
+                "Writing JSON and HTML results to {} and {}",
+                json_path.display(),
+                html_path.display()
+            );
+            write_json_file(results, &json_path)?;
+            write_html_file(results, &html_path)?;
+            tracing::info!(
+                "Results written to: {} and {}",
+                json_path.display(),
+                html_path.display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Write the JSON results file and log a failure.
+fn write_json_file(results: &DetailedExperimentResults, path: &Path) -> Result<()> {
+    let path_str = path.to_str().ok_or_else(|| anyhow::anyhow!("Invalid output file path"))?;
+    if let Err(e) = results.write_json(path_str) {
+        tracing::error!("Failed to write JSON results to {}: {}", path.display(), e);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Write the HTML report and log a failure.
+fn write_html_file(results: &DetailedExperimentResults, path: &Path) -> Result<()> {
+    let path_str = path.to_str().ok_or_else(|| anyhow::anyhow!("Invalid output file path"))?;
+    if let Err(e) = html::generate_html_report(results, path_str) {
+        tracing::error!("Failed to write HTML report to {}: {}", path.display(), e);
+        return Err(e);
+    }
+    Ok(())
 }
