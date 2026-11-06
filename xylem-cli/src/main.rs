@@ -11,75 +11,7 @@ use xylem_transport::{TcpTransportFactory, UdpTransportFactory};
 
 use xylem_cli::{completions, config, output};
 
-use config::ProfileConfig;
-
-/// Parsed protocol configuration for a traffic group.
-/// This enum holds the typed configuration for each supported protocol.
-enum ParsedProtocolConfig {
-    Redis(xylem_protocols::RedisConfig),
-    Http(xylem_protocols::HttpConfig),
-    Memcached(xylem_protocols::MemcachedConfig),
-    XylemEcho(xylem_protocols::XylemEchoConfig),
-    Masstree(xylem_protocols::MasstreeConfig),
-}
-
-impl ParsedProtocolConfig {
-    /// Parse protocol_config JSON value into the appropriate typed struct based on protocol name
-    fn parse(
-        protocol_name: &str,
-        protocol_config: Option<&serde_json::Value>,
-    ) -> anyhow::Result<Self> {
-        match protocol_name {
-            "redis" | "redis-cluster" => {
-                let config: xylem_protocols::RedisConfig = protocol_config
-                    .map(|pc| serde_json::from_value(pc.clone()))
-                    .transpose()
-                    .map_err(|e| anyhow::anyhow!("Failed to parse Redis protocol_config: {}", e))?
-                    .unwrap_or_default();
-                Ok(Self::Redis(config))
-            }
-            "http" => {
-                let config: xylem_protocols::HttpConfig = protocol_config
-                    .map(|pc| serde_json::from_value(pc.clone()))
-                    .transpose()
-                    .map_err(|e| anyhow::anyhow!("Failed to parse HTTP protocol_config: {}", e))?
-                    .unwrap_or_default();
-                Ok(Self::Http(config))
-            }
-            "memcached-binary" | "memcached-ascii" => {
-                let config: xylem_protocols::MemcachedConfig = protocol_config
-                    .map(|pc| serde_json::from_value(pc.clone()))
-                    .transpose()
-                    .map_err(|e| {
-                        anyhow::anyhow!("Failed to parse Memcached protocol_config: {}", e)
-                    })?
-                    .unwrap_or_default();
-                Ok(Self::Memcached(config))
-            }
-            "xylem-echo" => {
-                let config: xylem_protocols::XylemEchoConfig = protocol_config
-                    .map(|pc| serde_json::from_value(pc.clone()))
-                    .transpose()
-                    .map_err(|e| {
-                        anyhow::anyhow!("Failed to parse XylemEcho protocol_config: {}", e)
-                    })?
-                    .unwrap_or_default();
-                Ok(Self::XylemEcho(config))
-            }
-            "masstree" => {
-                let config: xylem_protocols::MasstreeConfig = protocol_config
-                    .map(|pc| serde_json::from_value(pc.clone()))
-                    .transpose()
-                    .map_err(|e| {
-                        anyhow::anyhow!("Failed to parse Masstree protocol_config: {}", e)
-                    })?
-                    .unwrap_or_default();
-                Ok(Self::Masstree(config))
-            }
-            other => anyhow::bail!("Unknown protocol: {}", other),
-        }
-    }
-}
+use config::{ProfileConfig, ProtocolConfig};
 
 /// Xylem: Reproducible latency measurement tool
 ///
@@ -235,7 +167,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
     // Load and parse profile configuration with overrides
     let config = if set.is_empty() {
         // No overrides, just load and validate
-        let config = ProfileConfig::from_file(&profile)?;
+        let mut config = ProfileConfig::from_file(&profile)?;
         config.validate()?;
         config
     } else {
@@ -410,70 +342,13 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
         for (group_id, _group_meta) in groups_for_thread.iter() {
             let group_config = &config_for_worker.traffic_groups[*group_id];
 
-            // Protocol and target are now required on each group
-            let protocol_name = &group_config.protocol;
-
-            // Parse the protocol_config into a typed struct based on protocol name
-            let parsed_config =
-                ParsedProtocolConfig::parse(protocol_name, group_config.protocol_config.as_ref())?;
-
-            // Use group's target for HTTP Host header (or explicit host from config)
-            let group_target_for_host = &group_config.target;
-
-            // Create protocol using multi_protocol factory
-            let protocol = match (&parsed_config, protocol_name.as_str()) {
-                (ParsedProtocolConfig::Http(http_config), "http") => {
-                    let mut http_config = http_config.clone();
-                    http_config.host.get_or_insert_with(|| group_target_for_host.clone());
-                    xylem_cli::multi_protocol::MultiProtocol::Http(
-                        xylem_protocols::HttpProtocol::from_config(&http_config)?,
-                    )
-                }
-                (ParsedProtocolConfig::Redis(redis_config), "redis") => {
-                    xylem_cli::multi_protocol::MultiProtocol::Redis(
-                        xylem_protocols::RedisProtocol::from_config(
-                            redis_config,
-                            config_for_worker.experiment.seed,
-                        )?,
-                    )
-                }
-                (ParsedProtocolConfig::Redis(redis_config), "redis-cluster") => {
-                    xylem_cli::multi_protocol::MultiProtocol::redis_cluster(
-                        xylem_protocols::RedisClusterProtocol::from_config(
-                            redis_config,
-                            config_for_worker.experiment.seed,
-                        )?,
-                    )
-                }
-                (ParsedProtocolConfig::Memcached(mc_config), "memcached-binary") => {
-                    xylem_cli::multi_protocol::MultiProtocol::MemcachedBinary(
-                        xylem_protocols::memcached::MemcachedBinaryProtocol::from_config(
-                            mc_config,
-                            config_for_worker.experiment.seed,
-                        )?,
-                    )
-                }
-                (ParsedProtocolConfig::Memcached(mc_config), "memcached-ascii") => {
-                    xylem_cli::multi_protocol::MultiProtocol::MemcachedAscii(
-                        xylem_protocols::memcached::MemcachedAsciiProtocol::from_config(
-                            mc_config,
-                            config_for_worker.experiment.seed,
-                        )?,
-                    )
-                }
-                (ParsedProtocolConfig::XylemEcho(_echo_config), "xylem-echo") => {
-                    xylem_cli::multi_protocol::create_xylem_echo_protocol()
-                }
-                (ParsedProtocolConfig::Masstree(mt_config), "masstree") => {
-                    xylem_cli::multi_protocol::MultiProtocol::Masstree(
-                        xylem_protocols::MasstreeProtocol::from_config(
-                            mt_config,
-                            config_for_worker.experiment.seed,
-                        )?,
-                    )
-                }
-                _ => return Err(anyhow::anyhow!("Unknown protocol: {}", protocol_name).into()),
-            };
+            // Validation parsed each group's protocol_config, in group order.
+            // The group's target is the HTTP Host header unless the config sets one.
+            let protocol = xylem_cli::multi_protocol::MultiProtocol::from_config(
+                &config_for_worker.protocol_configs[*group_id],
+                &group_config.target,
+                config_for_worker.experiment.seed,
+            )?;
 
             protocols.insert(*group_id, protocol);
         }
@@ -513,7 +388,9 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
             }
 
             // Non-cluster protocol: single target
-            if group_config.protocol != "redis-cluster" {
+            let ProtocolConfig::RedisCluster(redis_config) =
+                &config_for_worker.protocol_configs[*group_id]
+            else {
                 // Calculate total connections for rate distribution
                 let total_connections =
                     group_config.connections_per_thread * group_config.threads.len();
@@ -536,21 +413,10 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                     policy_scheduler,
                 ));
                 continue;
-            }
+            };
 
             // Redis-cluster: create connections to ALL cluster nodes
             redis_cluster_groups.push(*group_id);
-
-            // Parse protocol_config to get redis_cluster configuration
-            let redis_config: xylem_protocols::RedisConfig = group_config
-                .protocol_config
-                .as_ref()
-                .map(|pc| serde_json::from_value(pc.clone()))
-                .transpose()
-                .map_err(|e| {
-                    anyhow::anyhow!("Failed to parse redis-cluster protocol_config: {}", e)
-                })?
-                .unwrap_or_default();
 
             let cluster_config = redis_config.redis_cluster.as_ref().ok_or_else(|| {
                 anyhow::anyhow!(

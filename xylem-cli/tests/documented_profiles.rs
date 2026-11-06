@@ -1,6 +1,7 @@
 //! Keep complete book examples loadable as the CLI's profile format evolves.
 use std::path::{Path, PathBuf};
 use xylem_cli::config::ProfileConfig;
+use xylem_cli::multi_protocol::MultiProtocol;
 
 fn check_markdown(path: &Path) -> usize {
     let markdown = std::fs::read_to_string(path).unwrap();
@@ -15,7 +16,7 @@ fn check_markdown(path: &Path) -> usize {
         {
             continue;
         }
-        let config: ProfileConfig =
+        let mut config: ProfileConfig =
             toml::from_str(profile).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         config.validate().unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         assert!(!profile.contains("[target]"), "{} uses obsolete target section", path.display());
@@ -68,7 +69,7 @@ fn bundled_profiles() -> Vec<PathBuf> {
 fn bundled_profiles_are_valid() {
     let profiles = bundled_profiles();
     for path in &profiles {
-        let config =
+        let mut config =
             ProfileConfig::from_file(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         config.validate().unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         check_workloads(&config, path);
@@ -91,37 +92,11 @@ fn bundled_profiles_have_no_target_section() {
     }
 }
 
+/// Build each group's protocol the way a worker does, from the validated configs.
 fn check_workloads(config: &ProfileConfig, path: &Path) {
-    for group in &config.traffic_groups {
-        let value = group.protocol_config.clone().unwrap_or_else(|| serde_json::json!({}));
-        let result = match group.protocol.as_str() {
-            "redis" => xylem_protocols::RedisProtocol::from_config(
-                &serde_json::from_value(value).unwrap(),
-                config.experiment.seed,
-            )
-            .map(|_| ()),
-            "redis-cluster" => xylem_protocols::RedisClusterProtocol::from_config(
-                &serde_json::from_value(value).unwrap(),
-                config.experiment.seed,
-            )
-            .map(|_| ()),
-            "memcached-ascii" => xylem_protocols::memcached::MemcachedAsciiProtocol::from_config(
-                &serde_json::from_value(value).unwrap(),
-                config.experiment.seed,
-            )
-            .map(|_| ()),
-            "memcached-binary" => xylem_protocols::memcached::MemcachedBinaryProtocol::from_config(
-                &serde_json::from_value(value).unwrap(),
-                config.experiment.seed,
-            )
-            .map(|_| ()),
-            "http" => {
-                xylem_protocols::HttpProtocol::from_config(&serde_json::from_value(value).unwrap())
-                    .map(|_| ())
-            }
-            "xylem-echo" => Ok(()),
-            other => panic!("Add constructor validation for {other}"),
-        };
-        result.unwrap_or_else(|e| panic!("{} group {}: {e}", path.display(), group.name));
+    assert_eq!(config.protocol_configs.len(), config.traffic_groups.len(), "{}", path.display());
+    for (group, protocol_config) in config.traffic_groups.iter().zip(&config.protocol_configs) {
+        MultiProtocol::from_config(protocol_config, &group.target, config.experiment.seed)
+            .unwrap_or_else(|e| panic!("{} group {}: {e}", path.display(), group.name));
     }
 }

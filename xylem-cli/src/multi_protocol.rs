@@ -1,3 +1,4 @@
+use crate::config::ProtocolConfig;
 use anyhow::Result;
 use std::collections::HashMap;
 use xylem_common::Request;
@@ -49,6 +50,36 @@ impl MultiProtocol {
     /// before generating requests.
     pub fn redis_cluster(protocol: xylem_protocols::RedisClusterProtocol) -> Self {
         Self::RedisCluster(Box::new(RedisClusterState { protocol, request_map: HashMap::new() }))
+    }
+
+    /// Construct a traffic group's protocol from the protocol_config that
+    /// `ProfileConfig::validate` parsed. HTTP sends `target` as the Host header
+    /// unless the config sets `host`.
+    pub fn from_config(config: &ProtocolConfig, target: &str, seed: Option<u64>) -> Result<Self> {
+        let protocol = match config {
+            ProtocolConfig::Redis(redis_config) => {
+                Self::Redis(xylem_protocols::RedisProtocol::from_config(redis_config, seed)?)
+            }
+            ProtocolConfig::RedisCluster(redis_config) => Self::redis_cluster(
+                xylem_protocols::RedisClusterProtocol::from_config(redis_config, seed)?,
+            ),
+            ProtocolConfig::MemcachedBinary(mc_config) => Self::MemcachedBinary(
+                xylem_protocols::memcached::MemcachedBinaryProtocol::from_config(mc_config, seed)?,
+            ),
+            ProtocolConfig::MemcachedAscii(mc_config) => Self::MemcachedAscii(
+                xylem_protocols::memcached::MemcachedAsciiProtocol::from_config(mc_config, seed)?,
+            ),
+            ProtocolConfig::Http(http_config) => {
+                let mut http_config = http_config.clone();
+                http_config.host.get_or_insert_with(|| target.to_string());
+                Self::Http(xylem_protocols::HttpProtocol::from_config(&http_config)?)
+            }
+            ProtocolConfig::Masstree(mt_config) => {
+                Self::Masstree(xylem_protocols::MasstreeProtocol::from_config(mt_config, seed)?)
+            }
+            ProtocolConfig::XylemEcho(_echo_config) => create_xylem_echo_protocol(),
+        };
+        Ok(protocol)
     }
 
     /// Generate a SET request with imported data (string key + value bytes)

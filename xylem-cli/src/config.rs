@@ -24,6 +24,10 @@ pub struct ProfileConfig {
     /// Statistics collection configuration
     #[serde(default)]
     pub stats: StatsConfig,
+    /// Typed protocol_config of each traffic group, in group order.
+    /// Empty until `validate` succeeds; not part of the profile format.
+    #[serde(skip)]
+    pub protocol_configs: Vec<ProtocolConfig>,
 }
 
 /// Experiment metadata
@@ -165,6 +169,43 @@ fn default_retention_buckets() -> usize {
     60 // 1 minute of 1-second buckets by default
 }
 
+/// Protocols a traffic group can name
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProtocolKind {
+    Redis,
+    RedisCluster,
+    MemcachedBinary,
+    MemcachedAscii,
+    Http,
+    Masstree,
+    XylemEcho,
+}
+
+/// Every accepted traffic group protocol name. The invalid-protocol error lists
+/// the names in this order.
+const PROTOCOLS: [(&str, ProtocolKind); 7] = [
+    ("redis", ProtocolKind::Redis),
+    ("redis-cluster", ProtocolKind::RedisCluster),
+    ("memcached-binary", ProtocolKind::MemcachedBinary),
+    ("memcached-ascii", ProtocolKind::MemcachedAscii),
+    ("http", ProtocolKind::Http),
+    ("masstree", ProtocolKind::Masstree),
+    ("xylem-echo", ProtocolKind::XylemEcho), // Test protocol
+];
+
+/// A traffic group's protocol_config parsed as the typed config of its protocol.
+/// `ProfileConfig::validate` parses each group once and workers build protocols from it.
+#[derive(Debug, Clone)]
+pub enum ProtocolConfig {
+    Redis(xylem_protocols::RedisConfig),
+    RedisCluster(xylem_protocols::RedisConfig),
+    MemcachedBinary(xylem_protocols::MemcachedConfig),
+    MemcachedAscii(xylem_protocols::MemcachedConfig),
+    Http(xylem_protocols::HttpConfig),
+    Masstree(xylem_protocols::MasstreeConfig),
+    XylemEcho(xylem_protocols::XylemEchoConfig),
+}
+
 impl ProfileConfig {
     /// Load profile from TOML file
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
@@ -199,7 +240,7 @@ impl ProfileConfig {
         }
 
         // Deserialize modified TOML to ProfileConfig
-        let config: ProfileConfig = value
+        let mut config: ProfileConfig = value
             .try_into()
             .with_context(|| "Failed to deserialize modified configuration")?;
 
@@ -208,8 +249,8 @@ impl ProfileConfig {
         Ok(config)
     }
 
-    /// Validate configuration
-    pub fn validate(&self) -> Result<()> {
+    /// Validate configuration and parse each group's protocol_config into `protocol_configs`
+    pub fn validate(&mut self) -> Result<()> {
         if self.stats.streaming.is_some() {
             bail!("stats.streaming is not supported by the CLI; omit this section");
         }
@@ -231,16 +272,6 @@ impl ProfileConfig {
             bail!("Experiment duration must be > 0");
         }
 
-        let valid_protocols = [
-            "redis",
-            "redis-cluster",
-            "memcached-binary",
-            "memcached-ascii",
-            "http",
-            "masstree",
-            "xylem-echo", // Test protocol
-        ];
-
         let valid_transports = ["tcp", "udp", "unix"];
 
         // Traffic groups validation
@@ -251,6 +282,8 @@ impl ProfileConfig {
         // Track transport per thread for validation
         let mut thread_transports: std::collections::HashMap<usize, (&str, usize, &str)> =
             std::collections::HashMap::new();
+
+        let mut protocol_configs = Vec::with_capacity(self.traffic_groups.len());
 
         for (i, group) in self.traffic_groups.iter().enumerate() {
             // Validate target address
@@ -270,15 +303,17 @@ impl ProfileConfig {
             }
 
             // Validate protocol
-            if !valid_protocols.contains(&group.protocol.as_str()) {
+            let Some(&(_, protocol)) = PROTOCOLS.iter().find(|(name, _)| *name == group.protocol)
+            else {
+                let names: Vec<&str> = PROTOCOLS.iter().map(|(name, _)| *name).collect();
                 bail!(
                     "Invalid protocol '{}' for traffic group {} '{}'. Valid options: {}",
                     group.protocol,
                     i,
                     group.name,
-                    valid_protocols.join(", ")
+                    names.join(", ")
                 );
-            }
+            };
 
             if group.threads.is_empty() {
                 bail!("Traffic group {} '{}' must have at least one thread", i, group.name);
@@ -341,8 +376,11 @@ impl ProfileConfig {
             // Key-value protocols (Redis, Memcached) require protocol_config with keys
             // HTTP and XylemEcho have sensible defaults and don't require protocol_config
             let requires_protocol_config = matches!(
-                group.protocol.as_str(),
-                "redis" | "redis-cluster" | "memcached-binary" | "memcached-ascii"
+                protocol,
+                ProtocolKind::Redis
+                    | ProtocolKind::RedisCluster
+                    | ProtocolKind::MemcachedBinary
+                    | ProtocolKind::MemcachedAscii
             );
 
             if requires_protocol_config && group.protocol_config.is_none() {
@@ -356,42 +394,15 @@ impl ProfileConfig {
                 );
             }
 
-            // Attempt to parse protocol_config as the appropriate typed struct
-            // This validates the structure and provides better error messages
-            if let Some(ref pc) = group.protocol_config {
-                validate_protocol_config(&group.protocol, pc, i, &group.name)?;
-            }
-
-            // redis-cluster protocol requires redis_cluster configuration in protocol_config
-            if group.protocol == "redis-cluster" {
-                let pc = group.protocol_config.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Traffic group {} '{}' uses redis-cluster protocol but has no protocol_config",
-                        i,
-                        group.name
-                    )
-                })?;
-
-                let cluster = pc.get("redis_cluster").ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Traffic group {} '{}' uses redis-cluster protocol but \
-                         protocol_config.redis_cluster is missing. \
-                         Add a redis_cluster.nodes section with cluster node addresses.",
-                        i,
-                        group.name
-                    )
-                })?;
-
-                let nodes = cluster.get("nodes").and_then(|n| n.as_array());
-                if nodes.map_or(true, |n| n.is_empty()) {
-                    bail!(
-                        "Traffic group {} '{}' uses redis-cluster protocol but \
-                         protocol_config.redis_cluster.nodes is empty or missing. Add at least one cluster node.",
-                        i,
-                        group.name
-                    );
-                }
-            }
+            // Parse protocol_config once as the appropriate typed struct.
+            // This validates the structure, provides better error messages,
+            // and gives workers the config they build protocols from.
+            protocol_configs.push(parse_protocol_config(
+                protocol,
+                group.protocol_config.as_ref(),
+                i,
+                &group.name,
+            )?);
         }
 
         // Validate thread assignment
@@ -401,6 +412,7 @@ impl ProfileConfig {
 
         // Output validation - format is now an enum, so always valid
 
+        self.protocol_configs = protocol_configs;
         Ok(())
     }
 }
@@ -423,74 +435,108 @@ fn validate_positive_rate(
     );
 }
 
-/// Validate protocol_config by parsing it as the appropriate typed struct
-fn validate_protocol_config(
-    protocol_name: &str,
-    pc: &serde_json::Value,
+/// Parse protocol_config as the typed struct of the group's protocol
+fn parse_protocol_config(
+    protocol: ProtocolKind,
+    pc: Option<&serde_json::Value>,
     group_idx: usize,
     group_name: &str,
-) -> Result<()> {
-    match protocol_name {
-        "redis" | "redis-cluster" => {
+) -> Result<ProtocolConfig> {
+    match protocol {
+        ProtocolKind::Redis => {
             let config: xylem_protocols::RedisConfig =
-                serde_json::from_value(pc.clone()).map_err(|e| {
-                    anyhow::anyhow!(
-                        "Traffic group {} '{}' has invalid Redis protocol_config: {}",
-                        group_idx,
-                        group_name,
-                        e
-                    )
-                })?;
+                parse_typed_config(pc, "Redis", group_idx, group_name)?;
 
-            // data_import is not supported for redis-cluster (would panic at runtime)
-            if protocol_name == "redis-cluster" && config.data_import.is_some() {
+            // data_import needs an imported-data driver, which the CLI does not provide
+            if config.data_import.is_some() {
                 bail!(
-                    "Traffic group {} '{}': data_import is not supported for redis-cluster protocol. \
-                     Use plain 'redis' protocol for data import workloads.",
+                    "Traffic group {} '{}': data_import is not supported for redis protocol. \
+                     Remove protocol_config.data_import.",
                     group_idx,
                     group_name
                 );
             }
+            Ok(ProtocolConfig::Redis(config))
         }
-        "http" => {
-            serde_json::from_value::<xylem_protocols::HttpConfig>(pc.clone()).map_err(|e| {
-                anyhow::anyhow!(
-                    "Traffic group {} '{}' has invalid HTTP protocol_config: {}",
+        ProtocolKind::RedisCluster => {
+            let config: xylem_protocols::RedisConfig =
+                parse_typed_config(pc, "Redis", group_idx, group_name)?;
+
+            // data_import needs an imported-data driver, which the CLI does not provide
+            if config.data_import.is_some() {
+                bail!(
+                    "Traffic group {} '{}': data_import is not supported for redis-cluster protocol. \
+                     Remove protocol_config.data_import.",
                     group_idx,
-                    group_name,
-                    e
-                )
-            })?;
+                    group_name
+                );
+            }
+
+            // redis-cluster protocol requires redis_cluster configuration in protocol_config
+            let Some(cluster) = &config.redis_cluster else {
+                bail!(
+                    "Traffic group {} '{}' uses redis-cluster protocol but \
+                     protocol_config.redis_cluster is missing. \
+                     Add a redis_cluster.nodes section with cluster node addresses.",
+                    group_idx,
+                    group_name
+                );
+            };
+            if cluster.nodes.is_empty() {
+                bail!(
+                    "Traffic group {} '{}' uses redis-cluster protocol but \
+                     protocol_config.redis_cluster.nodes is empty or missing. Add at least one cluster node.",
+                    group_idx,
+                    group_name
+                );
+            }
+            Ok(ProtocolConfig::RedisCluster(config))
         }
-        "memcached-binary" | "memcached-ascii" => {
-            serde_json::from_value::<xylem_protocols::MemcachedConfig>(pc.clone()).map_err(
-                |e| {
-                    anyhow::anyhow!(
-                        "Traffic group {} '{}' has invalid Memcached protocol_config: {}",
-                        group_idx,
-                        group_name,
-                        e
-                    )
-                },
-            )?;
+        ProtocolKind::MemcachedBinary => {
+            let config = parse_typed_config(pc, "Memcached", group_idx, group_name)?;
+            Ok(ProtocolConfig::MemcachedBinary(config))
         }
-        "xylem-echo" => {
-            serde_json::from_value::<xylem_protocols::XylemEchoConfig>(pc.clone()).map_err(
-                |e| {
-                    anyhow::anyhow!(
-                        "Traffic group {} '{}' has invalid XylemEcho protocol_config: {}",
-                        group_idx,
-                        group_name,
-                        e
-                    )
-                },
-            )?;
+        ProtocolKind::MemcachedAscii => {
+            let config = parse_typed_config(pc, "Memcached", group_idx, group_name)?;
+            Ok(ProtocolConfig::MemcachedAscii(config))
         }
-        _ => {
-            // Unknown protocol - will be caught later during execution
+        ProtocolKind::Http => {
+            let config = parse_typed_config(pc, "HTTP", group_idx, group_name)?;
+            Ok(ProtocolConfig::Http(config))
+        }
+        ProtocolKind::Masstree => {
+            let config = parse_typed_config(pc, "Masstree", group_idx, group_name)?;
+            Ok(ProtocolConfig::Masstree(config))
+        }
+        ProtocolKind::XylemEcho => {
+            let config = parse_typed_config(pc, "XylemEcho", group_idx, group_name)?;
+            Ok(ProtocolConfig::XylemEcho(config))
         }
     }
-    Ok(())
+}
+
+/// Parse protocol_config as `T`; an omitted protocol_config uses `T`'s defaults
+fn parse_typed_config<T>(
+    pc: Option<&serde_json::Value>,
+    label: &str,
+    group_idx: usize,
+    group_name: &str,
+) -> Result<T>
+where
+    T: serde::de::DeserializeOwned + Default,
+{
+    let Some(pc) = pc else {
+        return Ok(T::default());
+    };
+    serde_json::from_value(pc.clone()).map_err(|e| {
+        anyhow::anyhow!(
+            "Traffic group {} '{}' has invalid {} protocol_config: {}",
+            group_idx,
+            group_name,
+            label,
+            e
+        )
+    })
 }
 
 /// Parse a "key=value" string into (key, value) tuple
@@ -948,7 +994,7 @@ file = "results/test.json"
         tmpfile.write_all(profile_without_target.as_bytes()).unwrap();
         tmpfile.flush().unwrap();
 
-        let config = ProfileConfig::from_file(tmpfile.path()).unwrap();
+        let mut config = ProfileConfig::from_file(tmpfile.path()).unwrap();
 
         let result = config.validate();
         assert!(result.is_err());
@@ -1248,7 +1294,7 @@ file = "test.json"
         tmpfile.write_all(config_str.as_bytes()).unwrap();
         tmpfile.flush().unwrap();
 
-        let config = ProfileConfig::from_file(tmpfile.path()).unwrap();
+        let mut config = ProfileConfig::from_file(tmpfile.path()).unwrap();
         let result = config.validate();
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
@@ -1568,7 +1614,7 @@ file = "/tmp/test.json"
         let config: Result<ProfileConfig, _> = toml::from_str(toml_str);
         assert!(config.is_ok(), "TOML should parse");
 
-        let config = config.unwrap();
+        let mut config = config.unwrap();
         let result = config.validate();
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -1577,6 +1623,91 @@ file = "/tmp/test.json"
             "Error should mention data_import not supported for redis-cluster: {}",
             err
         );
+    }
+
+    #[test]
+    fn redis_data_import_fails_validation() {
+        let toml_str = r#"
+[experiment]
+name = "test"
+duration = "10s"
+
+[[traffic_groups]]
+name = "main"
+protocol = "redis"
+target = "127.0.0.1:6379"
+threads = [0]
+connections_per_thread = 1
+
+[traffic_groups.protocol_config.keys]
+strategy = "sequential"
+start = 0
+value_size = 64
+
+[traffic_groups.protocol_config.data_import]
+file = "/tmp/test.csv"
+
+[traffic_groups.traffic_policy]
+type = "closed-loop"
+
+[output]
+format = "json"
+file = "/tmp/test.json"
+"#;
+        let mut config: ProfileConfig = toml::from_str(toml_str).expect("TOML should parse");
+        let err = config.validate().expect_err("redis data_import must fail validation");
+        assert_eq!(
+            err.to_string(),
+            "Traffic group 0 'main': data_import is not supported for redis protocol. \
+             Remove protocol_config.data_import."
+        );
+    }
+
+    #[test]
+    fn invalid_masstree_protocol_config_fails_validation() {
+        let profile = |protocol_config: &str| -> ProfileConfig {
+            let toml_str = format!(
+                r#"
+[experiment]
+name = "test"
+duration = "10s"
+
+[[traffic_groups]]
+name = "main"
+protocol = "masstree"
+target = "127.0.0.1:2117"
+threads = [0]
+connections_per_thread = 1
+
+[traffic_groups.protocol_config]
+{protocol_config}
+
+[traffic_groups.traffic_policy]
+type = "closed-loop"
+
+[output]
+format = "json"
+file = "/tmp/test.json"
+"#
+            );
+            toml::from_str(&toml_str).expect("TOML should parse")
+        };
+
+        let err = profile("operation = 5").validate().expect_err("operation must be a string");
+        let err = err.to_string();
+        assert!(
+            err.starts_with("Traffic group 0 'main' has invalid Masstree protocol_config: "),
+            "Error should name the invalid Masstree protocol_config: {}",
+            err
+        );
+
+        // A valid config is kept, parsed, with the validated profile.
+        let mut config = profile("operation = \"set\"");
+        config.validate().expect("valid masstree protocol_config");
+        match &config.protocol_configs[..] {
+            [ProtocolConfig::Masstree(masstree)] => assert_eq!(masstree.operation, "set"),
+            other => panic!("Expected one Masstree protocol config, got {:?}", other),
+        }
     }
 
     #[test]
