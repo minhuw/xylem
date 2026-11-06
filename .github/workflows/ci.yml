@@ -57,6 +57,9 @@ jobs:
       - name: Run unit tests
         run: nix develop --command cargo nextest run --profile unit --workspace
 
+      - name: Run doc tests
+        run: nix develop --command cargo test --workspace --doc
+
       - name: Run integration tests
         run: nix develop --command cargo nextest run --profile integration --workspace
 

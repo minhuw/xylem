@@ -37,9 +37,19 @@ repos:
 
   - repo: local
     hooks:
-      - id: cargo-test
-        name: cargo test
-        entry: cargo test --workspace
+      - id: cargo-nextest-unit
+        name: cargo nextest (unit profile)
+        entry: cargo nextest run --profile unit --workspace
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-push]
+
+  - repo: local
+    hooks:
+      - id: cargo-test-doc
+        name: cargo test (doc tests)
+        entry: cargo test --workspace --doc
         language: system
         types: [rust]
         pass_filenames: false

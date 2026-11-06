@@ -6,7 +6,7 @@ BINARY_NAME := "xylem"
 DEFAULT_REDIS_PORT := "6379"
 DEFAULT_MEMCACHED_PORT := "11211"
 
-# Default recipe - shows help
+# Default recipe - lists available recipes
 _default:
     @just --list
 
@@ -19,9 +19,9 @@ test:
     @just test-cleanup
     cargo nextest run --profile integration --workspace
 
-# Run all examples to validate they work
+# Run the redis_basic example against a Docker Redis server
 examples:
-    @echo "📚 Running all examples..."
+    @echo "📚 Running the redis_basic example..."
     @echo ""
     @echo "🚀 Starting Redis server for examples..."
     @just redis-start
@@ -32,12 +32,17 @@ examples:
     @echo "🧹 Cleaning up: Stopping Redis server..."
     @just redis-stop
     @echo ""
-    @echo "✅ All examples completed successfully!"
+    @echo "✅ Example completed successfully!"
 
 # Run fast unit tests only (no integration tests)
 test-unit:
     @echo "🚀 Running unit tests..."
     cargo nextest run --profile unit --workspace
+
+# Run doc tests (nextest does not run them)
+test-doc:
+    @echo "📖 Running doc tests..."
+    cargo test --workspace --doc
 
 # Run integration tests only (requires Docker)
 test-integration: test-cleanup
@@ -99,7 +104,7 @@ fmt:
 # Run linter (clippy)
 lint:
     @echo "🔍 Running linter (clippy)..."
-    cargo clippy --workspace -- -D warnings
+    cargo clippy --all-targets --all-features -- -D warnings
 
 # Fix linting issues automatically
 lint-fix:
@@ -117,7 +122,7 @@ clean:
     cargo clean
 
 # Pre-commit check - runs everything you should check before committing
-precommit: fmt lint test-unit
+precommit: fmt lint test-unit test-doc
     @echo "✅ Pre-commit checks passed!"
     @echo "   If you want to run full integration tests too, run: just test"
 
@@ -417,54 +422,3 @@ completions-bash:
 completions-zsh:
     @echo "🐚 Generating zsh completion..."
     cargo run --bin {{BINARY_NAME}} -- completions zsh
-
-# Show this help
-help:
-    @echo "Xylem Justfile - Available Commands"
-    @echo "===================================="
-    @echo ""
-    @echo "📊 Testing:"
-    @echo "  just test              - Run ALL tests (unit + integration)"
-    @echo "  just test-unit         - Unit tests only (fast, no Docker)"
-    @echo "  just test-integration  - All integration tests (requires Docker)"
-    @echo "  just test-redis        - Redis-related integration tests"
-    @echo "  just test-memcached    - Memcached integration tests"
-    @echo "  just test-http         - HTTP integration tests"
-    @echo "  just examples          - Run all examples"
-    @echo ""
-    @echo "🔨 Building:"
-    @echo "  just build             - Debug build"
-    @echo "  just build-release     - Release build"
-    @echo ""
-    @echo "🚀 Running:"
-    @echo "  just run <args>        - Run CLI in debug mode"
-    @echo "  just run-release <args> - Run CLI in release mode"
-    @echo ""
-    @echo "🎨 Code Quality:"
-    @echo "  just fmt               - Format code"
-    @echo "  just lint              - Run linter"
-    @echo "  just lint-fix          - Auto-fix lint issues"
-    @echo "  just check             - Type check"
-    @echo "  just precommit         - Run pre-commit checks"
-    @echo ""
-    @echo "🔥 Performance:"
-    @echo "  just flamegraph-echo     - Generate flamegraph with echo benchmark (30s)"
-    @echo "  just bench-quick         - Redis benchmark (10 seconds, one connection)"
-    @echo "  just bench-full          - Redis benchmark (60 seconds, two threads)"
-    @echo ""
-    @echo "📝 Demos:"
-    @echo "  just demo-request-dump   - Demo request dump feature (records to CSV)"
-    @echo ""
-    @echo "🎯 Server Management:"
-    @echo "  just servers-start     - Start Redis & Memcached"
-    @echo "  just servers-stop      - Stop Redis & Memcached"
-    @echo "  just servers-restart   - Restart both servers"
-    @echo "  just servers-status    - Check server status"
-    @echo ""
-    @echo "📦 Other:"
-    @echo "  just clean             - Clean build artifacts"
-    @echo "  just install           - Install xylem locally"
-    @echo "  just schema            - Generate JSON Schema for config files"
-    @echo "  just completions-bash  - Generate bash completion script"
-    @echo "  just completions-zsh   - Generate zsh completion script"
-    @echo "  just help              - Show this help"
