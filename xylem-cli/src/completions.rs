@@ -1,8 +1,11 @@
 //! Shell completion support for --set overrides
 //!
 //! This module provides intelligent autocompletion for the --set flag by
-//! extracting paths from the JSON Schema of ProfileConfig.
+//! extracting paths from the JSON Schema of ProfileConfig. The bash and zsh
+//! scripts take their flag, subcommand, and shell lists from the clap command
+//! of the binary.
 
+use clap::{Arg, ArgAction, Command};
 use schemars::schema_for;
 use schemars::Schema;
 use serde_json::Value;
@@ -11,7 +14,28 @@ use std::collections::BTreeSet;
 use crate::config::ProfileConfig;
 
 /// Generate enhanced bash completion script with --set support
-pub fn generate_bash_completion(bin_name: &str) -> String {
+///
+/// The flags, subcommands, and shell names are taken from `cmd`, the clap
+/// command of the binary.
+pub fn generate_bash_completion(cmd: &mut Command, bin_name: &str) -> String {
+    // Building adds clap's --help and --version flags and help subcommand
+    cmd.build();
+
+    let mut flags = Vec::new();
+    for arg in visible_flags(cmd) {
+        flags.extend(flag_names(arg));
+    }
+
+    let mut subcommands = Vec::new();
+    for subcommand in visible_subcommands(cmd) {
+        subcommands.push(subcommand.get_name());
+    }
+
+    let flag_words = flags.join(" ");
+    let subcommand_words = subcommands.join(" ");
+    let subcommand_pattern = subcommands.join("|");
+    let shell_words = shell_names(cmd).join(" ");
+
     format!(
         r#"# Bash completion for {bin_name}
 # Installation:
@@ -64,7 +88,7 @@ _{bin_name}() {{
 
     # Complete flags and subcommands
     if [[ "$cur" == -* ]]; then
-        COMPREPLY=( $(compgen -W "-P --profile --set -l --log-level -h --help -V --version" -- "$cur") )
+        COMPREPLY=( $(compgen -W "{flag_words}" -- "$cur") )
         return 0
     fi
 
@@ -72,7 +96,7 @@ _{bin_name}() {{
     local has_subcommand=0
     for ((i=1; i<cword; i++)); do
         case "${{words[i]}}" in
-            completions|schema|help)
+            {subcommand_pattern})
                 has_subcommand=1
                 break
                 ;;
@@ -83,14 +107,14 @@ _{bin_name}() {{
     if [[ $has_subcommand -eq 0 && "$cur" != -* ]]; then
         # If we're at position 1 or haven't seen a profile flag yet, suggest subcommands
         if [[ $cword -eq 1 ]]; then
-            COMPREPLY=( $(compgen -W "completions schema help" -- "$cur") )
+            COMPREPLY=( $(compgen -W "{subcommand_words}" -- "$cur") )
             return 0
         fi
     fi
 
     # Complete shell names for 'completions' subcommand
     if [[ "${{words[1]}}" == "completions" ]]; then
-        COMPREPLY=( $(compgen -W "bash zsh fish" -- "$cur") )
+        COMPREPLY=( $(compgen -W "{shell_words}" -- "$cur") )
         return 0
     fi
 }}
@@ -102,7 +126,35 @@ complete -F _{bin_name} {bin_name}
 }
 
 /// Generate enhanced zsh completion script with --set support
-pub fn generate_zsh_completion(bin_name: &str) -> String {
+///
+/// The flags, subcommands, and shell names are taken from `cmd`, the clap
+/// command of the binary.
+pub fn generate_zsh_completion(cmd: &mut Command, bin_name: &str) -> String {
+    // Building adds clap's --help and --version flags and help subcommand
+    cmd.build();
+
+    let mut flag_lines = Vec::new();
+    for arg in visible_flags(cmd) {
+        flag_lines.push(format!("        {} \\", zsh_flag_spec(arg, bin_name)));
+    }
+
+    let mut subcommand_lines = Vec::new();
+    for subcommand in visible_subcommands(cmd) {
+        let about = match subcommand.get_about() {
+            Some(about) => about.to_string(),
+            None => String::new(),
+        };
+        subcommand_lines.push(format!(
+            "                '{}:{}'",
+            subcommand.get_name(),
+            zsh_escape_help(&about)
+        ));
+    }
+
+    let flag_lines = flag_lines.join("\n");
+    let subcommand_lines = subcommand_lines.join("\n");
+    let shell_words = shell_names(cmd).join(" ");
+
     format!(
         r#"#compdef {bin_name}
 # Zsh completion for {bin_name}
@@ -122,9 +174,7 @@ _{bin_name}() {{
     local line state
 
     _arguments -C \
-        '(-P --profile)'{{'{{'}}-P,--profile{{'}}'}}'[Profile path]:file:_files -g "*.toml"' \
-        '*--set[Override config]:key=value:_{bin_name}_complete_set_keys' \
-        '(-l --log-level)'{{'{{'}}-l,--log-level{{'}}'}}'[Log level]:level:(trace debug info warn error)' \
+{flag_lines}
         '1: :->command' \
         '*:: :->args'
 
@@ -132,16 +182,14 @@ _{bin_name}() {{
         command)
             local -a subcommands
             subcommands=(
-                'completions:Generate shell completions'
-                'schema:Generate JSON Schema'
-                'help:Print help'
+{subcommand_lines}
             )
             _describe 'command' subcommands
             ;;
         args)
             case $line[1] in
                 completions)
-                    _arguments '1:shell:(bash zsh fish)'
+                    _arguments '1:shell:({shell_words})'
                     ;;
             esac
             ;;
@@ -152,6 +200,118 @@ _{bin_name} "$@"
 "#,
         bin_name = bin_name
     )
+}
+
+/// Flags of the command that shell completions offer (not positional, not hidden)
+fn visible_flags(cmd: &Command) -> Vec<&Arg> {
+    let mut flags = Vec::new();
+    for arg in cmd.get_arguments() {
+        if !arg.is_positional() && !arg.is_hide_set() {
+            flags.push(arg);
+        }
+    }
+    flags
+}
+
+/// Subcommands that shell completions offer (complete-paths is hidden)
+fn visible_subcommands(cmd: &Command) -> Vec<&Command> {
+    let mut subcommands = Vec::new();
+    for subcommand in cmd.get_subcommands() {
+        if !subcommand.is_hide_set() {
+            subcommands.push(subcommand);
+        }
+    }
+    subcommands
+}
+
+/// Short and long spellings of a flag, e.g. `-P` and `--profile`
+fn flag_names(arg: &Arg) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Some(short) = arg.get_short() {
+        names.push(format!("-{}", short));
+    }
+    if let Some(long) = arg.get_long() {
+        names.push(format!("--{}", long));
+    }
+    names
+}
+
+/// Shell names accepted by the `completions` subcommand
+fn shell_names(cmd: &Command) -> Vec<String> {
+    let mut names = Vec::new();
+    let Some(completions) = cmd.find_subcommand("completions") else {
+        return names;
+    };
+    for arg in completions.get_positionals() {
+        for value in arg.get_possible_values() {
+            if !value.is_hide_set() {
+                names.push(value.get_name().to_string());
+            }
+        }
+    }
+    names
+}
+
+/// Zsh `_arguments` spec for one flag, e.g.
+/// `'(-P --profile)'{-P,--profile}'[Path to TOML profile configuration file]:file:_files -g "*.toml"'`
+fn zsh_flag_spec(arg: &Arg, bin_name: &str) -> String {
+    let names = flag_names(arg);
+
+    // Repeatable flags may be given many times; other flags exclude all their spellings
+    let prefix = if matches!(arg.get_action(), ArgAction::Append | ArgAction::Count) {
+        "*".to_string()
+    } else {
+        format!("({})", names.join(" "))
+    };
+
+    // Brace expansion turns {-P,--profile} into one spec per spelling
+    let spellings = if names.len() == 1 {
+        names[0].clone()
+    } else {
+        format!("{{{}}}", names.join(","))
+    };
+
+    let help = match arg.get_help() {
+        Some(help) => help.to_string(),
+        None => String::new(),
+    };
+
+    format!(
+        "'{}'{}'[{}]{}'",
+        prefix,
+        spellings,
+        zsh_escape_help(&help),
+        zsh_value_spec(arg, bin_name)
+    )
+}
+
+/// Zsh `:message:action` for the value of a flag, empty if the flag takes no value
+///
+/// clap only knows these values as strings, so the profile file filter, the
+/// --set key completion, and the log levels are chosen here by argument id.
+fn zsh_value_spec(arg: &Arg, bin_name: &str) -> String {
+    if !arg.get_action().takes_values() {
+        return String::new();
+    }
+    match arg.get_id().as_str() {
+        "profile" => ":file:_files -g \"*.toml\"".to_string(),
+        "set" => format!(":key=value:_{}_complete_set_keys", bin_name),
+        "log_level" => ":level:(trace debug info warn error)".to_string(),
+        // A single-space action completes nothing
+        _ => ":value: ".to_string(),
+    }
+}
+
+/// Escape clap help text for a single-quoted zsh string inside `[...]` or `_describe`
+fn zsh_escape_help(help: &str) -> String {
+    help.replace('\\', "\\\\")
+        .replace('\'', "'\\''")
+        .replace('[', "\\[")
+        .replace(']', "\\]")
+        .replace(':', "\\:")
+        .replace('$', "\\$")
+        .replace('`', "\\`")
+        .replace('\n', " ")
 }
 
 /// Get all valid TOML paths for --set autocompletion
@@ -316,6 +476,15 @@ fn extract_paths_from_schema_value(
         }
     }
 
+    // Handle anyOf (schemars emits it for Option<T> fields such as request_dump)
+    if let Some(Value::Array(any_of)) = schema_obj.get("anyOf") {
+        for variant_value in any_of {
+            if let Ok(variant_schema) = serde_json::from_value::<Schema>(variant_value.clone()) {
+                extract_paths_from_schema_value(&variant_schema, prefix, paths, defs);
+            }
+        }
+    }
+
     // Handle allOf (for composed schemas)
     if let Some(Value::Array(all_of)) = schema_obj.get("allOf") {
         for schema_value in all_of {
@@ -375,5 +544,17 @@ mod tests {
 
         // Ensure we have a reasonable number of paths (should be > 60 with protocol_config)
         assert!(paths.len() > 60, "Expected > 60 paths, got {}", paths.len());
+    }
+
+    #[test]
+    fn config_paths_include_anyof_children() {
+        let paths = get_config_paths();
+
+        // request_dump is Option<DumpConfig>, which the schema wraps in anyOf
+        assert!(paths.contains(&"request_dump".to_string()));
+        assert!(
+            paths.contains(&"request_dump.directory".to_string()),
+            "Missing request_dump.directory path"
+        );
     }
 }

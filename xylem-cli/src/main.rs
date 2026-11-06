@@ -97,16 +97,16 @@ fn main() {
     let result = match cli.command {
         Some(Commands::Completions { shell }) => {
             let bin_name = "xylem";
+            let mut cmd = Cli::command();
             match shell {
                 Shell::Bash => {
-                    println!("{}", completions::generate_bash_completion(bin_name));
+                    println!("{}", completions::generate_bash_completion(&mut cmd, bin_name));
                 }
                 Shell::Zsh => {
-                    println!("{}", completions::generate_zsh_completion(bin_name));
+                    println!("{}", completions::generate_zsh_completion(&mut cmd, bin_name));
                 }
                 _ => {
                     // For other shells, fall back to clap's default generator
-                    let mut cmd = Cli::command();
                     generate(shell, &mut cmd, bin_name.to_string(), &mut io::stdout());
                 }
             }
@@ -634,4 +634,41 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
 
     // Print the summary and write output files if configured
     output::write_results(&detailed_results, &config.output.format, &config.output.file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completion_scripts_list_every_flag() {
+        let bash = completions::generate_bash_completion(&mut Cli::command(), "xylem");
+        let zsh = completions::generate_zsh_completion(&mut Cli::command(), "xylem");
+
+        // Building adds clap's --help and --version flags and help subcommand
+        let mut cmd = Cli::command();
+        cmd.build();
+
+        let mut expected = Vec::new();
+        for arg in cmd.get_arguments() {
+            if arg.is_hide_set() {
+                continue;
+            }
+            if let Some(long) = arg.get_long() {
+                expected.push(format!("--{}", long));
+            }
+        }
+        for subcommand in cmd.get_subcommands() {
+            if !subcommand.is_hide_set() {
+                expected.push(subcommand.get_name().to_string());
+            }
+        }
+        assert!(expected.contains(&"--help".to_string()));
+        assert!(expected.contains(&"completions".to_string()));
+
+        for word in &expected {
+            assert!(bash.contains(word.as_str()), "bash completion is missing {}", word);
+            assert!(zsh.contains(word.as_str()), "zsh completion is missing {}", word);
+        }
+    }
 }
