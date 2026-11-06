@@ -4,6 +4,9 @@
 
 #![allow(dead_code)]
 
+// Docker compose fixture shared by the service guards
+mod compose;
+
 // Docker-based service guards
 pub mod masstree;
 pub mod memcached;

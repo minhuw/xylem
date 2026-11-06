@@ -1,19 +1,19 @@
 //! Redis Cluster test utilities
 //!
 //! Provides helpers for managing Redis Cluster instances in integration tests.
-//! Uses docker-compose directly from Rust for cluster lifecycle management.
+//! Uses the shared docker-compose fixture for cluster lifecycle management.
 
 use std::process::Command;
-use std::thread;
-use std::time::Duration;
+
+use super::compose::{ComposeSpec, ComposeStack};
 
 /// Guard for Redis Cluster that ensures cleanup
 ///
 /// This will start a 3-node Redis Cluster using Docker Compose and clean it up on drop.
 /// Pure Rust implementation - no bash scripts needed!
 pub struct RedisClusterGuard {
-    started: bool,
-    compose_file: std::path::PathBuf,
+    /// Held for its drop, which stops the cluster if this guard started it
+    _stack: ComposeStack,
 }
 
 impl RedisClusterGuard {
@@ -25,6 +25,9 @@ impl RedisClusterGuard {
     /// 3. Wait for cluster to initialize
     /// 4. Verify cluster is ready
     ///
+    /// If the cluster is already running and ready, the guard uses it and leaves it
+    /// running on drop.
+    ///
     /// # Errors
     ///
     /// Returns error if:
@@ -32,77 +35,13 @@ impl RedisClusterGuard {
     /// - Cluster fails to start
     /// - Cluster doesn't become ready within 30 seconds
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        // Check if Docker is available
-        let docker_check = Command::new("docker").arg("--version").output()?;
-        if !docker_check.status.success() {
-            return Err("Docker is not available".into());
-        }
-
-        // Check if docker-compose is available (try both docker-compose and docker compose)
-        let compose_cmd = if Command::new("docker-compose")
-            .arg("version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-        {
-            vec!["docker-compose"]
-        } else if Command::new("docker")
-            .args(["compose", "version"])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-        {
-            vec!["docker", "compose"]
-        } else {
-            return Err(
-                "docker-compose not available (tried 'docker-compose' and 'docker compose')".into(),
-            );
-        };
-
-        // Get path to docker-compose.yml
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let workspace_root =
-            std::path::Path::new(manifest_dir).parent().ok_or("No parent directory")?;
-        let compose_file = workspace_root.join("tests/redis-cluster/docker-compose.yml");
-
-        if !compose_file.exists() {
-            return Err(format!("docker-compose.yml not found at {:?}", compose_file).into());
-        }
-
-        // Check if cluster is already running and ready
-        if Self::is_cluster_ready() {
-            eprintln!("Redis Cluster already running and ready");
-            return Ok(Self { started: false, compose_file });
-        }
-
-        // Start cluster using docker-compose up -d
-        let mut cmd = Command::new(compose_cmd[0]);
-        if compose_cmd.len() > 1 {
-            cmd.args(&compose_cmd[1..]);
-        }
-        let status = cmd
-            .args(["-f", compose_file.to_str().unwrap(), "up", "-d"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()?;
-
-        if !status.success() {
-            return Err("Failed to start Redis Cluster with docker-compose".into());
-        }
-
-        // Wait for cluster to initialize with shorter initial sleep
-        thread::sleep(Duration::from_millis(500));
-
-        // Verify cluster is ready with more frequent polling and shorter timeout
-        for attempt in 0..60 {
-            if Self::is_cluster_ready() {
-                eprintln!("Redis Cluster ready after {} attempts", attempt + 1);
-                return Ok(Self { started: true, compose_file });
-            }
-            thread::sleep(Duration::from_millis(500));
-        }
-
-        Err("Cluster failed to become ready within 30 seconds".into())
+        let stack = ComposeStack::start(&ComposeSpec {
+            name: "Redis Cluster",
+            compose_file: "tests/redis-cluster/docker-compose.yml",
+            build_images: false,
+            is_ready: Self::is_cluster_ready,
+        })?;
+        Ok(Self { _stack: stack })
     }
 
     /// Check if the cluster is ready by querying each node
@@ -128,36 +67,6 @@ impl RedisClusterGuard {
     /// Get the ports of the cluster nodes
     pub fn get_node_ports(&self) -> Vec<u16> {
         vec![7000, 7001, 7002]
-    }
-}
-
-impl Drop for RedisClusterGuard {
-    fn drop(&mut self) {
-        if self.started {
-            // Determine compose command (docker-compose or docker compose)
-            let compose_cmd = if Command::new("docker-compose")
-                .arg("version")
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-            {
-                vec!["docker-compose"]
-            } else {
-                vec!["docker", "compose"]
-            };
-
-            // Stop and remove containers using docker-compose down -v
-            let mut cmd = Command::new(compose_cmd[0]);
-            if compose_cmd.len() > 1 {
-                cmd.args(&compose_cmd[1..]);
-            }
-
-            let _ = cmd
-                .args(["-f", self.compose_file.to_str().unwrap(), "down", "-v"])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-        }
     }
 }
 

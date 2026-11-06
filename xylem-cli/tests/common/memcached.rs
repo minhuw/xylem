@@ -1,22 +1,16 @@
 //! Memcached test utilities
 //!
 //! Provides helpers for managing Memcached instances in integration tests.
-//! Uses docker-compose for Memcached lifecycle management.
+//! Uses the shared docker-compose fixture for Memcached lifecycle management.
 
-use std::process::Command;
-use std::sync::Mutex;
-use std::thread;
-use std::time::Duration;
-
-// Global lock to prevent concurrent Memcached container start/stop
-static MEMCACHED_LOCK: Mutex<()> = Mutex::new(());
+use super::compose::{ComposeSpec, ComposeStack};
 
 /// Guard for Memcached that ensures cleanup
 ///
 /// This will start a Memcached instance using Docker Compose and clean it up on drop.
 pub struct MemcachedGuard {
-    started: bool,
-    compose_file: std::path::PathBuf,
+    /// Held for its drop, which stops Memcached if this guard started it
+    _stack: ComposeStack,
 }
 
 impl MemcachedGuard {
@@ -27,6 +21,8 @@ impl MemcachedGuard {
     /// 2. Start Memcached (port 11211) via docker-compose
     /// 3. Wait for Memcached to be ready
     ///
+    /// If Memcached is already running, the guard uses it and leaves it running on drop.
+    ///
     /// # Errors
     ///
     /// Returns error if:
@@ -34,81 +30,17 @@ impl MemcachedGuard {
     /// - Memcached fails to start
     /// - Memcached doesn't become ready within 30 seconds
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        // Acquire lock to prevent concurrent start attempts
-        let _lock = MEMCACHED_LOCK.lock().unwrap();
-
-        // Get path to docker-compose.yml first
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let workspace_root =
-            std::path::Path::new(manifest_dir).parent().ok_or("No parent directory")?;
-        let compose_file = workspace_root.join("tests/memcached/docker-compose.yml");
-
-        if !compose_file.exists() {
-            return Err(format!("docker-compose.yml not found at {:?}", compose_file).into());
-        }
-
-        // Check if Memcached is already running
-        if Self::is_memcached_ready() {
-            return Ok(Self { started: false, compose_file });
-        }
-
-        // Check if Docker is available
-        let docker_check = Command::new("docker").arg("--version").output()?;
-        if !docker_check.status.success() {
-            return Err("Docker is not available".into());
-        }
-
-        // Check if docker-compose is available (try both docker-compose and docker compose)
-        let compose_cmd = if Command::new("docker-compose")
-            .arg("version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-        {
-            vec!["docker-compose"]
-        } else if Command::new("docker")
-            .args(["compose", "version"])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-        {
-            vec!["docker", "compose"]
-        } else {
-            return Err(
-                "docker-compose not available (tried 'docker-compose' and 'docker compose')".into(),
-            );
-        };
-
-        // Start Memcached using docker-compose up -d
-        let mut cmd = Command::new(compose_cmd[0]);
-        if compose_cmd.len() > 1 {
-            cmd.args(&compose_cmd[1..]);
-        }
-        let status = cmd
-            .args(["-f", compose_file.to_str().unwrap(), "up", "-d"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()?;
-
-        if !status.success() {
-            return Err("Failed to start Memcached with docker-compose".into());
-        }
-
-        thread::sleep(Duration::from_secs(2));
-
-        // Verify Memcached is ready
-        for _ in 0..15 {
-            if Self::is_memcached_ready() {
-                return Ok(Self { started: true, compose_file });
-            }
-            thread::sleep(Duration::from_secs(2));
-        }
-
-        Err("Memcached failed to become ready within 30 seconds".into())
+        let stack = ComposeStack::start(&ComposeSpec {
+            name: "Memcached",
+            compose_file: "tests/memcached/docker-compose.yml",
+            build_images: false,
+            is_ready: Self::is_memcached_ready,
+        })?;
+        Ok(Self { _stack: stack })
     }
 
     /// Check if Memcached is ready
-    fn is_memcached_ready() -> bool {
+    pub(super) fn is_memcached_ready() -> bool {
         use std::io::{Read, Write};
         use std::net::TcpStream;
 
@@ -137,36 +69,6 @@ impl MemcachedGuard {
     /// Get the port Memcached is listening on
     pub fn get_port(&self) -> u16 {
         11211
-    }
-}
-
-impl Drop for MemcachedGuard {
-    fn drop(&mut self) {
-        if self.started {
-            // Determine compose command (docker-compose or docker compose)
-            let compose_cmd = if Command::new("docker-compose")
-                .arg("version")
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-            {
-                vec!["docker-compose"]
-            } else {
-                vec!["docker", "compose"]
-            };
-
-            // Stop and remove containers using docker-compose down -v
-            let mut cmd = Command::new(compose_cmd[0]);
-            if compose_cmd.len() > 1 {
-                cmd.args(&compose_cmd[1..]);
-            }
-
-            let _ = cmd
-                .args(["-f", self.compose_file.to_str().unwrap(), "down", "-v"])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-        }
     }
 }
 
