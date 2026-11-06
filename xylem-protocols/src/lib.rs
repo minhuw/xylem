@@ -188,10 +188,9 @@ pub use configs::{
     RedisConfig, RedisOperationsConfig, ValueSizeConfig, VerificationConfig, XylemEchoConfig,
 };
 pub use factories::{
-    HttpFactory, MemcachedAsciiFactory, MemcachedBinaryFactory, ProtocolRegistry, RedisFactory,
-    XylemEchoFactory,
+    HttpFactory, MemcachedAsciiFactory, MemcachedBinaryFactory, RedisFactory, XylemEchoFactory,
 };
-pub use factory::{DynProtocol, DynProtocolFactory, ProtocolFactory};
+pub use factory::ProtocolFactory;
 pub use http::HttpMethod;
 pub use http::HttpProtocol;
 pub use masstree::{MasstreeOp, MasstreeProtocol, ResultCode};

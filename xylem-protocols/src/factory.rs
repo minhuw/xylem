@@ -1,8 +1,7 @@
 //! Protocol factory trait for extensible protocol configuration
 //!
 //! This module provides the `ProtocolFactory` trait that allows protocols to define
-//! their own configuration structure. Users writing custom protocols can implement
-//! this trait to integrate their protocol with xylem's configuration system.
+//! their own configuration structure and create protocol instances from it.
 //!
 //! # Example
 //!
@@ -112,146 +111,6 @@ pub trait ProtocolFactory: Send + Sync {
     }
 }
 
-/// Type-erased protocol factory for use in registries.
-///
-/// This allows storing different protocol factories in a single collection.
-pub trait DynProtocolFactory: Send + Sync {
-    /// Protocol name
-    fn name(&self) -> &'static str;
-
-    /// Create a protocol from a JSON value configuration.
-    ///
-    /// # Arguments
-    /// * `config` - Protocol configuration as JSON value (can be null for defaults)
-    /// * `seed` - Optional random seed
-    fn create_from_value(
-        &self,
-        config: serde_json::Value,
-        seed: Option<u64>,
-    ) -> Result<Box<dyn DynProtocol>>;
-
-    /// Get the default configuration as a JSON value.
-    fn default_config_value(&self) -> serde_json::Value;
-
-    /// Validate configuration from a JSON value.
-    fn validate_value(&self, config: &serde_json::Value) -> Result<()>;
-
-    /// Get the JSON schema for this protocol's configuration (requires schema feature).
-    #[cfg(feature = "schema")]
-    fn config_schema(&self) -> schemars::Schema;
-
-    /// Placeholder for config_schema when schema feature is disabled.
-    #[cfg(not(feature = "schema"))]
-    fn config_schema(&self) -> ();
-}
-
-/// Type-erased protocol trait for runtime dispatch.
-pub trait DynProtocol: Send {
-    /// Returns a Request containing data, ID, and metadata where metadata indicates
-    /// whether this is a warmup request.
-    fn next_request(&mut self, conn_id: usize) -> crate::Request<(usize, u64)>;
-
-    /// Regenerate a request for retry using the original request ID
-    fn regenerate_request(
-        &mut self,
-        conn_id: usize,
-        original_request_id: (usize, u64),
-    ) -> crate::Request<(usize, u64)>;
-
-    /// Parse a response
-    fn parse_response(
-        &mut self,
-        conn_id: usize,
-        data: &[u8],
-    ) -> Result<(usize, Option<(usize, u64)>)>;
-
-    /// Protocol name
-    fn name(&self) -> &'static str;
-
-    /// Reset state
-    fn reset(&mut self);
-}
-
-/// Blanket implementation of DynProtocol for any Protocol implementation
-impl<P> DynProtocol for P
-where
-    P: Protocol<RequestId = (usize, u64)> + Send,
-{
-    fn next_request(&mut self, conn_id: usize) -> crate::Request<(usize, u64)> {
-        Protocol::next_request(self, conn_id)
-    }
-
-    fn regenerate_request(
-        &mut self,
-        conn_id: usize,
-        original_request_id: (usize, u64),
-    ) -> crate::Request<(usize, u64)> {
-        Protocol::regenerate_request(self, conn_id, original_request_id)
-    }
-
-    fn parse_response(
-        &mut self,
-        conn_id: usize,
-        data: &[u8],
-    ) -> Result<(usize, Option<(usize, u64)>)> {
-        Protocol::parse_response(self, conn_id, data)
-    }
-
-    fn name(&self) -> &'static str {
-        Protocol::name(self)
-    }
-
-    fn reset(&mut self) {
-        Protocol::reset(self)
-    }
-}
-
-/// Blanket implementation of DynProtocolFactory for any ProtocolFactory
-impl<F> DynProtocolFactory for F
-where
-    F: ProtocolFactory,
-    F::Config: 'static,
-{
-    fn name(&self) -> &'static str {
-        ProtocolFactory::name(self)
-    }
-
-    fn create_from_value(
-        &self,
-        config: serde_json::Value,
-        seed: Option<u64>,
-    ) -> Result<Box<dyn DynProtocol>> {
-        let typed_config: F::Config = if config.is_null() {
-            self.default_config()
-        } else {
-            serde_json::from_value(config)?
-        };
-        let protocol = self.create(typed_config, seed)?;
-        Ok(Box::new(protocol))
-    }
-
-    fn default_config_value(&self) -> serde_json::Value {
-        serde_json::to_value(self.default_config()).unwrap_or(serde_json::Value::Null)
-    }
-
-    fn validate_value(&self, config: &serde_json::Value) -> Result<()> {
-        let typed_config: F::Config = if config.is_null() {
-            self.default_config()
-        } else {
-            serde_json::from_value(config.clone())?
-        };
-        self.validate(&typed_config)
-    }
-
-    #[cfg(feature = "schema")]
-    fn config_schema(&self) -> schemars::Schema {
-        schemars::generate::SchemaGenerator::default().into_root_schema_for::<F::Config>()
-    }
-
-    #[cfg(not(feature = "schema"))]
-    fn config_schema(&self) {}
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,27 +182,5 @@ mod tests {
 
         let request = Protocol::next_request(&mut protocol, 0);
         assert_eq!(request.data, vec![100]);
-    }
-
-    #[test]
-    fn test_dyn_protocol_factory() {
-        let factory: &dyn DynProtocolFactory = &TestFactory;
-
-        assert_eq!(factory.name(), "test");
-
-        let config = serde_json::json!({"value": 50});
-        let mut protocol = factory.create_from_value(config, None).unwrap();
-
-        let request = DynProtocol::next_request(protocol.as_mut(), 0);
-        assert_eq!(request.data, vec![50]);
-    }
-
-    #[test]
-    fn test_default_config() {
-        let factory: &dyn DynProtocolFactory = &TestFactory;
-
-        let mut protocol = factory.create_from_value(serde_json::Value::Null, None).unwrap();
-        let request = DynProtocol::next_request(protocol.as_mut(), 0);
-        assert_eq!(request.data, vec![42]); // default value
     }
 }
