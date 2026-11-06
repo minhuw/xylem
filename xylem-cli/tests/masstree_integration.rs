@@ -4,7 +4,7 @@
 //! Docker is required to run these tests.
 
 use std::time::Duration;
-use xylem_core::stats::GroupStatsCollector;
+use xylem_core::stats::TupleStatsCollector;
 use xylem_core::threading::{ThreadingRuntime, Worker, WorkerConfig};
 
 use xylem_transport::TcpTransportFactory;
@@ -47,28 +47,30 @@ fn test_masstree_get_single_thread() {
 
     // Check stats
     let stats = worker.into_stats();
-    let basic_stats = stats.global().calculate_basic_stats();
+    let global = stats.aggregate_global(duration);
 
     println!("Results:");
-    println!("  Total requests: {}", stats.global().tx_requests());
+    println!("  Total requests: {}", global.total_requests);
     println!(
         "  Throughput: {:.2} req/s",
-        stats.global().tx_requests() as f64 / duration.as_secs_f64()
+        global.total_requests as f64 / duration.as_secs_f64()
     );
-    println!("  Min latency: {:.2} us", basic_stats.min.as_micros());
-    println!("  Mean latency: {:.2} us", basic_stats.mean.as_micros());
-    println!("  Max latency: {:.2} us", basic_stats.max.as_micros());
+    println!("  P50 latency: {:.2} us", global.latency_p50.as_micros());
+    println!("  Mean latency: {:.2} us", global.mean_latency.as_micros());
+    println!("  P99 latency: {:.2} us", global.latency_p99.as_micros());
 
     // Verify we got some requests through
-    assert!(stats.global().tx_requests() > 0, "Should have sent some requests");
-    assert!(stats.global().rx_requests() > 0, "Should have received some responses");
-    assert!(!stats.global().samples().is_empty(), "Should have collected latency samples");
+    assert!(global.total_requests > 0, "Should have completed some requests");
+    assert!(
+        stats.entries().values().any(|entry| entry.latency.count() > 0),
+        "Should have collected latency samples"
+    );
 
     // Sanity check on latency (should be < 50ms for local Masstree)
     assert!(
-        basic_stats.mean < Duration::from_millis(50),
+        global.mean_latency < Duration::from_millis(50),
         "Mean latency should be < 50ms for local Masstree, got {:?}",
-        basic_stats.mean
+        global.mean_latency
     );
 
     println!("Test passed!");
@@ -110,21 +112,20 @@ fn test_masstree_set_single_thread() {
 
     // Check stats
     let stats = worker.into_stats();
-    let basic_stats = stats.global().calculate_basic_stats();
+    let global = stats.aggregate_global(duration);
 
     println!("Results:");
-    println!("  Total requests: {}", stats.global().tx_requests());
+    println!("  Total requests: {}", global.total_requests);
     println!(
         "  Throughput: {:.2} req/s",
-        stats.global().tx_requests() as f64 / duration.as_secs_f64()
+        global.total_requests as f64 / duration.as_secs_f64()
     );
-    println!("  Min latency: {:.2} us", basic_stats.min.as_micros());
-    println!("  Mean latency: {:.2} us", basic_stats.mean.as_micros());
-    println!("  Max latency: {:.2} us", basic_stats.max.as_micros());
+    println!("  P50 latency: {:.2} us", global.latency_p50.as_micros());
+    println!("  Mean latency: {:.2} us", global.mean_latency.as_micros());
+    println!("  P99 latency: {:.2} us", global.latency_p99.as_micros());
 
     // Verify we got some requests through
-    assert!(stats.global().tx_requests() > 0, "Should have sent some requests");
-    assert!(stats.global().rx_requests() > 0, "Should have received some responses");
+    assert!(global.total_requests > 0, "Should have completed some requests");
 
     println!("Test passed!");
 }
@@ -177,26 +178,25 @@ fn test_masstree_multi_thread() {
     assert_eq!(results.len(), num_threads);
 
     // Merge stats from all threads
-    let merged_stats = GroupStatsCollector::merge(results);
-    let basic_stats = merged_stats.global().calculate_basic_stats();
+    let merged_stats = TupleStatsCollector::merge(results);
+    let global = merged_stats.aggregate_global(duration);
 
     println!("Results ({num_threads} threads):");
-    println!("  Total requests: {}", merged_stats.global().tx_requests());
+    println!("  Total requests: {}", global.total_requests);
     println!(
         "  Throughput: {:.2} req/s",
-        merged_stats.global().tx_requests() as f64 / duration.as_secs_f64()
+        global.total_requests as f64 / duration.as_secs_f64()
     );
-    println!("  Min latency: {:.2} us", basic_stats.min.as_micros());
-    println!("  Mean latency: {:.2} us", basic_stats.mean.as_micros());
-    println!("  Max latency: {:.2} us", basic_stats.max.as_micros());
+    println!("  P50 latency: {:.2} us", global.latency_p50.as_micros());
+    println!("  Mean latency: {:.2} us", global.mean_latency.as_micros());
+    println!("  P99 latency: {:.2} us", global.latency_p99.as_micros());
 
     // Verify we got some requests through
-    assert!(merged_stats.global().tx_requests() > 0, "Should have sent some requests");
-    assert!(merged_stats.global().rx_requests() > 0, "Should have received some responses");
+    assert!(global.total_requests > 0, "Should have completed some requests");
 
     // With multiple threads, we should get reasonable throughput
     assert!(
-        merged_stats.global().tx_requests() > 100,
+        global.total_requests > 100,
         "Should have reasonable throughput with {num_threads} threads"
     );
 
@@ -238,18 +238,17 @@ fn test_masstree_remove_operation() {
     assert!(result.is_ok(), "Worker should complete successfully: {:?}", result.err());
 
     // Check stats
-    let stats = worker.into_stats();
+    let global = worker.into_stats().aggregate_global(duration);
 
     println!("Results:");
-    println!("  Total requests: {}", stats.global().tx_requests());
+    println!("  Total requests: {}", global.total_requests);
     println!(
         "  Throughput: {:.2} req/s",
-        stats.global().tx_requests() as f64 / duration.as_secs_f64()
+        global.total_requests as f64 / duration.as_secs_f64()
     );
 
     // Verify we got some requests through
-    assert!(stats.global().tx_requests() > 0, "Should have sent some requests");
-    assert!(stats.global().rx_requests() > 0, "Should have received some responses");
+    assert!(global.total_requests > 0, "Should have completed some requests");
 
     println!("Test passed!");
 }
@@ -294,13 +293,13 @@ fn test_masstree_rate_limited() {
 
     assert!(result.is_ok(), "Worker should complete successfully");
 
-    let stats = worker.into_stats();
-    let actual_rate = stats.global().tx_requests() as f64 / duration.as_secs_f64();
+    let global = worker.into_stats().aggregate_global(duration);
+    let actual_rate = global.total_requests as f64 / duration.as_secs_f64();
 
     println!("Results:");
     println!("  Target rate: {target_rate:.2} req/s");
     println!("  Actual rate: {actual_rate:.2} req/s");
-    println!("  Total requests: {}", stats.global().tx_requests());
+    println!("  Total requests: {}", global.total_requests);
 
     // Verify we're close to target rate (within 50% tolerance for slower Masstree)
     let rate_ratio = actual_rate / target_rate;
@@ -348,25 +347,27 @@ fn test_masstree_pipelined() {
 
     // Check stats
     let stats = worker.into_stats();
-    let basic_stats = stats.global().calculate_basic_stats();
+    let global = stats.aggregate_global(duration);
 
     println!("Results:");
-    println!("  Total requests: {}", stats.global().tx_requests());
+    println!("  Total requests: {}", global.total_requests);
     println!(
         "  Throughput: {:.2} req/s",
-        stats.global().tx_requests() as f64 / duration.as_secs_f64()
+        global.total_requests as f64 / duration.as_secs_f64()
     );
-    println!("  Min latency: {:.2} us", basic_stats.min.as_micros());
-    println!("  Mean latency: {:.2} us", basic_stats.mean.as_micros());
-    println!("  Max latency: {:.2} us", basic_stats.max.as_micros());
+    println!("  P50 latency: {:.2} us", global.latency_p50.as_micros());
+    println!("  Mean latency: {:.2} us", global.mean_latency.as_micros());
+    println!("  P99 latency: {:.2} us", global.latency_p99.as_micros());
 
     // Verify we got some requests through
-    assert!(stats.global().tx_requests() > 0, "Should have sent some requests");
-    assert!(stats.global().rx_requests() > 0, "Should have received some responses");
-    assert!(!stats.global().samples().is_empty(), "Should have collected latency samples");
+    assert!(global.total_requests > 0, "Should have completed some requests");
+    assert!(
+        stats.entries().values().any(|entry| entry.latency.count() > 0),
+        "Should have collected latency samples"
+    );
 
     // With pipelining, we should get higher throughput than without
-    let throughput = stats.global().tx_requests() as f64 / duration.as_secs_f64();
+    let throughput = global.total_requests as f64 / duration.as_secs_f64();
     println!("✓ Pipelined throughput: {throughput:.0} req/s");
 
     // Basic sanity check - should be more than 100 req/s with pipelining

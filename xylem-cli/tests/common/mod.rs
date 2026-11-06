@@ -14,15 +14,15 @@ pub mod redis_acl;
 pub mod redis_auth;
 pub mod redis_cluster;
 
-use xylem_core::stats::GroupStatsCollector;
+use std::time::Duration;
+use xylem_core::stats::{SamplingPolicy, TupleStatsCollector};
 
-/// Create a GroupStatsCollector for testing with a single group (group_id=0)
+/// Create a TupleStatsCollector for testing with a single group (group_id=0)
 ///
-/// This is a helper for tests that were written for single-group Workers
-/// and need to be migrated to GroupStatsCollector.
-pub fn create_test_stats() -> GroupStatsCollector {
-    let mut stats = GroupStatsCollector::new();
-    // Register group 0 with unlimited sampling
-    stats.register_group_legacy(0, 1_000_000, 1.0);
+/// The global view uses the default sampling policy; group 0 keeps up to
+/// 1,000,000 latency samples per entry at full rate.
+pub fn create_test_stats() -> TupleStatsCollector {
+    let mut stats = TupleStatsCollector::new(SamplingPolicy::default(), Duration::from_secs(1));
+    stats.register_group_policy(0, SamplingPolicy::Limited { max_samples: 1_000_000, rate: 1.0 });
     stats
 }

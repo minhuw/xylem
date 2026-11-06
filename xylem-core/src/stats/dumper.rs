@@ -285,7 +285,7 @@ impl Default for StreamingConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stats::collector::SamplingPolicy;
+    use crate::stats::SamplingPolicy;
     use std::time::Duration;
     use tempfile::tempdir;
 

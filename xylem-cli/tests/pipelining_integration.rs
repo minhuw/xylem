@@ -47,21 +47,22 @@ fn test_redis_pipelined_single_connection() {
 
     assert!(result.is_ok(), "Worker should complete: {:?}", result.err());
 
-    let stats = worker.stats().global();
-    let basic_stats = stats.calculate_basic_stats();
+    let global = worker.stats().aggregate_global(duration);
 
     println!("Results:");
-    println!("  Total requests: {}", stats.tx_requests());
-    println!("  Throughput: {:.2} req/s", stats.tx_requests() as f64 / duration.as_secs_f64());
-    println!("  Min latency: {:.2} μs", basic_stats.min.as_micros());
-    println!("  Mean latency: {:.2} μs", basic_stats.mean.as_micros());
-    println!("  Max latency: {:.2} μs", basic_stats.max.as_micros());
+    println!("  Total requests: {}", global.total_requests);
+    println!(
+        "  Throughput: {:.2} req/s",
+        global.total_requests as f64 / duration.as_secs_f64()
+    );
+    println!("  P50 latency: {:.2} μs", global.latency_p50.as_micros());
+    println!("  Mean latency: {:.2} μs", global.mean_latency.as_micros());
+    println!("  P99 latency: {:.2} μs", global.latency_p99.as_micros());
 
-    assert!(stats.tx_requests() > 0, "Should have sent requests");
-    assert!(stats.rx_requests() > 0, "Should have received responses");
+    assert!(global.total_requests > 0, "Should have completed requests");
 
     // With pipelining, we should get much higher throughput
-    let throughput = stats.tx_requests() as f64 / duration.as_secs_f64();
+    let throughput = global.total_requests as f64 / duration.as_secs_f64();
     println!("✓ Pipelined throughput: {throughput:.0} req/s");
 }
 
@@ -93,21 +94,22 @@ fn test_redis_pipelined_multiple_connections() {
 
     assert!(result.is_ok(), "Worker should complete: {:?}", result.err());
 
-    let stats = worker.stats().global();
-    let basic_stats = stats.calculate_basic_stats();
+    let global = worker.stats().aggregate_global(duration);
 
     println!("Results:");
-    println!("  Total requests: {}", stats.tx_requests());
-    println!("  Throughput: {:.2} req/s", stats.tx_requests() as f64 / duration.as_secs_f64());
-    println!("  Min latency: {:.2} μs", basic_stats.min.as_micros());
-    println!("  Mean latency: {:.2} μs", basic_stats.mean.as_micros());
-    println!("  Max latency: {:.2} μs", basic_stats.max.as_micros());
+    println!("  Total requests: {}", global.total_requests);
+    println!(
+        "  Throughput: {:.2} req/s",
+        global.total_requests as f64 / duration.as_secs_f64()
+    );
+    println!("  P50 latency: {:.2} μs", global.latency_p50.as_micros());
+    println!("  Mean latency: {:.2} μs", global.mean_latency.as_micros());
+    println!("  P99 latency: {:.2} μs", global.latency_p99.as_micros());
 
-    assert!(stats.tx_requests() > 0, "Should have sent requests");
-    assert!(stats.rx_requests() > 0, "Should have received responses");
+    assert!(global.total_requests > 0, "Should have completed requests");
 
     // With 4 connections and pipelining, throughput should be very high
-    let throughput = stats.tx_requests() as f64 / duration.as_secs_f64();
+    let throughput = global.total_requests as f64 / duration.as_secs_f64();
     println!("✓ Multi-connection pipelined throughput: {throughput:.0} req/s");
 }
 
@@ -144,12 +146,12 @@ fn test_redis_pipelined_closed_loop() {
 
     assert!(result.is_ok(), "Worker should complete: {:?}", result.err());
 
-    let stats = worker.stats().global();
-    let actual_rate = stats.tx_requests() as f64 / duration.as_secs_f64();
+    let global = worker.stats().aggregate_global(duration);
+    let actual_rate = global.total_requests as f64 / duration.as_secs_f64();
 
     println!("Results:");
     println!("  Actual rate: {actual_rate:.2} req/s");
-    println!("  Total requests: {}", stats.tx_requests());
+    println!("  Total requests: {}", global.total_requests);
 
     // Closed-loop should achieve reasonable throughput (at least 1000 req/s with pipelining)
     assert!(

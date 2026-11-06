@@ -36,8 +36,8 @@ fn run_throughput_experiment(duration_secs: u64, conn_count: usize, pipeline_dep
     let result = worker.run();
     assert!(result.is_ok(), "Worker failed: {:?}", result.err());
 
-    let stats = worker.stats().global();
-    stats.tx_requests() as f64 / duration.as_secs_f64()
+    let global = worker.stats().aggregate_global(duration);
+    global.total_requests as f64 / duration.as_secs_f64()
 }
 
 /// Test closed-loop throughput with single connection
@@ -140,8 +140,8 @@ fn run_rate_limited_experiment(
     let result = worker.run();
     assert!(result.is_ok(), "Worker failed: {:?}", result.err());
 
-    let stats = worker.stats().global();
-    let actual_rate = stats.tx_requests() as f64 / duration.as_secs_f64();
+    let global = worker.stats().aggregate_global(duration);
+    let actual_rate = global.total_requests as f64 / duration.as_secs_f64();
     let error_percent = ((actual_rate - target_rate) / target_rate * 100.0).abs();
 
     (target_rate, actual_rate, error_percent)
@@ -221,8 +221,8 @@ fn test_poisson_rate_limiting() {
     let result = worker.run();
     assert!(result.is_ok(), "Worker failed: {:?}", result.err());
 
-    let stats = worker.stats().global();
-    let actual_rate = stats.tx_requests() as f64 / duration.as_secs_f64();
+    let global = worker.stats().aggregate_global(duration);
+    let actual_rate = global.total_requests as f64 / duration.as_secs_f64();
     let error = ((actual_rate - target_rate) / target_rate * 100.0).abs();
 
     println!("Target rate: {target_rate:.2} req/s");

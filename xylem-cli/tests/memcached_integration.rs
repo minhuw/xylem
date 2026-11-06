@@ -4,7 +4,7 @@
 //! Docker is required to run these tests.
 
 use std::time::Duration;
-use xylem_core::stats::GroupStatsCollector;
+use xylem_core::stats::TupleStatsCollector;
 use xylem_core::threading::{ThreadingRuntime, Worker, WorkerConfig};
 
 use xylem_transport::TcpTransportFactory;
@@ -40,19 +40,19 @@ fn test_memcached_binary_single_thread() {
         })
         .expect("Worker failed");
 
-    let stats = GroupStatsCollector::merge(results);
-    let basic_stats = stats.global().calculate_basic_stats();
+    let stats = TupleStatsCollector::merge(results);
+    let global = stats.aggregate_global(Duration::from_secs(1));
 
     println!("\n=== Memcached Binary Protocol Test Results ===");
-    println!("Requests: {}", stats.global().tx_requests());
-    println!("Mean latency: {:.2} μs", basic_stats.mean.as_micros());
-    println!("Min latency: {:.2} μs", basic_stats.min.as_micros());
-    println!("Max latency: {:.2} μs", basic_stats.max.as_micros());
+    println!("Requests: {}", global.total_requests);
+    println!("Mean latency: {:.2} μs", global.mean_latency.as_micros());
+    println!("P50 latency: {:.2} μs", global.latency_p50.as_micros());
+    println!("P99 latency: {:.2} μs", global.latency_p99.as_micros());
 
     // Assertions
-    assert!(stats.global().tx_requests() > 100, "Should process at least 100 requests");
-    assert!(basic_stats.mean.as_micros() > 0, "Mean latency should be positive");
-    assert!(basic_stats.mean.as_millis() < 10, "Mean latency should be < 10ms");
+    assert!(global.total_requests > 100, "Should process at least 100 requests");
+    assert!(global.mean_latency.as_micros() > 0, "Mean latency should be positive");
+    assert!(global.mean_latency.as_millis() < 10, "Mean latency should be < 10ms");
 }
 
 /// Test Memcached ASCII protocol with single thread
@@ -84,19 +84,19 @@ fn test_memcached_ascii_single_thread() {
         })
         .expect("Worker failed");
 
-    let stats = GroupStatsCollector::merge(results);
-    let basic_stats = stats.global().calculate_basic_stats();
+    let stats = TupleStatsCollector::merge(results);
+    let global = stats.aggregate_global(Duration::from_secs(1));
 
     println!("\n=== Memcached ASCII Protocol Test Results ===");
-    println!("Requests: {}", stats.global().tx_requests());
-    println!("Mean latency: {:.2} μs", basic_stats.mean.as_micros());
-    println!("Min latency: {:.2} μs", basic_stats.min.as_micros());
-    println!("Max latency: {:.2} μs", basic_stats.max.as_micros());
+    println!("Requests: {}", global.total_requests);
+    println!("Mean latency: {:.2} μs", global.mean_latency.as_micros());
+    println!("P50 latency: {:.2} μs", global.latency_p50.as_micros());
+    println!("P99 latency: {:.2} μs", global.latency_p99.as_micros());
 
     // Assertions
-    assert!(stats.global().tx_requests() > 100, "Should process at least 100 requests");
-    assert!(basic_stats.mean.as_micros() > 0, "Mean latency should be positive");
-    assert!(basic_stats.mean.as_millis() < 10, "Mean latency should be < 10ms");
+    assert!(global.total_requests > 100, "Should process at least 100 requests");
+    assert!(global.mean_latency.as_micros() > 0, "Mean latency should be positive");
+    assert!(global.mean_latency.as_millis() < 10, "Mean latency should be < 10ms");
 }
 
 /// Test Memcached Binary protocol with multiple threads
@@ -128,19 +128,19 @@ fn test_memcached_binary_multi_thread() {
         })
         .expect("Worker failed");
 
-    let stats = GroupStatsCollector::merge(results);
-    let basic_stats = stats.global().calculate_basic_stats();
-    let throughput_rps = stats.global().tx_requests() as f64 / 2.0; // 2 second duration
+    let stats = TupleStatsCollector::merge(results);
+    let global = stats.aggregate_global(Duration::from_secs(2));
+    let throughput_rps = global.total_requests as f64 / 2.0; // 2 second duration
 
     println!("\n=== Memcached Binary Multi-Thread Test Results ===");
     println!("Threads: 4");
-    println!("Requests: {}", stats.global().tx_requests());
+    println!("Requests: {}", global.total_requests);
     println!("Throughput: {throughput_rps:.2} req/s");
-    println!("Mean latency: {:.2} μs", basic_stats.mean.as_micros());
+    println!("Mean latency: {:.2} μs", global.mean_latency.as_micros());
 
     // Assertions
     assert!(
-        stats.global().tx_requests() > 1000,
+        global.total_requests > 1000,
         "Should process at least 1000 requests with 4 threads"
     );
     assert!(throughput_rps > 100.0, "Should achieve > 100 req/s");
@@ -185,15 +185,15 @@ fn test_memcached_ascii_rate_limited() {
         })
         .expect("Worker failed");
 
-    let stats = GroupStatsCollector::merge(results);
-    let basic_stats = stats.global().calculate_basic_stats();
-    let actual_rate = stats.global().tx_requests() as f64 / 2.0; // 2 second duration
+    let stats = TupleStatsCollector::merge(results);
+    let global = stats.aggregate_global(Duration::from_secs(2));
+    let actual_rate = global.total_requests as f64 / 2.0; // 2 second duration
 
     println!("\n=== Memcached ASCII Rate-Limited Test Results ===");
     println!("Target rate: {target_rate:.2} req/s");
     println!("Actual rate: {actual_rate:.2} req/s");
-    println!("Requests: {}", stats.global().tx_requests());
-    println!("Mean latency: {:.2} μs", basic_stats.mean.as_micros());
+    println!("Requests: {}", global.total_requests);
+    println!("Mean latency: {:.2} μs", global.mean_latency.as_micros());
 
     // Allow 10% deviation from target rate
     let rate_error = (actual_rate - target_rate).abs() / target_rate;

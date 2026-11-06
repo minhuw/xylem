@@ -5,8 +5,7 @@
 
 use std::process::Command;
 use std::time::Duration;
-use xylem_core::stats::collector::SamplingPolicy;
-use xylem_core::stats::GroupStatsCollector;
+use xylem_core::stats::{SamplingPolicy, TupleStatsCollector};
 use xylem_core::threading::{ThreadingRuntime, Worker, WorkerConfig};
 
 use xylem_transport::TcpTransportFactory;
@@ -90,17 +89,17 @@ fn test_redis_single_thread() {
 
     // Check stats
     let stats = worker.into_stats();
-    let basic_stats = stats.global().calculate_basic_stats();
+    let global = stats.aggregate_global(duration);
 
     println!("Results:");
-    println!("  Total requests: {}", stats.global().tx_requests());
+    println!("  Total requests: {}", global.total_requests);
     println!(
         "  Throughput: {:.2} req/s",
-        stats.global().tx_requests() as f64 / duration.as_secs_f64()
+        global.total_requests as f64 / duration.as_secs_f64()
     );
-    println!("  Min latency: {:.2} μs", basic_stats.min.as_micros());
-    println!("  Mean latency: {:.2} μs", basic_stats.mean.as_micros());
-    println!("  Max latency: {:.2} μs", basic_stats.max.as_micros());
+    println!("  P50 latency: {:.2} μs", global.latency_p50.as_micros());
+    println!("  Mean latency: {:.2} μs", global.mean_latency.as_micros());
+    println!("  P99 latency: {:.2} μs", global.latency_p99.as_micros());
 
     // Get Redis stats after test
     let stats_after = get_redis_stats().expect("Failed to get final Redis stats");
@@ -111,24 +110,26 @@ fn test_redis_single_thread() {
     println!("  Commands before: {}", stats_before.total_commands_processed);
     println!("  Commands after: {}", stats_after.total_commands_processed);
     println!("  Commands processed: {redis_commands_processed}");
-    println!("  Client tx_requests: {}", stats.global().tx_requests());
+    println!("  Client requests: {}", global.total_requests);
 
     // Verify we got some requests through
-    assert!(stats.global().tx_requests() > 0, "Should have sent some requests");
-    assert!(stats.global().rx_requests() > 0, "Should have received some responses");
-    assert!(!stats.global().samples().is_empty(), "Should have collected latency samples");
+    assert!(global.total_requests > 0, "Should have completed some requests");
+    assert!(
+        stats.entries().values().any(|entry| entry.latency.count() > 0),
+        "Should have collected latency samples"
+    );
 
     // STRICT VALIDATION: Verify Redis actually processed the requests
-    // Redis counts each GET command, so it should match our tx_requests
+    // Redis counts each GET command, so it should match our completed requests
     assert!(redis_commands_processed > 0, "Redis should have processed some commands");
 
     // Allow small discrepancy due to INFO command itself and potential connection setup commands
-    let discrepancy = (redis_commands_processed as i64 - stats.global().tx_requests() as i64).abs();
+    let discrepancy = (redis_commands_processed as i64 - global.total_requests as i64).abs();
     assert!(
         discrepancy < 10,
         "Redis commands processed ({}) should match client requests ({}) within small margin (discrepancy: {})",
         redis_commands_processed,
-        stats.global().tx_requests(),
+        global.total_requests,
         discrepancy
     );
 
@@ -136,9 +137,9 @@ fn test_redis_single_thread() {
 
     // Sanity check on latency (should be < 10ms for local Redis)
     assert!(
-        basic_stats.mean < Duration::from_millis(10),
+        global.mean_latency < Duration::from_millis(10),
         "Mean latency should be < 10ms for local Redis, got {:?}",
-        basic_stats.mean
+        global.mean_latency
     );
 }
 
@@ -158,8 +159,8 @@ fn test_global_sampling_none_disables_latency() {
     ));
 
     // Create stats collector with SamplingPolicy::None
-    let mut stats = GroupStatsCollector::with_global_policy(&SamplingPolicy::None);
-    stats.register_group(0, &SamplingPolicy::None);
+    let mut stats = TupleStatsCollector::new(SamplingPolicy::None, Duration::from_secs(1));
+    stats.register_group_policy(0, SamplingPolicy::None);
 
     let worker_config = WorkerConfig {
         target: target_addr,
@@ -184,23 +185,29 @@ fn test_global_sampling_none_disables_latency() {
 
     // Check stats
     let stats = worker.into_stats();
+    let global = stats.aggregate_global(duration);
+    let latency_samples: u64 = stats.entries().values().map(|entry| entry.latency.count()).sum();
 
     println!("Results:");
-    println!("  Total requests: {}", stats.global().tx_requests());
+    println!("  Total requests: {}", global.total_requests);
     println!(
         "  Throughput: {:.2} req/s",
-        stats.global().tx_requests() as f64 / duration.as_secs_f64()
+        global.total_requests as f64 / duration.as_secs_f64()
     );
-    println!("  Latency samples collected: {}", stats.global().samples().len());
+    println!("  Latency samples collected: {latency_samples}");
 
     // Verify we got some requests through
-    assert!(stats.global().tx_requests() > 0, "Should have sent some requests");
-    assert!(stats.global().rx_requests() > 0, "Should have received some responses");
+    assert!(global.total_requests > 0, "Should have completed some requests");
 
     // With SamplingPolicy::None, no latency samples should be collected
-    assert!(
-        stats.global().samples().is_empty(),
+    assert_eq!(
+        latency_samples, 0,
         "SamplingPolicy::None should not collect any latency samples"
+    );
+    assert_eq!(
+        global.latency_p99,
+        Duration::ZERO,
+        "SamplingPolicy::None should not report global latency"
     );
 
     println!("✓ SamplingPolicy::None validation passed - no latency samples collected as expected");
@@ -257,18 +264,18 @@ fn test_redis_multi_thread() {
     assert_eq!(results.len(), num_threads);
 
     // Merge stats from all threads
-    let merged_stats = GroupStatsCollector::merge(results);
-    let basic_stats = merged_stats.global().calculate_basic_stats();
+    let merged_stats = TupleStatsCollector::merge(results);
+    let global = merged_stats.aggregate_global(duration);
 
     println!("Results ({num_threads} threads):");
-    println!("  Total requests: {}", merged_stats.global().tx_requests());
+    println!("  Total requests: {}", global.total_requests);
     println!(
         "  Throughput: {:.2} req/s",
-        merged_stats.global().tx_requests() as f64 / duration.as_secs_f64()
+        global.total_requests as f64 / duration.as_secs_f64()
     );
-    println!("  Min latency: {:.2} μs", basic_stats.min.as_micros());
-    println!("  Mean latency: {:.2} μs", basic_stats.mean.as_micros());
-    println!("  Max latency: {:.2} μs", basic_stats.max.as_micros());
+    println!("  P50 latency: {:.2} μs", global.latency_p50.as_micros());
+    println!("  Mean latency: {:.2} μs", global.mean_latency.as_micros());
+    println!("  P99 latency: {:.2} μs", global.latency_p99.as_micros());
 
     // Get Redis stats after test
     let stats_after = get_redis_stats().expect("Failed to get final Redis stats");
@@ -277,22 +284,20 @@ fn test_redis_multi_thread() {
 
     println!("\nRedis server validation:");
     println!("  Commands processed by Redis: {redis_commands_processed}");
-    println!("  Client tx_requests: {}", merged_stats.global().tx_requests());
+    println!("  Client requests: {}", global.total_requests);
 
     // Verify we got some requests through
-    assert!(merged_stats.global().tx_requests() > 0, "Should have sent some requests");
-    assert!(merged_stats.global().rx_requests() > 0, "Should have received some responses");
+    assert!(global.total_requests > 0, "Should have completed some requests");
 
     // STRICT VALIDATION: Verify Redis actually processed the requests
     assert!(redis_commands_processed > 0, "Redis should have processed some commands");
 
-    let discrepancy =
-        (redis_commands_processed as i64 - merged_stats.global().tx_requests() as i64).abs();
+    let discrepancy = (redis_commands_processed as i64 - global.total_requests as i64).abs();
     assert!(
         discrepancy < 50, // Allow slightly more discrepancy for multi-threaded (connection setup per thread)
         "Redis commands processed ({}) should match client requests ({}) within margin (discrepancy: {})",
         redis_commands_processed,
-        merged_stats.global().tx_requests(),
+        global.total_requests,
         discrepancy
     );
 
@@ -301,7 +306,7 @@ fn test_redis_multi_thread() {
     // With 4 threads, we should get more throughput than single-threaded
     // (though this depends on Redis and system capacity)
     assert!(
-        merged_stats.global().tx_requests() > 1000,
+        global.total_requests > 1000,
         "Should have reasonable throughput with {num_threads} threads"
     );
 }
@@ -337,12 +342,12 @@ fn test_redis_closed_loop_minimal() {
 
     assert!(result.is_ok(), "Worker should complete successfully");
 
-    let stats = worker.into_stats();
-    let actual_rate = stats.global().tx_requests() as f64 / duration.as_secs_f64();
+    let global = worker.into_stats().aggregate_global(duration);
+    let actual_rate = global.total_requests as f64 / duration.as_secs_f64();
 
     println!("Results:");
     println!("  Actual rate: {actual_rate:.2} req/s");
-    println!("  Total requests: {}", stats.global().tx_requests());
+    println!("  Total requests: {}", global.total_requests);
 
     // With minimal pipelining (1 outstanding request), we should still achieve some throughput
     assert!(

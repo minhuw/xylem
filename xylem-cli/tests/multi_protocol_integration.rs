@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 use xylem_cli::multi_protocol;
-use xylem_core::stats::{GroupStatsCollector, SamplingPolicy};
+use xylem_core::stats::{SamplingPolicy, TupleStatsCollector};
 use xylem_core::threading::{ThreadingRuntime, Worker, WorkerConfig};
 
 use xylem_transport::TcpTransportFactory;
@@ -54,10 +54,10 @@ fn run_multi_protocol_test() -> Result<(), Box<dyn std::error::Error>> {
             multi_protocol::create_protocol("http", Some(("/", "127.0.0.1:8080")), None)?;
         protocols.insert(2, http_protocol);
 
-        let mut stats = GroupStatsCollector::new();
-        stats.register_group(0, &SamplingPolicy::Unlimited);
-        stats.register_group(1, &SamplingPolicy::Unlimited);
-        stats.register_group(2, &SamplingPolicy::Unlimited);
+        let mut stats = TupleStatsCollector::new(SamplingPolicy::default(), Duration::from_secs(1));
+        stats.register_group_policy(0, SamplingPolicy::Unlimited);
+        stats.register_group_policy(1, SamplingPolicy::Unlimited);
+        stats.register_group_policy(2, SamplingPolicy::Unlimited);
 
         // Build groups configuration with per-group targets
         // Each group now gets its own target address!
@@ -123,26 +123,27 @@ fn run_multi_protocol_test() -> Result<(), Box<dyn std::error::Error>> {
         Ok(worker.into_stats())
     })?;
 
-    let stats = GroupStatsCollector::merge(results);
+    let stats = TupleStatsCollector::merge(results);
+    let groups = stats.aggregate_by_group(duration);
 
     // Verify all three protocols generated traffic
-    let redis_stats = stats.get_group(0).expect("Redis group stats not found");
-    let memcached_stats = stats.get_group(1).expect("Memcached group stats not found");
-    let http_stats = stats.get_group(2).expect("HTTP group stats not found");
+    let redis_stats = groups.get(&0).expect("Redis group stats not found");
+    let memcached_stats = groups.get(&1).expect("Memcached group stats not found");
+    let http_stats = groups.get(&2).expect("HTTP group stats not found");
 
-    eprintln!("Redis requests: {}", redis_stats.tx_requests());
-    eprintln!("Memcached requests: {}", memcached_stats.tx_requests());
-    eprintln!("HTTP requests: {}", http_stats.tx_requests());
+    eprintln!("Redis requests: {}", redis_stats.total_requests);
+    eprintln!("Memcached requests: {}", memcached_stats.total_requests);
+    eprintln!("HTTP requests: {}", http_stats.total_requests);
 
     // Assert that all protocols generated some traffic
-    assert!(redis_stats.tx_requests() > 0, "Redis should have processed requests");
-    assert!(memcached_stats.tx_requests() > 0, "Memcached should have processed requests");
-    assert!(http_stats.tx_requests() > 0, "HTTP should have processed requests");
+    assert!(redis_stats.total_requests > 0, "Redis should have processed requests");
+    assert!(memcached_stats.total_requests > 0, "Memcached should have processed requests");
+    assert!(http_stats.total_requests > 0, "HTTP should have processed requests");
 
     eprintln!("✓ Multi-protocol test passed!");
-    eprintln!("  - Redis: {} requests", redis_stats.tx_requests());
-    eprintln!("  - Memcached: {} requests", memcached_stats.tx_requests());
-    eprintln!("  - HTTP: {} requests", http_stats.tx_requests());
+    eprintln!("  - Redis: {} requests", redis_stats.total_requests);
+    eprintln!("  - Memcached: {} requests", memcached_stats.total_requests);
+    eprintln!("  - HTTP: {} requests", http_stats.total_requests);
 
     Ok(())
 }
@@ -180,9 +181,9 @@ fn run_redis_memcached_test() -> Result<(), Box<dyn std::error::Error>> {
             multi_protocol::create_protocol("redis", None, Some(redis_selector2))?;
         protocols.insert(1, redis_protocol2);
 
-        let mut stats = GroupStatsCollector::new();
-        stats.register_group(0, &SamplingPolicy::Unlimited);
-        stats.register_group(1, &SamplingPolicy::Unlimited);
+        let mut stats = TupleStatsCollector::new(SamplingPolicy::default(), Duration::from_secs(1));
+        stats.register_group_policy(0, SamplingPolicy::Unlimited);
+        stats.register_group_policy(1, SamplingPolicy::Unlimited);
 
         // Both groups on same thread - this validates the core multi-protocol architecture
         let groups_config = vec![
@@ -221,22 +222,23 @@ fn run_redis_memcached_test() -> Result<(), Box<dyn std::error::Error>> {
         Ok(worker.into_stats())
     })?;
 
-    let stats = GroupStatsCollector::merge(results);
+    let stats = TupleStatsCollector::merge(results);
+    let groups = stats.aggregate_by_group(duration);
 
-    let group0_stats = stats.get_group(0).expect("Group 0 stats");
-    let group1_stats = stats.get_group(1).expect("Group 1 stats");
+    let group0_stats = groups.get(&0).expect("Group 0 stats");
+    let group1_stats = groups.get(&1).expect("Group 1 stats");
 
     eprintln!("✓ Multi-protocol architecture test passed!");
-    eprintln!("  - Group 0 (Redis): {} requests", group0_stats.tx_requests());
-    eprintln!("  - Group 1 (Redis): {} requests", group1_stats.tx_requests());
+    eprintln!("  - Group 0 (Redis): {} requests", group0_stats.total_requests);
+    eprintln!("  - Group 1 (Redis): {} requests", group1_stats.total_requests);
     eprintln!();
     eprintln!("This validates that:");
     eprintln!("  1. Multiple protocol instances can coexist on same thread");
     eprintln!("  2. Protocol dispatch by group_id works correctly");
     eprintln!("  3. Stats are tracked separately per group");
 
-    assert!(group0_stats.tx_requests() > 0, "Group 0 should have processed requests");
-    assert!(group1_stats.tx_requests() > 0, "Group 1 should have processed requests");
+    assert!(group0_stats.total_requests > 0, "Group 0 should have processed requests");
+    assert!(group1_stats.total_requests > 0, "Group 1 should have processed requests");
 
     Ok(())
 }

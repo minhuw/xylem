@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::thread;
 use std::time::Duration;
 use xylem_common::Request;
-use xylem_core::stats::GroupStatsCollector;
+use xylem_core::stats::{SamplingPolicy, TupleStatsCollector};
 use xylem_core::threading::{Worker, WorkerConfig};
 use xylem_transport::TcpTransportFactory;
 
@@ -86,7 +86,7 @@ fn run_worker(
     num_connections: usize,
     max_pending: usize,
     core_id: usize,
-) -> (u64, u64, Duration, Duration) {
+) -> (u64, Duration, Duration) {
     // Pin to core
     if let Some(core_ids) = core_affinity::get_core_ids() {
         if core_id < core_ids.len() {
@@ -96,14 +96,14 @@ fn run_worker(
 
     let protocol = EchoProtocol::new();
 
-    let mut stats = GroupStatsCollector::new();
-    stats.register_group(
-        0,
-        &xylem_core::stats::SamplingPolicy::HdrHistogram {
-            sigfigs: 3,
-            max_value_us: 3_600_000_000,
-        },
+    // Record latency in one HDR histogram per time bucket for the global view.
+    // Group 0 skips latency storage: a histogram (about 270 KB) per connection
+    // and time bucket is too much memory with the default 1024 connections.
+    let mut stats = TupleStatsCollector::new(
+        SamplingPolicy::HdrHistogram { sigfigs: 3, max_value_us: 3_600_000_000 },
+        Duration::from_secs(1),
     );
+    stats.register_group_policy(0, SamplingPolicy::None);
 
     let config = WorkerConfig {
         target,
@@ -121,11 +121,9 @@ fn run_worker(
 
     // Extract stats
     let stats = worker.into_stats();
-    let tx = stats.global().tx_requests();
-    let rx = stats.global().rx_requests();
-    let basic = stats.global().calculate_basic_stats();
+    let global = stats.aggregate_global(duration);
 
-    (tx, rx, basic.mean, basic.max)
+    (global.total_requests, global.mean_latency, global.latency_p999)
 }
 
 fn main() {
@@ -199,34 +197,31 @@ fn main() {
     let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
 
     let total_elapsed = start.elapsed();
-    let total_tx: u64 = results.iter().map(|(tx, _, _, _)| tx).sum();
-    let total_rx: u64 = results.iter().map(|(_, rx, _, _)| rx).sum();
+    let total_requests: u64 = results.iter().map(|(requests, _, _)| requests).sum();
 
     println!();
     println!("Results:");
-    println!("  Total TX: {} requests", total_tx);
-    println!("  Total RX: {} requests", total_rx);
-    println!("  Throughput: {:.0} req/s", total_tx as f64 / total_elapsed.as_secs_f64());
+    println!("  Total: {} requests", total_requests);
+    println!("  Throughput: {:.0} req/s", total_requests as f64 / total_elapsed.as_secs_f64());
     println!(
         "  Avg latency: {:.2} μs",
-        results.iter().map(|(_, _, mean, _)| mean.as_micros()).sum::<u128>() as f64
+        results.iter().map(|(_, mean, _)| mean.as_micros()).sum::<u128>() as f64
             / num_threads as f64
     );
     println!(
-        "  Max latency: {:.2} μs",
-        results.iter().map(|(_, _, _, max)| max.as_micros()).max().unwrap_or(0)
+        "  Max p99.9 latency: {:.2} μs",
+        results.iter().map(|(_, _, p999)| p999.as_micros()).max().unwrap_or(0)
     );
 
     if num_threads > 1 {
         println!("\nPer-thread results:");
-        for (i, (tx, rx, mean, max)) in results.iter().enumerate() {
+        for (i, (requests, mean, p999)) in results.iter().enumerate() {
             println!(
-                "  Thread {}: TX={}, RX={}, mean={:.2}μs, max={:.2}μs",
+                "  Thread {}: requests={}, mean={:.2}μs, p99.9={:.2}μs",
                 i,
-                tx,
-                rx,
+                requests,
                 mean.as_micros(),
-                max.as_micros()
+                p999.as_micros()
             );
         }
     }

@@ -3,7 +3,7 @@
 //! Stores statistics keyed by `(time_bucket, group_id, connection_id)` tuple,
 //! enabling flexible post-hoc aggregation by any dimension.
 
-use super::collector::SamplingPolicy;
+use super::policy::SamplingPolicy;
 use super::AggregatedStats;
 use hdrhistogram::Histogram;
 use sketches_ddsketch::{Config as DDSketchConfig, DDSketch};
@@ -1117,6 +1117,46 @@ mod tests {
         assert_eq!(storage.count(), 100);
         assert!(storage.percentile(0.5) > 0);
         assert!(storage.mean() > 0);
+    }
+
+    #[test]
+    fn adaptive_sampling_policy_samples_at_initial_rate() {
+        let policy: SamplingPolicy = serde_json::from_str(
+            r#"{"type": "adaptive", "max_samples": 3, "initial_rate": 1.0, "target_ci_width_us": 10}"#,
+        )
+        .unwrap();
+        let mut storage = LatencyStorage::from_policy(&policy);
+        match &storage {
+            LatencyStorage::Samples { max_samples, sampling_rate, .. } => {
+                assert_eq!(*max_samples, 3);
+                assert_eq!(*sampling_rate, 1.0);
+            }
+            _ => panic!("adaptive policy must store samples"),
+        }
+        for i in 1..=5 {
+            storage.record(Duration::from_micros(i));
+        }
+        // Every sample is kept until max_samples is reached.
+        assert_eq!(storage.count(), 3);
+        assert_eq!(storage.max(), 3_000);
+
+        // The rate stays at initial_rate: min_rate and target_ci_width_us do not adjust it.
+        let policy: SamplingPolicy = serde_json::from_str(
+            r#"{"type": "adaptive", "initial_rate": 0.0, "target_ci_width_us": 10, "min_rate": 0.5}"#,
+        )
+        .unwrap();
+        let mut storage = LatencyStorage::from_policy(&policy);
+        match &storage {
+            LatencyStorage::Samples { max_samples, sampling_rate, .. } => {
+                assert_eq!(*max_samples, 128 * 1024);
+                assert_eq!(*sampling_rate, 0.0);
+            }
+            _ => panic!("adaptive policy must store samples"),
+        }
+        for _ in 0..1000 {
+            storage.record(Duration::from_micros(1));
+        }
+        assert_eq!(storage.count(), 0);
     }
 
     #[test]

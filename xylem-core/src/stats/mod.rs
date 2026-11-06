@@ -3,30 +3,21 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-pub mod analysis;
-pub mod collector;
 pub mod dumper;
-pub mod group_collector;
-pub mod metadata;
-pub mod sampler;
+pub mod policy;
 pub mod tuple_collector;
 
 // Re-export main types
-pub use analysis::{aggregate_stats, aggregate_stats_per_group};
-pub use collector::{BasicStats, SamplingMode, SamplingPolicy, StatsCollector};
 pub use dumper::{StatsDumper, StatsDumperError, StatsRow, StreamingConfig};
-pub use group_collector::GroupStatsCollector;
-pub use metadata::{GroupMetadataCollector, StatsMetadata};
-pub use sampler::{AdaptiveSampler, AdaptiveSamplerConfig};
+pub use policy::SamplingPolicy;
 pub use tuple_collector::{
     ConnectionStats, LatencyStorage, StatsEntry, StatsKey, TimeSeriesPoint, TupleStatsCollector,
 };
 
 /// Trait for statistics collectors used by Worker
 ///
-/// This trait abstracts over different statistics collection strategies:
-/// - `GroupStatsCollector`: Groups stats by traffic group only
-/// - `TupleStatsCollector`: Groups stats by (time_bucket, group_id, connection_id)
+/// `TupleStatsCollector` implements this trait and groups stats by
+/// (time_bucket, group_id, connection_id).
 pub trait StatsRecorder: Send {
     /// Record a latency sample
     ///
@@ -41,21 +32,6 @@ pub trait StatsRecorder: Send {
 
     /// Record received bytes
     fn record_rx_bytes(&mut self, group_id: usize, connection_id: usize, bytes: usize);
-}
-
-// Implement StatsRecorder for GroupStatsCollector (ignores connection_id for backward compatibility)
-impl StatsRecorder for GroupStatsCollector {
-    fn record_latency(&mut self, group_id: usize, _connection_id: usize, latency: Duration) {
-        GroupStatsCollector::record_latency(self, group_id, latency);
-    }
-
-    fn record_tx_bytes(&mut self, group_id: usize, _connection_id: usize, bytes: usize) {
-        GroupStatsCollector::record_tx_bytes(self, group_id, bytes);
-    }
-
-    fn record_rx_bytes(&mut self, group_id: usize, _connection_id: usize, bytes: usize) {
-        GroupStatsCollector::record_rx_bytes(self, group_id, bytes);
-    }
 }
 
 // Implement StatsRecorder for TupleStatsCollector (uses all dimensions)

@@ -9,7 +9,7 @@
 
 use crate::connection::{ConnectionPool, ReceivedResponse, RequestTiming, TrafficGroupConfig};
 use crate::request_dump::RequestDumper;
-use crate::stats::{GroupStatsCollector, StatsRecorder};
+use crate::stats::{StatsRecorder, TupleStatsCollector};
 use crate::timing;
 use crate::Result;
 use std::collections::{HashMap, HashSet};
@@ -36,10 +36,9 @@ pub struct WorkerConfig {
 /// Uses `ConnectionGroup` internally for efficient I/O multiplexing.
 ///
 /// The worker is generic over the stats collector type `S` which must implement
-/// `StatsRecorder`. This allows using either:
-/// - `GroupStatsCollector` - aggregates by traffic group only (default)
-/// - `TupleStatsCollector` - aggregates by (time_bucket, group_id, connection_id)
-pub struct Worker<G: ConnectionGroup, P: Protocol, S: StatsRecorder = GroupStatsCollector> {
+/// `StatsRecorder`. The default, `TupleStatsCollector`, aggregates by
+/// (time_bucket, group_id, connection_id).
+pub struct Worker<G: ConnectionGroup, P: Protocol, S: StatsRecorder = TupleStatsCollector> {
     pool: ConnectionPool<G, P::RequestId>,
     /// Map of traffic group ID to protocol instance
     protocols: HashMap<usize, P>,
@@ -580,6 +579,7 @@ mod tests {
 
     use crate::connection::test_support::{FakeFactory, FakeGroup};
     use crate::scheduler::{PolicyScheduler, UniformPolicyScheduler};
+    use crate::stats::SamplingPolicy;
 
     #[derive(Default)]
     struct FakeProtocol {
@@ -639,8 +639,8 @@ mod tests {
         max_pending: usize,
         scheduler: Box<dyn PolicyScheduler>,
     ) -> Worker<FakeGroup, FakeProtocol> {
-        let mut stats = GroupStatsCollector::default();
-        stats.register_group_legacy(0, 1000, 1.0);
+        let mut stats = TupleStatsCollector::default();
+        stats.register_group_policy(0, SamplingPolicy::Limited { max_samples: 1000, rate: 1.0 });
         Worker::new(
             factory,
             FakeProtocol::default(),
@@ -695,9 +695,12 @@ mod tests {
     #[test]
     fn queued_retry_blocks_only_its_group_and_resumes_after_capacity_returns() {
         let factory = FakeFactory::default();
-        let mut stats = GroupStatsCollector::default();
+        let mut stats = TupleStatsCollector::default();
         for group in 0..2 {
-            stats.register_group_legacy(group, 1000, 1.0);
+            stats.register_group_policy(
+                group,
+                SamplingPolicy::Limited { max_samples: 1000, rate: 1.0 },
+            );
         }
         let mut worker = Worker::new_multi_group(
             &factory,
@@ -750,7 +753,7 @@ mod tests {
             io.responses.push_back(Ok(0u64.to_le_bytes().to_vec()));
         }
         worker.process_responses(Some(Duration::ZERO)).unwrap();
-        assert_eq!(worker.stats.get_group(1).unwrap().rx_requests(), 1);
+        assert_eq!(worker.stats.aggregate_by_group(Duration::from_secs(1))[&1].total_requests, 1);
         assert_eq!(worker.retry_queue.len(), 1);
         worker.send_requests().unwrap();
         assert_eq!(worker.protocols[&1].next_id, 2);
@@ -821,7 +824,7 @@ mod tests {
             worker.send_requests().unwrap();
             factory.0.lock().unwrap().responses.push_back(Ok(0u64.to_le_bytes().to_vec()));
             worker.process_responses(Some(Duration::ZERO)).unwrap();
-            assert_eq!(worker.stats.global().rx_requests(), 1);
+            assert_eq!(worker.stats.aggregate_global(Duration::from_secs(1)).total_requests, 1);
             if disconnect {
                 factory
                     .0
@@ -832,8 +835,8 @@ mod tests {
             }
             worker.config.duration = Duration::ZERO;
             worker.run().unwrap();
-            assert_eq!(worker.stats.global().rx_requests(), 1);
-            assert_eq!(worker.stats.global().rx_bytes(), 8);
+            assert_eq!(worker.stats.aggregate_global(Duration::from_secs(1)).total_requests, 1);
+            assert_eq!(worker.stats.entries().values().map(|entry| entry.rx_bytes).sum::<u64>(), 8);
             assert!(factory.0.lock().unwrap().closed);
             assert!(worker.pool.get_state(0).unwrap().is_closed());
             assert_eq!(worker.pool.get_state(0).unwrap().pending_count(), 0);
@@ -924,8 +927,8 @@ mod tests {
             xylem_protocols::FixedCommandSelector::new(xylem_protocols::RedisOp::Get),
         ));
         cluster.register_connection("127.0.0.1:1".parse().unwrap(), 0);
-        let mut stats = GroupStatsCollector::default();
-        stats.register_group_legacy(0, 1000, 1.0);
+        let mut stats = TupleStatsCollector::default();
+        stats.register_group_policy(0, SamplingPolicy::Limited { max_samples: 1000, rate: 1.0 });
         let mut worker = Worker::with_closed_loop(
             &factory,
             cluster,
@@ -956,13 +959,13 @@ mod tests {
         factory.0.lock().unwrap().responses.push_back(Ok(b"\n".to_vec()));
         worker.process_responses(Some(Duration::ZERO)).unwrap();
         assert_eq!(worker.pool.get_state(0).unwrap().pending_count(), 0);
-        assert_eq!(worker.stats.global().rx_requests(), 1);
+        assert_eq!(worker.stats.aggregate_global(Duration::from_secs(1)).total_requests, 1);
         assert_eq!(
-            worker.stats.global().tx_bytes(),
+            worker.stats.entries().values().map(|entry| entry.tx_bytes).sum::<u64>(),
             factory.0.lock().unwrap().sent.iter().map(|data| data.len() as u64).sum::<u64>()
         );
         assert_eq!(
-            worker.stats.global().rx_bytes(),
+            worker.stats.entries().values().map(|entry| entry.rx_bytes).sum::<u64>(),
             b"-ASK 1 127.0.0.1:1\r\n+OK\r\n$-1\r\n".len() as u64
         );
     }
@@ -1010,7 +1013,7 @@ mod tests {
         worker.send_requests().unwrap();
         factory.0.lock().unwrap().responses.push_back(Ok(0u64.to_le_bytes().to_vec()));
         assert!(!worker.drain_iteration().unwrap());
-        assert_eq!(worker.stats.global().rx_requests(), 1);
+        assert_eq!(worker.stats.aggregate_global(Duration::from_secs(1)).total_requests, 1);
         assert_eq!(factory.0.lock().unwrap().tx_polls, 1);
         // Already drained: no extra blocking poll.
         assert!(!worker.drain_iteration().unwrap());
@@ -1031,7 +1034,7 @@ mod tests {
                 Err(xylem_transport::Error::Io(std::io::Error::other("test I/O error")))
             });
             assert!(worker.drain_iteration().is_err());
-            assert_eq!(worker.stats.global().rx_requests(), 0);
+            assert_eq!(worker.stats.aggregate_global(Duration::from_secs(1)).total_requests, 0);
         }
     }
 
@@ -1054,8 +1057,8 @@ mod tests {
     #[test]
     fn disconnect_keeps_collecting_other_connections() {
         let factory = FakeFactory::default();
-        let mut stats = GroupStatsCollector::default();
-        stats.register_group_legacy(0, 1000, 1.0);
+        let mut stats = TupleStatsCollector::default();
+        stats.register_group_policy(0, SamplingPolicy::Limited { max_samples: 1000, rate: 1.0 });
         let mut worker = Worker::with_closed_loop(
             &factory,
             FakeProtocol::default(),
@@ -1085,8 +1088,8 @@ mod tests {
             io.responses.push_back(Ok(1u64.to_le_bytes().to_vec()));
         }
         worker.run().unwrap();
-        assert_eq!(worker.stats.global().rx_requests(), 1);
-        assert_eq!(worker.stats.global().rx_bytes(), 8);
+        assert_eq!(worker.stats.aggregate_global(Duration::from_secs(1)).total_requests, 1);
+        assert_eq!(worker.stats.entries().values().map(|entry| entry.rx_bytes).sum::<u64>(), 8);
         assert_eq!(factory.0.lock().unwrap().timeouts.len(), 2);
         assert!(!worker.has_pending());
         assert!(worker.pool.get_state(1).unwrap().is_closed());
@@ -1104,9 +1107,9 @@ mod tests {
         // FakeProtocol's default regenerate_request assigns the next ID.
         factory.0.lock().unwrap().responses.push_back(Ok(1u64.to_le_bytes().to_vec()));
         assert!(!worker.drain_iteration().unwrap());
-        assert_eq!(worker.stats.global().rx_requests(), 1);
-        assert_eq!(worker.stats.global().tx_bytes(), 16);
-        assert_eq!(worker.stats.global().rx_bytes(), 16);
+        assert_eq!(worker.stats.aggregate_global(Duration::from_secs(1)).total_requests, 1);
+        assert_eq!(worker.stats.entries().values().map(|entry| entry.tx_bytes).sum::<u64>(), 16);
+        assert_eq!(worker.stats.entries().values().map(|entry| entry.rx_bytes).sum::<u64>(), 16);
     }
 
     #[cfg(target_os = "linux")]
@@ -1251,20 +1254,44 @@ mod tests {
     fn queued_repeated_redirects_preserve_group_count_timing_bytes_and_warmup() {
         for (warmup, hardware_tx) in [(false, false), (false, true), (true, false), (true, true)] {
             let mut stats =
-                GroupStatsCollector::with_global_policy(&crate::stats::SamplingPolicy::Unlimited);
-            stats.register_group(0, &crate::stats::SamplingPolicy::Unlimited);
+                TupleStatsCollector::new(SamplingPolicy::Unlimited, Duration::from_secs(1));
+            stats.register_group_policy(0, SamplingPolicy::Unlimited);
             let stats = exercise_queued_redirects(stats, warmup, hardware_tx);
-            let expected = if warmup {
-                vec![]
-            } else {
-                vec![Duration::from_nanos(if hardware_tx { 800 } else { 900 })]
-            };
-            for collector in [stats.global(), stats.get_group(0).unwrap()] {
-                assert_eq!(collector.tx_requests(), u64::from(!warmup));
-                assert_eq!(collector.rx_requests(), u64::from(!warmup));
-                assert_eq!(collector.tx_bytes(), if warmup { 0 } else { 36 });
-                assert_eq!(collector.rx_bytes(), if warmup { 0 } else { 24 });
-                assert_eq!(collector.samples(), expected);
+            let duration = Duration::from_secs(1);
+            let global = stats.aggregate_global(duration);
+            assert_eq!(global.total_requests, u64::from(!warmup));
+            // 36 TX bytes plus 24 RX bytes over one second.
+            assert_eq!(global.throughput_mbps, if warmup { 0.0 } else { 0.00048 });
+            let group_entries: Vec<_> = stats
+                .entries()
+                .iter()
+                .filter(|(key, _)| key.group_id == 0)
+                .map(|(_, entry)| entry)
+                .collect();
+            assert_eq!(
+                group_entries.iter().map(|entry| entry.request_count).sum::<u64>(),
+                u64::from(!warmup)
+            );
+            assert_eq!(
+                group_entries.iter().map(|entry| entry.tx_bytes).sum::<u64>(),
+                if warmup { 0 } else { 36 }
+            );
+            assert_eq!(
+                group_entries.iter().map(|entry| entry.rx_bytes).sum::<u64>(),
+                if warmup { 0 } else { 24 }
+            );
+            assert_eq!(
+                group_entries.iter().map(|entry| entry.latency.count()).sum::<u64>(),
+                u64::from(!warmup)
+            );
+            if !warmup {
+                // A single stored sample: its median and mean equal the expected latency.
+                let expected = Duration::from_nanos(if hardware_tx { 800 } else { 900 });
+                let group = &stats.aggregate_by_group(duration)[&0];
+                for aggregated in [&global, group] {
+                    assert_eq!(aggregated.latency_p50, expected);
+                    assert_eq!(aggregated.mean_latency, expected);
+                }
             }
         }
     }
@@ -1379,10 +1406,13 @@ mod tests {
             let next = worker.pool.peek_next_ready_time().unwrap();
             if warmup {
                 assert_eq!(next, 10_000_100, "warmup must not change the adaptive rate");
-                assert_eq!(worker.stats.global().rx_requests(), 0);
+                assert_eq!(worker.stats.aggregate_global(Duration::from_secs(1)).total_requests, 0);
             } else {
                 assert_eq!(next, 9_091_009, "100 zero-latency responses increase rate to 110/s");
-                assert_eq!(worker.stats.global().rx_requests(), 100);
+                assert_eq!(
+                    worker.stats.aggregate_global(Duration::from_secs(1)).total_requests,
+                    100
+                );
             }
         }
     }
@@ -1429,8 +1459,8 @@ mod tests {
 
         // Create pipelined worker
         let protocol = xylem_protocols::xylem_echo::XylemEchoProtocol::new(0);
-        let mut stats = GroupStatsCollector::default();
-        stats.register_group_legacy(0, 100000, 1.0);
+        let mut stats = TupleStatsCollector::default();
+        stats.register_group_policy(0, SamplingPolicy::Limited { max_samples: 100000, rate: 1.0 });
         let config = WorkerConfig {
             target: addr,
             duration: Duration::from_millis(100),
@@ -1445,7 +1475,10 @@ mod tests {
         assert!(result.is_ok(), "Worker should complete: {:?}", result.err());
 
         let stats = worker.stats();
-        assert!(stats.global().tx_requests() > 0, "Should have sent requests");
+        assert!(
+            stats.aggregate_global(Duration::from_millis(100)).total_requests > 0,
+            "Should have sent requests"
+        );
     }
 
     #[test]
@@ -1479,8 +1512,8 @@ mod tests {
         // Create worker with fixed-rate policy
         let protocol = xylem_protocols::xylem_echo::XylemEchoProtocol::new(0);
 
-        let mut stats = GroupStatsCollector::default();
-        stats.register_group_legacy(0, 100000, 1.0);
+        let mut stats = TupleStatsCollector::default();
+        stats.register_group_policy(0, SamplingPolicy::Limited { max_samples: 100000, rate: 1.0 });
         let config = WorkerConfig {
             target: addr,
             duration: Duration::from_millis(200),
@@ -1503,7 +1536,7 @@ mod tests {
 
         // At 100 req/s for 200ms, expect ~20 requests
         let expected = 20;
-        let actual = stats.global().tx_requests();
+        let actual = stats.aggregate_global(Duration::from_millis(200)).total_requests;
         assert!(
             actual >= expected - 5 && actual <= expected + 5,
             "Expected ~{} requests at 100 req/s for {:?}, got {}",

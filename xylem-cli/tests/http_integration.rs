@@ -16,7 +16,7 @@
 //! ```
 
 use std::time::Duration;
-use xylem_core::stats::GroupStatsCollector;
+use xylem_core::stats::TupleStatsCollector;
 use xylem_core::threading::{ThreadingRuntime, Worker, WorkerConfig};
 
 use xylem_transport::TcpTransportFactory;
@@ -55,28 +55,30 @@ fn test_http_get_single_thread() {
     assert!(result.is_ok(), "Worker should complete successfully: {:?}", result.err());
 
     let stats = worker.into_stats();
-    let basic_stats = stats.global().calculate_basic_stats();
+    let global = stats.aggregate_global(duration);
 
     println!("Results:");
-    println!("  Total requests: {}", stats.global().tx_requests());
+    println!("  Total requests: {}", global.total_requests);
     println!(
         "  Throughput: {:.2} req/s",
-        stats.global().tx_requests() as f64 / duration.as_secs_f64()
+        global.total_requests as f64 / duration.as_secs_f64()
     );
-    println!("  Min latency: {:.2} μs", basic_stats.min.as_micros());
-    println!("  Mean latency: {:.2} μs", basic_stats.mean.as_micros());
-    println!("  Max latency: {:.2} μs", basic_stats.max.as_micros());
+    println!("  P50 latency: {:.2} μs", global.latency_p50.as_micros());
+    println!("  Mean latency: {:.2} μs", global.mean_latency.as_micros());
+    println!("  P99 latency: {:.2} μs", global.latency_p99.as_micros());
 
     // Verify we got some requests through
-    assert!(stats.global().tx_requests() > 0, "Should have sent some requests");
-    assert!(stats.global().rx_requests() > 0, "Should have received some responses");
-    assert!(!stats.global().samples().is_empty(), "Should have collected latency samples");
+    assert!(global.total_requests > 0, "Should have completed some requests");
+    assert!(
+        stats.entries().values().any(|entry| entry.latency.count() > 0),
+        "Should have collected latency samples"
+    );
 
     // Sanity check on latency (should be < 10ms for local nginx)
     assert!(
-        basic_stats.mean < Duration::from_millis(10),
+        global.mean_latency < Duration::from_millis(10),
         "Mean latency should be < 10ms for local nginx, got {:?}",
-        basic_stats.mean
+        global.mean_latency
     );
 }
 
@@ -112,18 +114,17 @@ fn test_http_post_single_thread() {
     assert!(result.is_ok(), "Worker should complete successfully");
 
     let stats = worker.into_stats();
-    let basic_stats = stats.global().calculate_basic_stats();
+    let global = stats.aggregate_global(duration);
 
     println!("Results:");
-    println!("  Total requests: {}", stats.global().tx_requests());
+    println!("  Total requests: {}", global.total_requests);
     println!(
         "  Throughput: {:.2} req/s",
-        stats.global().tx_requests() as f64 / duration.as_secs_f64()
+        global.total_requests as f64 / duration.as_secs_f64()
     );
-    println!("  Mean latency: {:.2} μs", basic_stats.mean.as_micros());
+    println!("  Mean latency: {:.2} μs", global.mean_latency.as_micros());
 
-    assert!(stats.global().tx_requests() > 0, "Should have sent POST requests");
-    assert!(stats.global().rx_requests() > 0, "Should have received responses");
+    assert!(global.total_requests > 0, "Should have completed POST requests");
 }
 
 #[test]
@@ -175,26 +176,25 @@ fn test_http_multi_thread() {
     assert_eq!(results.len(), num_threads);
 
     // Merge stats from all threads
-    let merged_stats = GroupStatsCollector::merge(results);
-    let basic_stats = merged_stats.global().calculate_basic_stats();
+    let merged_stats = TupleStatsCollector::merge(results);
+    let global = merged_stats.aggregate_global(duration);
 
     println!("Results ({num_threads} threads):");
-    println!("  Total requests: {}", merged_stats.global().tx_requests());
+    println!("  Total requests: {}", global.total_requests);
     println!(
         "  Throughput: {:.2} req/s",
-        merged_stats.global().tx_requests() as f64 / duration.as_secs_f64()
+        global.total_requests as f64 / duration.as_secs_f64()
     );
-    println!("  Min latency: {:.2} μs", basic_stats.min.as_micros());
-    println!("  Mean latency: {:.2} μs", basic_stats.mean.as_micros());
-    println!("  Max latency: {:.2} μs", basic_stats.max.as_micros());
+    println!("  P50 latency: {:.2} μs", global.latency_p50.as_micros());
+    println!("  Mean latency: {:.2} μs", global.mean_latency.as_micros());
+    println!("  P99 latency: {:.2} μs", global.latency_p99.as_micros());
 
     // Verify we got some requests through
-    assert!(merged_stats.global().tx_requests() > 0, "Should have sent some requests");
-    assert!(merged_stats.global().rx_requests() > 0, "Should have received some responses");
+    assert!(global.total_requests > 0, "Should have completed some requests");
 
     // With 4 threads, we should get reasonable throughput
     assert!(
-        merged_stats.global().tx_requests() > 100,
+        global.total_requests > 100,
         "Should have reasonable throughput with {num_threads} threads"
     );
 }
@@ -234,12 +234,13 @@ fn test_http_rate_limited() {
     assert!(result.is_ok(), "Worker should complete successfully");
 
     let stats = worker.into_stats();
-    let actual_rate = stats.global().tx_requests() as f64 / duration.as_secs_f64();
+    let global = stats.aggregate_global(duration);
+    let actual_rate = global.total_requests as f64 / duration.as_secs_f64();
 
     println!("Results:");
     println!("  Target rate: {target_rate:.2} req/s");
     println!("  Actual rate: {actual_rate:.2} req/s");
-    println!("  Total requests: {}", stats.global().tx_requests());
+    println!("  Total requests: {}", global.total_requests);
 
     // Verify we're close to target rate (within 40% tolerance)
     let rate_ratio = actual_rate / target_rate;
@@ -281,13 +282,16 @@ fn test_http_put_request() {
     assert!(result.is_ok(), "Worker should complete successfully");
 
     let stats = worker.into_stats();
+    let global = stats.aggregate_global(duration);
 
     println!("Results:");
-    println!("  Total requests: {}", stats.global().tx_requests());
-    println!("  Total bytes sent: {}", stats.global().tx_bytes());
+    println!("  Total requests: {}", global.total_requests);
+    println!(
+        "  Total bytes sent: {}",
+        stats.entries().values().map(|entry| entry.tx_bytes).sum::<u64>()
+    );
 
-    assert!(stats.global().tx_requests() > 0, "Should have sent PUT requests");
-    assert!(stats.global().rx_requests() > 0, "Should have received responses");
+    assert!(global.total_requests > 0, "Should have completed PUT requests");
 }
 
 #[test]
@@ -321,20 +325,21 @@ fn test_http_pipelined() {
 
     assert!(result.is_ok(), "Worker should complete: {:?}", result.err());
 
-    let stats = worker.stats().global();
-    let basic_stats = stats.calculate_basic_stats();
+    let global = worker.stats().aggregate_global(duration);
 
     println!("Results:");
-    println!("  Total requests: {}", stats.tx_requests());
-    println!("  Throughput: {:.2} req/s", stats.tx_requests() as f64 / duration.as_secs_f64());
-    println!("  Min latency: {:.2} μs", basic_stats.min.as_micros());
-    println!("  Mean latency: {:.2} μs", basic_stats.mean.as_micros());
-    println!("  Max latency: {:.2} μs", basic_stats.max.as_micros());
+    println!("  Total requests: {}", global.total_requests);
+    println!(
+        "  Throughput: {:.2} req/s",
+        global.total_requests as f64 / duration.as_secs_f64()
+    );
+    println!("  P50 latency: {:.2} μs", global.latency_p50.as_micros());
+    println!("  Mean latency: {:.2} μs", global.mean_latency.as_micros());
+    println!("  P99 latency: {:.2} μs", global.latency_p99.as_micros());
 
-    assert!(stats.tx_requests() > 0, "Should have sent requests");
-    assert!(stats.rx_requests() > 0, "Should have received responses");
+    assert!(global.total_requests > 0, "Should have completed requests");
 
     // With pipelining, we should get higher throughput
-    let throughput = stats.tx_requests() as f64 / duration.as_secs_f64();
+    let throughput = global.total_requests as f64 / duration.as_secs_f64();
     println!("✓ HTTP pipelined throughput: {throughput:.0} req/s");
 }

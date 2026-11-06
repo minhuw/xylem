@@ -23,7 +23,7 @@
 //! ```
 
 use std::time::Duration;
-use xylem_core::stats::{GroupStatsCollector, SamplingPolicy};
+use xylem_core::stats::{SamplingPolicy, TupleStatsCollector};
 use xylem_core::threading::{Worker, WorkerConfig};
 use xylem_transport::TcpTransportFactory;
 
@@ -71,8 +71,7 @@ fn main() -> anyhow::Result<()> {
         xylem_protocols::redis::RedisProtocol::with_workload(selector, key_gen, value_size);
 
     // Create stats collector with unlimited sampling (collect all latencies)
-    let mut stats = GroupStatsCollector::new();
-    stats.register_group(0, &SamplingPolicy::Unlimited);
+    let stats = TupleStatsCollector::new(SamplingPolicy::Unlimited, Duration::from_secs(1));
 
     // Create worker configuration
     let worker_config = WorkerConfig {
@@ -96,11 +95,9 @@ fn main() -> anyhow::Result<()> {
 
     // Extract and display results
     let stats = worker.into_stats();
-    let global_stats = stats.global();
-    let basic_stats = global_stats.calculate_basic_stats();
 
-    // Calculate aggregated stats with percentiles (95% confidence level)
-    let agg_stats = xylem_core::stats::aggregate_stats(global_stats, elapsed, 0.95);
+    // Calculate aggregated stats with percentiles
+    let agg_stats = stats.aggregate_global(elapsed);
 
     println!("\n╔════════════════════════════════════════════════╗");
     println!("║              Benchmark Results                 ║");
@@ -109,20 +106,16 @@ fn main() -> anyhow::Result<()> {
     // Throughput metrics
     println!("📈 Throughput:");
     println!("  • Total requests: {}", agg_stats.total_requests);
-    println!("  • Total responses: {}", global_stats.rx_requests());
     println!("  • Requests/sec: {:.2}", agg_stats.throughput_rps);
     println!("  • Throughput: {:.2} MB/s", agg_stats.throughput_mbps);
 
     // Latency metrics
     println!("\n⏱️  Latency (microseconds):");
-    println!("  • Min:    {:>10.2} μs", basic_stats.min.as_micros());
     println!("  • Mean:   {:>10.2} μs", agg_stats.mean_latency.as_micros());
     println!("  • Median: {:>10.2} μs", agg_stats.latency_p50.as_micros());
     println!("  • p95:    {:>10.2} μs", agg_stats.latency_p95.as_micros());
     println!("  • p99:    {:>10.2} μs", agg_stats.latency_p99.as_micros());
     println!("  • p99.9:  {:>10.2} μs", agg_stats.latency_p999.as_micros());
-    println!("  • Max:    {:>10.2} μs", basic_stats.max.as_micros());
-    println!("  • Std Dev: {:>9.2} μs", agg_stats.std_dev.as_micros());
 
     println!("\n✅ Benchmark completed successfully!\n");
 

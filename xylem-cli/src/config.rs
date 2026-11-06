@@ -130,7 +130,7 @@ pub struct StatsConfig {
     /// If unset, the first traffic group's policy is used (current behavior).
     /// Set to "none" to disable global latency recording.
     #[serde(default)]
-    pub sampling_policy: Option<xylem_core::stats::collector::SamplingPolicy>,
+    pub sampling_policy: Option<xylem_core::stats::SamplingPolicy>,
     /// Reserved Parquet streaming configuration; not supported by the CLI.
     #[serde(default)]
     pub streaming: Option<StreamingStatsConfig>,
@@ -664,7 +664,7 @@ fn parse_value(value_str: &str) -> Result<toml::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xylem_core::stats::collector::SamplingPolicy;
+    use xylem_core::stats::SamplingPolicy;
     use xylem_protocols::workload::KeyGeneration;
 
     /// Helper to extract KeysConfig from protocol_config

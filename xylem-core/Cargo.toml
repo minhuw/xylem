@@ -19,7 +19,6 @@ serde_json = { workspace = true }
 schemars = { workspace = true, optional = true }
 tracing = { workspace = true }
 rand = { workspace = true }
-statrs = { workspace = true }
 core_affinity = { workspace = true }
 humantime-serde = { workspace = true }
 sha2 = "0.10"

@@ -2,7 +2,6 @@
 //!
 //! Uses native OS threads (std::thread) for maximum control and performance.
 
-use crate::stats::StatsCollector;
 use crate::Result;
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -101,17 +100,6 @@ impl ThreadingRuntime {
         Ok(results)
     }
 
-    /// Run multiple workers in parallel and aggregate results
-    ///
-    /// Uses native OS threads with a barrier for synchronization.
-    /// All threads start execution simultaneously after the barrier.
-    pub fn run_workers<F>(&self, worker_factory: F) -> Result<Vec<StatsCollector>>
-    where
-        F: Fn(usize) -> Result<StatsCollector> + Send + Sync + Clone + 'static,
-    {
-        self.run_workers_generic(worker_factory)
-    }
-
     /// Get number of threads
     pub fn num_threads(&self) -> usize {
         self.thread_ids.len()
@@ -121,6 +109,7 @@ impl ThreadingRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stats::{SamplingPolicy, TupleStatsCollector};
     use std::thread;
     use std::time::Duration;
 
@@ -129,13 +118,16 @@ mod tests {
         let runtime = ThreadingRuntime::new(4);
 
         let results = runtime
-            .run_workers(|thread_id| {
+            .run_workers_generic(|thread_id| {
                 // Simulate some work
                 thread::sleep(Duration::from_millis(10));
 
                 // Create a collector with thread-specific data
-                let mut collector = StatsCollector::new(100, 1.0);
-                collector.record_latency(Duration::from_micros(thread_id as u64 * 10));
+                let mut collector = TupleStatsCollector::new(
+                    SamplingPolicy::Limited { max_samples: 100, rate: 1.0 },
+                    Duration::from_secs(1),
+                );
+                collector.record_latency(0, 0, Duration::from_micros(thread_id as u64 * 10));
 
                 Ok(collector)
             })
@@ -145,9 +137,10 @@ mod tests {
 
         // Verify each worker produced results
         for (i, stats) in results.iter().enumerate() {
-            assert_eq!(stats.sample_count(), 1);
-            assert_eq!(stats.samples().len(), 1);
-            assert_eq!(stats.samples()[0], Duration::from_micros(i as u64 * 10));
+            let global = stats.aggregate_global(Duration::from_secs(1));
+            assert_eq!(global.total_requests, 1);
+            assert_eq!(stats.entries().values().map(|entry| entry.latency.count()).sum::<u64>(), 1);
+            assert_eq!(global.latency_p50, Duration::from_micros(i as u64 * 10));
         }
     }
 
@@ -156,14 +149,14 @@ mod tests {
         let runtime = ThreadingRuntime::new(1);
 
         let results = runtime
-            .run_workers(|_thread_id| {
-                let mut collector = StatsCollector::default();
-                collector.record_latency(Duration::from_micros(100));
+            .run_workers_generic(|_thread_id| {
+                let mut collector = TupleStatsCollector::default();
+                collector.record_latency(0, 0, Duration::from_micros(100));
                 Ok(collector)
             })
             .unwrap();
 
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].sample_count(), 1);
+        assert_eq!(results[0].aggregate_global(Duration::from_secs(1)).total_requests, 1);
     }
 }
