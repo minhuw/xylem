@@ -283,7 +283,7 @@ fn configure_nic_timestamping(
     let config = HwtstampConfig { flags: 0, tx_type, rx_filter };
 
     // Create ifreq structure
-    let mut ifr: libc::ifreq = unsafe { mem::zeroed() };
+    let mut ifr: libc::ifreq = unsafe { mem::MaybeUninit::zeroed().assume_init() };
 
     // Copy interface name (max 15 chars + null terminator)
     let if_bytes = interface.as_bytes();
@@ -413,7 +413,7 @@ pub fn recvmsg_with_timestamp(
         iov_len: buf.len(),
     };
 
-    let mut hdr: libc::msghdr = unsafe { mem::zeroed() };
+    let mut hdr: libc::msghdr = unsafe { mem::MaybeUninit::zeroed().assume_init() };
     hdr.msg_iov = &mut iov;
     hdr.msg_iovlen = 1;
     hdr.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
@@ -441,7 +441,7 @@ pub fn recv_tx_timestamp(fd: RawFd) -> io::Result<Option<(Timestamp, u32)>> {
         iov_len: 0, // No actual data expected
     };
 
-    let mut hdr: libc::msghdr = unsafe { mem::zeroed() };
+    let mut hdr: libc::msghdr = unsafe { mem::MaybeUninit::zeroed().assume_init() };
     hdr.msg_iov = &mut iov;
     hdr.msg_iovlen = 1;
     hdr.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;

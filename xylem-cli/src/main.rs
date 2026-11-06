@@ -6,7 +6,6 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use xylem_common::Request;
 use xylem_core::threading::{CpuPinning, ThreadingRuntime, Worker, WorkerConfig};
 use xylem_transport::{TcpTransportFactory, UdpTransportFactory};
 
@@ -146,103 +145,6 @@ enum Commands {
     /// List all valid config paths for --set flag (used by shell completions)
     #[command(hide = true)]
     CompletePaths,
-}
-
-// Protocol adapter to bridge xylem_protocols::Protocol with xylem_core Protocol trait
-// For simplicity, we use a common RequestId type for protocols that support it
-struct ProtocolAdapter<P: xylem_protocols::Protocol<RequestId = (usize, u64)> + 'static> {
-    inner: P,
-}
-
-impl<P: xylem_protocols::Protocol<RequestId = (usize, u64)> + 'static> ProtocolAdapter<P> {
-    fn new(protocol: P) -> Self {
-        Self { inner: protocol }
-    }
-}
-
-impl<P: xylem_protocols::Protocol<RequestId = (usize, u64)> + 'static>
-    xylem_core::threading::Protocol for ProtocolAdapter<P>
-{
-    type RequestId = (usize, u64);
-
-    fn next_request(&mut self, conn_id: usize) -> Request<Self::RequestId> {
-        self.inner.next_request(conn_id)
-    }
-
-    fn regenerate_request(
-        &mut self,
-        conn_id: usize,
-        original_request_id: Self::RequestId,
-    ) -> Request<Self::RequestId> {
-        self.inner.regenerate_request(conn_id, original_request_id)
-    }
-
-    fn parse_response(
-        &mut self,
-        conn_id: usize,
-        data: &[u8],
-    ) -> anyhow::Result<(usize, Option<Self::RequestId>)> {
-        self.inner.parse_response(conn_id, data)
-    }
-
-    fn parse_response_extended(
-        &mut self,
-        conn_id: usize,
-        data: &[u8],
-    ) -> anyhow::Result<xylem_core::threading::ParseResult<Self::RequestId>> {
-        let result = self.inner.parse_response_extended(conn_id, data)?;
-
-        // Convert xylem_protocols::ParseResult to xylem_core::threading::ParseResult
-        match result {
-            xylem_protocols::ParseResult::Complete { bytes_consumed, request_id } => {
-                Ok(xylem_core::threading::ParseResult::Complete { bytes_consumed, request_id })
-            }
-            xylem_protocols::ParseResult::Incomplete => {
-                Ok(xylem_core::threading::ParseResult::Incomplete)
-            }
-            xylem_protocols::ParseResult::Retry(retry) => {
-                Ok(xylem_core::threading::ParseResult::Retry(xylem_core::threading::RetryRequest {
-                    bytes_consumed: retry.bytes_consumed,
-                    original_request_id: retry.original_request_id,
-                    is_warmup: retry.is_warmup,
-                    target_conn_id: retry.target_conn_id,
-                    prepare_commands: retry.prepare_commands,
-                    attempt: retry.attempt,
-                }))
-            }
-        }
-    }
-
-    fn name(&self) -> &'static str {
-        self.inner.name()
-    }
-
-    fn reset(&mut self) {
-        self.inner.reset()
-    }
-
-    fn can_send(&self, conn_id: usize) -> bool {
-        self.inner.can_send(conn_id)
-    }
-}
-
-impl<P: xylem_protocols::Protocol<RequestId = (usize, u64)> + 'static> ProtocolAdapter<P> {
-    /// Register cluster connections from actual pool mappings
-    ///
-    /// Only applicable for RedisCluster protocol. For other protocols, this is a no-op.
-    fn register_cluster_connections(&mut self, connections: &[(usize, std::net::SocketAddr)]) {
-        use std::any::TypeId;
-        let p_type = TypeId::of::<P>();
-        let multi_type = TypeId::of::<xylem_cli::multi_protocol::MultiProtocol>();
-
-        if p_type == multi_type {
-            // SAFETY: We just checked that P is MultiProtocol
-            let multi = unsafe {
-                &mut *(&mut self.inner as *mut P as *mut xylem_cli::multi_protocol::MultiProtocol)
-            };
-            multi.register_cluster_connections(connections);
-        }
-    }
 }
 
 fn main() {
@@ -519,65 +421,63 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
             let group_target_for_host = &group_config.target;
 
             // Create protocol using multi_protocol factory
-            let protocol_adapted = match (&parsed_config, protocol_name.as_str()) {
+            let protocol = match (&parsed_config, protocol_name.as_str()) {
                 (ParsedProtocolConfig::Http(http_config), "http") => {
                     let mut http_config = http_config.clone();
                     http_config.host.get_or_insert_with(|| group_target_for_host.clone());
-                    ProtocolAdapter::new(xylem_cli::multi_protocol::MultiProtocol::Http(
+                    xylem_cli::multi_protocol::MultiProtocol::Http(
                         xylem_protocols::HttpProtocol::from_config(&http_config)?,
-                    ))
+                    )
                 }
                 (ParsedProtocolConfig::Redis(redis_config), "redis") => {
-                    ProtocolAdapter::new(xylem_cli::multi_protocol::MultiProtocol::Redis(
+                    xylem_cli::multi_protocol::MultiProtocol::Redis(
                         xylem_protocols::RedisProtocol::from_config(
                             redis_config,
                             config_for_worker.experiment.seed,
                         )?,
-                    ))
+                    )
                 }
                 (ParsedProtocolConfig::Redis(redis_config), "redis-cluster") => {
-                    ProtocolAdapter::new(xylem_cli::multi_protocol::MultiProtocol::redis_cluster(
+                    xylem_cli::multi_protocol::MultiProtocol::redis_cluster(
                         xylem_protocols::RedisClusterProtocol::from_config(
                             redis_config,
                             config_for_worker.experiment.seed,
                         )?,
-                    ))
+                    )
                 }
                 (ParsedProtocolConfig::Memcached(mc_config), "memcached-binary") => {
-                    ProtocolAdapter::new(xylem_cli::multi_protocol::MultiProtocol::MemcachedBinary(
+                    xylem_cli::multi_protocol::MultiProtocol::MemcachedBinary(
                         xylem_protocols::memcached::MemcachedBinaryProtocol::from_config(
                             mc_config,
                             config_for_worker.experiment.seed,
                         )?,
-                    ))
+                    )
                 }
                 (ParsedProtocolConfig::Memcached(mc_config), "memcached-ascii") => {
-                    ProtocolAdapter::new(xylem_cli::multi_protocol::MultiProtocol::MemcachedAscii(
+                    xylem_cli::multi_protocol::MultiProtocol::MemcachedAscii(
                         xylem_protocols::memcached::MemcachedAsciiProtocol::from_config(
                             mc_config,
                             config_for_worker.experiment.seed,
                         )?,
-                    ))
+                    )
                 }
                 (ParsedProtocolConfig::XylemEcho(_echo_config), "xylem-echo") => {
-                    let p = xylem_cli::multi_protocol::create_xylem_echo_protocol();
-                    ProtocolAdapter::new(p)
+                    xylem_cli::multi_protocol::create_xylem_echo_protocol()
                 }
                 (ParsedProtocolConfig::Masstree(mt_config), "masstree") => {
                     let operation = parse_masstree_op(mt_config)?;
                     let key_gen = mt_config.keys.to_key_gen(config_for_worker.experiment.seed)?;
-                    let p = xylem_cli::multi_protocol::create_masstree_protocol_from_config(
+                    xylem_cli::multi_protocol::create_masstree_protocol_from_config(
                         mt_config,
                         operation,
                         key_gen,
                         config_for_worker.experiment.seed,
-                    )?;
-                    ProtocolAdapter::new(p)
+                    )?
                 }
                 _ => return Err(anyhow::anyhow!("Unknown protocol: {}", protocol_name).into()),
             };
 
-            protocols.insert(*group_id, protocol_adapted);
+            protocols.insert(*group_id, protocol);
         }
 
         // Initialize tuple stats collector
@@ -722,7 +622,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
 
         // Helper function to wire redis-cluster connections after worker creation
         fn wire_cluster_connections<G, S>(
-            worker: &mut Worker<G, ProtocolAdapter<xylem_cli::multi_protocol::MultiProtocol>, S>,
+            worker: &mut Worker<G, xylem_cli::multi_protocol::MultiProtocol, S>,
             cluster_groups: &[usize],
         ) where
             G: xylem_transport::ConnectionGroup,

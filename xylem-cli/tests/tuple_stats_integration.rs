@@ -13,48 +13,6 @@ use xylem_transport::TcpTransportFactory;
 
 mod common;
 
-struct ProtocolAdapter<P: xylem_protocols::Protocol> {
-    inner: P,
-}
-
-impl<P: xylem_protocols::Protocol> ProtocolAdapter<P> {
-    fn new(protocol: P) -> Self {
-        Self { inner: protocol }
-    }
-}
-
-impl<P: xylem_protocols::Protocol> xylem_core::threading::worker::Protocol for ProtocolAdapter<P> {
-    type RequestId = P::RequestId;
-
-    fn next_request(&mut self, conn_id: usize) -> xylem_common::Request<Self::RequestId> {
-        self.inner.next_request(conn_id)
-    }
-
-    fn regenerate_request(
-        &mut self,
-        conn_id: usize,
-        original_request_id: Self::RequestId,
-    ) -> xylem_common::Request<Self::RequestId> {
-        self.inner.regenerate_request(conn_id, original_request_id)
-    }
-
-    fn parse_response(
-        &mut self,
-        conn_id: usize,
-        data: &[u8],
-    ) -> anyhow::Result<(usize, Option<Self::RequestId>)> {
-        self.inner.parse_response(conn_id, data)
-    }
-
-    fn name(&self) -> &'static str {
-        self.inner.name()
-    }
-
-    fn reset(&mut self) {
-        self.inner.reset()
-    }
-}
-
 /// Create a TupleStatsCollector for testing
 fn create_tuple_stats() -> TupleStatsCollector {
     let policy = SamplingPolicy::Limited { max_samples: 100_000, rate: 1.0 };
@@ -72,7 +30,6 @@ fn test_tuple_stats_single_thread_redis() {
     let protocol = xylem_protocols::redis::RedisProtocol::new(Box::new(
         xylem_protocols::FixedCommandSelector::new(xylem_protocols::redis::RedisOp::Get),
     ));
-    let protocol = ProtocolAdapter::new(protocol);
 
     let stats = create_tuple_stats();
     let worker_config = WorkerConfig {
@@ -155,7 +112,6 @@ fn test_tuple_stats_multi_thread_redis() {
             let protocol = xylem_protocols::redis::RedisProtocol::new(Box::new(
                 xylem_protocols::FixedCommandSelector::new(xylem_protocols::redis::RedisOp::Get),
             ));
-            let protocol = ProtocolAdapter::new(protocol);
 
             let stats = create_tuple_stats();
             let worker_config = WorkerConfig {
@@ -228,7 +184,6 @@ fn test_tuple_stats_output_generation() {
     let protocol = xylem_protocols::redis::RedisProtocol::new(Box::new(
         xylem_protocols::FixedCommandSelector::new(xylem_protocols::redis::RedisOp::Get),
     ));
-    let protocol = ProtocolAdapter::new(protocol);
 
     let stats = create_tuple_stats();
     let worker_config = WorkerConfig {
@@ -338,7 +293,6 @@ fn test_tuple_stats_time_buckets() {
     let protocol = xylem_protocols::redis::RedisProtocol::new(Box::new(
         xylem_protocols::FixedCommandSelector::new(xylem_protocols::redis::RedisOp::Get),
     ));
-    let protocol = ProtocolAdapter::new(protocol);
 
     let worker_config = WorkerConfig {
         target: target_addr,

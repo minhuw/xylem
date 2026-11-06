@@ -23,49 +23,6 @@ use xylem_transport::TcpTransportFactory;
 
 mod common;
 
-// Protocol adapter to bridge xylem_protocols::Protocol with worker Protocol trait
-struct ProtocolAdapter<P: xylem_protocols::Protocol> {
-    inner: P,
-}
-
-impl<P: xylem_protocols::Protocol> ProtocolAdapter<P> {
-    fn new(protocol: P) -> Self {
-        Self { inner: protocol }
-    }
-}
-
-impl<P: xylem_protocols::Protocol> xylem_core::threading::worker::Protocol for ProtocolAdapter<P> {
-    type RequestId = P::RequestId;
-
-    fn next_request(&mut self, conn_id: usize) -> xylem_common::Request<Self::RequestId> {
-        self.inner.next_request(conn_id)
-    }
-
-    fn regenerate_request(
-        &mut self,
-        conn_id: usize,
-        original_request_id: Self::RequestId,
-    ) -> xylem_common::Request<Self::RequestId> {
-        self.inner.regenerate_request(conn_id, original_request_id)
-    }
-
-    fn parse_response(
-        &mut self,
-        conn_id: usize,
-        data: &[u8],
-    ) -> anyhow::Result<(usize, Option<Self::RequestId>)> {
-        self.inner.parse_response(conn_id, data)
-    }
-
-    fn name(&self) -> &'static str {
-        self.inner.name()
-    }
-
-    fn reset(&mut self) {
-        self.inner.reset()
-    }
-}
-
 #[test]
 fn test_http_get_single_thread() {
     let _nginx = common::nginx::NginxGuard::new().expect("Failed to start nginx");
@@ -80,7 +37,6 @@ fn test_http_get_single_thread() {
         "/".to_string(),
         "localhost".to_string(),
     );
-    let protocol = ProtocolAdapter::new(protocol);
     let stats = common::create_test_stats();
     let worker_config = WorkerConfig {
         target: target_addr,
@@ -138,7 +94,6 @@ fn test_http_post_single_thread() {
         "/".to_string(),
         "localhost".to_string(),
     );
-    let protocol = ProtocolAdapter::new(protocol);
     let stats = common::create_test_stats();
     let worker_config = WorkerConfig {
         target: target_addr,
@@ -191,7 +146,6 @@ fn test_http_multi_thread() {
             "/".to_string(),
             "localhost".to_string(),
         );
-        let protocol = ProtocolAdapter::new(protocol);
         let stats = common::create_test_stats();
         let worker_config = WorkerConfig {
             target: target_addr,
@@ -260,7 +214,6 @@ fn test_http_rate_limited() {
         "/".to_string(),
         "localhost".to_string(),
     );
-    let protocol = ProtocolAdapter::new(protocol);
     let stats = common::create_test_stats();
     let worker_config = WorkerConfig {
         target: target_addr,
@@ -310,7 +263,6 @@ fn test_http_put_request() {
         "/".to_string(),
         "localhost".to_string(),
     );
-    let protocol = ProtocolAdapter::new(protocol);
     let stats = common::create_test_stats();
     let worker_config = WorkerConfig {
         target: target_addr,
@@ -352,7 +304,6 @@ fn test_http_pipelined() {
         "/".to_string(),
         "localhost".to_string(),
     );
-    let protocol = ProtocolAdapter::new(protocol);
     let stats = common::create_test_stats();
     let worker_config = WorkerConfig {
         target: target_addr,

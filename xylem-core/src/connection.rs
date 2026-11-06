@@ -7,12 +7,12 @@
 //! poll syscall checks all connections in the pool.
 
 use crate::scheduler::{Policy, ReadyHeap};
-use crate::threading::worker::{ParseResult, RetryRequest};
 use crate::Result;
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
 use std::net::SocketAddr;
 use std::time::Duration;
+use xylem_common::{ParseResult, Protocol, RetryRequest};
 use xylem_transport::{ConnectionGroup, GroupConnection, Timestamp, TransportFactory};
 
 /// Wrapping less-than-or-equal comparison for u32 counters
@@ -843,7 +843,7 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
     /// - `false` if connection was already on heap or cannot be scheduled (pipeline full or protocol not ready)
     pub fn try_schedule_connection<P>(&mut self, connection_id: usize, protocol: &P) -> bool
     where
-        P: crate::threading::worker::Protocol,
+        P: Protocol,
     {
         self.try_schedule_connection_after(connection_id, protocol, 0)
     }
@@ -857,7 +857,7 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         earliest_ns: u64,
     ) -> bool
     where
-        P: crate::threading::worker::Protocol,
+        P: Protocol,
     {
         let current_time_ns = crate::timing::time_ns();
 

@@ -23,53 +23,9 @@
 //! ```
 
 use std::time::Duration;
-use xylem_common::Request;
 use xylem_core::stats::{GroupStatsCollector, SamplingPolicy};
 use xylem_core::threading::{Worker, WorkerConfig};
 use xylem_transport::TcpTransportFactory;
-
-// Protocol adapter to bridge xylem_protocols::Protocol with worker Protocol trait
-struct ProtocolAdapter<P: xylem_protocols::Protocol> {
-    inner: P,
-}
-
-impl<P: xylem_protocols::Protocol> ProtocolAdapter<P> {
-    fn new(protocol: P) -> Self {
-        Self { inner: protocol }
-    }
-}
-
-impl<P: xylem_protocols::Protocol> xylem_core::threading::worker::Protocol for ProtocolAdapter<P> {
-    type RequestId = P::RequestId;
-
-    fn next_request(&mut self, conn_id: usize) -> Request<Self::RequestId> {
-        self.inner.next_request(conn_id)
-    }
-
-    fn regenerate_request(
-        &mut self,
-        conn_id: usize,
-        original_request_id: Self::RequestId,
-    ) -> Request<Self::RequestId> {
-        self.inner.regenerate_request(conn_id, original_request_id)
-    }
-
-    fn parse_response(
-        &mut self,
-        conn_id: usize,
-        data: &[u8],
-    ) -> anyhow::Result<(usize, Option<Self::RequestId>)> {
-        self.inner.parse_response(conn_id, data)
-    }
-
-    fn name(&self) -> &'static str {
-        self.inner.name()
-    }
-
-    fn reset(&mut self) {
-        self.inner.reset()
-    }
-}
 
 fn main() -> anyhow::Result<()> {
     println!("╔════════════════════════════════════════════════╗");
@@ -113,7 +69,6 @@ fn main() -> anyhow::Result<()> {
     let key_gen = xylem_protocols::workload::KeyGeneration::sequential(0);
     let protocol =
         xylem_protocols::redis::RedisProtocol::with_workload(selector, key_gen, value_size);
-    let protocol = ProtocolAdapter::new(protocol);
 
     // Create stats collector with unlimited sampling (collect all latencies)
     let mut stats = GroupStatsCollector::new();

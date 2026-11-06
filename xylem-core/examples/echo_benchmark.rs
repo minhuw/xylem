@@ -37,7 +37,7 @@ impl EchoProtocol {
     }
 }
 
-impl xylem_core::threading::worker::Protocol for EchoProtocol {
+impl xylem_core::threading::Protocol for EchoProtocol {
     type RequestId = u64;
 
     fn next_request(&mut self, _conn_id: usize) -> Request<Self::RequestId> {

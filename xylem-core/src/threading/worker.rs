@@ -16,144 +16,8 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use xylem_common::Request;
+use xylem_common::{Protocol, RetryRequest};
 use xylem_transport::{ConnectionGroup, TransportFactory};
-
-/// Retry request information for protocol-level retries
-#[derive(Debug, Clone)]
-pub struct RetryRequest<ReqId> {
-    /// Number of bytes consumed from the response buffer
-    pub bytes_consumed: usize,
-    /// Original request ID that triggered this retry (protocol uses this to look up request data)
-    pub original_request_id: ReqId,
-    /// Whether the original request was a warmup request
-    pub is_warmup: bool,
-    /// Target connection ID for the retry (None = use routing logic)
-    pub target_conn_id: Option<usize>,
-    /// Preparation commands to send before the retry (e.g., ASKING for Redis Cluster)
-    pub prepare_commands: Vec<Vec<u8>>,
-    /// Retry attempt number (0 for first retry)
-    pub attempt: usize,
-}
-
-/// Extended parse result that supports retries
-#[derive(Debug)]
-pub enum ParseResult<ReqId> {
-    /// Complete response parsed successfully
-    Complete {
-        /// Number of bytes consumed from buffer
-        bytes_consumed: usize,
-        /// Request ID this response corresponds to
-        request_id: ReqId,
-    },
-    /// Response incomplete, need more data
-    Incomplete,
-    /// Retry needed (e.g., cluster redirect)
-    Retry(RetryRequest<ReqId>),
-}
-
-/// Protocol trait for generating requests and parsing responses with request ID tracking
-pub trait Protocol: Send {
-    /// Type of request ID used by this protocol
-    type RequestId: Eq + std::hash::Hash + Clone + Copy + std::fmt::Debug;
-
-    /// Generate the next request for a connection
-    ///
-    /// The protocol generates the request based on its internal state
-    /// (command selector, key generator, value size, etc.)
-    ///
-    /// # Arguments
-    /// * `conn_id` - Connection identifier
-    ///
-    /// # Returns
-    /// A Request containing data, ID, and metadata where metadata indicates
-    /// whether this is a warm-up request (stats should not be collected)
-    fn next_request(&mut self, conn_id: usize) -> Request<Self::RequestId>;
-
-    /// Regenerate a request for retry using the original request ID
-    ///
-    /// The protocol looks up any stored metadata for the original request
-    /// and generates a new request with the same parameters.
-    /// This is used for retry scenarios (e.g., cluster redirects).
-    ///
-    /// # Arguments
-    /// * `conn_id` - Target connection ID for the retry
-    /// * `original_request_id` - The request ID from the original request
-    ///
-    /// # Returns
-    /// A new Request with data, ID, and metadata
-    ///
-    /// Default implementation just generates a new request (ignores original).
-    /// The worker preserves the original request's warmup status and timing.
-    fn regenerate_request(
-        &mut self,
-        conn_id: usize,
-        _original_request_id: Self::RequestId,
-    ) -> Request<Self::RequestId> {
-        let request = self.next_request(conn_id);
-        // Retries are always measurement requests
-        Request::measurement(request.data, request.request_id)
-    }
-
-    /// Parse a response and return the request ID it corresponds to
-    /// Returns Ok((bytes_consumed, Some(request_id))) if complete response found
-    /// Returns Ok((0, None)) if response is incomplete
-    fn parse_response(
-        &mut self,
-        conn_id: usize,
-        data: &[u8],
-    ) -> anyhow::Result<(usize, Option<Self::RequestId>)>;
-
-    /// Check if the protocol is ready to send a request on this connection
-    ///
-    /// This allows protocols to impose their own constraints beyond pipeline depth.
-    /// For example, protocols that require handshakes (like Masstree) can return
-    /// false until the handshake completes, preventing duplicate handshake requests
-    /// from filling the pipeline with the same request ID.
-    ///
-    /// # Arguments
-    /// * `conn_id` - Connection identifier
-    ///
-    /// # Returns
-    /// true if the protocol is ready to generate a request for this connection
-    ///
-    /// Default implementation always returns true (no protocol-level constraints).
-    fn can_send(&self, _conn_id: usize) -> bool {
-        true
-    }
-
-    /// Parse a response with retry support (extended version)
-    ///
-    /// Default implementation delegates to `parse_response()` for backward compatibility.
-    fn parse_response_extended(
-        &mut self,
-        conn_id: usize,
-        data: &[u8],
-    ) -> anyhow::Result<ParseResult<Self::RequestId>> {
-        match self.parse_response(conn_id, data)? {
-            (bytes_consumed, Some(request_id)) => {
-                Ok(ParseResult::Complete { bytes_consumed, request_id })
-            }
-            (0, None) => Ok(ParseResult::Incomplete),
-            (bytes_consumed, None) => {
-                if bytes_consumed > 0 {
-                    Err(anyhow::anyhow!(
-                        "Protocol consumed {} bytes but returned no request ID",
-                        bytes_consumed
-                    ))
-                } else {
-                    Ok(ParseResult::Incomplete)
-                }
-            }
-        }
-    }
-
-    /// Protocol name
-    fn name(&self) -> &'static str;
-
-    /// Reset protocol state
-    fn reset(&mut self);
-}
 
 /// Configuration for worker
 pub struct WorkerConfig {
@@ -711,6 +575,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
+    use xylem_common::{ParseResult, Request};
     use xylem_transport::TcpTransportFactory;
 
     use crate::connection::test_support::{FakeFactory, FakeGroup};
@@ -1063,7 +928,7 @@ mod tests {
         stats.register_group_legacy(0, 1000, 1.0);
         let mut worker = Worker::with_closed_loop(
             &factory,
-            ProtocolAdapter::new(cluster),
+            cluster,
             stats,
             WorkerConfig {
                 target: "127.0.0.1:1".parse().unwrap(),
@@ -1537,74 +1402,6 @@ mod tests {
         assert_eq!(worker.next_tx_cleanup_ns, 2_000_000_100);
     }
 
-    // Protocol adapter
-    struct ProtocolAdapter<P: xylem_protocols::Protocol> {
-        inner: P,
-    }
-
-    impl<P: xylem_protocols::Protocol> ProtocolAdapter<P> {
-        fn new(protocol: P) -> Self {
-            Self { inner: protocol }
-        }
-    }
-
-    impl<P: xylem_protocols::Protocol> Protocol for ProtocolAdapter<P> {
-        type RequestId = P::RequestId;
-
-        fn next_request(&mut self, conn_id: usize) -> Request<Self::RequestId> {
-            self.inner.next_request(conn_id)
-        }
-
-        fn regenerate_request(
-            &mut self,
-            conn_id: usize,
-            original_request_id: Self::RequestId,
-        ) -> Request<Self::RequestId> {
-            self.inner.regenerate_request(conn_id, original_request_id)
-        }
-
-        fn parse_response(
-            &mut self,
-            conn_id: usize,
-            data: &[u8],
-        ) -> anyhow::Result<(usize, Option<Self::RequestId>)> {
-            self.inner.parse_response(conn_id, data)
-        }
-
-        fn parse_response_extended(
-            &mut self,
-            conn_id: usize,
-            data: &[u8],
-        ) -> anyhow::Result<ParseResult<Self::RequestId>> {
-            match self.inner.parse_response_extended(conn_id, data)? {
-                xylem_protocols::ParseResult::Complete { bytes_consumed, request_id } => {
-                    Ok(ParseResult::Complete { bytes_consumed, request_id })
-                }
-                xylem_protocols::ParseResult::Incomplete => Ok(ParseResult::Incomplete),
-                xylem_protocols::ParseResult::Retry(r) => Ok(ParseResult::Retry(RetryRequest {
-                    bytes_consumed: r.bytes_consumed,
-                    original_request_id: r.original_request_id,
-                    is_warmup: r.is_warmup,
-                    target_conn_id: r.target_conn_id,
-                    prepare_commands: r.prepare_commands,
-                    attempt: r.attempt,
-                })),
-            }
-        }
-
-        fn name(&self) -> &'static str {
-            self.inner.name()
-        }
-
-        fn reset(&mut self) {
-            self.inner.reset()
-        }
-
-        fn can_send(&self, conn_id: usize) -> bool {
-            self.inner.can_send(conn_id)
-        }
-    }
-
     #[test]
     fn test_pipelined_worker_basic() {
         // Start echo server
@@ -1631,8 +1428,7 @@ mod tests {
         thread::sleep(Duration::from_millis(50));
 
         // Create pipelined worker
-        let echo_protocol = xylem_protocols::xylem_echo::XylemEchoProtocol::new(0);
-        let protocol = ProtocolAdapter::new(echo_protocol);
+        let protocol = xylem_protocols::xylem_echo::XylemEchoProtocol::new(0);
         let mut stats = GroupStatsCollector::default();
         stats.register_group_legacy(0, 100000, 1.0);
         let config = WorkerConfig {
@@ -1681,8 +1477,7 @@ mod tests {
         thread::sleep(Duration::from_millis(50));
 
         // Create worker with fixed-rate policy
-        let echo_protocol = xylem_protocols::xylem_echo::XylemEchoProtocol::new(0);
-        let protocol = ProtocolAdapter::new(echo_protocol);
+        let protocol = xylem_protocols::xylem_echo::XylemEchoProtocol::new(0);
 
         let mut stats = GroupStatsCollector::default();
         stats.register_group_legacy(0, 100000, 1.0);

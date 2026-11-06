@@ -16,49 +16,6 @@ use xylem_transport::TcpTransportFactory;
 
 mod common;
 
-// Protocol adapter to bridge xylem_protocols::Protocol with worker Protocol trait
-struct ProtocolAdapter<P: xylem_protocols::Protocol> {
-    inner: P,
-}
-
-impl<P: xylem_protocols::Protocol> ProtocolAdapter<P> {
-    fn new(protocol: P) -> Self {
-        Self { inner: protocol }
-    }
-}
-
-impl<P: xylem_protocols::Protocol> xylem_core::threading::worker::Protocol for ProtocolAdapter<P> {
-    type RequestId = P::RequestId;
-
-    fn next_request(&mut self, conn_id: usize) -> xylem_common::Request<Self::RequestId> {
-        self.inner.next_request(conn_id)
-    }
-
-    fn regenerate_request(
-        &mut self,
-        conn_id: usize,
-        original_request_id: Self::RequestId,
-    ) -> xylem_common::Request<Self::RequestId> {
-        self.inner.regenerate_request(conn_id, original_request_id)
-    }
-
-    fn parse_response(
-        &mut self,
-        conn_id: usize,
-        data: &[u8],
-    ) -> anyhow::Result<(usize, Option<Self::RequestId>)> {
-        self.inner.parse_response(conn_id, data)
-    }
-
-    fn name(&self) -> &'static str {
-        self.inner.name()
-    }
-
-    fn reset(&mut self) {
-        self.inner.reset()
-    }
-}
-
 #[test]
 fn test_multi_protocol_redis_memcached_http() {
     eprintln!("Testing multi-protocol with Redis + Memcached + HTTP on different targets");
@@ -86,16 +43,16 @@ fn run_multi_protocol_test() -> Result<(), Box<dyn std::error::Error>> {
         let redis_selector =
             Box::new(xylem_protocols::FixedCommandSelector::new(xylem_protocols::RedisOp::Get));
         let redis_protocol = multi_protocol::create_protocol("redis", None, Some(redis_selector))?;
-        protocols.insert(0, ProtocolAdapter::new(redis_protocol));
+        protocols.insert(0, redis_protocol);
 
         // Group 1: Memcached on port 11211
         let memcached_protocol = multi_protocol::create_protocol("memcached-binary", None, None)?;
-        protocols.insert(1, ProtocolAdapter::new(memcached_protocol));
+        protocols.insert(1, memcached_protocol);
 
         // Group 2: HTTP on port 8080
         let http_protocol =
             multi_protocol::create_protocol("http", Some(("/", "127.0.0.1:8080")), None)?;
-        protocols.insert(2, ProtocolAdapter::new(http_protocol));
+        protocols.insert(2, http_protocol);
 
         let mut stats = GroupStatsCollector::new();
         stats.register_group(0, &SamplingPolicy::Unlimited);
@@ -214,14 +171,14 @@ fn run_redis_memcached_test() -> Result<(), Box<dyn std::error::Error>> {
             Box::new(xylem_protocols::FixedCommandSelector::new(xylem_protocols::RedisOp::Get));
         let redis_protocol1 =
             multi_protocol::create_protocol("redis", None, Some(redis_selector1))?;
-        protocols.insert(0, ProtocolAdapter::new(redis_protocol1));
+        protocols.insert(0, redis_protocol1);
 
         // Group 1: Redis (simulating another protocol - validates multi-protocol dispatch)
         let redis_selector2 =
             Box::new(xylem_protocols::FixedCommandSelector::new(xylem_protocols::RedisOp::Get));
         let redis_protocol2 =
             multi_protocol::create_protocol("redis", None, Some(redis_selector2))?;
-        protocols.insert(1, ProtocolAdapter::new(redis_protocol2));
+        protocols.insert(1, redis_protocol2);
 
         let mut stats = GroupStatsCollector::new();
         stats.register_group(0, &SamplingPolicy::Unlimited);

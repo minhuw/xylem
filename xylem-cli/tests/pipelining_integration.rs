@@ -19,53 +19,6 @@ use xylem_transport::TcpTransportFactory;
 
 mod common;
 
-// Protocol adapter
-struct ProtocolAdapter<P: xylem_protocols::Protocol> {
-    inner: P,
-}
-
-impl<P: xylem_protocols::Protocol> ProtocolAdapter<P> {
-    fn new(protocol: P) -> Self {
-        Self { inner: protocol }
-    }
-}
-
-impl<P: xylem_protocols::Protocol> xylem_core::threading::worker::Protocol for ProtocolAdapter<P> {
-    type RequestId = P::RequestId;
-
-    fn next_request(&mut self, conn_id: usize) -> xylem_common::Request<Self::RequestId> {
-        self.inner.next_request(conn_id)
-    }
-
-    fn regenerate_request(
-        &mut self,
-        conn_id: usize,
-        original_request_id: Self::RequestId,
-    ) -> xylem_common::Request<Self::RequestId> {
-        self.inner.regenerate_request(conn_id, original_request_id)
-    }
-
-    fn parse_response(
-        &mut self,
-        conn_id: usize,
-        data: &[u8],
-    ) -> anyhow::Result<(usize, Option<Self::RequestId>)> {
-        self.inner.parse_response(conn_id, data)
-    }
-
-    fn name(&self) -> &'static str {
-        self.inner.name()
-    }
-
-    fn reset(&mut self) {
-        self.inner.reset()
-    }
-
-    fn can_send(&self, conn_id: usize) -> bool {
-        self.inner.can_send(conn_id)
-    }
-}
-
 #[test]
 fn test_redis_pipelined_single_connection() {
     let _guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
@@ -78,7 +31,6 @@ fn test_redis_pipelined_single_connection() {
     let protocol = xylem_protocols::redis::RedisProtocol::new(Box::new(
         xylem_protocols::FixedCommandSelector::new(xylem_protocols::redis::RedisOp::Get),
     ));
-    let protocol = ProtocolAdapter::new(protocol);
     let stats = common::create_test_stats();
     let config = WorkerConfig {
         target: target_addr,
@@ -125,7 +77,6 @@ fn test_redis_pipelined_multiple_connections() {
     let protocol = xylem_protocols::redis::RedisProtocol::new(Box::new(
         xylem_protocols::FixedCommandSelector::new(xylem_protocols::redis::RedisOp::Get),
     ));
-    let protocol = ProtocolAdapter::new(protocol);
     let stats = common::create_test_stats();
     let config = WorkerConfig {
         target: target_addr,
@@ -177,7 +128,6 @@ fn test_redis_pipelined_closed_loop() {
     let protocol = xylem_protocols::redis::RedisProtocol::new(Box::new(
         xylem_protocols::FixedCommandSelector::new(xylem_protocols::redis::RedisOp::Get),
     ));
-    let protocol = ProtocolAdapter::new(protocol);
     let stats = common::create_test_stats();
     let config = WorkerConfig {
         target: target_addr,

@@ -11,49 +11,6 @@ use xylem_transport::TcpTransportFactory;
 
 mod common;
 
-// Protocol adapter to bridge xylem_protocols::Protocol with worker Protocol trait
-struct ProtocolAdapter<P: xylem_protocols::Protocol> {
-    inner: P,
-}
-
-impl<P: xylem_protocols::Protocol> ProtocolAdapter<P> {
-    fn new(protocol: P) -> Self {
-        Self { inner: protocol }
-    }
-}
-
-impl<P: xylem_protocols::Protocol> xylem_core::threading::worker::Protocol for ProtocolAdapter<P> {
-    type RequestId = P::RequestId;
-
-    fn next_request(&mut self, conn_id: usize) -> xylem_common::Request<Self::RequestId> {
-        self.inner.next_request(conn_id)
-    }
-
-    fn regenerate_request(
-        &mut self,
-        conn_id: usize,
-        original_request_id: Self::RequestId,
-    ) -> xylem_common::Request<Self::RequestId> {
-        self.inner.regenerate_request(conn_id, original_request_id)
-    }
-
-    fn parse_response(
-        &mut self,
-        conn_id: usize,
-        data: &[u8],
-    ) -> anyhow::Result<(usize, Option<Self::RequestId>)> {
-        self.inner.parse_response(conn_id, data)
-    }
-
-    fn name(&self) -> &'static str {
-        self.inner.name()
-    }
-
-    fn reset(&mut self) {
-        self.inner.reset()
-    }
-}
-
 /// Test Memcached Binary protocol with single thread
 #[test]
 fn test_memcached_binary_single_thread() {
@@ -64,10 +21,8 @@ fn test_memcached_binary_single_thread() {
 
     let results = runtime
         .run_workers_generic(move |_thread_id| {
-            let protocol = ProtocolAdapter::new(
-                xylem_protocols::memcached::binary::MemcachedBinaryProtocol::new(
-                    xylem_protocols::memcached::binary::MemcachedOp::Get,
-                ),
+            let protocol = xylem_protocols::memcached::binary::MemcachedBinaryProtocol::new(
+                xylem_protocols::memcached::binary::MemcachedOp::Get,
             );
             let _transport = TcpTransportFactory::default();
             let stats = common::create_test_stats();
@@ -110,10 +65,8 @@ fn test_memcached_ascii_single_thread() {
 
     let results = runtime
         .run_workers_generic(move |_thread_id| {
-            let protocol = ProtocolAdapter::new(
-                xylem_protocols::memcached::ascii::MemcachedAsciiProtocol::new(
-                    xylem_protocols::memcached::ascii::MemcachedOp::Get,
-                ),
+            let protocol = xylem_protocols::memcached::ascii::MemcachedAsciiProtocol::new(
+                xylem_protocols::memcached::ascii::MemcachedOp::Get,
             );
             let _transport = TcpTransportFactory::default();
             let stats = common::create_test_stats();
@@ -156,10 +109,8 @@ fn test_memcached_binary_multi_thread() {
 
     let results = runtime
         .run_workers_generic(move |_thread_id| {
-            let protocol = ProtocolAdapter::new(
-                xylem_protocols::memcached::binary::MemcachedBinaryProtocol::new(
-                    xylem_protocols::memcached::binary::MemcachedOp::Get,
-                ),
+            let protocol = xylem_protocols::memcached::binary::MemcachedBinaryProtocol::new(
+                xylem_protocols::memcached::binary::MemcachedOp::Get,
             );
             let _transport = TcpTransportFactory::default();
             let stats = common::create_test_stats();
@@ -206,10 +157,8 @@ fn test_memcached_ascii_rate_limited() {
 
     let results = runtime
         .run_workers_generic(move |_thread_id| {
-            let protocol = ProtocolAdapter::new(
-                xylem_protocols::memcached::ascii::MemcachedAsciiProtocol::new(
-                    xylem_protocols::memcached::ascii::MemcachedOp::Get,
-                ),
+            let protocol = xylem_protocols::memcached::ascii::MemcachedAsciiProtocol::new(
+                xylem_protocols::memcached::ascii::MemcachedOp::Get,
             );
             let _transport = TcpTransportFactory::default();
             let stats = common::create_test_stats();
