@@ -17,9 +17,6 @@ description = "YCSB Workload B: Read Mostly (95% read, 5% update)"
 duration = "60s"
 seed = 42
 
-[target]
-transport = "tcp"
-
 # Traffic Configuration
 [[traffic_groups]]
 name = "workload-b"

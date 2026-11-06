@@ -17,9 +17,6 @@ description = "YCSB Workload C: Read Only (100% read)"
 duration = "60s"
 seed = 42
 
-[target]
-transport = "tcp"
-
 # Traffic Configuration
 [[traffic_groups]]
 name = "workload-c"

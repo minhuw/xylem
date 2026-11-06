@@ -1,5 +1,5 @@
 //! Keep complete book examples loadable as the CLI's profile format evolves.
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use xylem_cli::config::ProfileConfig;
 
 fn check_markdown(path: &Path) -> usize {
@@ -47,25 +47,48 @@ fn complete_book_profiles_are_valid() {
     assert!(count >= 6, "Expected at least six complete profiles, found {count}");
 }
 
-#[test]
-fn bundled_profiles_are_valid() {
-    fn visit(path: &Path, count: &mut usize) {
+/// Every TOML file under `profiles/`, including subdirectories.
+fn bundled_profiles() -> Vec<PathBuf> {
+    fn visit(path: &Path, profiles: &mut Vec<PathBuf>) {
         for entry in std::fs::read_dir(path).unwrap() {
             let path = entry.unwrap().path();
             if path.is_dir() {
-                visit(&path, count);
+                visit(&path, profiles);
             } else if path.extension().is_some_and(|ext| ext == "toml") {
-                let config = ProfileConfig::from_file(&path)
-                    .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-                config.validate().unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-                check_workloads(&config, &path);
-                *count += 1;
+                profiles.push(path);
             }
         }
     }
-    let mut count = 0;
-    visit(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../profiles"), &mut count);
-    assert_eq!(count, 15, "Update coverage when adding or removing bundled profiles");
+    let mut profiles = Vec::new();
+    visit(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../profiles"), &mut profiles);
+    profiles
+}
+
+#[test]
+fn bundled_profiles_are_valid() {
+    let profiles = bundled_profiles();
+    for path in &profiles {
+        let config =
+            ProfileConfig::from_file(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        config.validate().unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        check_workloads(&config, path);
+    }
+    assert_eq!(profiles.len(), 15, "Update coverage when adding or removing bundled profiles");
+}
+
+#[test]
+fn bundled_profiles_have_no_target_section() {
+    for path in bundled_profiles() {
+        let content = std::fs::read_to_string(&path).unwrap();
+        let profile: toml::Table =
+            toml::from_str(&content).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        // ProfileConfig has no top-level target, so serde would silently drop it.
+        assert!(
+            !profile.contains_key("target"),
+            "{} has an ignored [target] section; set target in each traffic group",
+            path.display()
+        );
+    }
 }
 
 fn check_workloads(config: &ProfileConfig, path: &Path) {

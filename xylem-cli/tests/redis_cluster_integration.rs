@@ -1,7 +1,7 @@
 //! Integration tests for Redis Cluster support
 //!
 //! These tests require a real Redis Cluster running via Docker Compose.
-//! Run with: cargo test --test redis_cluster_integration -- --ignored
+//! Run with: cargo nextest run --profile integration -E 'binary(redis_cluster_integration)'
 
 mod common;
 

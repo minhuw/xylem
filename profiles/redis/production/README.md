@@ -12,7 +12,7 @@ Research-backed workload patterns from published academic papers.
 
 ```bash
 # Facebook TAO: Social graph cache
-xylem run profiles/redis/production/facebook-tao-workload.toml
+xylem -P profiles/redis/production/facebook-tao-workload.toml
 ```
 
 ## Facebook TAO Workload

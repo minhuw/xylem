@@ -41,8 +41,8 @@ xylem -P tests/redis/redis-bench.toml
 Override any configuration value using dot notation. Can be specified multiple times.
 
 ```bash
-xylem -P profiles/redis.toml --set traffic_groups.0.target=192.168.1.100:6379
-xylem -P profiles/http.toml --set experiment.duration=120s --set experiment.seed=12345
+xylem -P tests/redis/redis-get-zipfian.toml --set traffic_groups.0.target=192.168.1.100:6379
+xylem -P profiles/http-spike.toml --set experiment.duration=60s --set experiment.seed=12345
 ```
 
 **Examples:**
@@ -62,7 +62,7 @@ Set log level (trace, debug, info, warn, error).
 **Default:** info
 
 ```bash
-xylem -P profiles/redis.toml --log-level debug
+xylem -P tests/redis/redis-get-zipfian.toml --log-level debug
 ```
 
 ## Subcommands
@@ -105,20 +105,20 @@ The `--set` flag uses dot notation to override any configuration value:
 
 ```bash
 # Override target address for a traffic group
-xylem -P profiles/redis.toml --set traffic_groups.0.target=127.0.0.1:6379
+xylem -P tests/redis/redis-get-zipfian.toml --set traffic_groups.0.target=127.0.0.1:6379
 
 # Override protocol for a traffic group
-xylem -P profiles/redis.toml --set traffic_groups.0.protocol=memcached-binary
+xylem -P profiles/memcached-ramp.toml --set traffic_groups.0.protocol=memcached-ascii
 
 # Override experiment parameters
-xylem -P profiles/bench.toml --set experiment.duration=300s --set experiment.seed=42
+xylem -P profiles/memcached-ramp.toml --set experiment.duration=300s --set experiment.seed=42
 
 # Override protocol_config settings (keys, operations, value sizes)
-xylem -P profiles/redis.toml --set traffic_groups.0.protocol_config.keys.n=1000000
-xylem -P profiles/redis.toml --set traffic_groups.0.protocol_config.keys.strategy=zipfian
+xylem -P tests/redis/redis-get-zipfian.toml --set traffic_groups.0.protocol_config.keys.n=1000000
+xylem -P tests/redis/redis-get-zipfian.toml --set traffic_groups.0.protocol_config.keys.strategy=zipfian
 
 # Override traffic group settings
-xylem -P profiles/multi.toml --set traffic_groups.0.threads=[0,1,2,3]
+xylem -P profiles/multi-protocol-example.toml --set traffic_groups.0.threads=[0,1,2,3]
 ```
 
 ## Profile Files
@@ -169,7 +169,7 @@ Xylem respects the following environment variables:
 - `RUST_LOG` - Set logging level (e.g., `debug`, `info`, `warn`, `error`)
 
 ```bash
-RUST_LOG=debug xylem -P profiles/redis.toml
+RUST_LOG=debug xylem -P tests/redis/redis-get-zipfian.toml
 ```
 
 ## See Also

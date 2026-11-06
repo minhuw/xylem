@@ -18,9 +18,6 @@ description = "YCSB Workload E: Short Ranges (95% read, 5% insert)"
 duration = "60s"
 seed = 42
 
-[target]
-transport = "tcp"
-
 # Traffic Configuration
 [[traffic_groups]]
 name = "workload-e"

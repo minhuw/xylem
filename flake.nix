@@ -97,7 +97,6 @@
             echo "  bacon                          - Watch and build"
             echo ""
             echo "⚠️  Integration tests require Docker to be installed and running"
-            echo "See PROFILING.md for profiling guide"
             echo ""
 
             # Setup pre-commit hooks if not already installed

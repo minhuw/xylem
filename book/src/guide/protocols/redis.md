@@ -229,6 +229,7 @@ Xylem handles this for you. You tell it about your cluster topology—which node
 Here's the setup:
 ```rust
 use xylem_protocols::*;
+use xylem_protocols::redis::cluster::calculate_slot_range;
 
 // Create a cluster-aware protocol
 let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
@@ -242,7 +243,8 @@ protocol.register_connection("127.0.0.1:7002".parse()?, 2);
 // Define the topology
 let mut ranges = vec![];
 for i in 0..3 {
-    let (start, end) = calculate_slot_range(i, 3)?;
+    // Returns None only when the node index is not below the node count
+    let (start, end) = calculate_slot_range(i, 3).expect("node index is in range");
     let master = format!("127.0.0.1:{}", 7000 + i).parse()?;
     ranges.push(SlotRange { start, end, master, replicas: vec![] });
 }

@@ -14,9 +14,6 @@ description = "YCSB Workload F: Read-Modify-Write (50% read, 50% write)"
 duration = "60s"
 seed = 42
 
-[target]
-transport = "tcp"
-
 # Traffic Configuration
 [[traffic_groups]]
 name = "workload-f"

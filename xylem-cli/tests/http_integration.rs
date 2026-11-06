@@ -7,12 +7,12 @@
 //!
 //! Run all HTTP integration tests:
 //! ```bash
-//! cargo test --test http_integration -- --ignored
+//! just test-http
 //! ```
 //!
 //! Run a specific test:
 //! ```bash
-//! cargo test --test http_integration test_http_get_single_thread -- --ignored
+//! cargo nextest run --profile integration -E 'binary(http_integration) and test(test_http_get_single_thread)'
 //! ```
 
 use std::time::Duration;

@@ -27,9 +27,6 @@ description = "Facebook TAO social graph cache workload (99.8% read, 0.2% write)
 duration = "120s"  # Longer duration to capture diurnal patterns
 seed = 42
 
-[target]
-transport = "tcp"
-
 # Traffic Configuration
 # High connection count to simulate many concurrent users
 [[traffic_groups]]

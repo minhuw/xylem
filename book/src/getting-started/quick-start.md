@@ -183,10 +183,10 @@ Control logging verbosity:
 
 ```bash
 # Debug level logging
-xylem -P profiles/redis.toml --log-level debug
+xylem -P tests/redis/redis-get-zipfian.toml --log-level debug
 
 # Using RUST_LOG environment variable
-RUST_LOG=debug xylem -P profiles/redis.toml
+RUST_LOG=debug xylem -P tests/redis/redis-get-zipfian.toml
 ```
 
 ## Next Steps

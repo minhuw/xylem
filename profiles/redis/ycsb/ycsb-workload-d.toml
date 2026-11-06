@@ -17,9 +17,6 @@ description = "YCSB Workload D: Read Latest (95% read latest, 5% insert)"
 duration = "60s"
 seed = 42
 
-[target]
-transport = "tcp"
-
 # Traffic Configuration
 [[traffic_groups]]
 name = "workload-d"

@@ -1,7 +1,3 @@
-[target.x86_64-unknown-linux-gnu]
-# Link-time optimization (commented out - requires lld)
-# rustflags = ["-C", "link-arg=-fuse-ld=lld"]
-
 [alias]
 # Convenient aliases
 b = "build"
@@ -16,6 +12,3 @@ fmt-check = "fmt --all -- --check"
 
 # Testing
 test-all = "test --all-features --workspace"
-
-[profile.release]
-# Already configured in workspace Cargo.toml
