@@ -49,6 +49,11 @@ pub type TrafficGroupConfig =
 pub type UnixTrafficGroupConfig =
     (usize, String, usize, usize, Box<dyn crate::scheduler::PolicyScheduler>);
 
+/// Traffic group configuration with either target type, as used by the pool builder:
+/// (group_id, target, conn_count, max_pending_per_conn, policy_scheduler)
+type GroupConfig<Target> =
+    (usize, Target, usize, usize, Box<dyn crate::scheduler::PolicyScheduler>);
+
 /// Timeout for stale TX queue entries (1 minute in nanoseconds)
 /// Entries older than this are cleaned up to prevent memory leaks from lost packets
 const TX_QUEUE_STALE_TIMEOUT_NS: u64 = 60_000_000_000;
@@ -498,42 +503,19 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         target: SocketAddr,
         connection_count: usize,
         max_pending_per_connection: usize,
-        mut policy_scheduler: Box<dyn crate::scheduler::PolicyScheduler>,
+        policy_scheduler: Box<dyn crate::scheduler::PolicyScheduler>,
         group_id: usize,
     ) -> Result<Self> {
-        let mut group = factory.create_group()?;
-        let mut connection_states = HashMap::with_capacity(connection_count);
-        let mut connection_ids = Vec::with_capacity(connection_count);
-        let mut ready_heap = ReadyHeap::new();
-        let current_time_ns = crate::timing::time_ns();
+        // With a single group, the pool-wide policy index is the per-group index
+        let groups = vec![(
+            group_id,
+            target,
+            connection_count,
+            max_pending_per_connection,
+            policy_scheduler,
+        )];
 
-        for idx in 0..connection_count {
-            let connection_id = group.add_connection(&target)?;
-            let mut policy = policy_scheduler.assign_policy(idx);
-
-            // Get initial next_send_time and add to heap
-            let next_send_time = policy.next_send_time(current_time_ns);
-            ready_heap.push(connection_id, next_send_time);
-
-            let mut state = ConnectionState::new(
-                connection_id,
-                target,
-                max_pending_per_connection,
-                policy,
-                group_id,
-            );
-
-            state.set_on_heap(true);
-            connection_states.insert(connection_id, state);
-            connection_ids.push(connection_id);
-        }
-
-        Ok(Self {
-            group,
-            connection_states,
-            connection_ids,
-            ready_heap,
-        })
+        Self::new_multi_group_with_targets(factory, groups)
     }
 
     /// Create a new connection pool with connections from multiple traffic groups
@@ -557,8 +539,23 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         factory: &F,
         groups: Vec<TrafficGroupConfig>,
     ) -> Result<Self> {
+        Self::build(factory.create_group()?, groups, |group, target| {
+            let connection_id = group.add_connection(target)?;
+            Ok((connection_id, *target))
+        })
+    }
+
+    /// Build a pool by adding every group's connections to `group`
+    ///
+    /// `add_connection` opens one connection to a group's target and returns its
+    /// connection ID and the address recorded in its state. Policies are assigned
+    /// with a pool-wide index that counts connections across groups in order.
+    fn build<T>(
+        mut group: G,
+        groups: Vec<GroupConfig<T>>,
+        mut add_connection: impl FnMut(&mut G, &T) -> Result<(usize, SocketAddr)>,
+    ) -> Result<Self> {
         let total_connections: usize = groups.iter().map(|(_, _, count, _, _)| count).sum();
-        let mut group = factory.create_group()?;
         let mut connection_states = HashMap::with_capacity(total_connections);
         let mut connection_ids = Vec::with_capacity(total_connections);
         let mut ready_heap = ReadyHeap::new();
@@ -574,7 +571,7 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         ) in groups
         {
             for _ in 0..connection_count {
-                let connection_id = group.add_connection(&target)?;
+                let (connection_id, address) = add_connection(&mut group, &target)?;
                 let mut policy = policy_scheduler.assign_policy(idx);
 
                 // Get initial next_send_time and add to heap
@@ -583,7 +580,7 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
 
                 let mut state = ConnectionState::new(
                     connection_id,
-                    target,
+                    address,
                     max_pending_per_connection,
                     policy,
                     group_id,
@@ -1005,48 +1002,13 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug>
         factory: &xylem_transport::UnixTransportFactory,
         groups: Vec<UnixTrafficGroupConfig>,
     ) -> Result<Self> {
-        let total_connections: usize = groups.iter().map(|(_, _, count, _, _)| count).sum();
-        let mut group = factory.create_group()?;
-        let mut connection_states = HashMap::with_capacity(total_connections);
-        let mut connection_ids = Vec::with_capacity(total_connections);
-        let mut ready_heap = ReadyHeap::new();
-        let current_time_ns = crate::timing::time_ns();
-        let mut idx = 0;
-
         // Placeholder address for Unix sockets (not used for actual connections)
         let placeholder_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
 
-        for (group_id, path, connection_count, max_pending_per_connection, mut policy_scheduler) in
-            groups
-        {
-            for _ in 0..connection_count {
-                let connection_id = group.add_connection_path(&path)?;
-                let mut policy = policy_scheduler.assign_policy(idx);
-
-                // Get initial next_send_time and add to heap
-                let next_send_time = policy.next_send_time(current_time_ns);
-                ready_heap.push(connection_id, next_send_time);
-
-                let mut state = ConnectionState::new(
-                    connection_id,
-                    placeholder_addr, // Unix sockets don't have a SocketAddr
-                    max_pending_per_connection,
-                    policy,
-                    group_id,
-                );
-
-                state.set_on_heap(true);
-                connection_states.insert(connection_id, state);
-                connection_ids.push(connection_id);
-                idx += 1;
-            }
-        }
-
-        Ok(Self {
-            group,
-            connection_states,
-            connection_ids,
-            ready_heap,
+        Self::build(factory.create_group()?, groups, |group, path| {
+            let connection_id = group.add_connection_path(path)?;
+            // Unix sockets don't have a SocketAddr
+            Ok((connection_id, placeholder_addr))
         })
     }
 }

@@ -620,11 +620,15 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
             max_pending_per_conn: 1, // This will be overridden per-group
         };
 
-        // Helper function to wire redis-cluster connections after worker creation
-        fn wire_cluster_connections<G, S>(
-            worker: &mut Worker<G, xylem_cli::multi_protocol::MultiProtocol, S>,
+        // Helper function to wire a created worker, run it, and return its stats.
+        // Redis-cluster connections are wired first, then the request dumper.
+        fn run_worker<G, S>(
+            mut worker: Worker<G, xylem_cli::multi_protocol::MultiProtocol, S>,
             cluster_groups: &[usize],
-        ) where
+            request_dumper: Option<&Arc<xylem_core::request_dump::RequestDumper>>,
+            thread_idx: usize,
+        ) -> xylem_core::Result<S>
+        where
             G: xylem_transport::ConnectionGroup,
             S: xylem_core::stats::StatsRecorder,
         {
@@ -636,51 +640,49 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                     protocol.register_cluster_connections(&conn_targets);
                 }
             }
+
+            // Wire request dumper if enabled
+            if let Some(dumper) = request_dumper {
+                worker.set_request_dumper(Arc::clone(dumper), thread_idx);
+            }
+
+            worker.run()?;
+            Ok(worker.into_stats())
         }
 
         // Select transport factory based on thread's transport
         match thread_transport {
             "tcp" => {
                 let factory = TcpTransportFactory::default();
-                let mut worker = Worker::new_multi_group_with_targets(
+                let worker = Worker::new_multi_group_with_targets(
                     &factory,
                     protocols,
                     stats,
                     worker_config,
                     groups_config,
                 )?;
-
-                // Wire redis-cluster connections
-                wire_cluster_connections(&mut worker, &redis_cluster_groups);
-
-                // Wire request dumper if enabled
-                if let Some(ref dumper) = request_dumper_for_worker {
-                    worker.set_request_dumper(Arc::clone(dumper), thread_idx);
-                }
-
-                worker.run()?;
-                Ok(worker.into_stats())
+                run_worker(
+                    worker,
+                    &redis_cluster_groups,
+                    request_dumper_for_worker.as_ref(),
+                    thread_idx,
+                )
             }
             "udp" => {
                 let factory = UdpTransportFactory::default();
-                let mut worker = Worker::new_multi_group_with_targets(
+                let worker = Worker::new_multi_group_with_targets(
                     &factory,
                     protocols,
                     stats,
                     worker_config,
                     groups_config,
                 )?;
-
-                // Wire redis-cluster connections
-                wire_cluster_connections(&mut worker, &redis_cluster_groups);
-
-                // Wire request dumper if enabled
-                if let Some(ref dumper) = request_dumper_for_worker {
-                    worker.set_request_dumper(Arc::clone(dumper), thread_idx);
-                }
-
-                worker.run()?;
-                Ok(worker.into_stats())
+                run_worker(
+                    worker,
+                    &redis_cluster_groups,
+                    request_dumper_for_worker.as_ref(),
+                    thread_idx,
+                )
             }
             "unix" => {
                 // Unix transport requires special handling - targets are paths, not SocketAddr
@@ -705,24 +707,20 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                 }
 
                 let factory = xylem_transport::UnixTransportFactory::default();
-                let mut worker = Worker::new_multi_group_unix(
+                let worker = Worker::new_multi_group_unix(
                     &factory,
                     protocols,
                     stats,
                     worker_config,
                     unix_groups_config,
                 )?;
-
-                // Wire redis-cluster connections (unlikely for Unix but for consistency)
-                wire_cluster_connections(&mut worker, &redis_cluster_groups);
-
-                // Wire request dumper if enabled
-                if let Some(ref dumper) = request_dumper_for_worker {
-                    worker.set_request_dumper(Arc::clone(dumper), thread_idx);
-                }
-
-                worker.run()?;
-                Ok(worker.into_stats())
+                // Redis-cluster wiring is unlikely for Unix but kept for consistency
+                run_worker(
+                    worker,
+                    &redis_cluster_groups,
+                    request_dumper_for_worker.as_ref(),
+                    thread_idx,
+                )
             }
             other => Err(xylem_core::Error::Config(format!("Unsupported transport: {}", other)))?,
         }

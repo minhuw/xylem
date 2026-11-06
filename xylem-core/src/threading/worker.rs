@@ -75,16 +75,7 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         let mut protocols = HashMap::new();
         protocols.insert(0, protocol);
 
-        Ok(Self {
-            pool,
-            protocols,
-            stats,
-            config,
-            request_dumper: None,
-            thread_id: 0,
-            next_tx_cleanup_ns: timing::time_ns().saturating_add(1_000_000_000),
-            retry_queue: Vec::new(),
-        })
+        Ok(Self::from_pool(pool, protocols, stats, config))
     }
 
     /// Create a new pipelined worker with closed-loop policy (max throughput)
@@ -108,16 +99,7 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
     ) -> Result<Self> {
         let pool = ConnectionPool::new_multi_group(factory, config.target, groups)?;
 
-        Ok(Self {
-            pool,
-            protocols,
-            stats,
-            config,
-            request_dumper: None,
-            thread_id: 0,
-            next_tx_cleanup_ns: timing::time_ns().saturating_add(1_000_000_000),
-            retry_queue: Vec::new(),
-        })
+        Ok(Self::from_pool(pool, protocols, stats, config))
     }
 
     /// Create a new pipelined worker with multiple traffic groups, each with its own target
@@ -130,7 +112,17 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
     ) -> Result<Self> {
         let pool = ConnectionPool::new_multi_group_with_targets(factory, groups)?;
 
-        Ok(Self {
+        Ok(Self::from_pool(pool, protocols, stats, config))
+    }
+
+    /// Create a worker around an already built connection pool
+    fn from_pool(
+        pool: ConnectionPool<G, P::RequestId>,
+        protocols: HashMap<usize, P>,
+        stats: S,
+        config: WorkerConfig,
+    ) -> Self {
+        Self {
             pool,
             protocols,
             stats,
@@ -139,7 +131,7 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             thread_id: 0,
             next_tx_cleanup_ns: timing::time_ns().saturating_add(1_000_000_000),
             retry_queue: Vec::new(),
-        })
+        }
     }
 
     /// Get mapping of connection ID to target address
@@ -555,16 +547,7 @@ impl<P: Protocol, S: StatsRecorder> Worker<xylem_transport::UnixConnectionGroup,
     ) -> Result<Self> {
         let pool = ConnectionPool::new_multi_group_unix(factory, groups)?;
 
-        Ok(Self {
-            pool,
-            protocols,
-            stats,
-            config,
-            request_dumper: None,
-            thread_id: 0,
-            next_tx_cleanup_ns: timing::time_ns().saturating_add(1_000_000_000),
-            retry_queue: Vec::new(),
-        })
+        Ok(Self::from_pool(pool, protocols, stats, config))
     }
 }
 
