@@ -3,13 +3,11 @@
 //! Provides reusable distribution implementations used by:
 //! - Key generation (Zipfian for hot-key workloads)
 //! - Inter-arrival timing (Exponential for Poisson process)
-//! - Value size variation (Normal, Pareto)
+//! - Value size variation (Normal)
 
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
-use rand_distr::{
-    Distribution as RandDistribution, Exp, Gamma, LogNormal, Normal, Pareto, Uniform, Zipf,
-};
+use rand_distr::{Distribution as RandDistribution, Exp, Normal, Uniform, Zipf};
 
 /// Trait for all distributions
 pub trait Distribution: Send {
@@ -20,9 +18,6 @@ pub trait Distribution: Send {
     fn reset(&mut self) {
         // Default: no-op (most distributions are stateless except RNG)
     }
-
-    /// Get distribution name
-    fn name(&self) -> &'static str;
 }
 
 /// Zipfian distribution (power law, hot-key pattern)
@@ -96,10 +91,6 @@ impl Distribution for ZipfianDistribution {
     }
 
     fn reset(&mut self) {}
-
-    fn name(&self) -> &'static str {
-        "Zipfian"
-    }
 }
 
 impl Clone for ZipfianDistribution {
@@ -155,10 +146,6 @@ impl Distribution for ExponentialDistribution {
     }
 
     fn reset(&mut self) {}
-
-    fn name(&self) -> &'static str {
-        "Exponential"
-    }
 }
 
 /// Uniform distribution
@@ -200,10 +187,6 @@ impl UniformDistribution {
 impl Distribution for UniformDistribution {
     fn sample(&mut self) -> f64 {
         self.dist.sample(&mut self.rng)
-    }
-
-    fn name(&self) -> &'static str {
-        "Uniform"
     }
 }
 
@@ -248,10 +231,6 @@ impl Distribution for NormalDistribution {
     fn sample(&mut self) -> f64 {
         self.dist.sample(&mut self.rng)
     }
-
-    fn name(&self) -> &'static str {
-        "Normal"
-    }
 }
 
 impl Clone for NormalDistribution {
@@ -264,430 +243,6 @@ impl Clone for NormalDistribution {
             dist: Normal::new(self.mean, self.std_dev)
                 .expect("Normal params validated in constructor"),
         }
-    }
-}
-
-/// Pareto distribution (heavy-tailed)
-pub struct ParetoDistribution {
-    scale: f64,
-    shape: f64,
-    rng: SmallRng,
-    dist: Pareto<f64>,
-}
-
-impl ParetoDistribution {
-    pub fn new(scale: f64, shape: f64) -> anyhow::Result<Self> {
-        Self::with_seed(scale, shape, None)
-    }
-
-    pub fn with_seed(scale: f64, shape: f64, seed: Option<u64>) -> anyhow::Result<Self> {
-        if scale <= 0.0 {
-            anyhow::bail!("Pareto scale must be > 0");
-        }
-        if shape <= 0.0 {
-            anyhow::bail!("Pareto shape must be > 0");
-        }
-
-        let rng = match seed {
-            Some(s) => SmallRng::seed_from_u64(s),
-            None => SmallRng::from_os_rng(),
-        };
-        let dist = Pareto::new(scale, shape)?;
-
-        Ok(Self { scale, shape, rng, dist })
-    }
-
-    pub fn scale(&self) -> f64 {
-        self.scale
-    }
-
-    pub fn shape(&self) -> f64 {
-        self.shape
-    }
-}
-
-impl Distribution for ParetoDistribution {
-    fn sample(&mut self) -> f64 {
-        self.dist.sample(&mut self.rng)
-    }
-
-    fn name(&self) -> &'static str {
-        "Pareto"
-    }
-}
-
-/// Generalized Pareto distribution with location parameter
-pub struct GeneralizedParetoDistribution {
-    location: f64,
-    scale: f64,
-    shape: f64,
-    rng: SmallRng,
-}
-
-impl GeneralizedParetoDistribution {
-    pub fn new(location: f64, scale: f64, shape: f64) -> anyhow::Result<Self> {
-        Self::with_seed(location, scale, shape, None)
-    }
-
-    pub fn with_seed(
-        location: f64,
-        scale: f64,
-        shape: f64,
-        seed: Option<u64>,
-    ) -> anyhow::Result<Self> {
-        if scale <= 0.0 {
-            anyhow::bail!("Generalized Pareto scale must be > 0");
-        }
-
-        let rng = match seed {
-            Some(s) => SmallRng::seed_from_u64(s),
-            None => SmallRng::from_os_rng(),
-        };
-
-        Ok(Self { location, scale, shape, rng })
-    }
-
-    pub fn location(&self) -> f64 {
-        self.location
-    }
-
-    pub fn scale(&self) -> f64 {
-        self.scale
-    }
-
-    pub fn shape(&self) -> f64 {
-        self.shape
-    }
-
-    fn inv_cdf(&self, u: f64) -> f64 {
-        if self.shape.abs() < 1e-10 {
-            self.location - self.scale * (1.0 - u).ln()
-        } else {
-            self.location + self.scale * ((1.0 - u).powf(-self.shape) - 1.0) / self.shape
-        }
-    }
-}
-
-impl Distribution for GeneralizedParetoDistribution {
-    fn sample(&mut self) -> f64 {
-        use rand::Rng;
-        let u: f64 = self.rng.random();
-        self.inv_cdf(u)
-    }
-
-    fn name(&self) -> &'static str {
-        "GeneralizedPareto"
-    }
-}
-
-/// Generalized Extreme Value (GEV) distribution
-pub struct GevDistribution {
-    location: f64,
-    scale: f64,
-    shape: f64,
-    rng: SmallRng,
-}
-
-impl GevDistribution {
-    pub fn new(location: f64, scale: f64, shape: f64) -> anyhow::Result<Self> {
-        Self::with_seed(location, scale, shape, None)
-    }
-
-    pub fn with_seed(
-        location: f64,
-        scale: f64,
-        shape: f64,
-        seed: Option<u64>,
-    ) -> anyhow::Result<Self> {
-        if scale <= 0.0 {
-            anyhow::bail!("GEV scale must be > 0");
-        }
-
-        let rng = match seed {
-            Some(s) => SmallRng::seed_from_u64(s),
-            None => SmallRng::from_os_rng(),
-        };
-
-        Ok(Self { location, scale, shape, rng })
-    }
-
-    pub fn location(&self) -> f64 {
-        self.location
-    }
-
-    pub fn scale(&self) -> f64 {
-        self.scale
-    }
-
-    pub fn shape(&self) -> f64 {
-        self.shape
-    }
-
-    fn inv_cdf(&self, u: f64) -> f64 {
-        let y = -u.ln();
-        if self.shape.abs() < 1e-10 {
-            self.location - self.scale * y.ln()
-        } else {
-            self.location + self.scale * (y.powf(-self.shape) - 1.0) / self.shape
-        }
-    }
-}
-
-impl Distribution for GevDistribution {
-    fn sample(&mut self) -> f64 {
-        use rand::Rng;
-        let u: f64 = self.rng.random();
-        self.inv_cdf(u)
-    }
-
-    fn name(&self) -> &'static str {
-        "GEV"
-    }
-}
-
-/// Bimodal distribution (two distinct modes)
-pub struct BimodalDistribution {
-    low: f64,
-    high: f64,
-    prob: f64,
-    rng: SmallRng,
-}
-
-impl BimodalDistribution {
-    pub fn new(low: f64, high: f64, prob: f64) -> anyhow::Result<Self> {
-        Self::with_seed(low, high, prob, None)
-    }
-
-    pub fn with_seed(low: f64, high: f64, prob: f64, seed: Option<u64>) -> anyhow::Result<Self> {
-        if !(0.0..=1.0).contains(&prob) {
-            anyhow::bail!("Bimodal prob must be in [0.0, 1.0]");
-        }
-
-        let rng = match seed {
-            Some(s) => SmallRng::seed_from_u64(s),
-            None => SmallRng::from_os_rng(),
-        };
-
-        Ok(Self { low, high, prob, rng })
-    }
-
-    pub fn low(&self) -> f64 {
-        self.low
-    }
-
-    pub fn high(&self) -> f64 {
-        self.high
-    }
-
-    pub fn prob(&self) -> f64 {
-        self.prob
-    }
-}
-
-impl Distribution for BimodalDistribution {
-    fn sample(&mut self) -> f64 {
-        use rand::Rng;
-        let u: f64 = self.rng.random();
-        if u <= self.prob {
-            self.low
-        } else {
-            self.high
-        }
-    }
-
-    fn name(&self) -> &'static str {
-        "Bimodal"
-    }
-}
-
-/// Log-normal distribution
-pub struct LognormalDistribution {
-    mu: f64,
-    sigma: f64,
-    rng: SmallRng,
-    dist: LogNormal<f64>,
-}
-
-impl LognormalDistribution {
-    pub fn new(mu: f64, sigma: f64) -> anyhow::Result<Self> {
-        Self::with_seed(mu, sigma, None)
-    }
-
-    pub fn with_seed(mu: f64, sigma: f64, seed: Option<u64>) -> anyhow::Result<Self> {
-        if sigma <= 0.0 {
-            anyhow::bail!("Lognormal sigma must be > 0");
-        }
-
-        let rng = match seed {
-            Some(s) => SmallRng::seed_from_u64(s),
-            None => SmallRng::from_os_rng(),
-        };
-        let dist = LogNormal::new(mu, sigma)?;
-
-        Ok(Self { mu, sigma, rng, dist })
-    }
-
-    pub fn mu(&self) -> f64 {
-        self.mu
-    }
-
-    pub fn sigma(&self) -> f64 {
-        self.sigma
-    }
-}
-
-impl Distribution for LognormalDistribution {
-    fn sample(&mut self) -> f64 {
-        self.dist.sample(&mut self.rng)
-    }
-
-    fn name(&self) -> &'static str {
-        "Lognormal"
-    }
-}
-
-/// Gamma distribution
-pub struct GammaDistribution {
-    shape: f64,
-    scale: f64,
-    rng: SmallRng,
-    dist: Gamma<f64>,
-}
-
-impl GammaDistribution {
-    pub fn new(shape: f64, scale: f64) -> anyhow::Result<Self> {
-        Self::with_seed(shape, scale, None)
-    }
-
-    pub fn with_seed(shape: f64, scale: f64, seed: Option<u64>) -> anyhow::Result<Self> {
-        if shape <= 0.0 {
-            anyhow::bail!("Gamma shape must be > 0");
-        }
-        if scale <= 0.0 {
-            anyhow::bail!("Gamma scale must be > 0");
-        }
-
-        let rng = match seed {
-            Some(s) => SmallRng::seed_from_u64(s),
-            None => SmallRng::from_os_rng(),
-        };
-        let dist = Gamma::new(shape, scale)?;
-
-        Ok(Self { shape, scale, rng, dist })
-    }
-
-    pub fn shape(&self) -> f64 {
-        self.shape
-    }
-
-    pub fn scale(&self) -> f64 {
-        self.scale
-    }
-}
-
-impl Distribution for GammaDistribution {
-    fn sample(&mut self) -> f64 {
-        self.dist.sample(&mut self.rng)
-    }
-
-    fn name(&self) -> &'static str {
-        "Gamma"
-    }
-}
-
-/// Facebook inter-arrival time distribution (fb_ia)
-pub struct FacebookInterArrivalDistribution {
-    inner: GeneralizedParetoDistribution,
-}
-
-impl FacebookInterArrivalDistribution {
-    pub fn new() -> anyhow::Result<Self> {
-        Self::with_seed(None)
-    }
-
-    pub fn with_seed(seed: Option<u64>) -> anyhow::Result<Self> {
-        let inner = GeneralizedParetoDistribution::with_seed(0.0, 16.0292, 0.154971, seed)?;
-        Ok(Self { inner })
-    }
-}
-
-impl Default for FacebookInterArrivalDistribution {
-    fn default() -> Self {
-        Self::new().expect("Facebook IA distribution should always be valid")
-    }
-}
-
-impl Distribution for FacebookInterArrivalDistribution {
-    fn sample(&mut self) -> f64 {
-        self.inner.sample()
-    }
-
-    fn name(&self) -> &'static str {
-        "FacebookIA"
-    }
-}
-
-/// Facebook key size distribution (fb_key)
-pub struct FacebookKeySizeDistribution {
-    inner: GevDistribution,
-}
-
-impl FacebookKeySizeDistribution {
-    pub fn new() -> anyhow::Result<Self> {
-        Self::with_seed(None)
-    }
-
-    pub fn with_seed(seed: Option<u64>) -> anyhow::Result<Self> {
-        let inner = GevDistribution::with_seed(30.7984, 8.20449, 0.078688, seed)?;
-        Ok(Self { inner })
-    }
-}
-
-impl Default for FacebookKeySizeDistribution {
-    fn default() -> Self {
-        Self::new().expect("Facebook key size distribution should always be valid")
-    }
-}
-
-impl Distribution for FacebookKeySizeDistribution {
-    fn sample(&mut self) -> f64 {
-        self.inner.sample()
-    }
-
-    fn name(&self) -> &'static str {
-        "FacebookKeySize"
-    }
-}
-
-/// Facebook value size distribution (fb_val)
-pub struct FacebookValueSizeDistribution {
-    inner: GeneralizedParetoDistribution,
-}
-
-impl FacebookValueSizeDistribution {
-    pub fn new() -> anyhow::Result<Self> {
-        Self::with_seed(None)
-    }
-
-    pub fn with_seed(seed: Option<u64>) -> anyhow::Result<Self> {
-        let inner = GeneralizedParetoDistribution::with_seed(15.0, 214.476, 0.348238, seed)?;
-        Ok(Self { inner })
-    }
-}
-
-impl Default for FacebookValueSizeDistribution {
-    fn default() -> Self {
-        Self::new().expect("Facebook value size distribution should always be valid")
-    }
-}
-
-impl Distribution for FacebookValueSizeDistribution {
-    fn sample(&mut self) -> f64 {
-        self.inner.sample()
-    }
-
-    fn name(&self) -> &'static str {
-        "FacebookValueSize"
     }
 }
 

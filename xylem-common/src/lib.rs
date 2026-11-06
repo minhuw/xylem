@@ -8,10 +8,8 @@ pub mod request;
 pub mod distributions;
 
 pub use distributions::{
-    BimodalDistribution, Distribution, ExponentialDistribution, FacebookInterArrivalDistribution,
-    FacebookKeySizeDistribution, FacebookValueSizeDistribution, GammaDistribution,
-    GeneralizedParetoDistribution, GevDistribution, LognormalDistribution, NormalDistribution,
-    ParetoDistribution, UniformDistribution, ZipfianDistribution,
+    Distribution, ExponentialDistribution, NormalDistribution, UniformDistribution,
+    ZipfianDistribution,
 };
 
 pub use request::{Request, RequestMeta};

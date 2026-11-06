@@ -8,12 +8,6 @@ pub mod patterns;
 
 // Re-export distributions from xylem-common
 pub use xylem_common::distributions;
-pub use xylem_common::{
-    BimodalDistribution, Distribution, ExponentialDistribution, FacebookInterArrivalDistribution,
-    FacebookKeySizeDistribution, FacebookValueSizeDistribution, GammaDistribution,
-    GeneralizedParetoDistribution, GevDistribution, LognormalDistribution, NormalDistribution,
-    ParetoDistribution, UniformDistribution, ZipfianDistribution,
-};
 
 // Re-export load patterns
 pub use patterns::{LoadPattern, RampPattern, SawtoothPattern, SinusoidalPattern, SpikePattern};
