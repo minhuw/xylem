@@ -129,18 +129,6 @@ impl RedisClusterGuard {
     pub fn get_node_ports(&self) -> Vec<u16> {
         vec![7000, 7001, 7002]
     }
-
-    /// Get the seed node address (first node)
-    pub fn get_seed_node(&self) -> String {
-        "127.0.0.1:7000".to_string()
-    }
-
-    /// Get cluster slot assignments
-    ///
-    /// Returns a map of (start_slot, end_slot, port)
-    pub fn get_slot_assignments(&self) -> Vec<(u16, u16, u16)> {
-        vec![(0, 5460, 7000), (5461, 10922, 7001), (10923, 16383, 7002)]
-    }
 }
 
 impl Drop for RedisClusterGuard {
@@ -171,75 +159,6 @@ impl Drop for RedisClusterGuard {
                 .status();
         }
     }
-}
-
-/// Trigger a slot migration for testing
-///
-/// This will put a slot into migration state:
-/// - Source node: MIGRATING state
-/// - Target node: IMPORTING state
-///
-/// # Arguments
-///
-/// * `from_port` - Source node port
-/// * `to_port` - Target node port
-/// * `slot` - Slot number to migrate
-///
-/// # Example
-///
-/// ```ignore
-/// migrate_slot(7000, 7001, 100)?;
-/// // Slot 100 is now in migration from node 7000 to node 7001
-/// ```
-pub fn migrate_slot(
-    from_port: u16,
-    to_port: u16,
-    slot: u16,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Get node IDs
-    let from_id = get_node_id(from_port)?;
-    let to_id = get_node_id(to_port)?;
-
-    // Mark slot as importing on target node
-    Command::new("redis-cli")
-        .args([
-            "-p",
-            &to_port.to_string(),
-            "cluster",
-            "setslot",
-            &slot.to_string(),
-            "importing",
-            &from_id,
-        ])
-        .status()?;
-
-    // Mark slot as migrating on source node
-    Command::new("redis-cli")
-        .args([
-            "-p",
-            &from_port.to_string(),
-            "cluster",
-            "setslot",
-            &slot.to_string(),
-            "migrating",
-            &to_id,
-        ])
-        .status()?;
-
-    Ok(())
-}
-
-/// Get the cluster node ID for a given port
-fn get_node_id(port: u16) -> Result<String, Box<dyn std::error::Error>> {
-    let output = Command::new("redis-cli")
-        .args(["-p", &port.to_string(), "cluster", "myid"])
-        .output()?;
-
-    if !output.status.success() {
-        return Err(format!("Failed to get node ID for port {}", port).into());
-    }
-
-    Ok(String::from_utf8(output.stdout)?.trim().to_string())
 }
 
 // Guard lifecycle tests moved to tests/guard_lifecycle.rs to avoid

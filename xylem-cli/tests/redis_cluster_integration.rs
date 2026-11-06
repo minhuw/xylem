@@ -160,23 +160,6 @@ fn test_moved_redirect_response() {
 }
 
 #[test]
-fn test_slot_migration_ask_redirect() {
-    let _cluster = RedisClusterGuard::new().expect("Failed to start cluster");
-
-    // This test would trigger a slot migration and verify ASK redirects
-    // For now, this is a placeholder as it requires more complex setup
-
-    // Steps would be:
-    // 1. Use common::redis_cluster::migrate_slot(7000, 7001, 100)
-    // 2. SET a key in slot 100
-    // 3. Query without cluster mode, expect ASK redirect
-    // 4. Complete the migration
-    // 5. Clean up
-
-    println!("Slot migration test not yet implemented - requires redis-cli cluster commands");
-}
-
-#[test]
 fn test_cluster_info_command() {
     let cluster = RedisClusterGuard::new().expect("Failed to start cluster");
 
