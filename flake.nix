@@ -159,11 +159,10 @@
           doCheck = false;
 
           # Move DWARF into a separate `debug` output for profile symbolization. separateDebugInfo
-          # appends `-g` to the rustc flags, so the level has to be appended after it.
+          # asks for it through NIX_RUSTFLAGS, which only nixpkgs' wrapped rustc reads, so the level
+          # is set in the cargo profile (the cargo build hook already turns its stripping off).
           separateDebugInfo = true;
-          preBuild = ''
-            export NIX_RUSTFLAGS+=" -C debuginfo=limited"
-          '';
+          CARGO_PROFILE_RELEASE_DEBUG = "limited";
 
           # Rhea's bench packaging contract: debug/share/rhea/sources/<name> is the source tree the build
           # had at <build dir>/<name>, which DWARF paths refer to; profilers then need nothing else.
