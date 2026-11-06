@@ -6,10 +6,12 @@ Use the configuration-aware constructors for workloads driven by configuration:
 - `RedisClusterProtocol::from_config(&RedisConfig, seed)`
 - `MemcachedAsciiProtocol::from_config(&MemcachedConfig, seed)`
 - `MemcachedBinaryProtocol::from_config(&MemcachedConfig, seed)`
+- `MasstreeProtocol::from_config(&MasstreeConfig, seed)`
 - `HttpProtocol::from_config(&HttpConfig)`
 
-Public factories delegate to these constructors. Existing low-level constructors
-remain available. Redis callers assembling their own workloads can share
+Public factories delegate to these constructors; Masstree has no factory, and
+its constructor sends a configured `value_size` at its representative fixed
+size. Existing low-level constructors remain available. Redis callers assembling their own workloads can share
 `RedisConfig::command_selector(seed)` and
 `factories::parse_redis_operation(command, params)`.
 

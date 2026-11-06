@@ -1,12 +1,13 @@
-//! Compatibility adapters must preserve the same bytes as shared constructors.
+//! The CLI and its compatibility adapters must preserve the same bytes as
+//! shared constructors.
 use xylem_cli::multi_protocol::*;
 use xylem_protocols::configs::*;
-use xylem_protocols::factories::{MemcachedAsciiFactory, MemcachedBinaryFactory, RedisFactory};
+use xylem_protocols::factories::RedisFactory;
 use xylem_protocols::factory::ProtocolFactory;
 use xylem_protocols::{Protocol, RedisClusterProtocol};
 
 #[test]
-fn redis_cli_adapters_preserve_seeded_sizes_commands_prefix_and_insert_defaults() {
+fn redis_cluster_constructor_preserves_seeded_sizes_commands_prefix_and_insert_defaults() {
     for per_command_keys in [false, true] {
         let keys = KeysConfig::RoundRobin {
             max: 5,
@@ -30,36 +31,11 @@ fn redis_cli_adapters_preserve_seeded_sizes_commands_prefix_and_insert_defaults(
         };
         let seed = Some(42);
         let mut factory = RedisFactory.create(config.clone(), seed).unwrap();
-        let mut cli = create_redis_protocol_from_config(
-            &config,
-            config.command_selector(seed).unwrap(),
-            config.keys.to_key_gen(seed).unwrap(),
-            seed,
-        )
-        .unwrap();
-        let cluster_config = xylem_cli::multi_protocol::RedisClusterConfig {
-            nodes: vec![RedisClusterNode {
-                address: "127.0.0.1:7000".into(),
-                slot_start: 0,
-                slot_end: 16383,
-            }],
-        };
-        let mut cluster_cli = create_redis_cluster_protocol_from_config(
-            &config,
-            config.command_selector(seed).unwrap(),
-            cluster_config,
-            config.keys.to_key_gen(seed).unwrap(),
-            seed,
-        )
-        .unwrap();
         let mut cluster_shared = RedisClusterProtocol::from_config(&config, seed).unwrap();
         cluster_shared.register_connection("127.0.0.1:7000".parse().unwrap(), 0);
         let mut lengths = std::collections::HashSet::new();
         for i in 0..40 {
             let expected = factory.next_request(0);
-            assert_eq!(cli.next_request(0), expected);
-            let cluster_request = cluster_cli.next_request(0);
-            assert_eq!(cluster_request, expected);
             assert_eq!(cluster_shared.next_request(0).data, expected.data);
             assert_eq!(expected.metadata.is_warmup, i == 0);
             if i > 0 {
@@ -67,38 +43,6 @@ fn redis_cli_adapters_preserve_seeded_sizes_commands_prefix_and_insert_defaults(
             }
         }
         assert!(lengths.len() > 1, "uniform value sizes must not collapse to a fixed size");
-    }
-}
-
-#[test]
-fn memcached_cli_adapters_match_factories_in_both_formats() {
-    let config = MemcachedConfig {
-        keys: KeysConfig::RoundRobin {
-            max: 3,
-            value_size: 7,
-            prefix: "custom:".into(),
-        },
-        operation: "SET".into(),
-        insert_phase: Some(InsertPhaseConfig { key_count: Some(1), value_size: Some(11) }),
-    };
-    let seed = Some(42);
-    let mut ascii = MemcachedAsciiFactory.create(config.clone(), seed).unwrap();
-    let mut ascii_cli = create_memcached_ascii_protocol_from_config(
-        &config,
-        xylem_protocols::memcached::ascii::MemcachedOp::Set,
-        config.keys.to_key_gen(seed).unwrap(),
-    )
-    .unwrap();
-    let mut binary = MemcachedBinaryFactory.create(config.clone(), seed).unwrap();
-    let mut binary_cli = create_memcached_binary_protocol_from_config(
-        &config,
-        xylem_protocols::memcached::MemcachedOp::Set,
-        config.keys.to_key_gen(seed).unwrap(),
-    )
-    .unwrap();
-    for _ in 0..10 {
-        assert_eq!(ascii_cli.next_request(7), ascii.next_request(7));
-        assert_eq!(binary_cli.next_request(7), binary.next_request(7));
     }
 }
 

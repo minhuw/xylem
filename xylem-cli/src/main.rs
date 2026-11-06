@@ -465,14 +465,12 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                     xylem_cli::multi_protocol::create_xylem_echo_protocol()
                 }
                 (ParsedProtocolConfig::Masstree(mt_config), "masstree") => {
-                    let operation = parse_masstree_op(mt_config)?;
-                    let key_gen = mt_config.keys.to_key_gen(config_for_worker.experiment.seed)?;
-                    xylem_cli::multi_protocol::create_masstree_protocol_from_config(
-                        mt_config,
-                        operation,
-                        key_gen,
-                        config_for_worker.experiment.seed,
-                    )?
+                    xylem_cli::multi_protocol::MultiProtocol::Masstree(
+                        xylem_protocols::MasstreeProtocol::from_config(
+                            mt_config,
+                            config_for_worker.experiment.seed,
+                        )?,
+                    )
                 }
                 _ => return Err(anyhow::anyhow!("Unknown protocol: {}", protocol_name).into()),
             };
@@ -843,41 +841,4 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
     }
 
     Ok(())
-}
-
-/// Parse Masstree operation from config
-fn parse_masstree_op(
-    config: &xylem_protocols::MasstreeConfig,
-) -> anyhow::Result<xylem_protocols::MasstreeOp> {
-    match config.operation.to_lowercase().as_str() {
-        "get" => Ok(xylem_protocols::MasstreeOp::Get),
-        "set" => Ok(xylem_protocols::MasstreeOp::Set),
-        "put" => {
-            // For PUT, create column updates. Default to single column (0) with empty placeholder.
-            // The actual value will be filled in during request generation.
-            let num_columns = config.put_columns.unwrap_or(1);
-            let columns: Vec<(u32, Vec<u8>)> =
-                (0..num_columns as u32).map(|i| (i, Vec::new())).collect();
-            Ok(xylem_protocols::MasstreeOp::Put { columns })
-        }
-        "remove" => Ok(xylem_protocols::MasstreeOp::Remove),
-        "scan" => {
-            let scan_config = config.scan.as_ref();
-            let count = scan_config.map(|s| s.count as u32).unwrap_or(10);
-            // Convert string field names to u32 indices (assume numeric field names or use index)
-            let fields: Vec<u32> = scan_config
-                .map(|s| s.fields.iter().filter_map(|f| f.parse().ok()).collect())
-                .unwrap_or_default();
-            Ok(xylem_protocols::MasstreeOp::Scan {
-                firstkey: String::new(), // Will be set during request generation
-                count,
-                fields,
-            })
-        }
-        "checkpoint" => Ok(xylem_protocols::MasstreeOp::Checkpoint),
-        other => anyhow::bail!(
-            "Unknown Masstree operation: {}. Supported: get, set, put, remove, scan, checkpoint",
-            other
-        ),
-    }
 }
