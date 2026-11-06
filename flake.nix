@@ -37,15 +37,27 @@
           protobuf # Required for evalsync's prost-build
         ];
 
-        # Sources the Rust standard library was compiled from: library/ and the crates its Cargo.lock
-        # takes from vendor/, except the Windows-only ones, which no Unix build compiles. Std code
-        # inlined into xylem has DWARF paths into them (/build/rustc-<version>-src/...), so profilers
-        # can show its source.
-        rustSrcTop = pkgs.lib.removeSuffix ".tar.gz" pkgs.rustc.src.name;
-        rustStdSrc = pkgs.runCommand "rust-std-src-${pkgs.rustc.version}" { } ''
-          tar -tzf ${pkgs.rustc.src} > members
+        # The package is built with upstream Rust, whose prebuilt standard library has line tables
+        # (nixpkgs' rustc builds it without), so profilers can resolve std code to source lines.
+        rustVersion = "1.91.0";
+        rustPackageToolchain = pkgs.rust-bin.stable.${rustVersion}.minimal;
+        rustPlatform = pkgs.makeRustPlatform {
+          cargo = rustPackageToolchain;
+          rustc = rustPackageToolchain;
+        };
+
+        # Sources that standard library was compiled from: library/ and the crates its Cargo.lock
+        # takes from vendor/, except the Windows-only ones, which no Unix build compiles. Its DWARF
+        # paths are /rustc/<commit>/library/... and /rust/deps/<crate>-<version>/...
+        rustSrcTop = "rustc-${rustVersion}-src";
+        rustSrcTarball = pkgs.fetchurl {
+          url = "https://static.rust-lang.org/dist/${rustSrcTop}.tar.xz";
+          sha256 = "9b94161dba3aa32192e0e75f7891912d98095ffb86087b07a05af35a0265a938";
+        };
+        rustStdSrc = pkgs.runCommand "rust-std-src-${rustVersion}" { } ''
+          tar -tJf ${rustSrcTarball} > members
           mkdir -p $out
-          tar -xzf ${pkgs.rustc.src} -C $out ${rustSrcTop}/library
+          tar -xJf ${rustSrcTarball} -C $out ${rustSrcTop}/library
           # Registry packages of std's lockfile, as cargo vendor --versioned-dirs names them, without
           # windows-sys, windows-targets and the windows_<target> import libraries
           awk -F '"' '/^name = /{n=$2} /^version = /{v=$2} /^source = "registry/{print n "-" v}' \
@@ -53,7 +65,7 @@
           grep -oE '^${rustSrcTop}/vendor/[^/]+/' members | sort -u > vendored
           grep -F -f <(sed 's|.*|${rustSrcTop}/vendor/&/|' crates) -x vendored > needed
           echo "$(wc -l < needed) of $(wc -l < crates) non-Windows crates of library/Cargo.lock are vendored"
-          tar -xzf ${pkgs.rustc.src} -C $out $(sed 's|/$||' needed)
+          tar -xJf ${rustSrcTarball} -C $out $(sed 's|/$||' needed)
         '';
 
       in
@@ -128,7 +140,7 @@
         };
 
         # Package definition
-        packages.default = pkgs.rustPlatform.buildRustPackage {
+        packages.default = rustPlatform.buildRustPackage {
           pname = "xylem";
           version = "0.1.0";
 
@@ -154,11 +166,15 @@
           '';
 
           # Rhea's bench packaging contract: debug/share/rhea/sources/<name> is the source tree the build
-          # had at <build dir>/<name>, which DWARF paths refer to; profilers then need nothing else
+          # had at <build dir>/<name>, which DWARF paths refer to; profilers then need nothing else.
+          # Upstream remaps the standard library to /rustc/<commit> and its crates to /rust/deps.
           postFixup = ''
             sources=$debug/share/rhea/sources
             mkdir -p $sources
-            ln -s ${rustStdSrc}/* $sources/
+            commit=$(rustc -vV | sed -n 's/^commit-hash: //p')
+            [ -n "$commit" ] || { echo "rustc -vV gives no commit-hash" >&2; exit 1; }
+            ln -s ${rustStdSrc}/${rustSrcTop} $sources/$commit
+            ln -s ${rustStdSrc}/${rustSrcTop}/vendor $sources/deps
             ln -s $cargoDeps $sources/$(stripHash $cargoDeps)
             ln -s $src $sources/$(stripHash $src)
           '';
