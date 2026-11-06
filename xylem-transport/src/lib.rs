@@ -334,7 +334,7 @@ pub mod hw_timestamp;
 // =============================================================================
 
 pub use mux::{Multiplexer, MultiplexerType};
-pub use timestamp::Timestamp;
+pub use timestamp::{time_ns, Timestamp};
 
 pub use tcp::TcpTransport;
 pub use udp::UdpTransport;

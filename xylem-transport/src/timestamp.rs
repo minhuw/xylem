@@ -103,6 +103,8 @@ impl Timestamp {
 
 /// Calibration data for converting RDTSC cycles to nanoseconds
 struct TscCalibration {
+    /// Cycle count at the start of calibration; `time_ns` counts from here
+    start_cycles: u64,
     cycles_per_ns: f64,
 }
 
@@ -121,7 +123,7 @@ impl TscCalibration {
         let cycles = (end_cycles - start_cycles) as f64;
         let cycles_per_ns = cycles / elapsed_ns;
 
-        Self { cycles_per_ns }
+        Self { start_cycles, cycles_per_ns }
     }
 
     fn cycles_to_nanos(&self, cycles: u64) -> u64 {
@@ -133,6 +135,17 @@ impl TscCalibration {
 fn get_calibration() -> &'static TscCalibration {
     static CALIBRATION: std::sync::OnceLock<TscCalibration> = std::sync::OnceLock::new();
     CALIBRATION.get_or_init(TscCalibration::calibrate)
+}
+
+/// Get current time in nanoseconds since calibration
+///
+/// Reads the same counter and calibration as [`Timestamp`], using RDTSCP on
+/// x86_64 for minimal overhead (~20 cycles vs ~200+ for syscall).
+#[inline(always)]
+pub fn time_ns() -> u64 {
+    let calibration = get_calibration();
+    let cycles = rdtsc() - calibration.start_cycles;
+    calibration.cycles_to_nanos(cycles)
 }
 
 /// Read the CPU timestamp counter with serialization

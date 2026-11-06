@@ -2,43 +2,12 @@
 //!
 //! Provides timing functions with nanosecond precision for accurate latency measurement.
 //! Uses RDTSCP on x86_64 for minimal overhead (~20 cycles vs ~200+ for clock_gettime syscall).
-
-use std::sync::OnceLock;
-use std::time::{Duration, Instant};
-
-/// Calibration: (start_cycles, cycles_per_ns)
-static CALIBRATION: OnceLock<(u64, f64)> = OnceLock::new();
-
-fn calibrate() -> (u64, f64) {
-    let start_cycles = rdtsc();
-    let start_instant = Instant::now();
-    std::thread::sleep(Duration::from_millis(10));
-    let end_cycles = rdtsc();
-    let elapsed_ns = start_instant.elapsed().as_nanos() as f64;
-    let cycles_per_ns = (end_cycles - start_cycles) as f64 / elapsed_ns;
-    (start_cycles, cycles_per_ns)
-}
-
-/// Read the CPU timestamp counter with serialization (RDTSCP)
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-fn rdtsc() -> u64 {
-    unsafe {
-        let mut _aux: u32 = 0;
-        core::arch::x86_64::__rdtscp(&mut _aux)
-    }
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-#[inline(always)]
-fn rdtsc() -> u64 {
-    static START: OnceLock<Instant> = OnceLock::new();
-    START.get_or_init(Instant::now).elapsed().as_nanos() as u64
-}
+//! The clock and its calibration live in `xylem_transport`, shared with `Timestamp`.
 
 /// Get current time in nanoseconds since calibration
 ///
 /// Uses RDTSCP on x86_64 for minimal overhead (~20 cycles vs ~200+ for syscall).
+/// Wraps [`xylem_transport::time_ns`].
 ///
 /// # Example
 /// ```
@@ -51,9 +20,7 @@ fn rdtsc() -> u64 {
 /// ```
 #[inline(always)]
 pub fn time_ns() -> u64 {
-    let &(start_cycles, cycles_per_ns) = CALIBRATION.get_or_init(calibrate);
-    let cycles = rdtsc() - start_cycles;
-    (cycles as f64 / cycles_per_ns) as u64
+    xylem_transport::time_ns()
 }
 
 /// Busy-wait until the target time is reached
