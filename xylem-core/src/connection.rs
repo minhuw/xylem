@@ -1349,10 +1349,6 @@ pub(crate) mod test_support {
             let data = io.responses.pop_front().unwrap_or_else(|| Ok(Vec::new()))?;
             Ok((data, io.timestamp))
         }
-
-        fn is_connected(&self) -> bool {
-            !self.0.lock().unwrap().closed
-        }
     }
 
     pub struct FakeGroup {

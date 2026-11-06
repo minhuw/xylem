@@ -9,11 +9,12 @@
 //! Note: Unix sockets use file paths, not network addresses. The ConnectionGroup API
 //! uses `add_connection_path()` instead of `add_connection()`.
 
+use crate::group::{GroupCore, GroupSocket};
 use crate::mux::{Interest, Multiplexer, MultiplexerType};
 use crate::{ConnectionGroup, Error, GroupConnection, Result, Timestamp, TransportFactory};
-use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -163,6 +164,12 @@ impl UnixConn {
     }
 }
 
+impl GroupSocket for UnixConn {
+    fn socket_fd(&self) -> RawFd {
+        self.stream.as_raw_fd()
+    }
+}
+
 impl GroupConnection for UnixConn {
     fn send(&mut self, data: &[u8]) -> Result<(Timestamp, u32, u32)> {
         if !self.connected {
@@ -209,17 +216,11 @@ impl GroupConnection for UnixConn {
             Err(e) => Err(e.into()),
         }
     }
-
-    fn is_connected(&self) -> bool {
-        self.connected
-    }
 }
 
 /// A group of Unix socket connections sharing a single multiplexer
 pub struct UnixConnectionGroup {
-    mux: Multiplexer,
-    connections: HashMap<usize, UnixConn>,
-    next_id: usize,
+    core: GroupCore<UnixConn>,
 }
 
 impl UnixConnectionGroup {
@@ -228,45 +229,24 @@ impl UnixConnectionGroup {
     }
 
     pub fn with_multiplexer(mux_type: MultiplexerType) -> Result<Self> {
-        Ok(Self {
-            mux: Multiplexer::new(mux_type)?,
-            connections: HashMap::new(),
-            next_id: 0,
-        })
+        Ok(Self { core: GroupCore::new(mux_type)? })
     }
 
     /// Add a connection by Unix socket path
     pub fn add_connection_path<P: AsRef<Path>>(&mut self, path: P) -> Result<usize> {
-        let conn_id = self.next_id;
-        self.next_id += 1;
+        let conn_id = self.core.reserve_id();
 
         let path = path.as_ref();
         let stream = UnixStream::connect(path)?;
         stream.set_nonblocking(true)?;
 
-        // Use a temporary multiplexer for connection establishment to avoid
-        // mixing connection events with other connections in the group
-        let mut temp_mux = Multiplexer::new(self.mux.mux_type())?;
-        temp_mux.register_fd(&stream, 0, Interest::BOTH)?;
+        self.core.wait_for_connect(&stream)?;
 
-        // Poll for connection complete
-        for _ in 0..50 {
-            let events = temp_mux.wait(Some(Duration::from_millis(100)))?;
-
-            let connected = events.iter().any(|e| e.id == 0 && e.writable);
-            if !connected {
-                continue;
-            }
-
-            // Connection successful - deregister from temp and register with main mux
-            let _ = temp_mux.deregister_fd(&stream);
-            self.mux.register_fd(&stream, conn_id, Interest::READABLE)?;
-            let conn = UnixConn::new(stream);
-            self.connections.insert(conn_id, conn);
-            return Ok(conn_id);
-        }
-
-        Err(Error::Connection("Connection timeout".to_string()))
+        // Connection successful - register with main mux
+        self.core.register_readable(&stream, conn_id)?;
+        let conn = UnixConn::new(stream);
+        self.core.insert(conn_id, conn);
+        Ok(conn_id)
     }
 }
 
@@ -286,42 +266,27 @@ impl ConnectionGroup for UnixConnectionGroup {
     }
 
     fn get(&self, conn_id: usize) -> Option<&Self::Conn> {
-        self.connections.get(&conn_id)
+        self.core.get(conn_id)
     }
 
     fn get_mut(&mut self, conn_id: usize) -> Option<&mut Self::Conn> {
-        self.connections.get_mut(&conn_id)
+        self.core.get_mut(conn_id)
     }
 
     fn poll(&mut self, timeout: Option<Duration>) -> Result<Vec<usize>> {
-        let events = self.mux.wait(timeout)?;
-        let ready: Vec<usize> = events
-            .iter()
-            .filter(|e| e.readable)
-            .map(|e| e.id)
-            .filter(|id| self.connections.contains_key(id))
-            .collect();
-        Ok(ready)
+        self.core.poll(timeout)
     }
 
     fn len(&self) -> usize {
-        self.connections.len()
+        self.core.len()
     }
 
     fn close(&mut self, conn_id: usize) -> Result<()> {
-        if let Some(mut conn) = self.connections.remove(&conn_id) {
-            conn.connected = false;
-            let _ = self.mux.deregister_fd(&conn.stream);
-        }
-        Ok(())
+        self.core.close(conn_id)
     }
 
     fn close_all(&mut self) -> Result<()> {
-        let conn_ids: Vec<usize> = self.connections.keys().copied().collect();
-        for conn_id in conn_ids {
-            self.close(conn_id)?;
-        }
-        Ok(())
+        self.core.close_all()
     }
 }
 
@@ -623,6 +588,56 @@ mod tests {
 
         group.close_all().unwrap();
         assert_eq!(group.len(), 0);
+    }
+
+    #[test]
+    fn test_unix_group_ids_are_not_reused() {
+        let temp_dir = TempDir::new().unwrap();
+        let socket_path = temp_dir.path().join("ids_group.sock");
+
+        let server_path = socket_path.clone();
+        let listener = UnixListener::bind(&server_path).unwrap();
+
+        thread::spawn(move || {
+            for _ in 0..5 {
+                let _ = listener.accept();
+            }
+        });
+
+        thread::sleep(Duration::from_millis(10));
+
+        let mut group = UnixConnectionGroup::new().unwrap();
+        assert_eq!(group.add_connection_path(&socket_path).unwrap(), 0);
+        assert_eq!(group.add_connection_path(&socket_path).unwrap(), 1);
+        assert_eq!(group.add_connection_path(&socket_path).unwrap(), 2);
+
+        // Closing a middle id must not let the next connection reuse it or
+        // the current length
+        group.close(1).unwrap();
+        assert!(group.get(1).is_none());
+        assert!(group.get_mut(1).is_none());
+        assert_eq!(group.len(), 2);
+
+        assert_eq!(group.add_connection_path(&socket_path).unwrap(), 3);
+        assert_eq!(group.len(), 3);
+        assert!(group.get(0).is_some());
+        assert!(group.get(1).is_none());
+        assert!(group.get(2).is_some());
+        assert!(group.get(3).is_some());
+
+        // Closing the highest id must not let the next connection reuse it
+        group.close(3).unwrap();
+        assert!(group.get(3).is_none());
+        assert!(group.get_mut(3).is_none());
+        assert_eq!(group.len(), 2);
+
+        assert_eq!(group.add_connection_path(&socket_path).unwrap(), 4);
+        assert_eq!(group.len(), 3);
+        assert!(group.get(0).is_some());
+        assert!(group.get(1).is_none());
+        assert!(group.get(2).is_some());
+        assert!(group.get(3).is_none());
+        assert!(group.get(4).is_some());
     }
 
     #[test]

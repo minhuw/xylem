@@ -229,9 +229,6 @@ pub trait GroupConnection: Send {
     ///
     /// Returns empty data if no data is available (non-blocking).
     fn recv(&mut self) -> Result<(Vec<u8>, Timestamp)>;
-
-    /// Check if this connection is established
-    fn is_connected(&self) -> bool;
 }
 
 /// A group of connections that can be polled together efficiently
@@ -317,6 +314,8 @@ pub trait TransportFactory: Send + Sync {
 // Module declarations
 // =============================================================================
 
+// Connection-group code shared by the tcp, udp, and unix modules
+mod group;
 pub mod mux;
 pub mod tcp;
 mod timestamp;

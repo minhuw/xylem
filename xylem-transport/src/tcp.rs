@@ -11,70 +11,26 @@
 //! NIC supports them, with automatic fallback to software timestamps.
 //! Configure via `TcpTimestampConfig`.
 
+use crate::group::{GroupCore, GroupSocket, TimestampConfig};
 use crate::mux::{Interest, Multiplexer, MultiplexerType};
 use crate::{
     ConnectionGroup, Error, GroupConnection, Result, Timestamp, Transport, TransportFactory,
 };
 use socket2::{Domain, Protocol, Socket, Type};
-use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::time::Duration;
 
 #[cfg(target_os = "linux")]
 use crate::hw_timestamp;
-#[cfg(target_os = "linux")]
-use std::os::unix::io::AsRawFd;
 
 const DEFAULT_RECV_BUFFER_SIZE: usize = 8192;
 
 /// Configuration for TCP timestamping (Linux only)
 ///
-/// On Linux, this configures kernel-level timestamping for more accurate
-/// latency measurement. Falls back to software timestamps if HW not available.
-///
-/// By default, kernel timestamps are enabled on Linux.
-#[derive(Debug, Clone)]
-pub struct TcpTimestampConfig {
-    /// Network interface to bind to for hardware timestamping (e.g., "eth0")
-    /// If None, no interface binding is performed.
-    #[cfg(target_os = "linux")]
-    pub interface: Option<String>,
-
-    /// Whether to enable kernel timestamping on sockets
-    /// When true, uses SO_TIMESTAMPING for RX timestamps
-    /// Default: true on Linux
-    #[cfg(target_os = "linux")]
-    pub enable_timestamps: bool,
-}
-
-impl Default for TcpTimestampConfig {
-    fn default() -> Self {
-        Self {
-            #[cfg(target_os = "linux")]
-            interface: None,
-            #[cfg(target_os = "linux")]
-            enable_timestamps: true, // Enable by default on Linux
-        }
-    }
-}
-
-impl TcpTimestampConfig {
-    /// Create config with timestamping enabled (no interface binding)
-    #[cfg(target_os = "linux")]
-    pub fn with_timestamps() -> Self {
-        Self { interface: None, enable_timestamps: true }
-    }
-
-    /// Create config with timestamping and interface binding
-    #[cfg(target_os = "linux")]
-    pub fn with_interface(interface: impl Into<String>) -> Self {
-        Self {
-            interface: Some(interface.into()),
-            enable_timestamps: true,
-        }
-    }
-}
+/// The same configuration type as `UdpTimestampConfig`.
+pub type TcpTimestampConfig = TimestampConfig;
 
 pub struct TcpTransport {
     stream: Option<TcpStream>,
@@ -244,16 +200,15 @@ impl TcpConn {
             timestamps_enabled,
         }
     }
+}
 
-    /// Get the raw file descriptor (for polling TX timestamps)
-    #[cfg(target_os = "linux")]
-    pub(crate) fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+impl GroupSocket for TcpConn {
+    fn socket_fd(&self) -> RawFd {
         self.stream.as_raw_fd()
     }
 
-    /// Check if timestamps are enabled
     #[cfg(target_os = "linux")]
-    pub(crate) fn timestamps_enabled(&self) -> bool {
+    fn timestamps_enabled(&self) -> bool {
         self.timestamps_enabled
     }
 }
@@ -302,10 +257,6 @@ impl GroupConnection for TcpConn {
         // Standard recv without kernel timestamps
         self.recv_standard()
     }
-
-    fn is_connected(&self) -> bool {
-        self.connected
-    }
 }
 
 impl TcpConn {
@@ -350,9 +301,7 @@ impl TcpConn {
 
 /// A group of TCP connections sharing a single multiplexer
 pub struct TcpConnectionGroup {
-    mux: Multiplexer,
-    connections: HashMap<usize, TcpConn>,
-    next_id: usize,
+    core: GroupCore<TcpConn>,
     /// Timestamp configuration for new connections
     #[cfg(target_os = "linux")]
     timestamp_config: TcpTimestampConfig,
@@ -365,9 +314,7 @@ impl TcpConnectionGroup {
 
     pub fn with_multiplexer(mux_type: MultiplexerType) -> Result<Self> {
         Ok(Self {
-            mux: Multiplexer::new(mux_type)?,
-            connections: HashMap::new(),
-            next_id: 0,
+            core: GroupCore::new(mux_type)?,
             #[cfg(target_os = "linux")]
             timestamp_config: TcpTimestampConfig::default(),
         })
@@ -380,44 +327,9 @@ impl TcpConnectionGroup {
         timestamp_config: TcpTimestampConfig,
     ) -> Result<Self> {
         Ok(Self {
-            mux: Multiplexer::new(mux_type)?,
-            connections: HashMap::new(),
-            next_id: 0,
+            core: GroupCore::new(mux_type)?,
             timestamp_config,
         })
-    }
-
-    /// Configure kernel timestamping on a socket (Linux only)
-    ///
-    /// Tries hardware timestamping first, falls back to software if unavailable.
-    /// Returns true if any form of kernel timestamping was enabled.
-    #[cfg(target_os = "linux")]
-    fn configure_timestamping(&self, fd: i32, conn_id: usize) -> bool {
-        // Bind to interface if specified
-        if let Some(ref interface) = self.timestamp_config.interface {
-            if let Err(e) = hw_timestamp::bind_to_device(fd, interface) {
-                tracing::warn!("Could not bind to device '{}': {}", interface, e);
-            }
-        }
-
-        // Try hardware timestamping first
-        if hw_timestamp::enable_socket_timestamping(fd).is_ok() {
-            tracing::debug!("Hardware timestamping enabled for connection {}", conn_id);
-            return true;
-        }
-
-        // Fallback to software timestamps
-        tracing::debug!("Hardware timestamping not available, trying software");
-        match hw_timestamp::enable_software_timestamping(fd) {
-            Ok(()) => {
-                tracing::debug!("Software timestamping enabled for connection {}", conn_id);
-                true
-            }
-            Err(e) => {
-                tracing::warn!("Could not enable kernel timestamping: {}", e);
-                false
-            }
-        }
     }
 
     fn connect_with_timeout(&mut self, target: &SocketAddr, conn_id: usize) -> Result<TcpStream> {
@@ -438,31 +350,15 @@ impl TcpConnectionGroup {
 
         let stream: TcpStream = socket.into();
 
-        // Use a temporary multiplexer for connection establishment to avoid
-        // mixing connection events with other connections in the group
-        let mut temp_mux = Multiplexer::new(self.mux.mux_type())?;
-        temp_mux.register_fd(&stream, 0, Interest::BOTH)?;
+        self.core.wait_for_connect(&stream)?;
 
-        // Poll for connection complete
-        for _ in 0..50 {
-            let events = temp_mux.wait(Some(Duration::from_millis(100)))?;
-
-            let connected = events.iter().any(|e| e.id == 0 && e.writable);
-            if !connected {
-                continue;
-            }
-
-            if let Some(err) = stream.take_error()? {
-                return Err(Error::Connection(format!("Connection failed: {err}")));
-            }
-
-            // Connection successful - deregister from temp and register with main mux
-            let _ = temp_mux.deregister_fd(&stream);
-            self.mux.register_fd(&stream, conn_id, Interest::READABLE)?;
-            return Ok(stream);
+        if let Some(err) = stream.take_error()? {
+            return Err(Error::Connection(format!("Connection failed: {err}")));
         }
 
-        Err(Error::Connection("Connection timeout".to_string()))
+        // Connection successful - register with main mux
+        self.core.register_readable(&stream, conn_id)?;
+        Ok(stream)
     }
 }
 
@@ -476,8 +372,7 @@ impl ConnectionGroup for TcpConnectionGroup {
     type Conn = TcpConn;
 
     fn add_connection(&mut self, target: &SocketAddr) -> Result<usize> {
-        let conn_id = self.next_id;
-        self.next_id += 1;
+        let conn_id = self.core.reserve_id();
 
         let stream = self.connect_with_timeout(target, conn_id)?;
 
@@ -485,7 +380,7 @@ impl ConnectionGroup for TcpConnectionGroup {
         #[cfg(target_os = "linux")]
         let conn = {
             let timestamps_enabled = if self.timestamp_config.enable_timestamps {
-                self.configure_timestamping(stream.as_raw_fd(), conn_id)
+                self.timestamp_config.configure_timestamping(stream.as_raw_fd(), "TCP", conn_id)
             } else {
                 false
             };
@@ -496,82 +391,38 @@ impl ConnectionGroup for TcpConnectionGroup {
         #[cfg(not(target_os = "linux"))]
         let conn = TcpConn::new(stream);
 
-        self.connections.insert(conn_id, conn);
+        self.core.insert(conn_id, conn);
 
         Ok(conn_id)
     }
 
     fn get(&self, conn_id: usize) -> Option<&Self::Conn> {
-        self.connections.get(&conn_id)
+        self.core.get(conn_id)
     }
 
     fn get_mut(&mut self, conn_id: usize) -> Option<&mut Self::Conn> {
-        self.connections.get_mut(&conn_id)
+        self.core.get_mut(conn_id)
     }
 
     fn poll(&mut self, timeout: Option<Duration>) -> Result<Vec<usize>> {
-        let events = self.mux.wait(timeout)?;
-        let ready: Vec<usize> = events
-            .iter()
-            .filter(|e| e.readable)
-            .map(|e| e.id)
-            .filter(|id| self.connections.contains_key(id))
-            .collect();
-        Ok(ready)
+        self.core.poll(timeout)
     }
 
     #[cfg(target_os = "linux")]
     fn poll_tx_timestamps(&mut self) -> Result<Vec<crate::TxTimestampInfo>> {
-        let mut results = Vec::new();
-
-        for (&conn_id, conn) in &self.connections {
-            if !conn.timestamps_enabled() {
-                continue;
-            }
-
-            let fd = conn.as_raw_fd();
-
-            // Poll error queue for TX timestamps (non-blocking)
-            loop {
-                match hw_timestamp::recv_tx_timestamp(fd) {
-                    Ok(Some((timestamp, opt_id))) => {
-                        results.push(crate::TxTimestampInfo {
-                            conn_id,
-                            tx_offset: opt_id,
-                            timestamp,
-                        });
-                    }
-                    Ok(None) => break, // No more timestamps available
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(e) => {
-                        tracing::trace!("Error polling TX timestamp for conn {}: {}", conn_id, e);
-                        break;
-                    }
-                }
-            }
-        }
-
-        Ok(results)
+        Ok(self.core.poll_tx_timestamps("TCP"))
     }
 
     fn len(&self) -> usize {
-        self.connections.len()
+        self.core.len()
     }
 
     fn close(&mut self, conn_id: usize) -> Result<()> {
-        if let Some(mut conn) = self.connections.remove(&conn_id) {
-            conn.connected = false;
-            let _ = self.mux.deregister_fd(&conn.stream);
-        }
-        Ok(())
+        self.core.close(conn_id)
     }
 
     fn close_all(&mut self) -> Result<()> {
-        let conn_ids: Vec<usize> = self.connections.keys().copied().collect();
-        for conn_id in conn_ids {
-            self.close(conn_id)?;
-        }
-        Ok(())
+        self.core.close_all()
     }
 }
 
@@ -905,6 +756,53 @@ mod tests {
 
         group.close_all().unwrap();
         assert_eq!(group.len(), 0);
+    }
+
+    #[test]
+    fn test_tcp_group_ids_are_not_reused() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        thread::spawn(move || {
+            for _ in 0..5 {
+                let _ = listener.accept();
+            }
+        });
+
+        thread::sleep(Duration::from_millis(10));
+
+        let mut group = TcpConnectionGroup::new().unwrap();
+        assert_eq!(group.add_connection(&addr).unwrap(), 0);
+        assert_eq!(group.add_connection(&addr).unwrap(), 1);
+        assert_eq!(group.add_connection(&addr).unwrap(), 2);
+
+        // Closing a middle id must not let the next connection reuse it or
+        // the current length
+        group.close(1).unwrap();
+        assert!(group.get(1).is_none());
+        assert!(group.get_mut(1).is_none());
+        assert_eq!(group.len(), 2);
+
+        assert_eq!(group.add_connection(&addr).unwrap(), 3);
+        assert_eq!(group.len(), 3);
+        assert!(group.get(0).is_some());
+        assert!(group.get(1).is_none());
+        assert!(group.get(2).is_some());
+        assert!(group.get(3).is_some());
+
+        // Closing the highest id must not let the next connection reuse it
+        group.close(3).unwrap();
+        assert!(group.get(3).is_none());
+        assert!(group.get_mut(3).is_none());
+        assert_eq!(group.len(), 2);
+
+        assert_eq!(group.add_connection(&addr).unwrap(), 4);
+        assert_eq!(group.len(), 3);
+        assert!(group.get(0).is_some());
+        assert!(group.get(1).is_none());
+        assert!(group.get(2).is_some());
+        assert!(group.get(3).is_none());
+        assert!(group.get(4).is_some());
     }
 
     #[test]

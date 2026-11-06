@@ -11,69 +11,25 @@
 //! NIC supports them, with automatic fallback to software timestamps.
 //! Configure via `UdpTimestampConfig`.
 
+use crate::group::{GroupCore, GroupSocket, TimestampConfig};
 use crate::mux::{Interest, Multiplexer, MultiplexerType};
 use crate::{
     ConnectionGroup, Error, GroupConnection, Result, Timestamp, Transport, TransportFactory,
 };
-use std::collections::HashMap;
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::time::Duration;
 
 #[cfg(target_os = "linux")]
 use crate::hw_timestamp;
-#[cfg(target_os = "linux")]
-use std::os::unix::io::AsRawFd;
 
 const DEFAULT_UDP_BUFFER_SIZE: usize = 65535;
 
 /// Configuration for UDP timestamping (Linux only)
 ///
-/// On Linux, this configures kernel-level timestamping for more accurate
-/// latency measurement. Falls back to software timestamps if HW not available.
-///
-/// By default, kernel timestamps are enabled on Linux.
-#[derive(Debug, Clone)]
-pub struct UdpTimestampConfig {
-    /// Network interface to bind to for hardware timestamping (e.g., "eth0")
-    /// If None, no interface binding is performed.
-    #[cfg(target_os = "linux")]
-    pub interface: Option<String>,
-
-    /// Whether to enable kernel timestamping on sockets
-    /// When true, uses SO_TIMESTAMPING for RX timestamps
-    /// Default: true on Linux
-    #[cfg(target_os = "linux")]
-    pub enable_timestamps: bool,
-}
-
-impl Default for UdpTimestampConfig {
-    fn default() -> Self {
-        Self {
-            #[cfg(target_os = "linux")]
-            interface: None,
-            #[cfg(target_os = "linux")]
-            enable_timestamps: true, // Enable by default on Linux
-        }
-    }
-}
-
-impl UdpTimestampConfig {
-    /// Create config with timestamping enabled (no interface binding)
-    #[cfg(target_os = "linux")]
-    pub fn with_timestamps() -> Self {
-        Self { interface: None, enable_timestamps: true }
-    }
-
-    /// Create config with timestamping and interface binding
-    #[cfg(target_os = "linux")]
-    pub fn with_interface(interface: impl Into<String>) -> Self {
-        Self {
-            interface: Some(interface.into()),
-            enable_timestamps: true,
-        }
-    }
-}
+/// The same configuration type as `TcpTimestampConfig`.
+pub type UdpTimestampConfig = TimestampConfig;
 
 pub struct UdpTransport {
     socket: Option<UdpSocket>,
@@ -217,16 +173,15 @@ impl UdpConn {
             timestamps_enabled,
         }
     }
+}
 
-    /// Get the raw file descriptor (for polling TX timestamps)
-    #[cfg(target_os = "linux")]
-    pub(crate) fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+impl GroupSocket for UdpConn {
+    fn socket_fd(&self) -> RawFd {
         self.socket.as_raw_fd()
     }
 
-    /// Check if timestamps are enabled
     #[cfg(target_os = "linux")]
-    pub(crate) fn timestamps_enabled(&self) -> bool {
+    fn timestamps_enabled(&self) -> bool {
         self.timestamps_enabled
     }
 }
@@ -291,17 +246,11 @@ impl GroupConnection for UdpConn {
             Err(e) => Err(e.into()),
         }
     }
-
-    fn is_connected(&self) -> bool {
-        true // UDP is always "connected"
-    }
 }
 
 /// A group of UDP sockets sharing a single multiplexer
 pub struct UdpConnectionGroup {
-    mux: Multiplexer,
-    connections: HashMap<usize, UdpConn>,
-    next_id: usize,
+    core: GroupCore<UdpConn>,
     /// Timestamp configuration for new connections
     #[cfg(target_os = "linux")]
     timestamp_config: UdpTimestampConfig,
@@ -314,9 +263,7 @@ impl UdpConnectionGroup {
 
     pub fn with_multiplexer(mux_type: MultiplexerType) -> Result<Self> {
         Ok(Self {
-            mux: Multiplexer::new(mux_type)?,
-            connections: HashMap::new(),
-            next_id: 0,
+            core: GroupCore::new(mux_type)?,
             #[cfg(target_os = "linux")]
             timestamp_config: UdpTimestampConfig::default(),
         })
@@ -329,44 +276,9 @@ impl UdpConnectionGroup {
         timestamp_config: UdpTimestampConfig,
     ) -> Result<Self> {
         Ok(Self {
-            mux: Multiplexer::new(mux_type)?,
-            connections: HashMap::new(),
-            next_id: 0,
+            core: GroupCore::new(mux_type)?,
             timestamp_config,
         })
-    }
-
-    /// Configure kernel timestamping on a socket (Linux only)
-    ///
-    /// Tries hardware timestamping first, falls back to software if unavailable.
-    /// Returns true if any form of kernel timestamping was enabled.
-    #[cfg(target_os = "linux")]
-    fn configure_timestamping(&self, fd: i32, conn_id: usize) -> bool {
-        // Bind to interface if specified
-        if let Some(ref interface) = self.timestamp_config.interface {
-            if let Err(e) = hw_timestamp::bind_to_device(fd, interface) {
-                tracing::warn!("Could not bind to device '{}': {}", interface, e);
-            }
-        }
-
-        // Try hardware timestamping first
-        if hw_timestamp::enable_socket_timestamping(fd).is_ok() {
-            tracing::debug!("Hardware timestamping enabled for UDP connection {}", conn_id);
-            return true;
-        }
-
-        // Fallback to software timestamps
-        tracing::debug!("Hardware timestamping not available, trying software");
-        match hw_timestamp::enable_software_timestamping(fd) {
-            Ok(()) => {
-                tracing::debug!("Software timestamping enabled for UDP connection {}", conn_id);
-                true
-            }
-            Err(e) => {
-                tracing::warn!("Could not enable kernel timestamping: {}", e);
-                false
-            }
-        }
     }
 }
 
@@ -380,8 +292,7 @@ impl ConnectionGroup for UdpConnectionGroup {
     type Conn = UdpConn;
 
     fn add_connection(&mut self, target: &SocketAddr) -> Result<usize> {
-        let conn_id = self.next_id;
-        self.next_id += 1;
+        let conn_id = self.core.reserve_id();
 
         let bind_addr: SocketAddr = if target.is_ipv4() {
             "0.0.0.0:0".parse().unwrap()
@@ -391,13 +302,13 @@ impl ConnectionGroup for UdpConnectionGroup {
 
         let socket = UdpSocket::bind(bind_addr)?;
         socket.set_nonblocking(true)?;
-        self.mux.register_fd(&socket, conn_id, Interest::READABLE)?;
+        self.core.register_readable(&socket, conn_id)?;
 
         // On Linux, configure timestamping
         #[cfg(target_os = "linux")]
         let conn = {
             let timestamps_enabled = if self.timestamp_config.enable_timestamps {
-                self.configure_timestamping(socket.as_raw_fd(), conn_id)
+                self.timestamp_config.configure_timestamping(socket.as_raw_fd(), "UDP", conn_id)
             } else {
                 false
             };
@@ -408,85 +319,38 @@ impl ConnectionGroup for UdpConnectionGroup {
         #[cfg(not(target_os = "linux"))]
         let conn = UdpConn::new(socket, *target);
 
-        self.connections.insert(conn_id, conn);
+        self.core.insert(conn_id, conn);
 
         Ok(conn_id)
     }
 
     fn get(&self, conn_id: usize) -> Option<&Self::Conn> {
-        self.connections.get(&conn_id)
+        self.core.get(conn_id)
     }
 
     fn get_mut(&mut self, conn_id: usize) -> Option<&mut Self::Conn> {
-        self.connections.get_mut(&conn_id)
+        self.core.get_mut(conn_id)
     }
 
     fn poll(&mut self, timeout: Option<Duration>) -> Result<Vec<usize>> {
-        let events = self.mux.wait(timeout)?;
-        let ready: Vec<usize> = events
-            .iter()
-            .filter(|e| e.readable)
-            .map(|e| e.id)
-            .filter(|id| self.connections.contains_key(id))
-            .collect();
-        Ok(ready)
+        self.core.poll(timeout)
     }
 
     #[cfg(target_os = "linux")]
     fn poll_tx_timestamps(&mut self) -> Result<Vec<crate::TxTimestampInfo>> {
-        let mut results = Vec::new();
-
-        for (&conn_id, conn) in &self.connections {
-            if !conn.timestamps_enabled() {
-                continue;
-            }
-
-            let fd = conn.as_raw_fd();
-
-            // Poll error queue for TX timestamps (non-blocking)
-            loop {
-                match hw_timestamp::recv_tx_timestamp(fd) {
-                    Ok(Some((timestamp, opt_id))) => {
-                        results.push(crate::TxTimestampInfo {
-                            conn_id,
-                            tx_offset: opt_id,
-                            timestamp,
-                        });
-                    }
-                    Ok(None) => break, // No more timestamps available
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(e) => {
-                        tracing::trace!(
-                            "Error polling TX timestamp for UDP conn {}: {}",
-                            conn_id,
-                            e
-                        );
-                        break;
-                    }
-                }
-            }
-        }
-
-        Ok(results)
+        Ok(self.core.poll_tx_timestamps("UDP"))
     }
 
     fn len(&self) -> usize {
-        self.connections.len()
+        self.core.len()
     }
 
     fn close(&mut self, conn_id: usize) -> Result<()> {
-        if let Some(conn) = self.connections.remove(&conn_id) {
-            let _ = self.mux.deregister_fd(&conn.socket);
-        }
-        Ok(())
+        self.core.close(conn_id)
     }
 
     fn close_all(&mut self) -> Result<()> {
-        let conn_ids: Vec<usize> = self.connections.keys().copied().collect();
-        for conn_id in conn_ids {
-            self.close(conn_id)?;
-        }
-        Ok(())
+        self.core.close_all()
     }
 }
 
@@ -739,6 +603,45 @@ mod tests {
 
         group.close_all().unwrap();
         assert_eq!(group.len(), 0);
+    }
+
+    #[test]
+    fn test_udp_group_ids_are_not_reused() {
+        let server = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+
+        let mut group = UdpConnectionGroup::new().unwrap();
+        assert_eq!(group.add_connection(&addr).unwrap(), 0);
+        assert_eq!(group.add_connection(&addr).unwrap(), 1);
+        assert_eq!(group.add_connection(&addr).unwrap(), 2);
+
+        // Closing a middle id must not let the next connection reuse it or
+        // the current length
+        group.close(1).unwrap();
+        assert!(group.get(1).is_none());
+        assert!(group.get_mut(1).is_none());
+        assert_eq!(group.len(), 2);
+
+        assert_eq!(group.add_connection(&addr).unwrap(), 3);
+        assert_eq!(group.len(), 3);
+        assert!(group.get(0).is_some());
+        assert!(group.get(1).is_none());
+        assert!(group.get(2).is_some());
+        assert!(group.get(3).is_some());
+
+        // Closing the highest id must not let the next connection reuse it
+        group.close(3).unwrap();
+        assert!(group.get(3).is_none());
+        assert!(group.get_mut(3).is_none());
+        assert_eq!(group.len(), 2);
+
+        assert_eq!(group.add_connection(&addr).unwrap(), 4);
+        assert_eq!(group.len(), 3);
+        assert!(group.get(0).is_some());
+        assert!(group.get(1).is_none());
+        assert!(group.get(2).is_some());
+        assert!(group.get(3).is_none());
+        assert!(group.get(4).is_some());
     }
 
     #[test]
