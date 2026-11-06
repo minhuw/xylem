@@ -164,24 +164,45 @@ impl LatencyStorage {
         }
     }
 
-    /// Calculate percentile (returns nanoseconds)
+    /// Calculate percentile (returns nanoseconds).
+    ///
+    /// Uses the same rule as [`Self::percentiles`].
     pub fn percentile(&self, p: f64) -> u64 {
+        self.percentiles(&[p])[0]
+    }
+
+    /// Calculate several percentiles (returns nanoseconds, in the order of `ps`).
+    ///
+    /// Sample storage is sorted once, and each percentile takes the nearest-rank
+    /// value at index `round(p * (n - 1))` of the ascending samples. Sketch
+    /// storage answers each percentile with its own quantile estimate.
+    pub fn percentiles(&self, ps: &[f64]) -> Vec<u64> {
         match self {
-            LatencyStorage::None => 0,
+            LatencyStorage::None => vec![0; ps.len()],
             LatencyStorage::Samples { samples, .. } => {
                 if samples.is_empty() {
-                    return 0;
+                    return vec![0; ps.len()];
                 }
-                let mut sorted = samples.clone();
+                let mut sorted = samples.to_vec();
                 sorted.sort();
-                let idx = ((p * (sorted.len() - 1) as f64).round() as usize).min(sorted.len() - 1);
-                sorted[idx].as_nanos() as u64
+                let last = sorted.len() - 1;
+                ps.iter()
+                    .map(|&p| {
+                        let idx = ((p * last as f64).round() as usize).min(last);
+                        sorted[idx].as_nanos() as u64
+                    })
+                    .collect()
             }
-            LatencyStorage::DdSketch(sketch) => {
-                sketch.quantile(p).ok().flatten().map(|v| v as u64).unwrap_or(0)
+            LatencyStorage::DdSketch(sketch) => ps
+                .iter()
+                .map(|&p| sketch.quantile(p).ok().flatten().map(|v| v as u64).unwrap_or(0))
+                .collect(),
+            LatencyStorage::TDigest(digest) => {
+                ps.iter().map(|&p| digest.estimate_quantile(p) as u64).collect()
             }
-            LatencyStorage::TDigest(digest) => digest.estimate_quantile(p) as u64,
-            LatencyStorage::HdrHistogram(hist) => hist.value_at_quantile(p),
+            LatencyStorage::HdrHistogram(hist) => {
+                ps.iter().map(|&p| hist.value_at_quantile(p)).collect()
+            }
         }
     }
 
@@ -689,14 +710,15 @@ impl TupleStatsCollector {
             .iter()
             .map(|(&bucket, entry)| {
                 let total_bytes = (entry.tx_bytes + entry.rx_bytes) as f64;
+                let latency_percentiles = entry.latency.percentiles(&[0.5, 0.99, 0.999]);
                 TimeSeriesPoint {
                     time_bucket: bucket,
                     request_count: entry.request_count,
                     throughput_rps: entry.request_count as f64 / bucket_duration_secs,
                     throughput_mbps: (total_bytes * 8.0) / (bucket_duration_secs * 1_000_000.0),
-                    latency_p50_ns: entry.latency.percentile(0.5),
-                    latency_p99_ns: entry.latency.percentile(0.99),
-                    latency_p999_ns: entry.latency.percentile(0.999),
+                    latency_p50_ns: latency_percentiles[0],
+                    latency_p99_ns: latency_percentiles[1],
+                    latency_p999_ns: latency_percentiles[2],
                     latency_mean_ns: entry.latency.mean(),
                 }
             })
@@ -727,14 +749,15 @@ impl TupleStatsCollector {
             .into_iter()
             .map(|(bucket, (requests, tx, rx, latency))| {
                 let total_bytes = (tx + rx) as f64;
+                let latency_percentiles = latency.percentiles(&[0.5, 0.99, 0.999]);
                 TimeSeriesPoint {
                     time_bucket: bucket,
                     request_count: requests,
                     throughput_rps: requests as f64 / bucket_duration_secs,
                     throughput_mbps: (total_bytes * 8.0) / (bucket_duration_secs * 1_000_000.0),
-                    latency_p50_ns: latency.percentile(0.5),
-                    latency_p99_ns: latency.percentile(0.99),
-                    latency_p999_ns: latency.percentile(0.999),
+                    latency_p50_ns: latency_percentiles[0],
+                    latency_p99_ns: latency_percentiles[1],
+                    latency_p999_ns: latency_percentiles[2],
                     latency_mean_ns: latency.mean(),
                 }
             })
@@ -758,14 +781,15 @@ impl TupleStatsCollector {
             .filter(|(k, _)| k.group_id == group_id && k.connection_id == connection_id)
             .map(|(key, entry)| {
                 let total_bytes = (entry.tx_bytes + entry.rx_bytes) as f64;
+                let latency_percentiles = entry.latency.percentiles(&[0.5, 0.99, 0.999]);
                 TimeSeriesPoint {
                     time_bucket: key.time_bucket,
                     request_count: entry.request_count,
                     throughput_rps: entry.request_count as f64 / bucket_duration_secs,
                     throughput_mbps: (total_bytes * 8.0) / (bucket_duration_secs * 1_000_000.0),
-                    latency_p50_ns: entry.latency.percentile(0.5),
-                    latency_p99_ns: entry.latency.percentile(0.99),
-                    latency_p999_ns: entry.latency.percentile(0.999),
+                    latency_p50_ns: latency_percentiles[0],
+                    latency_p99_ns: latency_percentiles[1],
+                    latency_p999_ns: latency_percentiles[2],
                     latency_mean_ns: entry.latency.mean(),
                 }
             })
@@ -871,14 +895,15 @@ impl TupleStatsCollector {
     ) -> AggregatedStats {
         let duration_secs = duration.as_secs_f64();
         let total_bytes = (total_tx_bytes + total_rx_bytes) as f64;
+        let latency_percentiles = latency.percentiles(&[0.5, 0.95, 0.99, 0.999, 0.9999, 0.99999]);
 
         AggregatedStats {
-            latency_p50: Duration::from_nanos(latency.percentile(0.5)),
-            latency_p95: Duration::from_nanos(latency.percentile(0.95)),
-            latency_p99: Duration::from_nanos(latency.percentile(0.99)),
-            latency_p999: Duration::from_nanos(latency.percentile(0.999)),
-            latency_p9999: Duration::from_nanos(latency.percentile(0.9999)),
-            latency_p99999: Duration::from_nanos(latency.percentile(0.99999)),
+            latency_p50: Duration::from_nanos(latency_percentiles[0]),
+            latency_p95: Duration::from_nanos(latency_percentiles[1]),
+            latency_p99: Duration::from_nanos(latency_percentiles[2]),
+            latency_p999: Duration::from_nanos(latency_percentiles[3]),
+            latency_p9999: Duration::from_nanos(latency_percentiles[4]),
+            latency_p99999: Duration::from_nanos(latency_percentiles[5]),
             mean_latency: Duration::from_nanos(latency.mean()),
             std_dev: Duration::ZERO, // TODO: compute from samples if available
             confidence_interval: Duration::ZERO,
@@ -1117,6 +1142,58 @@ mod tests {
         assert_eq!(storage.count(), 100);
         assert!(storage.percentile(0.5) > 0);
         assert!(storage.mean() > 0);
+    }
+
+    #[test]
+    fn percentiles_match_nearest_rank_values() {
+        // Expected values follow the nearest-rank rule: index round(p * (n - 1))
+        // into the samples sorted in ascending order.
+        const QUANTILES: [f64; 6] = [0.5, 0.95, 0.99, 0.999, 0.9999, 0.99999];
+        let storage_with = |samples_ns: &[u64]| {
+            let mut storage = LatencyStorage::from_policy(&SamplingPolicy::Unlimited);
+            for &ns in samples_ns {
+                storage.record(Duration::from_nanos(ns));
+            }
+            storage
+        };
+        let percentiles = |storage: &LatencyStorage| QUANTILES.map(|p| storage.percentile(p));
+        let percentiles_at_once = |storage: &LatencyStorage| storage.percentiles(&QUANTILES);
+
+        let empty = LatencyStorage::from_policy(&SamplingPolicy::Unlimited);
+        assert_eq!(empty.count(), 0);
+        assert_eq!(percentiles(&empty), [0, 0, 0, 0, 0, 0]);
+        assert_eq!(percentiles_at_once(&empty), [0, 0, 0, 0, 0, 0]);
+
+        // Odd count (n = 13). Sorted: 600, 1300, 1300, 2700, 2700, 2700, 3900,
+        // 4200, 5500, 7100, 9800, 15000, 31000. p * 12 rounds to indices
+        // 6, 11, 12, 12, 12, 12.
+        let odd = storage_with(&[
+            4_200, 1_300, 9_800, 1_300, 2_700, 15_000, 2_700, 600, 5_500, 2_700, 31_000, 7_100,
+            3_900,
+        ]);
+        assert_eq!(odd.count(), 13);
+        assert_eq!(percentiles(&odd), [3_900, 15_000, 31_000, 31_000, 31_000, 31_000]);
+        assert_eq!(percentiles_at_once(&odd), [3_900, 15_000, 31_000, 31_000, 31_000, 31_000]);
+
+        // Even count (n = 12). Sorted: 250, 250, 250, 800, 800, 800, 1900, 2100,
+        // 4400, 6300, 12000, 40000. p * 11 rounds to indices 6 (from 5.5),
+        // 10, 11, 11, 11, 11.
+        let even = storage_with(&[
+            800, 250, 250, 1_900, 12_000, 800, 4_400, 250, 6_300, 800, 2_100, 40_000,
+        ]);
+        assert_eq!(even.count(), 12);
+        assert_eq!(percentiles(&even), [1_900, 12_000, 40_000, 40_000, 40_000, 40_000]);
+        assert_eq!(percentiles_at_once(&even), [1_900, 12_000, 40_000, 40_000, 40_000, 40_000]);
+
+        // Even count (n = 100_002) recorded in descending order, so sorted index
+        // k holds k + 1 ns. p * 100_001 is 50_000.5, 95_000.95, 99_000.99,
+        // 99_900.999, 99_990.9999, and 99_999.99999; the half rounds away from
+        // zero, giving indices 50_001, 95_001, 99_001, 99_901, 99_991, 100_000.
+        let descending: Vec<u64> = (1..=100_002).rev().collect();
+        let large = storage_with(&descending);
+        assert_eq!(large.count(), 100_002);
+        assert_eq!(percentiles(&large), [50_002, 95_002, 99_002, 99_902, 99_992, 100_001]);
+        assert_eq!(percentiles_at_once(&large), [50_002, 95_002, 99_002, 99_902, 99_992, 100_001]);
     }
 
     #[test]

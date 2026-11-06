@@ -215,6 +215,7 @@ impl DetailedExperimentResults {
                 .iter()
                 .map(|(key, entry)| {
                     let total_bytes = (entry.tx_bytes + entry.rx_bytes) as f64;
+                    let latency_percentiles = entry.latency.percentiles(&[0.5, 0.99, 0.999]);
                     StatsRecord {
                         time_secs: key.time_bucket as f64 * bucket_duration_secs,
                         group_id: key.group_id,
@@ -222,9 +223,9 @@ impl DetailedExperimentResults {
                         request_count: entry.request_count,
                         throughput_rps: entry.request_count as f64 / bucket_duration_secs,
                         throughput_mbps: (total_bytes * 8.0) / (bucket_duration_secs * 1_000_000.0),
-                        latency_p50_us: entry.latency.percentile(0.5) as f64 / 1000.0,
-                        latency_p99_us: entry.latency.percentile(0.99) as f64 / 1000.0,
-                        latency_p999_us: entry.latency.percentile(0.999) as f64 / 1000.0,
+                        latency_p50_us: latency_percentiles[0] as f64 / 1000.0,
+                        latency_p99_us: latency_percentiles[1] as f64 / 1000.0,
+                        latency_p999_us: latency_percentiles[2] as f64 / 1000.0,
                         latency_mean_us: entry.latency.mean() as f64 / 1000.0,
                     }
                 })
