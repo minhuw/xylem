@@ -30,14 +30,18 @@ pub struct RedirectStats {
 /// Tracks: (original_conn_id, slot, (target_conn_id, sequence))
 pub type ClusterRequestId = (usize, u16, (usize, u64));
 
-/// Metadata for tracking requests (needed for retries)
+/// An in-flight request, kept until its final reply (needed for retries)
 #[derive(Debug, Clone)]
-struct RequestMetadata {
+struct InFlightRequest {
     data: Vec<u8>,
-    needs_asking: bool,
     slot: u16,
     original_conn_id: usize,
     is_warmup: bool,
+    /// Redirects followed so far, to prevent loops
+    retry_count: usize,
+    /// Set by an ASK redirect: the retry is sent after ASKING, whose `+OK`
+    /// reply is consumed together with the retry's response
+    asking_pending: bool,
 }
 
 /// Redis Cluster protocol with automatic slot-based routing
@@ -81,14 +85,9 @@ pub struct RedisClusterProtocol {
     /// Default node for requests if topology is empty
     default_node: Option<SocketAddr>,
 
-    /// Track request metadata for retry support (Phase 7)
-    /// Maps (conn_id, sequence) to request metadata
-    request_metadata: HashMap<(usize, u64), RequestMetadata>,
-
-    /// Track retry attempts per request to prevent loops
-    /// Maps (conn_id, sequence) to retry count
-    retry_counts: HashMap<(usize, u64), usize>,
-    asking_replies: std::collections::HashSet<(usize, u64)>,
+    /// Track in-flight requests for retry support (Phase 7)
+    /// Maps (conn_id, sequence) to the request's payload and retry state
+    in_flight: HashMap<(usize, u64), InFlightRequest>,
 }
 
 impl RedisClusterProtocol {
@@ -121,9 +120,7 @@ impl RedisClusterProtocol {
             redirect_stats: RedirectStats::default(),
             node_to_conn: HashMap::new(),
             default_node: None,
-            request_metadata: HashMap::new(),
-            retry_counts: HashMap::new(),
-            asking_replies: std::collections::HashSet::new(),
+            in_flight: HashMap::new(),
         }
     }
 
@@ -166,9 +163,7 @@ impl RedisClusterProtocol {
             redirect_stats: RedirectStats::default(),
             node_to_conn: HashMap::new(),
             default_node: None,
-            request_metadata: HashMap::new(),
-            retry_counts: HashMap::new(),
-            asking_replies: std::collections::HashSet::new(),
+            in_flight: HashMap::new(),
         }
     }
 
@@ -259,13 +254,10 @@ impl RedisClusterProtocol {
         self.topology.age()
     }
 
-    /// Get the target node for a given key
+    /// Get the target node for a given slot
     ///
-    /// Calculates the slot and looks up the responsible node.
-    fn get_target_node(&self, key: &[u8]) -> Result<SocketAddr> {
-        // Calculate slot
-        let slot = calculate_slot(key);
-
+    /// Looks up the node responsible for the key's slot.
+    fn get_target_node(&self, slot: u16) -> Result<SocketAddr> {
         // Look up node in topology
         let node = self.topology.get_node_for_slot(slot);
 
@@ -304,9 +296,8 @@ impl RedisClusterProtocol {
     /// Update redirect statistics based on redirect type
     fn update_redirect_stats(&mut self, redirect: &RedirectType) {
         match redirect {
-            RedirectType::Moved { slot, addr } => {
+            RedirectType::Moved { .. } => {
                 self.redirect_stats.moved_count += 1;
-                self.topology.update_slot(*slot, *addr);
             }
             RedirectType::Ask { .. } => {
                 self.redirect_stats.ask_count += 1;
@@ -316,21 +307,22 @@ impl RedisClusterProtocol {
 
     /// Build a retry request from redirect information
     ///
-    /// This function handles both stats updates and topology changes.
+    /// This function counts the attempt and records whether the retry needs ASKING.
     fn build_retry_request(
         &mut self,
         redirect: &RedirectType,
         req_id: (usize, u64),
         consumed: usize,
-        retry_count: usize,
     ) -> Result<crate::RetryRequest<ClusterRequestId>> {
-        let metadata = self
-            .request_metadata
+        let request = self
+            .in_flight
             .get_mut(&req_id)
             .ok_or_else(|| anyhow!("Missing metadata for request {:?}", req_id))?;
-        metadata.needs_asking = matches!(redirect, RedirectType::Ask { .. });
-        let original_request_id = (metadata.original_conn_id, metadata.slot, req_id);
-        let is_warmup = metadata.is_warmup;
+        let attempt = request.retry_count;
+        request.retry_count += 1;
+        request.asking_pending = matches!(redirect, RedirectType::Ask { .. });
+        let original_request_id = (request.original_conn_id, request.slot, req_id);
+        let is_warmup = request.is_warmup;
         let (addr, prepare_commands) = match redirect {
             RedirectType::Moved { addr, .. } => (addr, vec![]),
             RedirectType::Ask { addr, .. } => {
@@ -338,14 +330,13 @@ impl RedisClusterProtocol {
             }
         };
         let target_conn_id = Some(self.get_conn_id_for_node(*addr)?);
-        self.update_redirect_stats(redirect);
         Ok(crate::RetryRequest {
             bytes_consumed: consumed,
             original_request_id,
             is_warmup,
             target_conn_id,
             prepare_commands,
-            attempt: retry_count,
+            attempt,
         })
     }
 }
@@ -363,25 +354,19 @@ impl Protocol for RedisClusterProtocol {
         original_request_id: Self::RequestId,
     ) -> crate::Request<Self::RequestId> {
         let (orig_conn, slot, base_req_id) = original_request_id;
-        let retry_count = self.retry_counts.remove(&base_req_id);
         // Retry callers must supply an outstanding request returned by this protocol.
-        let meta = self
-            .request_metadata
+        let tracked = self
+            .in_flight
             .remove(&base_req_id)
             .expect("Cannot retry a Redis request without its original payload");
         let new_base_req_id = (conn_id, self.base_protocol.next_send_seq(conn_id));
         let request = crate::Request::new(
-            meta.data.clone(),
+            tracked.data.clone(),
             (orig_conn, slot, new_base_req_id),
-            crate::RequestMeta { is_warmup: meta.is_warmup },
+            crate::RequestMeta { is_warmup: tracked.is_warmup },
         );
-        if meta.needs_asking {
-            self.asking_replies.insert(new_base_req_id);
-        }
-        self.request_metadata.insert(new_base_req_id, meta);
-        if let Some(count) = retry_count {
-            self.retry_counts.insert(new_base_req_id, count);
-        }
+        // The retry count and pending ASKING move with the request to its new ID.
+        self.in_flight.insert(new_base_req_id, tracked);
         request
     }
 
@@ -410,9 +395,7 @@ impl Protocol for RedisClusterProtocol {
     fn reset(&mut self) {
         self.base_protocol.reset();
         self.redirect_stats = RedirectStats::default();
-        self.request_metadata.clear();
-        self.retry_counts.clear();
-        self.asking_replies.clear();
+        self.in_flight.clear();
     }
 }
 
@@ -488,15 +471,14 @@ impl RedisClusterProtocol {
         F: FnOnce(&mut RedisProtocol, usize, u64, usize) -> (Vec<u8>, (usize, u64)),
     {
         let key_str = self.base_protocol.format_key(key);
-        let key_bytes = key_str.as_bytes();
 
         // Calculate slot for this key
-        let slot = calculate_slot(key_bytes);
+        let slot = calculate_slot(key_str.as_bytes());
 
         // Generic workers send on the socket they selected. Routing-aware
         // callers may instead use the target encoded in the request ID.
         let target_conn_id = if route_by_slot {
-            self.get_target_node(key_bytes)
+            self.get_target_node(slot)
                 .and_then(|node| self.get_conn_id_for_node(node))
                 .unwrap_or(conn_id)
         } else {
@@ -507,15 +489,16 @@ impl RedisClusterProtocol {
         let (request_data, base_req_id) =
             build_request(&mut self.base_protocol, target_conn_id, key, value_size);
 
-        // Store request metadata for potential retry (Phase 7)
-        let metadata = RequestMetadata {
+        // Track the request for potential retry (Phase 7)
+        let tracked = InFlightRequest {
             data: request_data.clone(),
-            needs_asking: false,
             slot,
             original_conn_id: conn_id,
             is_warmup: false,
+            retry_count: 0,
+            asking_pending: false,
         };
-        self.request_metadata.insert(base_req_id, metadata);
+        self.in_flight.insert(base_req_id, tracked);
 
         // Create cluster request ID: (original_conn_id, slot, base_req_id)
         let cluster_req_id = (conn_id, slot, base_req_id);
@@ -525,8 +508,8 @@ impl RedisClusterProtocol {
 
     fn mark_request_warmup(&mut self, cluster_req_id: ClusterRequestId) {
         let base_req_id = cluster_req_id.2;
-        if let Some(meta) = self.request_metadata.get_mut(&base_req_id) {
-            meta.is_warmup = true;
+        if let Some(tracked) = self.in_flight.get_mut(&base_req_id) {
+            tracked.is_warmup = true;
         }
     }
 
@@ -595,8 +578,7 @@ impl RedisClusterProtocol {
             }
             crate::ParseResult::Incomplete => Ok((0, None)),
             crate::ParseResult::Retry(retry) => {
-                self.request_metadata.remove(&retry.original_request_id.2);
-                self.retry_counts.remove(&retry.original_request_id.2);
+                self.in_flight.remove(&retry.original_request_id.2);
                 Err(anyhow!("Redis cluster redirect requires parse_response_extended"))
             }
         }
@@ -610,7 +592,9 @@ impl RedisClusterProtocol {
         // ASKING's reply has no request ID. Consume it together with the retry's
         // response so the public ParseResult needs no new variant.
         let expected = (conn_id, *self.base_protocol.conn_recv_seq.get(&conn_id).unwrap_or(&0));
-        let prefix = if self.asking_replies.contains(&expected) {
+        let asking_pending =
+            self.in_flight.get(&expected).is_some_and(|tracked| tracked.asking_pending);
+        let prefix = if asking_pending {
             let size = RedisProtocol::find_resp_message_end(data)?;
             if size == 0 {
                 return Ok(crate::ParseResult::Incomplete);
@@ -625,14 +609,16 @@ impl RedisClusterProtocol {
             return Ok(crate::ParseResult::Incomplete);
         };
         reply.consumed += prefix;
-        self.asking_replies.remove(&expected);
         let req_id = reply.id;
+        // Any ASKING reply has been consumed with this response.
+        if let Some(tracked) = self.in_flight.get_mut(&req_id) {
+            tracked.asking_pending = false;
+        }
         match reply.kind {
             ReplyKind::Success => {
-                let metadata = self.request_metadata.remove(&req_id);
-                self.retry_counts.remove(&req_id);
-                let request_id = metadata
-                    .map(|meta| (meta.original_conn_id, meta.slot, req_id))
+                let tracked = self.in_flight.remove(&req_id);
+                let request_id = tracked
+                    .map(|tracked| (tracked.original_conn_id, tracked.slot, req_id))
                     .unwrap_or((conn_id, 0, req_id));
                 Ok(crate::ParseResult::Complete {
                     bytes_consumed: reply.consumed,
@@ -640,31 +626,32 @@ impl RedisClusterProtocol {
                 })
             }
             ReplyKind::Redirect(redirect) => {
-                let retry_count = self.retry_counts.entry(req_id).or_insert(0);
-                if *retry_count >= self.max_redirects {
+                // A request this protocol does not track has no redirects yet.
+                let retry_count =
+                    self.in_flight.get(&req_id).map_or(0, |tracked| tracked.retry_count);
+                if retry_count >= self.max_redirects {
                     self.redirect_stats.redirect_loops_prevented += 1;
-                    self.retry_counts.remove(&req_id);
-                    self.request_metadata.remove(&req_id);
+                    self.in_flight.remove(&req_id);
                     return Err(anyhow!(
                         "Max redirect limit ({}) exceeded for request",
                         self.max_redirects
                     ));
                 }
-                let attempt = *retry_count;
-                *retry_count += 1;
-                match self.build_retry_request(&redirect, req_id, reply.consumed, attempt) {
+                self.update_redirect_stats(&redirect);
+                // MOVED is permanent, so later requests for the slot go to the new node.
+                if let RedirectType::Moved { slot, addr } = &redirect {
+                    self.topology.update_slot(*slot, *addr);
+                }
+                match self.build_retry_request(&redirect, req_id, reply.consumed) {
                     Ok(retry) => Ok(crate::ParseResult::Retry(retry)),
                     Err(error) => {
-                        self.request_metadata.remove(&req_id);
-                        self.retry_counts.remove(&req_id);
-                        self.update_redirect_stats(&redirect);
+                        self.in_flight.remove(&req_id);
                         Err(error)
                     }
                 }
             }
             ReplyKind::Error(error) => {
-                self.request_metadata.remove(&req_id);
-                self.retry_counts.remove(&req_id);
+                self.in_flight.remove(&req_id);
                 Err(anyhow!("Redis error: {}", error))
             }
         }
@@ -720,9 +707,7 @@ mod tests {
                 u64::from(response.starts_with(b"-MOVED"))
             );
             assert_eq!(protocol.redirect_stats.ask_count, u64::from(response.starts_with(b"-ASK")));
-            assert!(protocol.request_metadata.is_empty());
-            assert!(protocol.retry_counts.is_empty());
-            assert!(protocol.asking_replies.is_empty());
+            assert!(protocol.in_flight.is_empty());
         }
     }
 
@@ -739,7 +724,7 @@ mod tests {
                 crate::ParseResult::Retry(_)
             ));
             let retry = protocol.regenerate_request(0, original.request_id);
-            assert!(!protocol.request_metadata.contains_key(&original.request_id.2));
+            assert!(!protocol.in_flight.contains_key(&original.request_id.2));
             let result =
                 protocol.parse_response_extended(0, &[b"+OK\r\n".as_slice(), response].concat());
             if response == b"+OK\r\n" {
@@ -749,9 +734,7 @@ mod tests {
             } else {
                 assert!(result.is_err());
             }
-            assert!(protocol.request_metadata.is_empty());
-            assert!(protocol.retry_counts.is_empty());
-            assert!(protocol.asking_replies.is_empty());
+            assert!(protocol.in_flight.is_empty());
         }
     }
 
