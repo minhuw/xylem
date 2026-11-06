@@ -11,6 +11,11 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tdigest::TDigest;
 
+/// Number of t-digest samples buffered before they are merged into the digest.
+/// Each merge rebuilds the digest, so batching keeps that cost off the
+/// per-request path.
+const TDIGEST_BATCH_SIZE: usize = 1024;
+
 /// Composite key for statistics entries
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct StatsKey {
@@ -34,8 +39,11 @@ pub enum LatencyStorage {
     },
     /// DDSketch for memory-efficient quantile estimation
     DdSketch(DDSketch),
-    /// T-Digest for accurate tail percentiles
-    TDigest(TDigest),
+    /// T-Digest for accurate tail percentiles.
+    ///
+    /// Recorded values wait in `pending` until [`TDIGEST_BATCH_SIZE`] of them
+    /// are merged into `digest` at once. Reads and merges include pending values.
+    TDigest { digest: TDigest, pending: Vec<f64> },
     /// HDR Histogram for high accuracy
     HdrHistogram(Histogram<u64>),
 }
@@ -64,9 +72,10 @@ impl LatencyStorage {
                 let config = DDSketchConfig::new(*alpha, *max_bins, 1.0);
                 LatencyStorage::DdSketch(DDSketch::new(config))
             }
-            SamplingPolicy::TDigest { compression } => {
-                LatencyStorage::TDigest(TDigest::new_with_size(*compression))
-            }
+            SamplingPolicy::TDigest { compression } => LatencyStorage::TDigest {
+                digest: TDigest::new_with_size(*compression),
+                pending: Vec::new(),
+            },
             SamplingPolicy::HdrHistogram { sigfigs, max_value_us } => {
                 let max_value_ns = max_value_us * 1000;
                 let histogram = Histogram::<u64>::new_with_max(max_value_ns, *sigfigs)
@@ -92,8 +101,13 @@ impl LatencyStorage {
             LatencyStorage::DdSketch(sketch) => {
                 sketch.add(latency.as_nanos() as f64);
             }
-            LatencyStorage::TDigest(digest) => {
-                *digest = digest.merge_unsorted(vec![latency.as_nanos() as f64]);
+            LatencyStorage::TDigest { digest, pending } => {
+                pending.push(latency.as_nanos() as f64);
+                if pending.len() >= TDIGEST_BATCH_SIZE {
+                    // Hand the full buffer to the digest and start a new one.
+                    let batch = std::mem::replace(pending, Vec::with_capacity(TDIGEST_BATCH_SIZE));
+                    *digest = digest.merge_unsorted(batch);
+                }
             }
             LatencyStorage::HdrHistogram(hist) => {
                 let _ = hist.record(latency.as_nanos() as u64);
@@ -137,10 +151,15 @@ impl LatencyStorage {
             (LatencyStorage::DdSketch(sketch), LatencyStorage::DdSketch(other)) => {
                 sketch.merge(other).map_err(|_| "DDSketch configurations differ")?;
             }
-            (LatencyStorage::TDigest(digest), LatencyStorage::TDigest(other))
-                if digest.max_size() == other.max_size() =>
-            {
-                *digest = TDigest::merge_digests(vec![digest.clone(), other.clone()]);
+            (
+                LatencyStorage::TDigest { digest, pending },
+                LatencyStorage::TDigest { digest: other, pending: other_pending },
+            ) if digest.max_size() == other.max_size() => {
+                // Fold pending values into both digests first, so the merged
+                // digest holds every value and this side has none pending.
+                let mine = digest.merge_unsorted(std::mem::take(pending));
+                let theirs = other.merge_unsorted(other_pending.clone());
+                *digest = TDigest::merge_digests(vec![mine, theirs]);
             }
             (LatencyStorage::HdrHistogram(hist), LatencyStorage::HdrHistogram(other))
                 if (hist.low(), hist.high(), hist.sigfig())
@@ -159,7 +178,9 @@ impl LatencyStorage {
             LatencyStorage::None => 0,
             LatencyStorage::Samples { samples, .. } => samples.len() as u64,
             LatencyStorage::DdSketch(sketch) => sketch.count() as u64,
-            LatencyStorage::TDigest(digest) => digest.count() as u64,
+            LatencyStorage::TDigest { digest, pending } => {
+                digest.count() as u64 + pending.len() as u64
+            }
             LatencyStorage::HdrHistogram(hist) => hist.len(),
         }
     }
@@ -197,7 +218,8 @@ impl LatencyStorage {
                 .iter()
                 .map(|&p| sketch.quantile(p).ok().flatten().map(|v| v as u64).unwrap_or(0))
                 .collect(),
-            LatencyStorage::TDigest(digest) => {
+            LatencyStorage::TDigest { digest, pending } => {
+                let digest = tdigest_with_pending(digest, pending);
                 ps.iter().map(|&p| digest.estimate_quantile(p) as u64).collect()
             }
             LatencyStorage::HdrHistogram(hist) => {
@@ -221,7 +243,9 @@ impl LatencyStorage {
                 // DDSketch doesn't have mean, approximate with median
                 sketch.quantile(0.5).ok().flatten().map(|v| v as u64).unwrap_or(0)
             }
-            LatencyStorage::TDigest(digest) => digest.mean() as u64,
+            LatencyStorage::TDigest { digest, pending } => {
+                tdigest_with_pending(digest, pending).mean() as u64
+            }
             LatencyStorage::HdrHistogram(hist) => hist.mean() as u64,
         }
     }
@@ -234,7 +258,9 @@ impl LatencyStorage {
                 samples.iter().min().map(|d| d.as_nanos() as u64).unwrap_or(0)
             }
             LatencyStorage::DdSketch(sketch) => sketch.min().map(|v| v as u64).unwrap_or(0),
-            LatencyStorage::TDigest(digest) => digest.min() as u64,
+            LatencyStorage::TDigest { digest, pending } => {
+                tdigest_with_pending(digest, pending).min() as u64
+            }
             LatencyStorage::HdrHistogram(hist) => hist.min(),
         }
     }
@@ -247,10 +273,20 @@ impl LatencyStorage {
                 samples.iter().max().map(|d| d.as_nanos() as u64).unwrap_or(0)
             }
             LatencyStorage::DdSketch(sketch) => sketch.max().map(|v| v as u64).unwrap_or(0),
-            LatencyStorage::TDigest(digest) => digest.max() as u64,
+            LatencyStorage::TDigest { digest, pending } => {
+                tdigest_with_pending(digest, pending).max() as u64
+            }
             LatencyStorage::HdrHistogram(hist) => hist.max(),
         }
     }
+}
+
+/// Returns a copy of `digest` that also holds the `pending` values.
+///
+/// Reads take `&self`, so they fold pending values into this temporary digest
+/// instead of flushing them into the stored one.
+fn tdigest_with_pending(digest: &TDigest, pending: &[f64]) -> TDigest {
+    digest.merge_unsorted(pending.to_vec())
 }
 
 /// Statistics entry for a single (time, group, connection) tuple
@@ -1248,6 +1284,97 @@ mod tests {
         assert_eq!(storage.count(), 1000);
         let p50 = storage.percentile(0.5);
         assert!((400_000..=600_000).contains(&p50)); // ~500us in ns
+    }
+
+    /// T-digest policy as parsed from a config that omits `compression`.
+    fn default_tdigest_policy() -> SamplingPolicy {
+        let policy: SamplingPolicy = serde_json::from_str(r#"{"type": "t-digest"}"#).unwrap();
+        assert_eq!(policy, SamplingPolicy::TDigest { compression: 1000 });
+        policy
+    }
+
+    /// 100,000 latencies with a long exponential tail above a 20 us floor. The
+    /// value of rank k (0-based, ascending) is 20 us + 30 us * -ln(1 - (k + 0.5) / n),
+    /// and the values arrive in a fixed scrambled order: position i holds rank
+    /// i * 7_919 mod n, which visits every rank once because 7_919 is coprime to n.
+    fn tdigest_batch_latencies_ns() -> Vec<u64> {
+        const N: u64 = 100_000;
+        (0..N)
+            .map(|i| {
+                let rank = (i * 7_919) % N;
+                let u = (rank as f64 + 0.5) / N as f64;
+                20_000 + (-30_000.0 * (1.0 - u).ln()).round() as u64
+            })
+            .collect()
+    }
+
+    fn record_tdigest(latencies_ns: &[u64]) -> LatencyStorage {
+        let mut storage = LatencyStorage::from_policy(&default_tdigest_policy());
+        for &ns in latencies_ns {
+            storage.record(Duration::from_nanos(ns));
+        }
+        storage
+    }
+
+    fn assert_within_one_percent(what: &str, estimate: u64, exact: u64) {
+        assert!(
+            estimate.abs_diff(exact) * 100 <= exact,
+            "{what}: estimate {estimate} ns is not within 1% of exact {exact} ns"
+        );
+    }
+
+    /// Compares p50, p99, and p999 with the exact nearest-rank values of
+    /// `latencies_ns`: index round(p * (n - 1)) of the ascending values.
+    fn assert_tdigest_batch_quantiles(storage: &LatencyStorage, latencies_ns: &[u64]) {
+        let mut sorted = latencies_ns.to_vec();
+        sorted.sort_unstable();
+        let last = sorted.len() - 1;
+        let quantiles = [("p50", 0.5), ("p99", 0.99), ("p999", 0.999)];
+        let estimates = storage.percentiles(&quantiles.map(|(_, p)| p));
+        for ((name, p), estimate) in quantiles.into_iter().zip(estimates) {
+            let exact = sorted[(p * last as f64).round() as usize];
+            assert_within_one_percent(name, estimate, exact);
+        }
+    }
+
+    #[test]
+    fn tdigest_batch_quantiles_match_nearest_rank() {
+        let latencies_ns = tdigest_batch_latencies_ns();
+        let storage = record_tdigest(&latencies_ns);
+        assert_eq!(storage.count(), 100_000);
+        assert_tdigest_batch_quantiles(&storage, &latencies_ns);
+    }
+
+    #[test]
+    fn tdigest_batch_merged_storages_keep_quantiles_and_count() {
+        let latencies_ns = tdigest_batch_latencies_ns();
+        // Uneven, odd-sized parts, as two connections might record them.
+        let (first, second) = latencies_ns.split_at(33_333);
+        let mut first = record_tdigest(first);
+        let second = record_tdigest(second);
+        assert_eq!((first.count(), second.count()), (33_333, 66_667));
+
+        // Aggregation merges each entry into fresh storage.
+        let mut aggregated = LatencyStorage::from_policy(&default_tdigest_policy());
+        aggregated.merge_ref(&first);
+        aggregated.merge_ref(&second);
+        assert_eq!(aggregated.count(), 100_000);
+        assert_tdigest_batch_quantiles(&aggregated, &latencies_ns);
+
+        // Collector merges fold one entry's storage into another's.
+        first.merge_ref(&second);
+        assert_eq!(first.count(), 100_000);
+        assert_tdigest_batch_quantiles(&first, &latencies_ns);
+    }
+
+    #[test]
+    fn tdigest_batch_mean_min_max_match_exact() {
+        let latencies_ns = tdigest_batch_latencies_ns();
+        let storage = record_tdigest(&latencies_ns);
+        let exact_mean = latencies_ns.iter().sum::<u64>() / latencies_ns.len() as u64;
+        assert_within_one_percent("mean", storage.mean(), exact_mean);
+        assert_within_one_percent("min", storage.min(), *latencies_ns.iter().min().unwrap());
+        assert_within_one_percent("max", storage.max(), *latencies_ns.iter().max().unwrap());
     }
 
     #[test]
