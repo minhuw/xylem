@@ -2,10 +2,13 @@
 //!
 //! Implements the Memcached binary protocol (memcache_bin.h).
 
+use super::{next_conn_seq, InsertPhaseState};
 use crate::Protocol;
 use anyhow::Result;
 use std::collections::HashMap;
 use zeropool::BufferPool;
+
+pub use super::MemcachedOp;
 
 // Command opcodes
 const CMD_GETK: u8 = 0x0c;
@@ -60,61 +63,6 @@ impl BmcHeader {
 
     fn body_len(&self) -> u32 {
         u32::from_be(self.body_len)
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum MemcachedOp {
-    Get,
-    Set,
-}
-
-/// Insert phase state for data population before measurement
-#[derive(Debug)]
-pub struct InsertPhaseState {
-    /// Total number of keys to insert
-    key_count: u64,
-    /// Number of keys inserted so far
-    inserted: u64,
-    /// Value size for inserts
-    value_size: usize,
-    /// Key generator for inserts (clone of workload generator to preserve distribution/seed)
-    key_gen: Option<crate::workload::KeyGeneration>,
-}
-
-impl InsertPhaseState {
-    /// Create new insert phase state
-    pub fn new(
-        key_count: u64,
-        value_size: usize,
-        key_gen: Option<crate::workload::KeyGeneration>,
-    ) -> Self {
-        Self {
-            key_count,
-            inserted: 0,
-            value_size,
-            key_gen,
-        }
-    }
-
-    /// Check if insert phase is complete
-    pub fn is_complete(&self) -> bool {
-        self.inserted >= self.key_count
-    }
-
-    /// Get next key to insert, returns None if insert phase is complete
-    pub fn next_key(&mut self) -> Option<u64> {
-        if self.inserted >= self.key_count {
-            None
-        } else {
-            self.inserted += 1;
-            let key = if let Some(ref mut key_gen) = self.key_gen {
-                key_gen.next_key()
-            } else {
-                self.inserted - 1 // Fallback to sequential if no generator is configured
-            };
-            Some(key)
-        }
     }
 }
 
@@ -185,48 +133,33 @@ impl MemcachedBinaryProtocol {
         self.insert_phase.as_ref().is_some_and(|p| !p.is_complete())
     }
 
-    fn next_send_seq(&mut self, conn_id: usize) -> u64 {
-        let seq = self.conn_send_seq.entry(conn_id).or_insert(0);
-        let result = *seq;
-        *seq += 1;
-        result
-    }
-
-    fn next_recv_seq(&mut self, conn_id: usize) -> u64 {
-        let seq = self.conn_recv_seq.entry(conn_id).or_insert(0);
-        let result = *seq;
-        *seq += 1;
-        result
-    }
-
-    /// Generate a SET request for a specific key and value
-    fn generate_set_request(
-        &mut self,
-        conn_id: usize,
-        key: u64,
-        value_size: usize,
-    ) -> crate::Request<(usize, u64)> {
-        let seq = self.next_send_seq(conn_id);
+    /// Encode a SET request for a specific key and value size
+    fn encode_set(&self, key: u64, value_size: usize) -> Vec<u8> {
         let key_str = format!("{}{key}", self.key_prefix);
         let key_bytes = key_str.as_bytes();
         let key_len = key_bytes.len() as u16;
 
         // SET: header (24) + extras (8: flags + expiration) + key + value
-        let extra_len = 8u8;
-        let body_len = extra_len as u32 + key_len as u32 + value_size as u32;
-        let header = BmcHeader::new_request(CMD_SET, key_len, extra_len, body_len);
+        let extras_len = 8u8;
+        let body_len = extras_len as u32 + key_len as u32 + value_size as u32;
+        let header = BmcHeader::new_request(CMD_SET, key_len, extras_len, body_len);
 
-        let value = vec![b'x'; value_size];
         let mut buf = self
             .pool
-            .get(BmcHeader::SIZE + extra_len as usize + key_len as usize + value_size);
+            .get(BmcHeader::SIZE + extras_len as usize + key_len as usize + value_size);
         buf.clear();
         buf.extend_from_slice(&header.as_bytes());
-        buf.extend_from_slice(&[0u8; 8]); // flags (4) + expiration (4) = 0
-        buf.extend_from_slice(key_bytes);
-        buf.extend_from_slice(&value);
 
-        crate::Request::measurement(buf.to_vec(), (conn_id, seq))
+        // Extras: 4 bytes flags (0) + 4 bytes expiration (0)
+        buf.extend_from_slice(&[0u8; 8]);
+
+        // Key
+        buf.extend_from_slice(key_bytes);
+
+        // Value
+        buf.resize(buf.len() + value_size, b'x');
+
+        buf.to_vec()
     }
 }
 
@@ -244,21 +177,22 @@ impl Protocol for MemcachedBinaryProtocol {
         if let Some(ref mut insert_state) = self.insert_phase {
             if let Some(key) = insert_state.next_key() {
                 let value_size = insert_state.value_size;
-                let request = self.generate_set_request(conn_id, key, value_size);
-                return crate::Request::warmup(request.data, request.request_id);
+                let seq = next_conn_seq(&mut self.conn_send_seq, conn_id);
+                let request_data = self.encode_set(key, value_size);
+                return crate::Request::warmup(request_data, (conn_id, seq));
             }
         }
 
         // Phase 2: Normal measurement phase
         let key = self.key_gen.as_mut().map(|g| g.next_key()).unwrap_or(0);
-        let seq = self.next_send_seq(conn_id);
-        let key_str = format!("{}{key}", self.key_prefix);
-        let key_bytes = key_str.as_bytes();
-        let key_len = key_bytes.len() as u16;
+        let seq = next_conn_seq(&mut self.conn_send_seq, conn_id);
 
         let request_data = match self.operation {
             MemcachedOp::Get => {
                 // GET/GETK: header + key
+                let key_str = format!("{}{key}", self.key_prefix);
+                let key_bytes = key_str.as_bytes();
+                let key_len = key_bytes.len() as u16;
                 let body_len = key_len as u32;
                 let header = BmcHeader::new_request(CMD_GETK, key_len, 0, body_len);
 
@@ -268,29 +202,7 @@ impl Protocol for MemcachedBinaryProtocol {
                 buf.extend_from_slice(key_bytes);
                 buf.to_vec()
             }
-            MemcachedOp::Set => {
-                // SET: header + extras (8 bytes: flags + expiration) + key + value
-                let extras_len = 8u8;
-                let body_len = extras_len as u32 + key_len as u32 + self.value_size as u32;
-                let header = BmcHeader::new_request(CMD_SET, key_len, extras_len, body_len);
-
-                let mut buf = self.pool.get(
-                    BmcHeader::SIZE + extras_len as usize + key_len as usize + self.value_size,
-                );
-                buf.clear();
-                buf.extend_from_slice(&header.as_bytes());
-
-                // Extras: 4 bytes flags (0) + 4 bytes expiration (0)
-                buf.extend_from_slice(&[0u8; 8]);
-
-                // Key
-                buf.extend_from_slice(key_bytes);
-
-                // Value
-                buf.resize(buf.len() + self.value_size, b'x');
-
-                buf.to_vec()
-            }
+            MemcachedOp::Set => self.encode_set(key, self.value_size),
         };
 
         crate::Request::measurement(request_data, (conn_id, seq))
@@ -325,7 +237,7 @@ impl Protocol for MemcachedBinaryProtocol {
         }
 
         // Complete response found
-        let seq = self.next_recv_seq(conn_id);
+        let seq = next_conn_seq(&mut self.conn_recv_seq, conn_id);
         Ok((total_len, Some((conn_id, seq))))
     }
 

@@ -53,21 +53,13 @@ impl ProtocolFactory for MemcachedAsciiFactory {
     }
 }
 
-/// Parse Memcached binary operation from string
+/// Parse Memcached operation from string
 fn parse_memcached_op(op: &str) -> Result<MemcachedOp> {
     match op.to_uppercase().as_str() {
         "GET" => Ok(MemcachedOp::Get),
         "SET" => Ok(MemcachedOp::Set),
         _ => anyhow::bail!("Unknown Memcached operation: {}. Supported: GET, SET", op),
     }
-}
-
-/// Parse Memcached ASCII operation from string
-fn parse_memcached_ascii_op(op: &str) -> Result<crate::memcached::ascii::MemcachedOp> {
-    Ok(match parse_memcached_op(op)? {
-        MemcachedOp::Get => crate::memcached::ascii::MemcachedOp::Get,
-        MemcachedOp::Set => crate::memcached::ascii::MemcachedOp::Set,
-    })
 }
 
 fn validate_keys(config: &MemcachedConfig) -> Result<()> {
@@ -103,7 +95,7 @@ impl MemcachedAsciiProtocol {
     pub fn from_config(config: &MemcachedConfig, seed: Option<u64>) -> Result<Self> {
         validate_keys(config)?;
         let mut protocol = Self::with_workload(
-            parse_memcached_ascii_op(&config.operation)?,
+            parse_memcached_op(&config.operation)?,
             config.keys.to_key_gen(seed)?,
             config.keys.value_size(),
         )
