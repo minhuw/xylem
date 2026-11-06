@@ -37,6 +37,25 @@
           protobuf # Required for evalsync's prost-build
         ];
 
+        # Sources the Rust standard library was compiled from: library/ and the crates its Cargo.lock
+        # takes from vendor/, except the Windows-only ones, which no Unix build compiles. Std code
+        # inlined into xylem has DWARF paths into them (/build/rustc-<version>-src/...), so profilers
+        # can show its source.
+        rustSrcTop = pkgs.lib.removeSuffix ".tar.gz" pkgs.rustc.src.name;
+        rustStdSrc = pkgs.runCommand "rust-std-src-${pkgs.rustc.version}" { } ''
+          tar -tzf ${pkgs.rustc.src} > members
+          mkdir -p $out
+          tar -xzf ${pkgs.rustc.src} -C $out ${rustSrcTop}/library
+          # Registry packages of std's lockfile, as cargo vendor --versioned-dirs names them, without
+          # windows-sys, windows-targets and the windows_<target> import libraries
+          awk -F '"' '/^name = /{n=$2} /^version = /{v=$2} /^source = "registry/{print n "-" v}' \
+            $out/${rustSrcTop}/library/Cargo.lock | grep -vE '^windows[-_]' | sort -u > crates
+          grep -oE '^${rustSrcTop}/vendor/[^/]+/' members | sort -u > vendored
+          grep -F -f <(sed 's|.*|${rustSrcTop}/vendor/&/|' crates) -x vendored > needed
+          echo "$(wc -l < needed) of $(wc -l < crates) non-Windows crates of library/Cargo.lock are vendored"
+          tar -xzf ${pkgs.rustc.src} -C $out $(sed 's|/$||' needed)
+        '';
+
       in
       {
         # Development shell
@@ -132,6 +151,16 @@
           separateDebugInfo = true;
           preBuild = ''
             export NIX_RUSTFLAGS+=" -C debuginfo=limited"
+          '';
+
+          # Rhea's bench packaging contract: debug/share/rhea/sources/<name> is the source tree the build
+          # had at <build dir>/<name>, which DWARF paths refer to; profilers then need nothing else
+          postFixup = ''
+            sources=$debug/share/rhea/sources
+            mkdir -p $sources
+            ln -s ${rustStdSrc}/* $sources/
+            ln -s $cargoDeps $sources/$(stripHash $cargoDeps)
+            ln -s $src $sources/$(stripHash $src)
           '';
 
           meta = with pkgs.lib; {
