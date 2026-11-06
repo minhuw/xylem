@@ -101,6 +101,21 @@ jobs:
       - name: Run clippy
         run: nix develop --command cargo clippy --all-targets --all-features -- -D warnings
 
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.85.0
+        run: rustup toolchain install --profile minimal 1.85.0
+
+      - name: Install protoc for evalsync's prost-build
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Check build with the MSRV toolchain
+        run: cargo +1.85.0 check --locked --workspace --all-targets --all-features
+
   audit:
     name: Security Audit
     runs-on: ubuntu-latest

@@ -1,8 +1,6 @@
 # Clippy configuration for Xylem
 # This file is read by `cargo clippy`
-
-# Minimum Supported Rust Version
-msrv = "1.75"
+# The MSRV comes from `rust-version` in the workspace Cargo.toml
 
 # Complexity thresholds
 cognitive-complexity-threshold = 30

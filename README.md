@@ -1,6 +1,6 @@
 # XYlem
 
-[![MSRV](https://img.shields.io/badge/MSRV-1.70%2B-orange.svg)](https://www.rust-lang.org/)
+[![MSRV](https://img.shields.io/badge/MSRV-1.85%2B-orange.svg)](https://www.rust-lang.org/)
 [![Documentation](https://img.shields.io/badge/docs-online-blue.svg)](https://xylem.minhuw.dev/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE-MIT)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE-APACHE)

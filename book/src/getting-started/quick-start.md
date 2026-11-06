@@ -4,7 +4,7 @@ This guide will help you run your first benchmark with Xylem.
 
 ## Prerequisites
 
-- Rust 1.70 or later
+- Rust 1.85 or later
 - A target service to benchmark (e.g., Redis, HTTP server, Memcached)
 
 ## Build Xylem

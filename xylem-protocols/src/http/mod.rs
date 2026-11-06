@@ -150,7 +150,7 @@ impl Protocol for HttpProtocol {
                 );
                 let length: usize = text.parse()?;
                 anyhow::ensure!(
-                    content_length.map_or(true, |old| old == length),
+                    content_length.is_none_or(|old| old == length),
                     "Conflicting HTTP Content-Length headers"
                 );
                 content_length = Some(length);

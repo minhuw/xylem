@@ -2,6 +2,7 @@
 name = "xylem-common"
 version = "0.1.0"
 edition = "2021"
+rust-version.workspace = true
 authors = ["xylem contributors"]
 description = "Common utilities for Xylem latency measurement tool"
 license = "MIT"
