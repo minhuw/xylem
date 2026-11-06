@@ -9,6 +9,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use xylem_core::traffic_group::PolicyConfig;
 
 /// Top-level profile configuration
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -293,6 +294,24 @@ impl ProfileConfig {
                 );
             }
 
+            // Rate-based policies need a positive rate. Pattern policies accept
+            // zero, which pauses sending by design.
+            match &group.traffic_policy {
+                PolicyConfig::FixedRate { rate } | PolicyConfig::Poisson { rate } => {
+                    validate_positive_rate(*rate, "rate", i, &group.name)?;
+                }
+                PolicyConfig::Adaptive { initial_rate, min_rate, max_rate, .. } => {
+                    validate_positive_rate(*initial_rate, "initial_rate", i, &group.name)?;
+                    validate_positive_rate(*min_rate, "min_rate", i, &group.name)?;
+                    validate_positive_rate(*max_rate, "max_rate", i, &group.name)?;
+                }
+                PolicyConfig::ClosedLoop
+                | PolicyConfig::Sinusoidal { .. }
+                | PolicyConfig::Ramp { .. }
+                | PolicyConfig::Spike { .. }
+                | PolicyConfig::Sawtooth { .. } => {}
+            }
+
             // Validate all groups on the same thread use the same transport
             for &thread_id in &group.threads {
                 match thread_transports.get(&thread_id) {
@@ -384,6 +403,24 @@ impl ProfileConfig {
 
         Ok(())
     }
+}
+
+/// Reject a traffic policy rate that is not > 0 (NaN fails too)
+fn validate_positive_rate(
+    rate: f64,
+    field: &str,
+    group_idx: usize,
+    group_name: &str,
+) -> Result<()> {
+    if rate > 0.0 {
+        return Ok(());
+    }
+    bail!(
+        "Traffic group {} '{}' traffic_policy.{} must be > 0",
+        group_idx,
+        group_name,
+        field
+    );
 }
 
 /// Validate protocol_config by parsing it as the appropriate typed struct
@@ -916,6 +953,73 @@ file = "results/test.json"
         let result = config.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("must have a target address"));
+    }
+
+    #[test]
+    fn test_validation_rejects_non_positive_rate() {
+        let profile = |traffic_policy: &str| -> ProfileConfig {
+            let toml_str = format!(
+                r#"
+[experiment]
+name = "rate-test"
+duration = "10s"
+
+[[traffic_groups]]
+name = "main"
+protocol = "redis"
+target = "127.0.0.1:6379"
+threads = [0]
+connections_per_thread = 1
+
+[traffic_groups.protocol_config.keys]
+strategy = "sequential"
+start = 0
+value_size = 64
+
+[traffic_groups.traffic_policy]
+{traffic_policy}
+
+[output]
+format = "json"
+file = "/tmp/test.json"
+"#
+            );
+            toml::from_str(&toml_str).expect("TOML should parse")
+        };
+
+        let rejected = [
+            ("type = \"fixed-rate\"\nrate = 0", "traffic_policy.rate"),
+            ("type = \"fixed-rate\"\nrate = -1.0", "traffic_policy.rate"),
+            ("type = \"fixed-rate\"\nrate = nan", "traffic_policy.rate"),
+            ("type = \"poisson\"\nrate = 0", "traffic_policy.rate"),
+            (
+                "type = \"adaptive\"\ninitial_rate = 0\ntarget_latency_us = 1000",
+                "traffic_policy.initial_rate",
+            ),
+            (
+                "type = \"adaptive\"\ninitial_rate = 1000.0\ntarget_latency_us = 1000\nmin_rate = 0",
+                "traffic_policy.min_rate",
+            ),
+            (
+                "type = \"adaptive\"\ninitial_rate = 1000.0\ntarget_latency_us = 1000\nmax_rate = 0",
+                "traffic_policy.max_rate",
+            ),
+        ];
+        for (traffic_policy, field) in rejected {
+            let err = profile(traffic_policy).validate().expect_err(traffic_policy).to_string();
+            assert_eq!(err, format!("Traffic group 0 'main' {field} must be > 0"));
+        }
+
+        // Positive rates pass, and a pattern policy may pause at zero.
+        let accepted = [
+            "type = \"fixed-rate\"\nrate = 1000.0",
+            "type = \"poisson\"\nrate = 1000.0",
+            "type = \"adaptive\"\ninitial_rate = 1000.0\ntarget_latency_us = 1000",
+            "type = \"ramp\"\nstart_rate = 0\nend_rate = 1000.0\nduration = \"5s\"",
+        ];
+        for traffic_policy in accepted {
+            profile(traffic_policy).validate().expect(traffic_policy);
+        }
     }
 
     #[test]

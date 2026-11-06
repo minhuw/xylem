@@ -8,7 +8,7 @@
 //! - Renamed from `TimingPolicy` to `Policy` (more general)
 //! - Designed for per-connection use (not global)
 //! - Simpler API: `next_send_time()` instead of complex `delay_until_next()`
-//! - Uses shared distributions from `workload::distributions`
+//! - Uses shared distributions from `xylem_common`
 
 use std::time::Duration;
 use xylem_common::ExponentialDistribution;
@@ -55,6 +55,35 @@ pub trait Policy: Send {
     fn name(&self) -> &'static str;
 }
 
+/// Convert a rate in requests per second into nanoseconds between sends
+///
+/// Every rate-based policy uses this one rule. Positive rates truncate to whole
+/// nanoseconds, and rates too small to represent saturate at `u64::MAX`.
+///
+/// Returns `None` unless `rate > 0`, so zero, negative, and NaN rates pause the
+/// policy instead of producing an interval that overflows or is zero, either of
+/// which would let the connection send unthrottled. A paused policy never permits
+/// a send, not even the first request:
+/// - `PatternAwarePolicy` keeps waking at its refresh cadence, because its pattern
+///   can raise the rate again.
+/// - `FixedRatePolicy` and `AdaptivePolicy` have no rate to refresh, so their
+///   `next_send_time` returns `u64::MAX`, a wakeup that never arrives. The
+///   connection stays idle for the rest of the run.
+fn rate_to_interval_ns(rate: f64) -> Option<u64> {
+    (rate > 0.0).then(|| (1_000_000_000.0 / rate) as u64)
+}
+
+/// Absolute time of the next send after `last_send_time_ns`
+///
+/// The first request is due immediately. Later requests are due one interval
+/// after the last send, saturating so a huge interval cannot wrap into the past.
+fn next_send_after(last_send_time_ns: Option<u64>, interval_ns: u64) -> u64 {
+    match last_send_time_ns {
+        Some(last_time) => last_time.saturating_add(interval_ns),
+        None => 0, // First request: send immediately (time 0 is always in past)
+    }
+}
+
 /// Closed-loop policy (max throughput, send as fast as possible)
 ///
 /// Always returns `None` (send immediately when connection is available).
@@ -96,9 +125,11 @@ impl Policy for ClosedLoopPolicy {
 ///
 /// Sends requests at a fixed rate (requests per second) with deterministic spacing.
 /// Each request is exactly `1/rate` seconds after the previous one.
+/// A rate that is not greater than zero never sends (see `rate_to_interval_ns`).
 pub struct FixedRatePolicy {
     rate: f64,
-    inter_arrival_ns: u64,
+    /// None means paused, not an infinite interval to add to a timestamp.
+    inter_arrival_ns: Option<u64>,
     last_send_time_ns: Option<u64>,
 }
 
@@ -108,7 +139,7 @@ impl FixedRatePolicy {
     /// # Parameters
     /// - `rate`: Target rate in requests per second
     pub fn new(rate: f64) -> Self {
-        let inter_arrival_ns = (1_000_000_000.0 / rate) as u64;
+        let inter_arrival_ns = rate_to_interval_ns(rate);
         Self {
             rate,
             inter_arrival_ns,
@@ -124,9 +155,11 @@ impl FixedRatePolicy {
 
 impl Policy for FixedRatePolicy {
     fn next_send_time(&mut self, _current_time_ns: u64) -> Option<u64> {
-        match self.last_send_time_ns {
-            Some(last_time) => Some(last_time + self.inter_arrival_ns),
-            None => Some(0), // First request: send immediately (time 0 is always in past)
+        match self.inter_arrival_ns {
+            Some(inter_arrival_ns) => {
+                Some(next_send_after(self.last_send_time_ns, inter_arrival_ns))
+            }
+            None => Some(u64::MAX), // Paused: a wakeup that never arrives
         }
     }
 
@@ -214,6 +247,8 @@ impl Policy for PoissonPolicy {
 /// Dynamically adjusts the request rate based on observed latency:
 /// - If latency > target: reduce rate (back off)
 /// - If latency < target: increase rate (push harder)
+///
+/// A current rate that is not greater than zero never sends (see `rate_to_interval_ns`).
 pub struct AdaptivePolicy {
     target_latency: Duration,
     current_rate: f64,
@@ -291,11 +326,11 @@ impl Policy for AdaptivePolicy {
             self.latency_sum = Duration::ZERO;
         }
 
-        let inter_arrival_ns = (1_000_000_000.0 / self.current_rate) as u64;
-
-        match self.last_send_time_ns {
-            Some(last_time) => Some(last_time + inter_arrival_ns),
-            None => Some(0), // First request: send immediately
+        match rate_to_interval_ns(self.current_rate) {
+            Some(inter_arrival_ns) => {
+                Some(next_send_after(self.last_send_time_ns, inter_arrival_ns))
+            }
+            None => Some(u64::MAX), // Paused: a wakeup that never arrives
         }
     }
 
@@ -431,7 +466,7 @@ impl PatternAwarePolicy {
         pattern: std::sync::Arc<dyn crate::workload::LoadPattern>,
         start_time_ns: u64,
     ) -> Self {
-        let inter_arrival_ns = Self::interval(pattern.rate_at(Duration::ZERO));
+        let inter_arrival_ns = rate_to_interval_ns(pattern.rate_at(Duration::ZERO));
         Self {
             pattern,
             start_time_ns,
@@ -441,22 +476,18 @@ impl PatternAwarePolicy {
         }
     }
 
-    fn interval(rate: f64) -> Option<u64> {
-        (rate > 0.0).then(|| (1_000_000_000.0 / rate) as u64)
-    }
-
     fn update_rate(&mut self, current_time_ns: u64) {
         if current_time_ns.saturating_sub(self.last_rate_update_ns) < PATTERN_REFRESH_NS {
             return;
         }
         let elapsed = Duration::from_nanos(current_time_ns.saturating_sub(self.start_time_ns));
-        self.inter_arrival_ns = Self::interval(self.pattern.rate_at(elapsed));
+        self.inter_arrival_ns = rate_to_interval_ns(self.pattern.rate_at(elapsed));
         self.last_rate_update_ns = current_time_ns;
     }
 
     fn send_deadline(&self) -> Option<u64> {
         self.inter_arrival_ns
-            .map(|interval| self.last_send_time_ns.map_or(0, |last| last.saturating_add(interval)))
+            .map(|interval| next_send_after(self.last_send_time_ns, interval))
     }
 }
 
@@ -480,7 +511,7 @@ impl Policy for PatternAwarePolicy {
     fn reset(&mut self) {
         self.last_send_time_ns = None;
         self.last_rate_update_ns = self.start_time_ns;
-        self.inter_arrival_ns = Self::interval(self.pattern.rate_at(Duration::ZERO));
+        self.inter_arrival_ns = rate_to_interval_ns(self.pattern.rate_at(Duration::ZERO));
     }
 
     fn name(&self) -> &'static str {
@@ -565,6 +596,27 @@ mod tests {
     }
 
     #[test]
+    fn test_fixed_rate_policy_non_positive_rate_never_sends() {
+        for rate in [0.0, -1.0, f64::NAN] {
+            let mut policy = FixedRatePolicy::new(rate);
+
+            // Not even the first request is due; the wakeup never arrives.
+            assert_eq!(policy.next_send_time(100), Some(u64::MAX), "rate {rate}");
+
+            policy.on_request_sent(100);
+            assert_eq!(policy.next_send_time(200), Some(u64::MAX), "rate {rate}");
+        }
+    }
+
+    #[test]
+    fn test_fixed_rate_policy_huge_interval_saturates() {
+        // An interval too large for u64 must not wrap the deadline into the past.
+        let mut policy = FixedRatePolicy::new(1e-300);
+        policy.on_request_sent(100);
+        assert_eq!(policy.next_send_time(100), Some(u64::MAX));
+    }
+
+    #[test]
     fn test_poisson_policy() {
         let mut policy = PoissonPolicy::new(1000.0).expect("Failed to create Poisson");
 
@@ -623,6 +675,25 @@ mod tests {
 
         assert!(policy.current_rate() >= 500.0);
         assert!(policy.current_rate() <= 2000.0);
+    }
+
+    #[test]
+    fn test_adaptive_policy_non_positive_rate_never_sends() {
+        let target_latency = Duration::from_millis(10);
+        for rate in [0.0, -1.0] {
+            let mut policy = AdaptivePolicy::new(rate, target_latency, rate, rate);
+
+            // Not even the first request is due; the wakeup never arrives.
+            assert_eq!(policy.next_send_time(100), Some(u64::MAX), "rate {rate}");
+
+            // A rate adjustment stays within the non-positive bounds.
+            policy.on_request_sent(100);
+            for _ in 0..100 {
+                policy.add_latency_sample(Duration::ZERO);
+            }
+            assert_eq!(policy.next_send_time(200), Some(u64::MAX), "rate {rate}");
+            assert_eq!(policy.current_rate(), rate);
+        }
     }
 
     #[test]
