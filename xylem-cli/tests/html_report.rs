@@ -64,6 +64,9 @@ fn html_report_preserves_data_and_escapes_profile_text() {
     assert!(script.contains("data: [1.25,2.5,3.75,4.125,5.0625]"));
     assert!(script.contains("data: [1.25,2.5,3.75,4.125]"));
     assert!(script.contains("data: [12.3456]"));
+    // No latency was recorded: unavailable values are n/a, never 0.
+    assert_eq!(body.matches("<td>n/a</td>").count(), 4);
+    assert!(body.contains("<td>0</td>"), "sample count");
     // Verify JSON labels round-trip even when a JavaScript runtime is unavailable.
     let label_json = script.split("labels: ").nth(2).unwrap().lines().next().unwrap();
     let labels: Vec<String> = serde_json::from_str(label_json.trim_end_matches(',')).unwrap();
@@ -104,4 +107,28 @@ assert.deepEqual(charts[2].options.data.datasets[0].data, [1.25,2.5,3.75,4.125])
     child.stdin.take().unwrap().write_all(harness.as_bytes()).unwrap();
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+fn unavailable_latency_values_serialize_as_null() {
+    let stats = TupleStatsCollector::new(SamplingPolicy::None, Duration::from_secs(1));
+    let results = DetailedExperimentResults::from_tuple_stats(
+        "none".into(),
+        None,
+        None,
+        "127.0.0.1:1".into(),
+        "redis".into(),
+        "tcp".into(),
+        Duration::from_secs(1),
+        &stats,
+        &[],
+        false,
+    );
+    let json = serde_json::to_value(&results).unwrap();
+    let latency = &json["global"]["latency"];
+    for key in ["min_us", "max_us", "std_dev_us", "confidence_interval_us"] {
+        assert!(latency[key].is_null(), "{key}: {}", latency[key]);
+    }
+    assert_eq!(latency["sample_count"], 0);
+    assert!(latency.get("clamped_samples").is_none());
 }

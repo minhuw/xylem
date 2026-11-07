@@ -1650,6 +1650,7 @@ dependencies = [
  "hex",
  "humantime-serde",
  "rand",
+ "rand_distr",
  "schemars",
  "serde",
  "serde_json",

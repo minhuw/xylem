@@ -177,15 +177,31 @@ rate = 50.0  # Mean 50 req/s per connection
 
 ### Sampling Policy
 
-**`[traffic_groups.sampling_policy]`** - Latency sampling:
+**`[traffic_groups.sampling_policy]`** - Latency storage. If the section is
+omitted, the group uses an auto-resizing HDR histogram with 3 significant
+figures, which records every latency and merges independently of order.
 
 - `type` (string, required):
-  - `"unlimited"`: Sample every request (100% sampling)
-  - `"limited"`: Sample a fraction of requests
-  - `"adaptive"`, `"dd-sketch"`, `"t-digest"`, `"hdr-histogram"`: advanced samplers
+  - `"hdr-histogram"` (default): HDR histogram of every latency.
+    - `sigfigs` (integer 1-5, default 3): precision of each value.
+    - `max_value_us` (integer, optional): upper bound in microseconds. Unset,
+      the histogram grows to fit every value. Set, larger values are recorded
+      as the bound and counted in the `clamped_samples` output field.
+  - `"unlimited"`: store every latency; exact nearest-rank percentiles, memory
+    grows with the request count.
+  - `"limited"`: keep a uniform random sample (reservoir) of at most
+    `max_samples` latencies per bucket and connection. Merging weights each
+    part by the number of latencies it saw, so percentiles describe the whole
+    run, not its first requests.
+    - `rate` (float, default 1.0): fraction of latencies offered to the sample.
+    - `max_samples` (integer, default 131072).
+  - `"dd-sketch"` (`alpha`, `max_bins`) and `"t-digest"` (`compression`):
+    mergeable quantile sketches.
   - `"none"`: Disable latency sampling (throughput/bytes still recorded)
-- `rate` (float, required for limited): Sampling rate (0.0 to 1.0)
-- `max_samples` (integer, optional): Maximum samples to store
+
+For every type except `none`, the mean, min, max, standard deviation and
+sample count are computed exactly from every recorded latency; only the
+percentiles depend on the storage type.
 
 ```toml
 [traffic_groups.sampling_policy]

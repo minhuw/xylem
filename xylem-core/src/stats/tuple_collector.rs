@@ -27,16 +27,147 @@ pub struct StatsKey {
     pub connection_id: usize,
 }
 
-/// Latency storage variants based on sampling policy
-pub enum LatencyStorage {
+/// Exact summary of every latency a storage recorded, in nanoseconds.
+///
+/// Integer sums make merges exact, so the summary does not depend on the order
+/// in which entries are merged. Sums saturate rather than wrap.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Moments {
+    count: u64,
+    sum: u128,
+    sum_sq: u128,
+    min: u64,
+    max: u64,
+}
+
+impl Moments {
+    fn record(&mut self, ns: u64) {
+        self.min = if self.count == 0 {
+            ns
+        } else {
+            self.min.min(ns)
+        };
+        self.max = self.max.max(ns);
+        self.count += 1;
+        self.sum = self.sum.saturating_add(ns as u128);
+        self.sum_sq = self.sum_sq.saturating_add((ns as u128) * (ns as u128));
+    }
+
+    fn merge(&mut self, other: &Self) {
+        if other.count == 0 {
+            return;
+        }
+        self.min = if self.count == 0 {
+            other.min
+        } else {
+            self.min.min(other.min)
+        };
+        self.max = self.max.max(other.max);
+        self.count += other.count;
+        self.sum = self.sum.saturating_add(other.sum);
+        self.sum_sq = self.sum_sq.saturating_add(other.sum_sq);
+    }
+
+    fn mean(&self) -> Option<f64> {
+        (self.count > 0).then(|| self.sum as f64 / self.count as f64)
+    }
+
+    /// Sample standard deviation (divides by n - 1); needs two values.
+    fn std_dev(&self) -> Option<f64> {
+        if self.count < 2 {
+            return None;
+        }
+        let n = self.count as u128;
+        // n * sum_sq - sum^2 is exact while it fits in u128.
+        let numerator = match (n.checked_mul(self.sum_sq), self.sum.checked_mul(self.sum)) {
+            (Some(a), Some(b)) => a.saturating_sub(b) as f64,
+            _ => {
+                let mean = self.sum as f64 / self.count as f64;
+                (self.sum_sq as f64 - self.sum as f64 * mean).max(0.0) * self.count as f64
+            }
+        };
+        let variance = numerator / (self.count as f64 * (self.count - 1) as f64);
+        Some(variance.sqrt())
+    }
+}
+
+/// Uniform random sample of at most `capacity` latencies (nanoseconds).
+///
+/// `seen` counts every latency offered after the rate filter; `samples` is a
+/// uniform sample of those, so it holds `min(seen, capacity)` values.
+struct Reservoir {
+    samples: Vec<u64>,
+    capacity: usize,
+    rate: f64,
+    seen: u64,
+}
+
+impl Reservoir {
+    fn new(capacity: usize, rate: f64) -> Self {
+        Self {
+            samples: Vec::with_capacity(capacity.min(1024)),
+            capacity,
+            rate,
+            seen: 0,
+        }
+    }
+
+    /// Offer one latency; returns whether it passed the rate filter.
+    fn offer(&mut self, ns: u64) -> bool {
+        if self.rate < 1.0 && rand::random::<f64>() >= self.rate {
+            return false;
+        }
+        self.seen += 1;
+        if self.samples.len() < self.capacity {
+            self.samples.push(ns);
+        } else {
+            // Algorithm R: the new value replaces a stored one with
+            // probability capacity / seen.
+            let slot = rand::random_range(0..self.seen);
+            if slot < self.capacity as u64 {
+                self.samples[slot as usize] = ns;
+            }
+        }
+        true
+    }
+
+    /// Merge so the result is a uniform sample of both sides' seen values.
+    ///
+    /// The number of samples taken from this side follows the hypergeometric
+    /// distribution of drawing `keep` values from `self.seen + other.seen`
+    /// without replacement. A uniform subset of a uniform sample is uniform.
+    fn merge(&mut self, other: &Self) {
+        use rand::seq::SliceRandom;
+        use rand_distr::{Distribution, Hypergeometric};
+
+        let total = self.seen + other.seen;
+        let keep = (self.capacity as u64).min(total);
+        if (self.samples.len() + other.samples.len()) as u64 <= keep {
+            self.samples.extend_from_slice(&other.samples);
+            self.seen = total;
+            return;
+        }
+        let mut rng = rand::rng();
+        let from_self = Hypergeometric::new(total, self.seen, keep)
+            .expect("valid hypergeometric parameters")
+            .sample(&mut rng) as usize;
+        let from_other = keep as usize - from_self;
+        let (mine, _) = self.samples.partial_shuffle(&mut rng, from_self);
+        let mut merged = mine.to_vec();
+        let mut theirs = other.samples.clone();
+        let (theirs, _) = theirs.partial_shuffle(&mut rng, from_other);
+        merged.extend_from_slice(theirs);
+        self.samples = merged;
+        self.seen = total;
+    }
+}
+
+/// How a storage keeps latencies for percentiles.
+enum Quantiles {
     /// Latency sampling disabled
     None,
     /// Sample-based storage (Limited/Unlimited modes)
-    Samples {
-        samples: Vec<Duration>,
-        max_samples: usize,
-        sampling_rate: f64,
-    },
+    Samples(Reservoir),
     /// DDSketch for memory-efficient quantile estimation
     DdSketch(DDSketch),
     /// T-Digest for accurate tail percentiles.
@@ -44,70 +175,87 @@ pub enum LatencyStorage {
     /// Recorded values wait in `pending` until [`TDIGEST_BATCH_SIZE`] of them
     /// are merged into `digest` at once. Reads and merges include pending values.
     TDigest { digest: TDigest, pending: Vec<f64> },
-    /// HDR Histogram for high accuracy
-    HdrHistogram(Histogram<u64>),
+    /// HDR histogram. It auto-resizes unless the policy sets a maximum; then
+    /// larger values are recorded as the maximum and counted in `clamped`.
+    HdrHistogram { hist: Histogram<u64>, clamped: u64 },
+}
+
+/// Latency storage for one entry, built from a sampling policy.
+///
+/// Percentiles come from the policy's structure (samples or a sketch). Mean,
+/// min, max and standard deviation are computed exactly from every recorded
+/// latency, for every policy except `None`.
+pub struct LatencyStorage {
+    quantiles: Quantiles,
+    moments: Moments,
 }
 
 impl LatencyStorage {
+    /// Storage that records no latencies.
+    pub fn none() -> Self {
+        Self {
+            quantiles: Quantiles::None,
+            moments: Moments::default(),
+        }
+    }
+
     /// Create new storage based on sampling policy
     pub fn from_policy(policy: &SamplingPolicy) -> Self {
-        match policy {
-            SamplingPolicy::None => LatencyStorage::None,
-            SamplingPolicy::Limited { max_samples, rate } => LatencyStorage::Samples {
-                samples: Vec::with_capacity((*max_samples).min(1024)),
-                max_samples: *max_samples,
-                sampling_rate: *rate,
-            },
-            SamplingPolicy::Unlimited => LatencyStorage::Samples {
-                samples: Vec::new(),
-                max_samples: usize::MAX,
-                sampling_rate: 1.0,
-            },
+        let quantiles = match policy {
+            SamplingPolicy::None => Quantiles::None,
+            SamplingPolicy::Limited { max_samples, rate } => {
+                Quantiles::Samples(Reservoir::new(*max_samples, *rate))
+            }
+            SamplingPolicy::Unlimited => Quantiles::Samples(Reservoir::new(usize::MAX, 1.0)),
             SamplingPolicy::DdSketch { alpha, max_bins } => {
                 let config = DDSketchConfig::new(*alpha, *max_bins, 1.0);
-                LatencyStorage::DdSketch(DDSketch::new(config))
+                Quantiles::DdSketch(DDSketch::new(config))
             }
-            SamplingPolicy::TDigest { compression } => LatencyStorage::TDigest {
+            SamplingPolicy::TDigest { compression } => Quantiles::TDigest {
                 digest: TDigest::new_with_size(*compression),
                 pending: Vec::new(),
             },
             SamplingPolicy::HdrHistogram { sigfigs, max_value_us } => {
-                let max_value_ns = max_value_us * 1000;
-                let histogram = Histogram::<u64>::new_with_max(max_value_ns, *sigfigs)
-                    .expect("Failed to create HDR histogram");
-                LatencyStorage::HdrHistogram(histogram)
+                let hist = match max_value_us {
+                    None => Histogram::<u64>::new(*sigfigs),
+                    Some(max_us) => Histogram::new_with_max(max_us.saturating_mul(1000), *sigfigs),
+                }
+                .expect("Failed to create HDR histogram");
+                Quantiles::HdrHistogram { hist, clamped: 0 }
             }
-        }
+        };
+        Self { quantiles, moments: Moments::default() }
     }
 
     /// Record a latency sample
     pub fn record(&mut self, latency: Duration) {
-        match self {
-            LatencyStorage::None => {
-                // Skip latency storage
-            }
-            LatencyStorage::Samples { samples, max_samples, sampling_rate } => {
-                if samples.len() < *max_samples
-                    && (*sampling_rate >= 1.0 || rand::random::<f64>() < *sampling_rate)
-                {
-                    samples.push(latency);
+        let ns = latency.as_nanos().min(u64::MAX as u128) as u64;
+        match &mut self.quantiles {
+            Quantiles::None => return,
+            Quantiles::Samples(reservoir) => {
+                if !reservoir.offer(ns) {
+                    return;
                 }
             }
-            LatencyStorage::DdSketch(sketch) => {
-                sketch.add(latency.as_nanos() as f64);
-            }
-            LatencyStorage::TDigest { digest, pending } => {
-                pending.push(latency.as_nanos() as f64);
+            Quantiles::DdSketch(sketch) => sketch.add(ns as f64),
+            Quantiles::TDigest { digest, pending } => {
+                pending.push(ns as f64);
                 if pending.len() >= TDIGEST_BATCH_SIZE {
                     // Hand the full buffer to the digest and start a new one.
                     let batch = std::mem::replace(pending, Vec::with_capacity(TDIGEST_BATCH_SIZE));
                     *digest = digest.merge_unsorted(batch);
                 }
             }
-            LatencyStorage::HdrHistogram(hist) => {
-                let _ = hist.record(latency.as_nanos() as u64);
+            Quantiles::HdrHistogram { hist, clamped } => {
+                // Only a bounded histogram (or a value beyond any resize)
+                // rejects a value; record it at the bound and count it.
+                if hist.record(ns).is_err() {
+                    hist.saturating_record(ns);
+                    *clamped += 1;
+                }
             }
         }
+        self.moments.record(ns);
     }
 
     /// Merge another storage into this one (consumes other).
@@ -127,28 +275,23 @@ impl LatencyStorage {
     }
 
     /// Merge compatible storage, returning an error instead of dropping samples
-    /// when policies differ. Limited samples are retained in input order up to
-    /// the configured capacity. None can only merge with None.
+    /// when policies differ. Limited samples are merged so the result is a
+    /// uniform sample of both sides, weighted by how many latencies each side
+    /// saw. None can only merge with None.
     pub fn try_merge_ref(&mut self, other: &Self) -> Result<(), &'static str> {
-        match (self, other) {
-            (LatencyStorage::None, LatencyStorage::None) => {}
-            (
-                LatencyStorage::Samples { samples, max_samples, sampling_rate },
-                LatencyStorage::Samples {
-                    samples: other_samples,
-                    max_samples: other_max,
-                    sampling_rate: other_rate,
-                },
-            ) if max_samples == other_max && sampling_rate == other_rate => {
-                samples
-                    .extend(other_samples.iter().take(max_samples.saturating_sub(samples.len())));
+        match (&mut self.quantiles, &other.quantiles) {
+            (Quantiles::None, Quantiles::None) => {}
+            (Quantiles::Samples(mine), Quantiles::Samples(theirs))
+                if mine.capacity == theirs.capacity && mine.rate == theirs.rate =>
+            {
+                mine.merge(theirs);
             }
-            (LatencyStorage::DdSketch(sketch), LatencyStorage::DdSketch(other)) => {
+            (Quantiles::DdSketch(sketch), Quantiles::DdSketch(other)) => {
                 sketch.merge(other).map_err(|_| "DDSketch configurations differ")?;
             }
             (
-                LatencyStorage::TDigest { digest, pending },
-                LatencyStorage::TDigest { digest: other, pending: other_pending },
+                Quantiles::TDigest { digest, pending },
+                Quantiles::TDigest { digest: other, pending: other_pending },
             ) if digest.max_size() == other.max_size() => {
                 // Fold pending values into both digests first, so the merged
                 // digest holds every value and this side has none pending.
@@ -156,27 +299,36 @@ impl LatencyStorage {
                 let theirs = other.merge_unsorted(other_pending.clone());
                 *digest = TDigest::merge_digests(vec![mine, theirs]);
             }
-            (LatencyStorage::HdrHistogram(hist), LatencyStorage::HdrHistogram(other))
-                if (hist.low(), hist.high(), hist.sigfig())
-                    == (other.low(), other.high(), other.sigfig()) =>
+            (
+                Quantiles::HdrHistogram { hist, clamped },
+                Quantiles::HdrHistogram { hist: other, clamped: other_clamped },
+            ) if hist.sigfig() == other.sigfig()
+                && hist.is_auto_resize() == other.is_auto_resize()
+                && (hist.is_auto_resize() || hist.high() == other.high()) =>
             {
                 hist.add(other).map_err(|_| "HDR histogram merge failed")?;
+                *clamped += other_clamped;
             }
             _ => return Err("latency storage configurations differ"),
         }
+        self.moments.merge(&other.moments);
         Ok(())
     }
 
-    /// Get sample count
+    /// Number of latencies recorded (after any sampling rate). For `limited`
+    /// storage this can exceed the number of samples kept for percentiles.
     pub fn count(&self) -> u64 {
-        match self {
-            LatencyStorage::None => 0,
-            LatencyStorage::Samples { samples, .. } => samples.len() as u64,
-            LatencyStorage::DdSketch(sketch) => sketch.count() as u64,
-            LatencyStorage::TDigest { digest, pending } => {
-                digest.count() as u64 + pending.len() as u64
+        self.moments.count
+    }
+
+    /// Number of latencies a bounded HDR histogram recorded at its maximum
+    /// because they exceeded it. `None` for storage that never clamps.
+    pub fn clamped_count(&self) -> Option<u64> {
+        match &self.quantiles {
+            Quantiles::HdrHistogram { hist, clamped } if !hist.is_auto_resize() || *clamped > 0 => {
+                Some(*clamped)
             }
-            LatencyStorage::HdrHistogram(hist) => hist.len(),
+            _ => None,
         }
     }
 
@@ -193,86 +345,55 @@ impl LatencyStorage {
     /// value at index `round(p * (n - 1))` of the ascending samples. Sketch
     /// storage answers each percentile with its own quantile estimate.
     pub fn percentiles(&self, ps: &[f64]) -> Vec<u64> {
-        match self {
-            LatencyStorage::None => vec![0; ps.len()],
-            LatencyStorage::Samples { samples, .. } => {
-                if samples.is_empty() {
+        match &self.quantiles {
+            Quantiles::None => vec![0; ps.len()],
+            Quantiles::Samples(reservoir) => {
+                if reservoir.samples.is_empty() {
                     return vec![0; ps.len()];
                 }
-                let mut sorted = samples.to_vec();
-                sorted.sort();
+                let mut sorted = reservoir.samples.clone();
+                sorted.sort_unstable();
                 let last = sorted.len() - 1;
                 ps.iter()
                     .map(|&p| {
                         let idx = ((p * last as f64).round() as usize).min(last);
-                        sorted[idx].as_nanos() as u64
+                        sorted[idx]
                     })
                     .collect()
             }
-            LatencyStorage::DdSketch(sketch) => ps
+            Quantiles::DdSketch(sketch) => ps
                 .iter()
                 .map(|&p| sketch.quantile(p).ok().flatten().map(|v| v as u64).unwrap_or(0))
                 .collect(),
-            LatencyStorage::TDigest { digest, pending } => {
+            Quantiles::TDigest { digest, pending } => {
                 let digest = tdigest_with_pending(digest, pending);
                 ps.iter().map(|&p| digest.estimate_quantile(p) as u64).collect()
             }
-            LatencyStorage::HdrHistogram(hist) => {
+            Quantiles::HdrHistogram { hist, .. } => {
                 ps.iter().map(|&p| hist.value_at_quantile(p)).collect()
             }
         }
     }
 
-    /// Calculate mean (returns nanoseconds)
+    /// Exact mean of the recorded latencies (nanoseconds, rounded); 0 when empty.
     pub fn mean(&self) -> u64 {
-        match self {
-            LatencyStorage::None => 0,
-            LatencyStorage::Samples { samples, .. } => {
-                if samples.is_empty() {
-                    return 0;
-                }
-                let sum: u128 = samples.iter().map(|d| d.as_nanos()).sum();
-                (sum / samples.len() as u128) as u64
-            }
-            LatencyStorage::DdSketch(sketch) => {
-                // DDSketch doesn't have mean, approximate with median
-                sketch.quantile(0.5).ok().flatten().map(|v| v as u64).unwrap_or(0)
-            }
-            LatencyStorage::TDigest { digest, pending } => {
-                tdigest_with_pending(digest, pending).mean() as u64
-            }
-            LatencyStorage::HdrHistogram(hist) => hist.mean() as u64,
-        }
+        self.moments.mean().map_or(0, |mean| mean.round() as u64)
     }
 
-    /// Get min value (returns nanoseconds)
-    pub fn min(&self) -> u64 {
-        match self {
-            LatencyStorage::None => 0,
-            LatencyStorage::Samples { samples, .. } => {
-                samples.iter().min().map(|d| d.as_nanos() as u64).unwrap_or(0)
-            }
-            LatencyStorage::DdSketch(sketch) => sketch.min().map(|v| v as u64).unwrap_or(0),
-            LatencyStorage::TDigest { digest, pending } => {
-                tdigest_with_pending(digest, pending).min() as u64
-            }
-            LatencyStorage::HdrHistogram(hist) => hist.min(),
-        }
+    /// Smallest recorded latency (nanoseconds), if any.
+    pub fn min(&self) -> Option<u64> {
+        (self.moments.count > 0).then_some(self.moments.min)
     }
 
-    /// Get max value (returns nanoseconds)
-    pub fn max(&self) -> u64 {
-        match self {
-            LatencyStorage::None => 0,
-            LatencyStorage::Samples { samples, .. } => {
-                samples.iter().max().map(|d| d.as_nanos() as u64).unwrap_or(0)
-            }
-            LatencyStorage::DdSketch(sketch) => sketch.max().map(|v| v as u64).unwrap_or(0),
-            LatencyStorage::TDigest { digest, pending } => {
-                tdigest_with_pending(digest, pending).max() as u64
-            }
-            LatencyStorage::HdrHistogram(hist) => hist.max(),
-        }
+    /// Largest recorded latency (nanoseconds), if any.
+    pub fn max(&self) -> Option<u64> {
+        (self.moments.count > 0).then_some(self.moments.max)
+    }
+
+    /// Sample standard deviation of the recorded latencies (nanoseconds);
+    /// `None` with fewer than two latencies.
+    pub fn std_dev(&self) -> Option<f64> {
+        self.moments.std_dev()
     }
 }
 
@@ -820,6 +941,8 @@ impl TupleStatsCollector {
         let duration_secs = duration.as_secs_f64();
         let total_bytes = (total_tx_bytes + total_rx_bytes) as f64;
         let latency_percentiles = latency.percentiles(&[0.5, 0.95, 0.99, 0.999, 0.9999, 0.99999]);
+        // Seconds, for Duration::from_secs_f64.
+        let std_dev = latency.std_dev().map(|ns| ns / 1e9);
 
         AggregatedStats {
             latency_p50: Duration::from_nanos(latency_percentiles[0]),
@@ -829,8 +952,13 @@ impl TupleStatsCollector {
             latency_p9999: Duration::from_nanos(latency_percentiles[4]),
             latency_p99999: Duration::from_nanos(latency_percentiles[5]),
             mean_latency: Duration::from_nanos(latency.mean()),
-            std_dev: Duration::ZERO, // TODO: compute from samples if available
-            confidence_interval: Duration::ZERO,
+            min_latency: latency.min().map(Duration::from_nanos),
+            max_latency: latency.max().map(Duration::from_nanos),
+            std_dev: std_dev.map(Duration::from_secs_f64),
+            confidence_interval: std_dev
+                .map(|sd| Duration::from_secs_f64(1.96 * sd / (latency.count() as f64).sqrt())),
+            latency_sample_count: latency.count(),
+            clamped_samples: latency.clamped_count(),
             throughput_rps: if duration_secs > 0.0 {
                 total_requests as f64 / duration_secs
             } else {
@@ -874,7 +1002,7 @@ mod tests {
         collector.register_group_policy(1, SamplingPolicy::TDigest { compression: 100 });
         collector.register_group_policy(
             2,
-            SamplingPolicy::HdrHistogram { sigfigs: 3, max_value_us: 10_000 },
+            SamplingPolicy::HdrHistogram { sigfigs: 3, max_value_us: Some(10_000) },
         );
         for group in 0..3 {
             // Both byte APIs can create an entry before the first latency arrives.
@@ -993,7 +1121,7 @@ mod tests {
         let mut other_sketch =
             LatencyStorage::from_policy(&SamplingPolicy::DdSketch { alpha: 0.02, max_bins: 1024 });
         assert!(other_sketch.try_merge_ref(&sketch).is_err());
-        assert!(LatencyStorage::None.try_merge_ref(&samples).is_err());
+        assert!(LatencyStorage::none().try_merge_ref(&samples).is_err());
     }
 
     #[test]
@@ -1101,6 +1229,194 @@ mod tests {
         assert!(error.to_string().contains("unknown variant `adaptive`"), "{error}");
     }
 
+    fn storage_with(
+        policy: &SamplingPolicy,
+        latencies_ns: impl IntoIterator<Item = u64>,
+    ) -> LatencyStorage {
+        let mut storage = LatencyStorage::from_policy(policy);
+        for ns in latencies_ns {
+            storage.record(Duration::from_nanos(ns));
+        }
+        storage
+    }
+
+    /// Ten buckets of 20,000 latencies each; bucket b holds (b + 1) ms, so
+    /// only an aggregate over every bucket has a median near 5.5 ms.
+    fn collector_with_ten_buckets(policy: SamplingPolicy) -> TupleStatsCollector {
+        let mut collector =
+            TupleStatsCollector::with_start_time(policy.clone(), Duration::from_secs(1), 0);
+        for bucket in 0..10u64 {
+            let mut entry = StatsEntry::new(&policy);
+            for _ in 0..20_000 {
+                entry.record_latency(Duration::from_millis(bucket + 1));
+            }
+            collector.global_entries.insert(bucket, entry);
+        }
+        collector
+    }
+
+    #[test]
+    fn percentiles_beyond_max_samples_reflect_every_bucket() {
+        for policy in [
+            SamplingPolicy::default(),
+            SamplingPolicy::Limited { max_samples: 128 * 1024, rate: 1.0 },
+            SamplingPolicy::Limited { max_samples: 1000, rate: 1.0 },
+        ] {
+            let stats = collector_with_ten_buckets(policy.clone())
+                .aggregate_global(Duration::from_secs(10));
+            assert_eq!(stats.total_requests, 200_000, "{policy:?}");
+            assert_eq!(stats.latency_sample_count, 200_000, "{policy:?}");
+            // Buckets 5 and 6 straddle the median; the old first-come merge
+            // reported whichever buckets the HashMap visited first.
+            let p50 = stats.latency_p50.as_micros();
+            assert!((5_000..=6_010).contains(&p50), "{policy:?}: p50 {p50} us");
+            let p99 = stats.latency_p99.as_micros();
+            assert!((9_990..=10_010).contains(&p99), "{policy:?}: p99 {p99} us");
+            assert_eq!(stats.mean_latency, Duration::from_micros(5_500), "{policy:?}");
+            assert_eq!(stats.min_latency, Some(Duration::from_millis(1)), "{policy:?}");
+            assert_eq!(stats.max_latency, Some(Duration::from_millis(10)), "{policy:?}");
+        }
+    }
+
+    #[test]
+    fn limited_reservoir_is_uniform_and_counts_every_latency() {
+        let policy = SamplingPolicy::Limited { max_samples: 1000, rate: 1.0 };
+        let storage = storage_with(&policy, 0..100_000);
+        assert_eq!(storage.count(), 100_000);
+        let Quantiles::Samples(reservoir) = &storage.quantiles else {
+            unreachable!()
+        };
+        assert_eq!(reservoir.samples.len(), 1000);
+        // Keeping the first 1,000 values would put the median at about 500.
+        let p50 = storage.percentile(0.5);
+        assert!((40_000..=60_000).contains(&p50), "p50 {p50}");
+        assert_eq!(storage.mean(), 49_999 + 1); // 49,999.5 rounded
+    }
+
+    #[test]
+    fn limited_merge_weights_each_side_by_observed_count() {
+        let policy = SamplingPolicy::Limited { max_samples: 1000, rate: 1.0 };
+        let many = storage_with(&policy, std::iter::repeat_n(1, 90_000));
+        let few = storage_with(&policy, std::iter::repeat_n(2, 10_000));
+        for (first, second) in [(&many, &few), (&few, &many)] {
+            let mut merged = LatencyStorage::from_policy(&policy);
+            merged.merge_ref(first);
+            merged.merge_ref(second);
+            assert_eq!(merged.count(), 100_000);
+            let Quantiles::Samples(reservoir) = &merged.quantiles else {
+                unreachable!()
+            };
+            assert_eq!(reservoir.samples.len(), 1000);
+            assert_eq!(reservoir.seen, 100_000);
+            // Expect 100 twos (10%); the standard deviation is under 10.
+            let twos = reservoir.samples.iter().filter(|&&ns| ns == 2).count();
+            assert!((40..=160).contains(&twos), "{twos} of 1000 samples from the 10% side");
+            assert_eq!(merged.mean(), 1); // 1.1 rounded
+            assert_eq!((merged.min(), merged.max()), (Some(1), Some(2)));
+        }
+    }
+
+    #[test]
+    fn hdr_merge_is_independent_of_order() {
+        let policy = SamplingPolicy::default();
+        let parts: Vec<LatencyStorage> = (0..5u64)
+            .map(|part| storage_with(&policy, (0..10_000).map(|i| 1_000 + part * 7_919 + i * 13)))
+            .collect();
+        let merge = |order: &[usize]| {
+            let mut merged = LatencyStorage::from_policy(&policy);
+            for &i in order {
+                merged.merge_ref(&parts[i]);
+            }
+            merged
+        };
+        let forward = merge(&[0, 1, 2, 3, 4]);
+        let backward = merge(&[4, 3, 2, 1, 0]);
+        let shuffled = merge(&[2, 0, 4, 1, 3]);
+        let quantiles = [0.0, 0.5, 0.9, 0.99, 0.999, 1.0];
+        for other in [&backward, &shuffled] {
+            assert_eq!(forward.percentiles(&quantiles), other.percentiles(&quantiles));
+            assert_eq!(forward.moments, other.moments);
+        }
+        assert_eq!(forward.count(), 50_000);
+    }
+
+    #[test]
+    fn hdr_never_drops_out_of_range_values() {
+        // The default histogram resizes: two hours exceeds the former 1 h bound.
+        let two_hours = Duration::from_secs(7_200).as_nanos() as u64;
+        let storage = storage_with(&SamplingPolicy::default(), [1_000, two_hours]);
+        assert_eq!(storage.count(), 2);
+        assert_eq!(storage.max(), Some(two_hours));
+        assert!(storage.percentile(1.0).abs_diff(two_hours) * 1000 <= two_hours);
+        assert_eq!(storage.clamped_count(), None);
+
+        // A configured bound clamps and counts instead of discarding.
+        let bounded = SamplingPolicy::HdrHistogram { sigfigs: 3, max_value_us: Some(1_000) };
+        let storage = storage_with(&bounded, [500_000, 5_000_000, 7_000_000]);
+        assert_eq!(storage.count(), 3);
+        assert_eq!(storage.clamped_count(), Some(2));
+        let p100 = storage.percentile(1.0);
+        assert!(p100.abs_diff(1_000_000) <= 1_000, "clamped to the bound: {p100}");
+        // Exact moments still see the true values.
+        assert_eq!(storage.max(), Some(7_000_000));
+        let mut merged = LatencyStorage::from_policy(&bounded);
+        merged.merge_ref(&storage);
+        merged.merge_ref(&storage);
+        assert_eq!(merged.clamped_count(), Some(4));
+        assert_eq!(LatencyStorage::from_policy(&bounded).clamped_count(), Some(0));
+    }
+
+    #[test]
+    fn mean_is_exact_for_a_skewed_distribution() {
+        // 99 x 1 us and 1 x 10 ms: the median is 1 us, the mean 100.99 us.
+        let latencies = std::iter::repeat_n(1_000, 99).chain([10_000_000]);
+        let latencies: Vec<u64> = latencies.collect();
+        for policy in [
+            SamplingPolicy::default(),
+            SamplingPolicy::Unlimited,
+            SamplingPolicy::Limited { max_samples: 10, rate: 1.0 },
+            SamplingPolicy::DdSketch { alpha: 0.01, max_bins: 1024 },
+            SamplingPolicy::TDigest { compression: 100 },
+        ] {
+            let storage = storage_with(&policy, latencies.iter().copied());
+            assert_eq!(storage.mean(), 100_990, "{policy:?}");
+        }
+    }
+
+    #[test]
+    fn aggregated_stats_report_std_dev_and_confidence_interval() {
+        let mut collector =
+            TupleStatsCollector::new(SamplingPolicy::default(), Duration::from_secs(3600));
+        for us in [2, 4, 4, 4, 5, 5, 7, 9] {
+            collector.record_latency(0, 0, Duration::from_micros(us));
+        }
+        let stats = collector.aggregate_global(Duration::from_secs(1));
+        // Sample variance: sum of squared deviations 32 over n - 1 = 7.
+        let sd = (32.0f64 / 7.0).sqrt();
+        let sd_us = stats.std_dev.unwrap().as_secs_f64() * 1e6;
+        // Durations hold whole nanoseconds.
+        assert!((sd_us - sd).abs() <= 1e-3, "{sd_us}");
+        let ci_us = stats.confidence_interval.unwrap().as_secs_f64() * 1e6;
+        assert!((ci_us - 1.96 * sd / 8f64.sqrt()).abs() <= 1e-3, "{ci_us}");
+        assert_eq!(stats.latency_sample_count, 8);
+        assert_eq!(stats.min_latency, Some(Duration::from_micros(2)));
+        assert_eq!(stats.max_latency, Some(Duration::from_micros(9)));
+        assert_eq!(stats.clamped_samples, None);
+
+        // Unavailable values are None rather than zero.
+        let mut single =
+            TupleStatsCollector::new(SamplingPolicy::default(), Duration::from_secs(3600));
+        single.record_latency(0, 0, Duration::from_micros(3));
+        let stats = single.aggregate_global(Duration::from_secs(1));
+        assert_eq!((stats.std_dev, stats.confidence_interval), (None, None));
+        let mut none = TupleStatsCollector::new(SamplingPolicy::None, Duration::from_secs(3600));
+        none.record_latency(0, 0, Duration::from_micros(3));
+        let stats = none.aggregate_global(Duration::from_secs(1));
+        assert_eq!(stats.total_requests, 1);
+        assert_eq!((stats.min_latency, stats.max_latency, stats.std_dev), (None, None, None));
+        assert_eq!(stats.latency_sample_count, 0);
+    }
+
     #[test]
     fn test_latency_storage_ddsketch() {
         let mut storage =
@@ -1202,8 +1518,9 @@ mod tests {
         let storage = record_tdigest(&latencies_ns);
         let exact_mean = latencies_ns.iter().sum::<u64>() / latencies_ns.len() as u64;
         assert_within_one_percent("mean", storage.mean(), exact_mean);
-        assert_within_one_percent("min", storage.min(), *latencies_ns.iter().min().unwrap());
-        assert_within_one_percent("max", storage.max(), *latencies_ns.iter().max().unwrap());
+        // Min and max are tracked exactly beside the digest.
+        assert_eq!(storage.min(), latencies_ns.iter().min().copied());
+        assert_eq!(storage.max(), latencies_ns.iter().max().copied());
     }
 
     #[test]

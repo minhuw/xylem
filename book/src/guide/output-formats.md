@@ -16,6 +16,24 @@ file = "results"
 The CLI sets the file extension to `.json` or `.html` as appropriate. `file` is
 required even for `human`. All formats also print a human-readable summary.
 
+## Latency fields
+
+Each `latency` object in JSON (global and per group) holds, in microseconds:
+
+- `p50_us` ... `p99999_us`: percentiles from the group's sampling policy.
+- `mean_us`, `min_us`, `max_us`: exact, from every recorded latency.
+- `std_dev_us`: sample standard deviation.
+- `confidence_interval_us`: half-width of the 95% confidence interval of the
+  mean, `1.96 * std_dev / sqrt(sample_count)`.
+- `sample_count`: number of latencies recorded, after any `limited` rate.
+- `clamped_samples`: present only for an HDR histogram with `max_value_us`;
+  the number of latencies above that bound, recorded as the bound.
+
+A value the run cannot provide is `null` in JSON and `n/a` in the console and
+HTML: `min_us` and `max_us` without recorded latencies (for example with
+`type = "none"`), and `std_dev_us` and `confidence_interval_us` with fewer than
+two.
+
 For raw per-time-bucket, per-connection records in JSON, use:
 
 ```toml

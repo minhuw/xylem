@@ -27,10 +27,14 @@ pub struct ExperimentResults {
     pub latency: LatencyStats,
 }
 
+/// Latency summary in microseconds. Values the sampling policy cannot provide
+/// are `None`, written as `null` in JSON and `n/a` in text and HTML.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LatencyStats {
-    pub min_us: f64,
-    pub max_us: f64,
+    /// Smallest recorded latency; null when no latency was recorded.
+    pub min_us: Option<f64>,
+    /// Largest recorded latency; null when no latency was recorded.
+    pub max_us: Option<f64>,
     pub mean_us: f64,
     pub p50_us: f64,
     pub p95_us: f64,
@@ -38,9 +42,27 @@ pub struct LatencyStats {
     pub p999_us: f64,
     pub p9999_us: f64,
     pub p99999_us: f64,
-    pub std_dev_us: f64,
-    pub confidence_interval_us: f64,
+    /// Sample standard deviation; null with fewer than two latencies.
+    pub std_dev_us: Option<f64>,
+    /// Half-width of the 95% confidence interval of the mean; null with
+    /// fewer than two latencies.
+    pub confidence_interval_us: Option<f64>,
+    /// Number of latencies recorded, after any sampling rate.
     pub sample_count: usize,
+    /// Latencies above a configured `max_value_us` of an HDR histogram, which
+    /// were recorded at that bound. Omitted unless the bound is configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clamped_samples: Option<u64>,
+}
+
+/// Microseconds in a duration.
+fn micros(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1_000_000.0
+}
+
+/// Format an optional value with two decimals, or `n/a`.
+pub(crate) fn format_optional(value: Option<f64>) -> String {
+    value.map_or_else(|| "n/a".to_string(), |value| format!("{value:.2}"))
 }
 
 /// Per-second per-connection statistics record
@@ -260,22 +282,44 @@ impl DetailedExperimentResults {
     }
 
     /// Convert aggregated latencies to microseconds.
-    ///
-    /// Aggregated stats have no min, max, or sample count, so those are zero.
     fn latency_stats(aggregated: &AggregatedStats) -> LatencyStats {
         LatencyStats {
-            min_us: 0.0,
-            max_us: 0.0,
-            mean_us: aggregated.mean_latency.as_secs_f64() * 1_000_000.0,
-            p50_us: aggregated.latency_p50.as_secs_f64() * 1_000_000.0,
-            p95_us: aggregated.latency_p95.as_secs_f64() * 1_000_000.0,
-            p99_us: aggregated.latency_p99.as_secs_f64() * 1_000_000.0,
-            p999_us: aggregated.latency_p999.as_secs_f64() * 1_000_000.0,
-            p9999_us: aggregated.latency_p9999.as_secs_f64() * 1_000_000.0,
-            p99999_us: aggregated.latency_p99999.as_secs_f64() * 1_000_000.0,
-            std_dev_us: aggregated.std_dev.as_secs_f64() * 1_000_000.0,
-            confidence_interval_us: aggregated.confidence_interval.as_secs_f64() * 1_000_000.0,
-            sample_count: 0,
+            min_us: aggregated.min_latency.map(micros),
+            max_us: aggregated.max_latency.map(micros),
+            mean_us: micros(aggregated.mean_latency),
+            p50_us: micros(aggregated.latency_p50),
+            p95_us: micros(aggregated.latency_p95),
+            p99_us: micros(aggregated.latency_p99),
+            p999_us: micros(aggregated.latency_p999),
+            p9999_us: micros(aggregated.latency_p9999),
+            p99999_us: micros(aggregated.latency_p99999),
+            std_dev_us: aggregated.std_dev.map(micros),
+            confidence_interval_us: aggregated.confidence_interval.map(micros),
+            sample_count: aggregated.latency_sample_count as usize,
+            clamped_samples: aggregated.clamped_samples,
+        }
+    }
+
+    /// Print the latency summary lines with `indent` before each label.
+    fn print_latency(latency: &LatencyStats, indent: &str) {
+        // Values start in column 17, as in the rest of the summary.
+        let width = 17 - indent.len();
+        let line = |label: &str, value: String| println!("{indent}{label:<width$}{value}");
+        line("Mean:", format!("{:.2}", latency.mean_us));
+        line("Min:", format_optional(latency.min_us));
+        line("Max:", format_optional(latency.max_us));
+        line("p50:", format!("{:.2}", latency.p50_us));
+        line("p95:", format!("{:.2}", latency.p95_us));
+        line("p99:", format!("{:.2}", latency.p99_us));
+        line("p999:", format!("{:.2}", latency.p999_us));
+        line("Std Dev:", format_optional(latency.std_dev_us));
+        line(
+            "95% CI:",
+            latency.confidence_interval_us.map_or("n/a".into(), |ci| format!("±{ci:.2}")),
+        );
+        line("Samples:", latency.sample_count.to_string());
+        if let Some(clamped) = latency.clamped_samples {
+            line("Clamped:", clamped.to_string());
         }
     }
 
@@ -352,17 +396,7 @@ impl DetailedExperimentResults {
         println!("Bandwidth:       {:.2} Mbps", self.global.throughput_mbps);
         println!();
         println!("Latency (μs):");
-        println!("  Mean:          {:.2}", self.global.latency.mean_us);
-        println!("  p50:           {:.2}", self.global.latency.p50_us);
-        println!("  p95:           {:.2}", self.global.latency.p95_us);
-        println!("  p99:           {:.2}", self.global.latency.p99_us);
-        println!("  p999:          {:.2}", self.global.latency.p999_us);
-        if self.global.latency.std_dev_us > 0.0 {
-            println!("  Std Dev:       {:.2}", self.global.latency.std_dev_us);
-        }
-        if self.global.latency.confidence_interval_us > 0.0 {
-            println!("  95% CI:        ±{:.2}", self.global.latency.confidence_interval_us);
-        }
+        Self::print_latency(&self.global.latency, "  ");
         println!();
 
         for (i, group) in self.traffic_groups.iter().enumerate() {
@@ -380,11 +414,7 @@ impl DetailedExperimentResults {
             println!("  Bandwidth:     {:.2} Mbps", group.stats.throughput_mbps);
             println!();
             println!("  Latency (μs):");
-            println!("    Mean:        {:.2}", group.stats.latency.mean_us);
-            println!("    p50:         {:.2}", group.stats.latency.p50_us);
-            println!("    p95:         {:.2}", group.stats.latency.p95_us);
-            println!("    p99:         {:.2}", group.stats.latency.p99_us);
-            println!("    p999:        {:.2}", group.stats.latency.p999_us);
+            Self::print_latency(&group.stats.latency, "    ");
 
             if let Some(ref metadata) = group.protocol_metadata {
                 println!();

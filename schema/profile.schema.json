@@ -505,7 +505,7 @@
           ]
         },
         {
-          "description": "Limited sampling with fixed rate and max samples",
+          "description": "Uniform random sample of at most `max_samples` latencies per entry.\nEach latency is first kept with probability `rate`; the kept latencies\nare reservoir-sampled, so the stored samples are a uniform sample of\nevery kept latency, not the first ones. Mean, min, max and standard\ndeviation are computed from every kept latency.",
           "type": "object",
           "properties": {
             "max_samples": {
@@ -590,14 +590,16 @@
           ]
         },
         {
-          "description": "HDR Histogram: High dynamic range histogram for maximum accuracy\nHigher memory usage but excellent for all percentiles",
+          "description": "HDR Histogram: records every latency with bounded relative error.\nThis is the default policy.",
           "type": "object",
           "properties": {
             "max_value_us": {
-              "description": "Maximum expected value (in microseconds)",
-              "type": "integer",
+              "description": "Optional upper bound (in microseconds). When unset, the histogram\ngrows to fit every recorded value. When set, larger values are\nrecorded as this bound and counted in the `clamped_samples` output.",
+              "type": [
+                "integer",
+                "null"
+              ],
               "format": "uint64",
-              "default": 3600000000,
               "minimum": 0
             },
             "sigfigs": {
@@ -681,9 +683,8 @@
           "description": "Latency sampling policy",
           "$ref": "#/$defs/SamplingPolicy",
           "default": {
-            "max_samples": 131072,
-            "rate": 1.0,
-            "type": "limited"
+            "sigfigs": 3,
+            "type": "hdr-histogram"
           }
         },
         "target": {

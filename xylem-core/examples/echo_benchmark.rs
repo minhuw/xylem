@@ -100,7 +100,7 @@ fn run_worker(
     // Group 0 skips latency storage: a histogram (about 270 KB) per connection
     // and time bucket is too much memory with the default 1024 connections.
     let mut stats = TupleStatsCollector::new(
-        SamplingPolicy::HdrHistogram { sigfigs: 3, max_value_us: 3_600_000_000 },
+        SamplingPolicy::HdrHistogram { sigfigs: 3, max_value_us: None },
         Duration::from_secs(1),
     );
     stats.register_group_policy(0, SamplingPolicy::None);

@@ -56,9 +56,22 @@ pub struct AggregatedStats {
     pub latency_p999: Duration,
     pub latency_p9999: Duration,
     pub latency_p99999: Duration,
+    /// Exact mean of every recorded latency; zero when none were recorded.
     pub mean_latency: Duration,
-    pub std_dev: Duration,
-    pub confidence_interval: Duration,
+    /// Smallest recorded latency; `None` when none were recorded.
+    pub min_latency: Option<Duration>,
+    /// Largest recorded latency; `None` when none were recorded.
+    pub max_latency: Option<Duration>,
+    /// Sample standard deviation; `None` with fewer than two latencies.
+    pub std_dev: Option<Duration>,
+    /// Half-width of the 95% confidence interval of the mean
+    /// (1.96 * std_dev / sqrt(n)); `None` with fewer than two latencies.
+    pub confidence_interval: Option<Duration>,
+    /// Number of latencies recorded, after any sampling rate.
+    pub latency_sample_count: u64,
+    /// Latencies a bounded HDR histogram recorded at its `max_value_us`;
+    /// `None` unless the policy sets that bound.
+    pub clamped_samples: Option<u64>,
     pub throughput_rps: f64,
     pub throughput_mbps: f64,
     pub total_requests: u64,
