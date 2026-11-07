@@ -380,12 +380,8 @@ pub struct ConnectionStats {
 /// Stores statistics keyed by (time_bucket, group_id, connection_id) for flexible
 /// on-demand aggregation by any dimension. Global latency storage is independent
 /// of group storage: each recorded latency is sampled once under each policy.
-/// This requires additional storage per retained bucket and allows heterogeneous
+/// This requires additional storage per bucket and allows heterogeneous
 /// groups without converting or discarding their sketches.
-///
-/// Supports two modes:
-/// - **In-memory**: All entries kept in memory (default)
-/// - **Streaming**: Old buckets flushed to Parquet files for bounded memory
 pub struct TupleStatsCollector {
     /// Statistics entries keyed by (time_bucket, group_id, connection_id)
     entries: HashMap<StatsKey, StatsEntry>,
@@ -401,16 +397,10 @@ pub struct TupleStatsCollector {
     bucket_duration_ns: u64,
     /// Experiment start time in nanoseconds
     experiment_start_ns: u64,
-    /// Current time bucket (for optimization)
-    current_bucket: u64,
-    /// Optional streaming dumper for bounded-memory operation
-    dumper: Option<super::dumper::StatsDumper>,
-    /// Number of buckets to retain in memory when streaming
-    retention_buckets: u64,
 }
 
 impl TupleStatsCollector {
-    /// Create a new tuple stats collector (in-memory mode)
+    /// Create a new tuple stats collector
     pub fn new(sampling_policy: SamplingPolicy, bucket_duration: Duration) -> Self {
         Self {
             entries: HashMap::new(),
@@ -419,9 +409,6 @@ impl TupleStatsCollector {
             group_sampling_policies: HashMap::new(),
             bucket_duration_ns: bucket_duration.as_nanos() as u64,
             experiment_start_ns: crate::timing::time_ns(),
-            current_bucket: 0,
-            dumper: None,
-            retention_buckets: u64::MAX, // Keep all buckets in memory
         }
     }
 
@@ -438,37 +425,6 @@ impl TupleStatsCollector {
             group_sampling_policies: HashMap::new(),
             bucket_duration_ns: bucket_duration.as_nanos() as u64,
             experiment_start_ns: start_time_ns,
-            current_bucket: 0,
-            dumper: None,
-            retention_buckets: u64::MAX,
-        }
-    }
-
-    /// Create with streaming to Parquet file (bounded memory mode)
-    ///
-    /// # Arguments
-    /// * `sampling_policy` - Policy for latency sampling
-    /// * `bucket_duration` - Duration of each time bucket
-    /// * `start_time_ns` - Experiment start time in nanoseconds
-    /// * `dumper` - Parquet writer for streaming old buckets
-    /// * `retention_buckets` - Number of buckets to keep in memory (default: 2)
-    pub fn with_streaming(
-        sampling_policy: SamplingPolicy,
-        bucket_duration: Duration,
-        start_time_ns: u64,
-        dumper: super::dumper::StatsDumper,
-        retention_buckets: usize,
-    ) -> Self {
-        Self {
-            entries: HashMap::new(),
-            global_entries: HashMap::new(),
-            sampling_policy,
-            group_sampling_policies: HashMap::new(),
-            bucket_duration_ns: bucket_duration.as_nanos() as u64,
-            experiment_start_ns: start_time_ns,
-            current_bucket: 0,
-            dumper: Some(dumper),
-            retention_buckets: retention_buckets as u64,
         }
     }
 
@@ -500,10 +456,6 @@ impl TupleStatsCollector {
         connection_id: usize,
     ) -> (&mut StatsEntry, &mut StatsEntry) {
         let time_bucket = self.compute_bucket(crate::timing::time_ns());
-        if time_bucket > self.current_bucket && self.dumper.is_some() {
-            self.flush_old_buckets(time_bucket);
-        }
-        self.current_bucket = time_bucket;
         let policy = self.group_sampling_policies.get(&group_id).unwrap_or(&self.sampling_policy);
         let key = StatsKey { time_bucket, group_id, connection_id };
         let entry = self.entries.entry(key).or_insert_with(|| StatsEntry::new(policy));
@@ -535,58 +487,6 @@ impl TupleStatsCollector {
         global.record_rx_bytes(bytes);
     }
 
-    /// Flush old buckets to disk (streaming mode only)
-    fn flush_old_buckets(&mut self, current_bucket: u64) {
-        let Some(ref mut dumper) = self.dumper else {
-            return;
-        };
-
-        let cutoff = current_bucket.saturating_sub(self.retention_buckets);
-        self.global_entries.retain(|bucket, _| *bucket >= cutoff);
-
-        // Collect keys to flush
-        let old_keys: Vec<StatsKey> =
-            self.entries.keys().filter(|k| k.time_bucket < cutoff).cloned().collect();
-
-        // Flush and remove old entries
-        for key in old_keys {
-            let Some(entry) = self.entries.remove(&key) else {
-                continue;
-            };
-            if let Err(e) = dumper.write_row(&key, &entry) {
-                tracing::warn!("Failed to write stats row to Parquet: {}", e);
-            }
-        }
-    }
-
-    /// Finalize the collector, flushing all remaining entries to disk
-    ///
-    /// Must be called at the end of an experiment when using streaming mode.
-    /// Returns the path to the output file if streaming was enabled.
-    pub fn finalize(mut self) -> Option<std::path::PathBuf> {
-        if let Some(mut dumper) = self.dumper.take() {
-            // Flush all remaining entries
-            for (key, entry) in self.entries.drain() {
-                if let Err(e) = dumper.write_row(&key, &entry) {
-                    tracing::warn!("Failed to write stats row to Parquet: {}", e);
-                }
-            }
-
-            let path = dumper.path().clone();
-            if let Err(e) = dumper.close() {
-                tracing::error!("Failed to close stats dumper: {}", e);
-            }
-            Some(path)
-        } else {
-            None
-        }
-    }
-
-    /// Check if streaming mode is enabled
-    pub fn is_streaming(&self) -> bool {
-        self.dumper.is_some()
-    }
-
     /// Get all unique group IDs
     pub fn group_ids(&self) -> Vec<usize> {
         let mut ids: Vec<usize> = self.entries.keys().map(|k| k.group_id).collect();
@@ -616,10 +516,9 @@ impl TupleStatsCollector {
         buckets
     }
 
-    /// Aggregate retained buckets using the independently recorded global policy.
+    /// Aggregate all buckets using the independently recorded global policy.
     /// Global sampling is independent of group sampling, including when groups
-    /// disable sampling or use different sketch types. Streaming evicts global
-    /// buckets alongside group entries; Parquet output contains group entries only.
+    /// disable sampling or use different sketch types.
     pub fn aggregate_global(&self, duration: Duration) -> AggregatedStats {
         let mut total_requests = 0u64;
         let mut total_tx_bytes = 0u64;
@@ -840,9 +739,6 @@ impl TupleStatsCollector {
     /// # Panics
     /// Panics if global/group policies differ. As before, bucket coordinates are
     /// interpreted relative to the first collector's start time and bucket duration.
-    ///
-    /// Note: Streaming dumpers are not merged - each thread should finalize
-    /// its own dumper before merging in-memory entries.
     pub fn merge(collectors: Vec<Self>) -> Self {
         if collectors.is_empty() {
             return Self::new(SamplingPolicy::default(), Duration::from_secs(1));
@@ -856,9 +752,6 @@ impl TupleStatsCollector {
             group_sampling_policies: HashMap::new(),
             bucket_duration_ns: first.bucket_duration_ns,
             experiment_start_ns: first.experiment_start_ns,
-            current_bucket: 0,
-            dumper: None, // Merged collector is always in-memory
-            retention_buckets: u64::MAX,
         };
 
         // Validate policies before merging any entries.
@@ -900,12 +793,12 @@ impl TupleStatsCollector {
         merged
     }
 
-    /// Get raw entries (for dumping)
+    /// Get raw entries
     pub fn entries(&self) -> &HashMap<StatsKey, StatsEntry> {
         &self.entries
     }
 
-    /// Take ownership of entries (for dumping)
+    /// Take ownership of entries
     pub fn into_entries(self) -> HashMap<StatsKey, StatsEntry> {
         self.entries
     }
@@ -1074,34 +967,6 @@ mod tests {
             assert_eq!(stats.total_requests, 200);
             assert!(stats.latency_p99 > Duration::ZERO);
         }
-    }
-
-    #[test]
-    fn streaming_evicts_global_storage_alongside_group_entries() {
-        use parquet::file::reader::{FileReader, SerializedFileReader};
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("stats.parquet");
-        let dumper = super::super::StatsDumper::new(path.clone(), None).unwrap();
-        let mut collector = TupleStatsCollector::with_streaming(
-            SamplingPolicy::Unlimited,
-            Duration::from_secs(3600),
-            crate::timing::time_ns(),
-            dumper,
-            1,
-        );
-        collector
-            .register_group_policy(0, SamplingPolicy::DdSketch { alpha: 0.01, max_bins: 1024 });
-        collector.record_tx_bytes(0, 0, 100);
-        collector.record_latency(0, 0, Duration::from_micros(10));
-        assert_eq!(collector.global_entries.len(), 1);
-        collector.flush_old_buckets(2);
-        assert!(collector.entries.is_empty());
-        assert!(collector.global_entries.is_empty());
-        assert_eq!(collector.aggregate_global(Duration::from_secs(1)).total_requests, 0);
-        assert_eq!(collector.finalize(), Some(path.clone()));
-        let reader = SerializedFileReader::new(std::fs::File::open(path).unwrap()).unwrap();
-        // Only group entries are written; no synthetic global rows enter Parquet.
-        assert_eq!(reader.metadata().file_metadata().num_rows(), 1);
     }
 
     #[test]

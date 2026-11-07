@@ -28,8 +28,7 @@
       "default": {
         "bucket_duration": "1s",
         "include_records": false,
-        "sampling_policy": null,
-        "streaming": null
+        "sampling_policy": null
       }
     },
     "traffic_groups": {
@@ -690,40 +689,9 @@
             }
           ],
           "default": null
-        },
-        "streaming": {
-          "description": "Reserved Parquet streaming configuration; not supported by the CLI.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/StreamingStatsConfig"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        }
-      }
-    },
-    "StreamingStatsConfig": {
-      "description": "Reserved streaming stats configuration. The CLI rejects profiles that set this.",
-      "type": "object",
-      "properties": {
-        "path": {
-          "description": "Output path prefix for Parquet files",
-          "type": "string"
-        },
-        "retention_buckets": {
-          "description": "Number of time buckets to retain in memory before flushing",
-          "type": "integer",
-          "format": "uint",
-          "default": 60,
-          "minimum": 0
         }
       },
-      "required": [
-        "path"
-      ]
+      "additionalProperties": false
     },
     "TrafficGroupConfig": {
       "description": "Traffic group configuration",

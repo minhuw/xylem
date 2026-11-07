@@ -212,7 +212,8 @@ Top-level stats configuration (`[stats]`).
 - `bucket_duration` (string, default `"1s"`): time bucket for per-connection records
 - `include_records` (bool, default false)
 - `sampling_policy` (optional): global latency sampling policy; set to `type = "none"` to disable global latency recording; if omitted, the first traffic group’s policy is used
-- `streaming`: reserved for future CLI support. Profiles that configure this section are rejected; no Parquet files are currently written by the CLI.
+
+Other keys are rejected. The former `streaming` (Parquet) section was removed, so profiles that still set it fail to load.
 
 ## Output Section
 

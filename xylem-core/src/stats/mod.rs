@@ -3,12 +3,10 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-pub mod dumper;
 pub mod policy;
 pub mod tuple_collector;
 
 // Re-export main types
-pub use dumper::{StatsDumper, StatsDumperError, StatsRow, StreamingConfig};
 pub use policy::SamplingPolicy;
 pub use tuple_collector::{
     ConnectionStats, LatencyStorage, StatsEntry, StatsKey, TimeSeriesPoint, TupleStatsCollector,

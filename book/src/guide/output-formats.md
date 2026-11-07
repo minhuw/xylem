@@ -26,8 +26,8 @@ bucket_duration = "1s"
 
 HTML uses Chart.js (loaded from a CDN) and the light theme. Only
 `output.html.library = "chartjs"` and `output.html.theme = "light"` are supported.
-`output.real_time` must remain false and `stats.streaming` must be omitted;
-these features are not implemented by the CLI and validation rejects them.
+`output.real_time` must remain false; the feature is not implemented by the CLI
+and validation rejects it.
 The obsolete `detailed-json` format has been replaced by `json`.
 
 Request CSV dumps are configured separately through `[request_dump]`; see the
