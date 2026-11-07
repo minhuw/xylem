@@ -9,7 +9,11 @@ use serde::{Deserialize, Serialize};
 pub enum SamplingPolicy {
     /// Disable latency sampling entirely (still counts bytes/requests)
     None,
-    /// Limited sampling with fixed rate and max samples
+    /// Uniform random sample of at most `max_samples` latencies per entry.
+    /// Each latency is first kept with probability `rate`; the kept latencies
+    /// are reservoir-sampled, so the stored samples are a uniform sample of
+    /// every kept latency, not the first ones. Mean, min, max and standard
+    /// deviation are computed from every kept latency.
     Limited {
         /// Maximum number of samples to store
         #[serde(default = "default_max_samples")]
@@ -21,23 +25,6 @@ pub enum SamplingPolicy {
     /// Zero sampling: record every latency (unlimited storage)
     /// WARNING: Can consume large amounts of memory for high-throughput workloads
     Unlimited,
-    /// Adaptive sampling: dynamically adjust rate to maintain target CI width
-    Adaptive {
-        /// Maximum number of samples to store
-        #[serde(default = "default_max_samples")]
-        max_samples: usize,
-        /// Initial sampling rate
-        #[serde(default = "default_rate")]
-        initial_rate: f64,
-        /// Target confidence interval width (in microseconds)
-        target_ci_width_us: u64,
-        /// Minimum sampling rate
-        #[serde(default = "default_min_rate")]
-        min_rate: f64,
-        /// Maximum sampling rate
-        #[serde(default = "default_max_rate")]
-        max_rate: f64,
-    },
     /// DDSketch: Distributed quantile sketch with relative-error guarantees
     /// Memory-efficient and fully mergeable across traffic groups
     DdSketch {
@@ -56,16 +43,18 @@ pub enum SamplingPolicy {
         #[serde(default = "default_tdigest_compression")]
         compression: usize,
     },
-    /// HDR Histogram: High dynamic range histogram for maximum accuracy
-    /// Higher memory usage but excellent for all percentiles
+    /// HDR Histogram: records every latency with bounded relative error.
+    /// This is the default policy.
     HdrHistogram {
         /// Number of significant digits (1-5)
         /// Higher = more accurate but more memory
         #[serde(default = "default_hdr_sigfigs")]
         sigfigs: u8,
-        /// Maximum expected value (in microseconds)
-        #[serde(default = "default_hdr_max_value")]
-        max_value_us: u64,
+        /// Optional upper bound (in microseconds). When unset, the histogram
+        /// grows to fit every recorded value. When set, larger values are
+        /// recorded as this bound and counted in the `clamped_samples` output.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_value_us: Option<u64>,
     },
 }
 
@@ -74,14 +63,6 @@ fn default_max_samples() -> usize {
 }
 
 fn default_rate() -> f64 {
-    1.0
-}
-
-fn default_min_rate() -> f64 {
-    0.001
-}
-
-fn default_max_rate() -> f64 {
     1.0
 }
 
@@ -101,15 +82,40 @@ fn default_hdr_sigfigs() -> u8 {
     3 // 3 significant figures (0.1% precision)
 }
 
-fn default_hdr_max_value() -> u64 {
-    3_600_000_000 // 1 hour in microseconds
+impl Default for SamplingPolicy {
+    /// An auto-resizing HDR histogram with 3 significant figures, which keeps
+    /// every latency and merges independently of order.
+    fn default() -> Self {
+        SamplingPolicy::HdrHistogram {
+            sigfigs: default_hdr_sigfigs(),
+            max_value_us: None,
+        }
+    }
 }
 
-impl Default for SamplingPolicy {
-    fn default() -> Self {
-        SamplingPolicy::Limited {
-            max_samples: default_max_samples(),
-            rate: default_rate(),
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_is_auto_resizing_hdr_histogram() {
+        assert_eq!(
+            SamplingPolicy::default(),
+            SamplingPolicy::HdrHistogram { sigfigs: 3, max_value_us: None }
+        );
+        let parsed: SamplingPolicy = serde_json::from_str(r#"{"type": "hdr-histogram"}"#).unwrap();
+        assert_eq!(parsed, SamplingPolicy::default());
+    }
+
+    #[test]
+    fn explicit_policies_keep_parsing() {
+        let limited: SamplingPolicy =
+            serde_json::from_str(r#"{"type": "limited", "rate": 0.5, "max_samples": 10}"#).unwrap();
+        assert_eq!(limited, SamplingPolicy::Limited { max_samples: 10, rate: 0.5 });
+        let bounded: SamplingPolicy = serde_json::from_str(
+            r#"{"type": "hdr-histogram", "sigfigs": 2, "max_value_us": 1000}"#,
+        )
+        .unwrap();
+        assert_eq!(bounded, SamplingPolicy::HdrHistogram { sigfigs: 2, max_value_us: Some(1000) });
     }
 }

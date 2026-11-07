@@ -1,6 +1,6 @@
 //! Tuple-keyed statistics collection with on-demand aggregation
 //!
-//! Stores statistics keyed by `(time_bucket, group_id, connection_id)` tuple,
+//! Stores statistics keyed by `(time_bucket, group_id, thread_id, connection_id)`,
 //! enabling flexible post-hoc aggregation by any dimension.
 
 use super::policy::SamplingPolicy;
@@ -23,20 +23,154 @@ pub struct StatsKey {
     pub time_bucket: u64,
     /// Traffic group ID
     pub group_id: usize,
-    /// Connection ID within the group
+    /// Worker thread that owns the connection. Each thread numbers its
+    /// connections from 0, so this tells apart equal connection IDs.
+    pub thread_id: usize,
+    /// Connection ID within the thread's connection pool
     pub connection_id: usize,
 }
 
-/// Latency storage variants based on sampling policy
-pub enum LatencyStorage {
+/// Exact summary of every latency a storage recorded, in nanoseconds.
+///
+/// Integer sums make merges exact, so the summary does not depend on the order
+/// in which entries are merged. Sums saturate rather than wrap.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Moments {
+    count: u64,
+    sum: u128,
+    sum_sq: u128,
+    min: u64,
+    max: u64,
+}
+
+impl Moments {
+    fn record(&mut self, ns: u64) {
+        self.min = if self.count == 0 {
+            ns
+        } else {
+            self.min.min(ns)
+        };
+        self.max = self.max.max(ns);
+        self.count += 1;
+        self.sum = self.sum.saturating_add(ns as u128);
+        self.sum_sq = self.sum_sq.saturating_add((ns as u128) * (ns as u128));
+    }
+
+    fn merge(&mut self, other: &Self) {
+        if other.count == 0 {
+            return;
+        }
+        self.min = if self.count == 0 {
+            other.min
+        } else {
+            self.min.min(other.min)
+        };
+        self.max = self.max.max(other.max);
+        self.count += other.count;
+        self.sum = self.sum.saturating_add(other.sum);
+        self.sum_sq = self.sum_sq.saturating_add(other.sum_sq);
+    }
+
+    fn mean(&self) -> Option<f64> {
+        (self.count > 0).then(|| self.sum as f64 / self.count as f64)
+    }
+
+    /// Sample standard deviation (divides by n - 1); needs two values.
+    fn std_dev(&self) -> Option<f64> {
+        if self.count < 2 {
+            return None;
+        }
+        let n = self.count as u128;
+        // n * sum_sq - sum^2 is exact while it fits in u128.
+        let numerator = match (n.checked_mul(self.sum_sq), self.sum.checked_mul(self.sum)) {
+            (Some(a), Some(b)) => a.saturating_sub(b) as f64,
+            _ => {
+                let mean = self.sum as f64 / self.count as f64;
+                (self.sum_sq as f64 - self.sum as f64 * mean).max(0.0) * self.count as f64
+            }
+        };
+        let variance = numerator / (self.count as f64 * (self.count - 1) as f64);
+        Some(variance.sqrt())
+    }
+}
+
+/// Uniform random sample of at most `capacity` latencies (nanoseconds).
+///
+/// `seen` counts every latency offered after the rate filter; `samples` is a
+/// uniform sample of those, so it holds `min(seen, capacity)` values.
+struct Reservoir {
+    samples: Vec<u64>,
+    capacity: usize,
+    rate: f64,
+    seen: u64,
+}
+
+impl Reservoir {
+    fn new(capacity: usize, rate: f64) -> Self {
+        Self {
+            samples: Vec::with_capacity(capacity.min(1024)),
+            capacity,
+            rate,
+            seen: 0,
+        }
+    }
+
+    /// Offer one latency; returns whether it passed the rate filter.
+    fn offer(&mut self, ns: u64) -> bool {
+        if self.rate < 1.0 && rand::random::<f64>() >= self.rate {
+            return false;
+        }
+        self.seen += 1;
+        if self.samples.len() < self.capacity {
+            self.samples.push(ns);
+        } else {
+            // Algorithm R: the new value replaces a stored one with
+            // probability capacity / seen.
+            let slot = rand::random_range(0..self.seen);
+            if slot < self.capacity as u64 {
+                self.samples[slot as usize] = ns;
+            }
+        }
+        true
+    }
+
+    /// Merge so the result is a uniform sample of both sides' seen values.
+    ///
+    /// The number of samples taken from this side follows the hypergeometric
+    /// distribution of drawing `keep` values from `self.seen + other.seen`
+    /// without replacement. A uniform subset of a uniform sample is uniform.
+    fn merge(&mut self, other: &Self) {
+        use rand::seq::SliceRandom;
+        use rand_distr::{Distribution, Hypergeometric};
+
+        let total = self.seen + other.seen;
+        let keep = (self.capacity as u64).min(total);
+        if (self.samples.len() + other.samples.len()) as u64 <= keep {
+            self.samples.extend_from_slice(&other.samples);
+            self.seen = total;
+            return;
+        }
+        let mut rng = rand::rng();
+        let from_self = Hypergeometric::new(total, self.seen, keep)
+            .expect("valid hypergeometric parameters")
+            .sample(&mut rng) as usize;
+        let from_other = keep as usize - from_self;
+        let (mine, _) = self.samples.partial_shuffle(&mut rng, from_self);
+        let mut merged = mine.to_vec();
+        let mut theirs = other.samples.clone();
+        let (theirs, _) = theirs.partial_shuffle(&mut rng, from_other);
+        merged.extend_from_slice(theirs);
+        self.samples = merged;
+        self.seen = total;
+    }
+}
+
+/// How a storage keeps latencies for percentiles.
+enum Quantiles {
     /// Latency sampling disabled
     None,
     /// Sample-based storage (Limited/Unlimited modes)
-    Samples {
-        samples: Vec<Duration>,
-        max_samples: usize,
-        sampling_rate: f64,
-    },
+    Samples(Reservoir),
     /// DDSketch for memory-efficient quantile estimation
     DdSketch(DDSketch),
     /// T-Digest for accurate tail percentiles.
@@ -44,75 +178,87 @@ pub enum LatencyStorage {
     /// Recorded values wait in `pending` until [`TDIGEST_BATCH_SIZE`] of them
     /// are merged into `digest` at once. Reads and merges include pending values.
     TDigest { digest: TDigest, pending: Vec<f64> },
-    /// HDR Histogram for high accuracy
-    HdrHistogram(Histogram<u64>),
+    /// HDR histogram. It auto-resizes unless the policy sets a maximum; then
+    /// larger values are recorded as the maximum and counted in `clamped`.
+    HdrHistogram { hist: Histogram<u64>, clamped: u64 },
+}
+
+/// Latency storage for one entry, built from a sampling policy.
+///
+/// Percentiles come from the policy's structure (samples or a sketch). Mean,
+/// min, max and standard deviation are computed exactly from every recorded
+/// latency, for every policy except `None`.
+pub struct LatencyStorage {
+    quantiles: Quantiles,
+    moments: Moments,
 }
 
 impl LatencyStorage {
+    /// Storage that records no latencies.
+    pub fn none() -> Self {
+        Self {
+            quantiles: Quantiles::None,
+            moments: Moments::default(),
+        }
+    }
+
     /// Create new storage based on sampling policy
     pub fn from_policy(policy: &SamplingPolicy) -> Self {
-        match policy {
-            SamplingPolicy::None => LatencyStorage::None,
-            SamplingPolicy::Limited { max_samples, rate } => LatencyStorage::Samples {
-                samples: Vec::with_capacity((*max_samples).min(1024)),
-                max_samples: *max_samples,
-                sampling_rate: *rate,
-            },
-            SamplingPolicy::Unlimited => LatencyStorage::Samples {
-                samples: Vec::new(),
-                max_samples: usize::MAX,
-                sampling_rate: 1.0,
-            },
-            SamplingPolicy::Adaptive { max_samples, initial_rate, .. } => LatencyStorage::Samples {
-                samples: Vec::with_capacity((*max_samples).min(1024)),
-                max_samples: *max_samples,
-                sampling_rate: *initial_rate,
-            },
+        let quantiles = match policy {
+            SamplingPolicy::None => Quantiles::None,
+            SamplingPolicy::Limited { max_samples, rate } => {
+                Quantiles::Samples(Reservoir::new(*max_samples, *rate))
+            }
+            SamplingPolicy::Unlimited => Quantiles::Samples(Reservoir::new(usize::MAX, 1.0)),
             SamplingPolicy::DdSketch { alpha, max_bins } => {
                 let config = DDSketchConfig::new(*alpha, *max_bins, 1.0);
-                LatencyStorage::DdSketch(DDSketch::new(config))
+                Quantiles::DdSketch(DDSketch::new(config))
             }
-            SamplingPolicy::TDigest { compression } => LatencyStorage::TDigest {
+            SamplingPolicy::TDigest { compression } => Quantiles::TDigest {
                 digest: TDigest::new_with_size(*compression),
                 pending: Vec::new(),
             },
             SamplingPolicy::HdrHistogram { sigfigs, max_value_us } => {
-                let max_value_ns = max_value_us * 1000;
-                let histogram = Histogram::<u64>::new_with_max(max_value_ns, *sigfigs)
-                    .expect("Failed to create HDR histogram");
-                LatencyStorage::HdrHistogram(histogram)
+                let hist = match max_value_us {
+                    None => Histogram::<u64>::new(*sigfigs),
+                    Some(max_us) => Histogram::new_with_max(max_us.saturating_mul(1000), *sigfigs),
+                }
+                .expect("Failed to create HDR histogram");
+                Quantiles::HdrHistogram { hist, clamped: 0 }
             }
-        }
+        };
+        Self { quantiles, moments: Moments::default() }
     }
 
     /// Record a latency sample
     pub fn record(&mut self, latency: Duration) {
-        match self {
-            LatencyStorage::None => {
-                // Skip latency storage
-            }
-            LatencyStorage::Samples { samples, max_samples, sampling_rate } => {
-                if samples.len() < *max_samples
-                    && (*sampling_rate >= 1.0 || rand::random::<f64>() < *sampling_rate)
-                {
-                    samples.push(latency);
+        let ns = latency.as_nanos().min(u64::MAX as u128) as u64;
+        match &mut self.quantiles {
+            Quantiles::None => return,
+            Quantiles::Samples(reservoir) => {
+                if !reservoir.offer(ns) {
+                    return;
                 }
             }
-            LatencyStorage::DdSketch(sketch) => {
-                sketch.add(latency.as_nanos() as f64);
-            }
-            LatencyStorage::TDigest { digest, pending } => {
-                pending.push(latency.as_nanos() as f64);
+            Quantiles::DdSketch(sketch) => sketch.add(ns as f64),
+            Quantiles::TDigest { digest, pending } => {
+                pending.push(ns as f64);
                 if pending.len() >= TDIGEST_BATCH_SIZE {
                     // Hand the full buffer to the digest and start a new one.
                     let batch = std::mem::replace(pending, Vec::with_capacity(TDIGEST_BATCH_SIZE));
                     *digest = digest.merge_unsorted(batch);
                 }
             }
-            LatencyStorage::HdrHistogram(hist) => {
-                let _ = hist.record(latency.as_nanos() as u64);
+            Quantiles::HdrHistogram { hist, clamped } => {
+                // Only a bounded histogram (or a value beyond any resize)
+                // rejects a value; record it at the bound and count it.
+                if hist.record(ns).is_err() {
+                    hist.saturating_record(ns);
+                    *clamped += 1;
+                }
             }
         }
+        self.moments.record(ns);
     }
 
     /// Merge another storage into this one (consumes other).
@@ -132,28 +278,23 @@ impl LatencyStorage {
     }
 
     /// Merge compatible storage, returning an error instead of dropping samples
-    /// when policies differ. Limited samples are retained in input order up to
-    /// the configured capacity. None can only merge with None.
+    /// when policies differ. Limited samples are merged so the result is a
+    /// uniform sample of both sides, weighted by how many latencies each side
+    /// saw. None can only merge with None.
     pub fn try_merge_ref(&mut self, other: &Self) -> Result<(), &'static str> {
-        match (self, other) {
-            (LatencyStorage::None, LatencyStorage::None) => {}
-            (
-                LatencyStorage::Samples { samples, max_samples, sampling_rate },
-                LatencyStorage::Samples {
-                    samples: other_samples,
-                    max_samples: other_max,
-                    sampling_rate: other_rate,
-                },
-            ) if max_samples == other_max && sampling_rate == other_rate => {
-                samples
-                    .extend(other_samples.iter().take(max_samples.saturating_sub(samples.len())));
+        match (&mut self.quantiles, &other.quantiles) {
+            (Quantiles::None, Quantiles::None) => {}
+            (Quantiles::Samples(mine), Quantiles::Samples(theirs))
+                if mine.capacity == theirs.capacity && mine.rate == theirs.rate =>
+            {
+                mine.merge(theirs);
             }
-            (LatencyStorage::DdSketch(sketch), LatencyStorage::DdSketch(other)) => {
+            (Quantiles::DdSketch(sketch), Quantiles::DdSketch(other)) => {
                 sketch.merge(other).map_err(|_| "DDSketch configurations differ")?;
             }
             (
-                LatencyStorage::TDigest { digest, pending },
-                LatencyStorage::TDigest { digest: other, pending: other_pending },
+                Quantiles::TDigest { digest, pending },
+                Quantiles::TDigest { digest: other, pending: other_pending },
             ) if digest.max_size() == other.max_size() => {
                 // Fold pending values into both digests first, so the merged
                 // digest holds every value and this side has none pending.
@@ -161,27 +302,36 @@ impl LatencyStorage {
                 let theirs = other.merge_unsorted(other_pending.clone());
                 *digest = TDigest::merge_digests(vec![mine, theirs]);
             }
-            (LatencyStorage::HdrHistogram(hist), LatencyStorage::HdrHistogram(other))
-                if (hist.low(), hist.high(), hist.sigfig())
-                    == (other.low(), other.high(), other.sigfig()) =>
+            (
+                Quantiles::HdrHistogram { hist, clamped },
+                Quantiles::HdrHistogram { hist: other, clamped: other_clamped },
+            ) if hist.sigfig() == other.sigfig()
+                && hist.is_auto_resize() == other.is_auto_resize()
+                && (hist.is_auto_resize() || hist.high() == other.high()) =>
             {
                 hist.add(other).map_err(|_| "HDR histogram merge failed")?;
+                *clamped += other_clamped;
             }
             _ => return Err("latency storage configurations differ"),
         }
+        self.moments.merge(&other.moments);
         Ok(())
     }
 
-    /// Get sample count
+    /// Number of latencies recorded (after any sampling rate). For `limited`
+    /// storage this can exceed the number of samples kept for percentiles.
     pub fn count(&self) -> u64 {
-        match self {
-            LatencyStorage::None => 0,
-            LatencyStorage::Samples { samples, .. } => samples.len() as u64,
-            LatencyStorage::DdSketch(sketch) => sketch.count() as u64,
-            LatencyStorage::TDigest { digest, pending } => {
-                digest.count() as u64 + pending.len() as u64
+        self.moments.count
+    }
+
+    /// Number of latencies a bounded HDR histogram recorded at its maximum
+    /// because they exceeded it. `None` for storage that never clamps.
+    pub fn clamped_count(&self) -> Option<u64> {
+        match &self.quantiles {
+            Quantiles::HdrHistogram { hist, clamped } if !hist.is_auto_resize() || *clamped > 0 => {
+                Some(*clamped)
             }
-            LatencyStorage::HdrHistogram(hist) => hist.len(),
+            _ => None,
         }
     }
 
@@ -198,86 +348,55 @@ impl LatencyStorage {
     /// value at index `round(p * (n - 1))` of the ascending samples. Sketch
     /// storage answers each percentile with its own quantile estimate.
     pub fn percentiles(&self, ps: &[f64]) -> Vec<u64> {
-        match self {
-            LatencyStorage::None => vec![0; ps.len()],
-            LatencyStorage::Samples { samples, .. } => {
-                if samples.is_empty() {
+        match &self.quantiles {
+            Quantiles::None => vec![0; ps.len()],
+            Quantiles::Samples(reservoir) => {
+                if reservoir.samples.is_empty() {
                     return vec![0; ps.len()];
                 }
-                let mut sorted = samples.to_vec();
-                sorted.sort();
+                let mut sorted = reservoir.samples.clone();
+                sorted.sort_unstable();
                 let last = sorted.len() - 1;
                 ps.iter()
                     .map(|&p| {
                         let idx = ((p * last as f64).round() as usize).min(last);
-                        sorted[idx].as_nanos() as u64
+                        sorted[idx]
                     })
                     .collect()
             }
-            LatencyStorage::DdSketch(sketch) => ps
+            Quantiles::DdSketch(sketch) => ps
                 .iter()
                 .map(|&p| sketch.quantile(p).ok().flatten().map(|v| v as u64).unwrap_or(0))
                 .collect(),
-            LatencyStorage::TDigest { digest, pending } => {
+            Quantiles::TDigest { digest, pending } => {
                 let digest = tdigest_with_pending(digest, pending);
                 ps.iter().map(|&p| digest.estimate_quantile(p) as u64).collect()
             }
-            LatencyStorage::HdrHistogram(hist) => {
+            Quantiles::HdrHistogram { hist, .. } => {
                 ps.iter().map(|&p| hist.value_at_quantile(p)).collect()
             }
         }
     }
 
-    /// Calculate mean (returns nanoseconds)
+    /// Exact mean of the recorded latencies (nanoseconds, rounded); 0 when empty.
     pub fn mean(&self) -> u64 {
-        match self {
-            LatencyStorage::None => 0,
-            LatencyStorage::Samples { samples, .. } => {
-                if samples.is_empty() {
-                    return 0;
-                }
-                let sum: u128 = samples.iter().map(|d| d.as_nanos()).sum();
-                (sum / samples.len() as u128) as u64
-            }
-            LatencyStorage::DdSketch(sketch) => {
-                // DDSketch doesn't have mean, approximate with median
-                sketch.quantile(0.5).ok().flatten().map(|v| v as u64).unwrap_or(0)
-            }
-            LatencyStorage::TDigest { digest, pending } => {
-                tdigest_with_pending(digest, pending).mean() as u64
-            }
-            LatencyStorage::HdrHistogram(hist) => hist.mean() as u64,
-        }
+        self.moments.mean().map_or(0, |mean| mean.round() as u64)
     }
 
-    /// Get min value (returns nanoseconds)
-    pub fn min(&self) -> u64 {
-        match self {
-            LatencyStorage::None => 0,
-            LatencyStorage::Samples { samples, .. } => {
-                samples.iter().min().map(|d| d.as_nanos() as u64).unwrap_or(0)
-            }
-            LatencyStorage::DdSketch(sketch) => sketch.min().map(|v| v as u64).unwrap_or(0),
-            LatencyStorage::TDigest { digest, pending } => {
-                tdigest_with_pending(digest, pending).min() as u64
-            }
-            LatencyStorage::HdrHistogram(hist) => hist.min(),
-        }
+    /// Smallest recorded latency (nanoseconds), if any.
+    pub fn min(&self) -> Option<u64> {
+        (self.moments.count > 0).then_some(self.moments.min)
     }
 
-    /// Get max value (returns nanoseconds)
-    pub fn max(&self) -> u64 {
-        match self {
-            LatencyStorage::None => 0,
-            LatencyStorage::Samples { samples, .. } => {
-                samples.iter().max().map(|d| d.as_nanos() as u64).unwrap_or(0)
-            }
-            LatencyStorage::DdSketch(sketch) => sketch.max().map(|v| v as u64).unwrap_or(0),
-            LatencyStorage::TDigest { digest, pending } => {
-                tdigest_with_pending(digest, pending).max() as u64
-            }
-            LatencyStorage::HdrHistogram(hist) => hist.max(),
-        }
+    /// Largest recorded latency (nanoseconds), if any.
+    pub fn max(&self) -> Option<u64> {
+        (self.moments.count > 0).then_some(self.moments.max)
+    }
+
+    /// Sample standard deviation of the recorded latencies (nanoseconds);
+    /// `None` with fewer than two latencies.
+    pub fn std_dev(&self) -> Option<f64> {
+        self.moments.std_dev()
     }
 }
 
@@ -361,7 +480,9 @@ pub struct TimeSeriesPoint {
 /// Per-connection statistics summary
 #[derive(Debug, Clone)]
 pub struct ConnectionStats {
-    /// Connection ID
+    /// Worker thread that owns the connection
+    pub thread_id: usize,
+    /// Connection ID within the thread
     pub connection_id: usize,
     /// Group ID this connection belongs to
     pub group_id: usize,
@@ -377,18 +498,16 @@ pub struct ConnectionStats {
 
 /// Tuple-keyed statistics collector
 ///
-/// Stores statistics keyed by (time_bucket, group_id, connection_id) for flexible
+/// Stores statistics keyed by (time_bucket, group_id, thread_id, connection_id) for flexible
 /// on-demand aggregation by any dimension. Global latency storage is independent
 /// of group storage: each recorded latency is sampled once under each policy.
-/// This requires additional storage per retained bucket and allows heterogeneous
+/// This requires additional storage per bucket and allows heterogeneous
 /// groups without converting or discarding their sketches.
-///
-/// Supports two modes:
-/// - **In-memory**: All entries kept in memory (default)
-/// - **Streaming**: Old buckets flushed to Parquet files for bounded memory
 pub struct TupleStatsCollector {
-    /// Statistics entries keyed by (time_bucket, group_id, connection_id)
+    /// Statistics entries keyed by (time_bucket, group_id, thread_id, connection_id)
     entries: HashMap<StatsKey, StatsEntry>,
+    /// Thread recorded in the keys of new entries; see [`Self::set_thread_id`].
+    thread_id: usize,
     /// Independent global storage per bucket, recorded with the global policy.
     /// This avoids trying to convert incompatible group sketches during aggregation.
     global_entries: HashMap<u64, StatsEntry>,
@@ -401,27 +520,28 @@ pub struct TupleStatsCollector {
     bucket_duration_ns: u64,
     /// Experiment start time in nanoseconds
     experiment_start_ns: u64,
-    /// Current time bucket (for optimization)
-    current_bucket: u64,
-    /// Optional streaming dumper for bounded-memory operation
-    dumper: Option<super::dumper::StatsDumper>,
-    /// Number of buckets to retain in memory when streaming
-    retention_buckets: u64,
+    /// Time of the first recorded event: the first measured request's send.
+    /// Warmup requests are not recorded, so they fall before this.
+    first_record_ns: Option<u64>,
+    /// End of the measurement loop, set by [`StatsRecorder::end_measurement`].
+    ///
+    /// [`StatsRecorder::end_measurement`]: super::StatsRecorder::end_measurement
+    measurement_end_ns: Option<u64>,
 }
 
 impl TupleStatsCollector {
-    /// Create a new tuple stats collector (in-memory mode)
+    /// Create a new tuple stats collector
     pub fn new(sampling_policy: SamplingPolicy, bucket_duration: Duration) -> Self {
         Self {
             entries: HashMap::new(),
+            thread_id: 0,
             global_entries: HashMap::new(),
             sampling_policy,
             group_sampling_policies: HashMap::new(),
             bucket_duration_ns: bucket_duration.as_nanos() as u64,
             experiment_start_ns: crate::timing::time_ns(),
-            current_bucket: 0,
-            dumper: None,
-            retention_buckets: u64::MAX, // Keep all buckets in memory
+            first_record_ns: None,
+            measurement_end_ns: None,
         }
     }
 
@@ -433,43 +553,29 @@ impl TupleStatsCollector {
     ) -> Self {
         Self {
             entries: HashMap::new(),
+            thread_id: 0,
             global_entries: HashMap::new(),
             sampling_policy,
             group_sampling_policies: HashMap::new(),
             bucket_duration_ns: bucket_duration.as_nanos() as u64,
             experiment_start_ns: start_time_ns,
-            current_bucket: 0,
-            dumper: None,
-            retention_buckets: u64::MAX,
+            first_record_ns: None,
+            measurement_end_ns: None,
         }
     }
 
-    /// Create with streaming to Parquet file (bounded memory mode)
+    /// Set the worker thread recorded with each connection's statistics.
     ///
-    /// # Arguments
-    /// * `sampling_policy` - Policy for latency sampling
-    /// * `bucket_duration` - Duration of each time bucket
-    /// * `start_time_ns` - Experiment start time in nanoseconds
-    /// * `dumper` - Parquet writer for streaming old buckets
-    /// * `retention_buckets` - Number of buckets to keep in memory (default: 2)
-    pub fn with_streaming(
-        sampling_policy: SamplingPolicy,
-        bucket_duration: Duration,
-        start_time_ns: u64,
-        dumper: super::dumper::StatsDumper,
-        retention_buckets: usize,
-    ) -> Self {
-        Self {
-            entries: HashMap::new(),
-            global_entries: HashMap::new(),
-            sampling_policy,
-            group_sampling_policies: HashMap::new(),
-            bucket_duration_ns: bucket_duration.as_nanos() as u64,
-            experiment_start_ns: start_time_ns,
-            current_bucket: 0,
-            dumper: Some(dumper),
-            retention_buckets: retention_buckets as u64,
-        }
+    /// Each worker thread numbers its connections from 0, so collectors from
+    /// different threads must have different thread IDs; otherwise merging
+    /// them combines unrelated connections that share an ID. Defaults to 0.
+    pub fn set_thread_id(&mut self, thread_id: usize) {
+        self.thread_id = thread_id;
+    }
+
+    /// The worker thread recorded with new entries.
+    pub fn thread_id(&self) -> usize {
+        self.thread_id
     }
 
     /// Register a per-group sampling policy before recording that group's data.
@@ -499,13 +605,16 @@ impl TupleStatsCollector {
         group_id: usize,
         connection_id: usize,
     ) -> (&mut StatsEntry, &mut StatsEntry) {
-        let time_bucket = self.compute_bucket(crate::timing::time_ns());
-        if time_bucket > self.current_bucket && self.dumper.is_some() {
-            self.flush_old_buckets(time_bucket);
-        }
-        self.current_bucket = time_bucket;
+        let now_ns = crate::timing::time_ns();
+        self.first_record_ns.get_or_insert(now_ns);
+        let time_bucket = self.compute_bucket(now_ns);
         let policy = self.group_sampling_policies.get(&group_id).unwrap_or(&self.sampling_policy);
-        let key = StatsKey { time_bucket, group_id, connection_id };
+        let key = StatsKey {
+            time_bucket,
+            group_id,
+            thread_id: self.thread_id,
+            connection_id,
+        };
         let entry = self.entries.entry(key).or_insert_with(|| StatsEntry::new(policy));
         let global = self
             .global_entries
@@ -535,58 +644,6 @@ impl TupleStatsCollector {
         global.record_rx_bytes(bytes);
     }
 
-    /// Flush old buckets to disk (streaming mode only)
-    fn flush_old_buckets(&mut self, current_bucket: u64) {
-        let Some(ref mut dumper) = self.dumper else {
-            return;
-        };
-
-        let cutoff = current_bucket.saturating_sub(self.retention_buckets);
-        self.global_entries.retain(|bucket, _| *bucket >= cutoff);
-
-        // Collect keys to flush
-        let old_keys: Vec<StatsKey> =
-            self.entries.keys().filter(|k| k.time_bucket < cutoff).cloned().collect();
-
-        // Flush and remove old entries
-        for key in old_keys {
-            let Some(entry) = self.entries.remove(&key) else {
-                continue;
-            };
-            if let Err(e) = dumper.write_row(&key, &entry) {
-                tracing::warn!("Failed to write stats row to Parquet: {}", e);
-            }
-        }
-    }
-
-    /// Finalize the collector, flushing all remaining entries to disk
-    ///
-    /// Must be called at the end of an experiment when using streaming mode.
-    /// Returns the path to the output file if streaming was enabled.
-    pub fn finalize(mut self) -> Option<std::path::PathBuf> {
-        if let Some(mut dumper) = self.dumper.take() {
-            // Flush all remaining entries
-            for (key, entry) in self.entries.drain() {
-                if let Err(e) = dumper.write_row(&key, &entry) {
-                    tracing::warn!("Failed to write stats row to Parquet: {}", e);
-                }
-            }
-
-            let path = dumper.path().clone();
-            if let Err(e) = dumper.close() {
-                tracing::error!("Failed to close stats dumper: {}", e);
-            }
-            Some(path)
-        } else {
-            None
-        }
-    }
-
-    /// Check if streaming mode is enabled
-    pub fn is_streaming(&self) -> bool {
-        self.dumper.is_some()
-    }
-
     /// Get all unique group IDs
     pub fn group_ids(&self) -> Vec<usize> {
         let mut ids: Vec<usize> = self.entries.keys().map(|k| k.group_id).collect();
@@ -595,13 +652,13 @@ impl TupleStatsCollector {
         ids
     }
 
-    /// Get all unique connection IDs for a group
-    pub fn connection_ids(&self, group_id: usize) -> Vec<usize> {
-        let mut ids: Vec<usize> = self
+    /// Get the `(thread_id, connection_id)` of every connection in a group, sorted
+    pub fn connection_ids(&self, group_id: usize) -> Vec<(usize, usize)> {
+        let mut ids: Vec<(usize, usize)> = self
             .entries
             .keys()
             .filter(|k| k.group_id == group_id)
-            .map(|k| k.connection_id)
+            .map(|k| (k.thread_id, k.connection_id))
             .collect();
         ids.sort_unstable();
         ids.dedup();
@@ -616,10 +673,9 @@ impl TupleStatsCollector {
         buckets
     }
 
-    /// Aggregate retained buckets using the independently recorded global policy.
+    /// Aggregate all buckets using the independently recorded global policy.
     /// Global sampling is independent of group sampling, including when groups
-    /// disable sampling or use different sketch types. Streaming evicts global
-    /// buckets alongside group entries; Parquet output contains group entries only.
+    /// disable sampling or use different sketch types.
     pub fn aggregate_global(&self, duration: Duration) -> AggregatedStats {
         let mut total_requests = 0u64;
         let mut total_tx_bytes = 0u64;
@@ -696,17 +752,20 @@ impl TupleStatsCollector {
         &self,
         group_id: usize,
         duration: Duration,
-    ) -> HashMap<usize, ConnectionStats> {
+    ) -> HashMap<(usize, usize), ConnectionStats> {
         let mut result = HashMap::new();
 
-        for conn_id in self.connection_ids(group_id) {
+        for (thread_id, conn_id) in self.connection_ids(group_id) {
             let mut total_requests = 0u64;
             let mut total_tx_bytes = 0u64;
             let mut total_rx_bytes = 0u64;
             let mut merged_latency = LatencyStorage::from_policy(self.get_group_policy(group_id));
 
             for (key, entry) in &self.entries {
-                if key.group_id == group_id && key.connection_id == conn_id {
+                if key.group_id == group_id
+                    && key.thread_id == thread_id
+                    && key.connection_id == conn_id
+                {
                     total_requests += entry.request_count;
                     total_tx_bytes += entry.tx_bytes;
                     total_rx_bytes += entry.rx_bytes;
@@ -723,8 +782,9 @@ impl TupleStatsCollector {
             );
 
             result.insert(
-                conn_id,
+                (thread_id, conn_id),
                 ConnectionStats {
+                    thread_id,
                     connection_id: conn_id,
                     group_id,
                     request_count: total_requests,
@@ -740,11 +800,11 @@ impl TupleStatsCollector {
 
     /// Get time series for global statistics (collapse group and connection)
     pub fn time_series_global(&self) -> Vec<TimeSeriesPoint> {
-        let bucket_duration_secs = self.bucket_duration_ns as f64 / 1_000_000_000.0;
         let mut points: Vec<TimeSeriesPoint> = self
             .global_entries
             .iter()
             .map(|(&bucket, entry)| {
+                let bucket_duration_secs = self.bucket_width(bucket).as_secs_f64();
                 let total_bytes = (entry.tx_bytes + entry.rx_bytes) as f64;
                 let latency_percentiles = entry.latency.percentiles(&[0.5, 0.99, 0.999]);
                 TimeSeriesPoint {
@@ -766,7 +826,6 @@ impl TupleStatsCollector {
 
     /// Get time series for a specific group
     pub fn time_series_by_group(&self, group_id: usize) -> Vec<TimeSeriesPoint> {
-        let bucket_duration_secs = self.bucket_duration_ns as f64 / 1_000_000_000.0;
         let mut bucket_data: HashMap<u64, (u64, u64, u64, LatencyStorage)> = HashMap::new();
 
         for (key, entry) in &self.entries {
@@ -784,6 +843,7 @@ impl TupleStatsCollector {
         let mut points: Vec<TimeSeriesPoint> = bucket_data
             .into_iter()
             .map(|(bucket, (requests, tx, rx, latency))| {
+                let bucket_duration_secs = self.bucket_width(bucket).as_secs_f64();
                 let total_bytes = (tx + rx) as f64;
                 let latency_percentiles = latency.percentiles(&[0.5, 0.99, 0.999]);
                 TimeSeriesPoint {
@@ -807,15 +867,19 @@ impl TupleStatsCollector {
     pub fn time_series_by_connection(
         &self,
         group_id: usize,
+        thread_id: usize,
         connection_id: usize,
     ) -> Vec<TimeSeriesPoint> {
-        let bucket_duration_secs = self.bucket_duration_ns as f64 / 1_000_000_000.0;
-
         let mut points: Vec<TimeSeriesPoint> = self
             .entries
             .iter()
-            .filter(|(k, _)| k.group_id == group_id && k.connection_id == connection_id)
+            .filter(|(k, _)| {
+                k.group_id == group_id
+                    && k.thread_id == thread_id
+                    && k.connection_id == connection_id
+            })
             .map(|(key, entry)| {
+                let bucket_duration_secs = self.bucket_width(key.time_bucket).as_secs_f64();
                 let total_bytes = (entry.tx_bytes + entry.rx_bytes) as f64;
                 let latency_percentiles = entry.latency.percentiles(&[0.5, 0.99, 0.999]);
                 TimeSeriesPoint {
@@ -840,9 +904,6 @@ impl TupleStatsCollector {
     /// # Panics
     /// Panics if global/group policies differ. As before, bucket coordinates are
     /// interpreted relative to the first collector's start time and bucket duration.
-    ///
-    /// Note: Streaming dumpers are not merged - each thread should finalize
-    /// its own dumper before merging in-memory entries.
     pub fn merge(collectors: Vec<Self>) -> Self {
         if collectors.is_empty() {
             return Self::new(SamplingPolicy::default(), Duration::from_secs(1));
@@ -851,14 +912,14 @@ impl TupleStatsCollector {
         let first = &collectors[0];
         let mut merged = Self {
             entries: HashMap::new(),
+            thread_id: 0,
             global_entries: HashMap::new(),
             sampling_policy: first.sampling_policy.clone(),
             group_sampling_policies: HashMap::new(),
             bucket_duration_ns: first.bucket_duration_ns,
             experiment_start_ns: first.experiment_start_ns,
-            current_bucket: 0,
-            dumper: None, // Merged collector is always in-memory
-            retention_buckets: u64::MAX,
+            first_record_ns: collectors.iter().filter_map(|c| c.first_record_ns).min(),
+            measurement_end_ns: collectors.iter().filter_map(|c| c.measurement_end_ns).max(),
         };
 
         // Validate policies before merging any entries.
@@ -900,14 +961,50 @@ impl TupleStatsCollector {
         merged
     }
 
-    /// Get raw entries (for dumping)
+    /// Get raw entries
     pub fn entries(&self) -> &HashMap<StatsKey, StatsEntry> {
         &self.entries
     }
 
-    /// Take ownership of entries (for dumping)
+    /// Take ownership of entries
     pub fn into_entries(self) -> HashMap<StatsKey, StatsEntry> {
         self.entries
+    }
+
+    /// Record the end of the measurement loop; a merge keeps the latest end.
+    pub fn end_measurement(&mut self, end_ns: u64) {
+        self.measurement_end_ns = Some(self.measurement_end_ns.map_or(end_ns, |e| e.max(end_ns)));
+    }
+
+    /// The measurement window in nanoseconds: from the first recorded event
+    /// (the first measured send, after any warmup) to the end of the
+    /// measurement loop. `None` until both are known.
+    pub fn measurement_window_ns(&self) -> Option<(u64, u64)> {
+        let (start, end) = (self.first_record_ns?, self.measurement_end_ns?);
+        Some((start, end.max(start)))
+    }
+
+    /// Length of [`Self::measurement_window_ns`]. Divide by this, not the
+    /// configured duration, so warmup and setup time do not lower throughput.
+    pub fn measured_duration(&self) -> Option<Duration> {
+        self.measurement_window_ns()
+            .map(|(start, end)| Duration::from_nanos(end - start))
+    }
+
+    /// Time a bucket overlaps the measurement window, so the partial first
+    /// and last buckets report rates over the time they covered. A bucket
+    /// outside the window (such as one holding only responses drained after
+    /// the end), or any bucket without a known window, uses the full width.
+    pub fn bucket_width(&self, time_bucket: u64) -> Duration {
+        let full = self.bucket_duration_ns;
+        let Some((start, end)) = self.measurement_window_ns() else {
+            return Duration::from_nanos(full);
+        };
+        let bucket_start =
+            self.experiment_start_ns.saturating_add(time_bucket.saturating_mul(full));
+        let bucket_end = bucket_start.saturating_add(full);
+        let overlap = bucket_end.min(end).saturating_sub(bucket_start.max(start));
+        Duration::from_nanos(if overlap > 0 { overlap } else { full })
     }
 
     /// Get bucket duration
@@ -932,6 +1029,8 @@ impl TupleStatsCollector {
         let duration_secs = duration.as_secs_f64();
         let total_bytes = (total_tx_bytes + total_rx_bytes) as f64;
         let latency_percentiles = latency.percentiles(&[0.5, 0.95, 0.99, 0.999, 0.9999, 0.99999]);
+        // Seconds, for Duration::from_secs_f64.
+        let std_dev = latency.std_dev().map(|ns| ns / 1e9);
 
         AggregatedStats {
             latency_p50: Duration::from_nanos(latency_percentiles[0]),
@@ -941,8 +1040,13 @@ impl TupleStatsCollector {
             latency_p9999: Duration::from_nanos(latency_percentiles[4]),
             latency_p99999: Duration::from_nanos(latency_percentiles[5]),
             mean_latency: Duration::from_nanos(latency.mean()),
-            std_dev: Duration::ZERO, // TODO: compute from samples if available
-            confidence_interval: Duration::ZERO,
+            min_latency: latency.min().map(Duration::from_nanos),
+            max_latency: latency.max().map(Duration::from_nanos),
+            std_dev: std_dev.map(Duration::from_secs_f64),
+            confidence_interval: std_dev
+                .map(|sd| Duration::from_secs_f64(1.96 * sd / (latency.count() as f64).sqrt())),
+            latency_sample_count: latency.count(),
+            clamped_samples: latency.clamped_count(),
             throughput_rps: if duration_secs > 0.0 {
                 total_requests as f64 / duration_secs
             } else {
@@ -986,7 +1090,7 @@ mod tests {
         collector.register_group_policy(1, SamplingPolicy::TDigest { compression: 100 });
         collector.register_group_policy(
             2,
-            SamplingPolicy::HdrHistogram { sigfigs: 3, max_value_us: 10_000 },
+            SamplingPolicy::HdrHistogram { sigfigs: 3, max_value_us: Some(10_000) },
         );
         for group in 0..3 {
             // Both byte APIs can create an entry before the first latency arrives.
@@ -1036,11 +1140,11 @@ mod tests {
                 assert_eq!(stats.total_requests, 100);
                 assert_eq!(stats.throughput_mbps, 0.0024);
                 close(stats.latency_p99.as_nanos() as u64);
-                let connection = &collector.aggregate_by_connection(group, duration)[&0];
+                let connection = &collector.aggregate_by_connection(group, duration)[&(0, 0)];
                 assert_eq!((connection.tx_bytes, connection.rx_bytes), (100, 200));
                 close(connection.latency.latency_p99.as_nanos() as u64);
                 close(collector.time_series_by_group(group)[0].latency_p99_ns);
-                close(collector.time_series_by_connection(group, 0)[0].latency_p99_ns);
+                close(collector.time_series_by_connection(group, 0, 0)[0].latency_p99_ns);
             }
             assert!(collector.entries.values().all(|entry| entry.latency.count() == 100));
         }
@@ -1077,34 +1181,6 @@ mod tests {
     }
 
     #[test]
-    fn streaming_evicts_global_storage_alongside_group_entries() {
-        use parquet::file::reader::{FileReader, SerializedFileReader};
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("stats.parquet");
-        let dumper = super::super::StatsDumper::new(path.clone(), None).unwrap();
-        let mut collector = TupleStatsCollector::with_streaming(
-            SamplingPolicy::Unlimited,
-            Duration::from_secs(3600),
-            crate::timing::time_ns(),
-            dumper,
-            1,
-        );
-        collector
-            .register_group_policy(0, SamplingPolicy::DdSketch { alpha: 0.01, max_bins: 1024 });
-        collector.record_tx_bytes(0, 0, 100);
-        collector.record_latency(0, 0, Duration::from_micros(10));
-        assert_eq!(collector.global_entries.len(), 1);
-        collector.flush_old_buckets(2);
-        assert!(collector.entries.is_empty());
-        assert!(collector.global_entries.is_empty());
-        assert_eq!(collector.aggregate_global(Duration::from_secs(1)).total_requests, 0);
-        assert_eq!(collector.finalize(), Some(path.clone()));
-        let reader = SerializedFileReader::new(std::fs::File::open(path).unwrap()).unwrap();
-        // Only group entries are written; no synthetic global rows enter Parquet.
-        assert_eq!(reader.metadata().file_metadata().num_rows(), 1);
-    }
-
-    #[test]
     #[should_panic(expected = "Global sampling policies differ")]
     fn tuple_merge_rejects_global_policy_mismatch() {
         TupleStatsCollector::merge(vec![
@@ -1133,7 +1209,7 @@ mod tests {
         let mut other_sketch =
             LatencyStorage::from_policy(&SamplingPolicy::DdSketch { alpha: 0.02, max_bins: 1024 });
         assert!(other_sketch.try_merge_ref(&sketch).is_err());
-        assert!(LatencyStorage::None.try_merge_ref(&samples).is_err());
+        assert!(LatencyStorage::none().try_merge_ref(&samples).is_err());
     }
 
     #[test]
@@ -1149,16 +1225,19 @@ mod tests {
         let k1 = StatsKey {
             time_bucket: 0,
             group_id: 1,
+            thread_id: 0,
             connection_id: 2,
         };
         let k2 = StatsKey {
             time_bucket: 0,
             group_id: 1,
+            thread_id: 0,
             connection_id: 2,
         };
         let k3 = StatsKey {
             time_bucket: 1,
             group_id: 1,
+            thread_id: 0,
             connection_id: 2,
         };
 
@@ -1233,43 +1312,200 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_sampling_policy_samples_at_initial_rate() {
-        let policy: SamplingPolicy = serde_json::from_str(
-            r#"{"type": "adaptive", "max_samples": 3, "initial_rate": 1.0, "target_ci_width_us": 10}"#,
+    fn adaptive_sampling_policy_is_rejected() {
+        let error = serde_json::from_str::<SamplingPolicy>(
+            r#"{"type": "adaptive", "initial_rate": 1.0, "target_ci_width_us": 10}"#,
         )
-        .unwrap();
-        let mut storage = LatencyStorage::from_policy(&policy);
-        match &storage {
-            LatencyStorage::Samples { max_samples, sampling_rate, .. } => {
-                assert_eq!(*max_samples, 3);
-                assert_eq!(*sampling_rate, 1.0);
-            }
-            _ => panic!("adaptive policy must store samples"),
-        }
-        for i in 1..=5 {
-            storage.record(Duration::from_micros(i));
-        }
-        // Every sample is kept until max_samples is reached.
-        assert_eq!(storage.count(), 3);
-        assert_eq!(storage.max(), 3_000);
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown variant `adaptive`"), "{error}");
+    }
 
-        // The rate stays at initial_rate: min_rate and target_ci_width_us do not adjust it.
-        let policy: SamplingPolicy = serde_json::from_str(
-            r#"{"type": "adaptive", "initial_rate": 0.0, "target_ci_width_us": 10, "min_rate": 0.5}"#,
-        )
-        .unwrap();
-        let mut storage = LatencyStorage::from_policy(&policy);
-        match &storage {
-            LatencyStorage::Samples { max_samples, sampling_rate, .. } => {
-                assert_eq!(*max_samples, 128 * 1024);
-                assert_eq!(*sampling_rate, 0.0);
+    fn storage_with(
+        policy: &SamplingPolicy,
+        latencies_ns: impl IntoIterator<Item = u64>,
+    ) -> LatencyStorage {
+        let mut storage = LatencyStorage::from_policy(policy);
+        for ns in latencies_ns {
+            storage.record(Duration::from_nanos(ns));
+        }
+        storage
+    }
+
+    /// Ten buckets of 20,000 latencies each; bucket b holds (b + 1) ms, so
+    /// only an aggregate over every bucket has a median near 5.5 ms.
+    fn collector_with_ten_buckets(policy: SamplingPolicy) -> TupleStatsCollector {
+        let mut collector =
+            TupleStatsCollector::with_start_time(policy.clone(), Duration::from_secs(1), 0);
+        for bucket in 0..10u64 {
+            let mut entry = StatsEntry::new(&policy);
+            for _ in 0..20_000 {
+                entry.record_latency(Duration::from_millis(bucket + 1));
             }
-            _ => panic!("adaptive policy must store samples"),
+            collector.global_entries.insert(bucket, entry);
         }
-        for _ in 0..1000 {
-            storage.record(Duration::from_micros(1));
+        collector
+    }
+
+    #[test]
+    fn percentiles_beyond_max_samples_reflect_every_bucket() {
+        for policy in [
+            SamplingPolicy::default(),
+            SamplingPolicy::Limited { max_samples: 128 * 1024, rate: 1.0 },
+            SamplingPolicy::Limited { max_samples: 1000, rate: 1.0 },
+        ] {
+            let stats = collector_with_ten_buckets(policy.clone())
+                .aggregate_global(Duration::from_secs(10));
+            assert_eq!(stats.total_requests, 200_000, "{policy:?}");
+            assert_eq!(stats.latency_sample_count, 200_000, "{policy:?}");
+            // Buckets 5 and 6 straddle the median; the old first-come merge
+            // reported whichever buckets the HashMap visited first.
+            let p50 = stats.latency_p50.as_micros();
+            assert!((5_000..=6_010).contains(&p50), "{policy:?}: p50 {p50} us");
+            let p99 = stats.latency_p99.as_micros();
+            assert!((9_990..=10_010).contains(&p99), "{policy:?}: p99 {p99} us");
+            assert_eq!(stats.mean_latency, Duration::from_micros(5_500), "{policy:?}");
+            assert_eq!(stats.min_latency, Some(Duration::from_millis(1)), "{policy:?}");
+            assert_eq!(stats.max_latency, Some(Duration::from_millis(10)), "{policy:?}");
         }
-        assert_eq!(storage.count(), 0);
+    }
+
+    #[test]
+    fn limited_reservoir_is_uniform_and_counts_every_latency() {
+        let policy = SamplingPolicy::Limited { max_samples: 1000, rate: 1.0 };
+        let storage = storage_with(&policy, 0..100_000);
+        assert_eq!(storage.count(), 100_000);
+        let Quantiles::Samples(reservoir) = &storage.quantiles else {
+            unreachable!()
+        };
+        assert_eq!(reservoir.samples.len(), 1000);
+        // Keeping the first 1,000 values would put the median at about 500.
+        let p50 = storage.percentile(0.5);
+        assert!((40_000..=60_000).contains(&p50), "p50 {p50}");
+        assert_eq!(storage.mean(), 49_999 + 1); // 49,999.5 rounded
+    }
+
+    #[test]
+    fn limited_merge_weights_each_side_by_observed_count() {
+        let policy = SamplingPolicy::Limited { max_samples: 1000, rate: 1.0 };
+        let many = storage_with(&policy, std::iter::repeat_n(1, 90_000));
+        let few = storage_with(&policy, std::iter::repeat_n(2, 10_000));
+        for (first, second) in [(&many, &few), (&few, &many)] {
+            let mut merged = LatencyStorage::from_policy(&policy);
+            merged.merge_ref(first);
+            merged.merge_ref(second);
+            assert_eq!(merged.count(), 100_000);
+            let Quantiles::Samples(reservoir) = &merged.quantiles else {
+                unreachable!()
+            };
+            assert_eq!(reservoir.samples.len(), 1000);
+            assert_eq!(reservoir.seen, 100_000);
+            // Expect 100 twos (10%); the standard deviation is under 10.
+            let twos = reservoir.samples.iter().filter(|&&ns| ns == 2).count();
+            assert!((40..=160).contains(&twos), "{twos} of 1000 samples from the 10% side");
+            assert_eq!(merged.mean(), 1); // 1.1 rounded
+            assert_eq!((merged.min(), merged.max()), (Some(1), Some(2)));
+        }
+    }
+
+    #[test]
+    fn hdr_merge_is_independent_of_order() {
+        let policy = SamplingPolicy::default();
+        let parts: Vec<LatencyStorage> = (0..5u64)
+            .map(|part| storage_with(&policy, (0..10_000).map(|i| 1_000 + part * 7_919 + i * 13)))
+            .collect();
+        let merge = |order: &[usize]| {
+            let mut merged = LatencyStorage::from_policy(&policy);
+            for &i in order {
+                merged.merge_ref(&parts[i]);
+            }
+            merged
+        };
+        let forward = merge(&[0, 1, 2, 3, 4]);
+        let backward = merge(&[4, 3, 2, 1, 0]);
+        let shuffled = merge(&[2, 0, 4, 1, 3]);
+        let quantiles = [0.0, 0.5, 0.9, 0.99, 0.999, 1.0];
+        for other in [&backward, &shuffled] {
+            assert_eq!(forward.percentiles(&quantiles), other.percentiles(&quantiles));
+            assert_eq!(forward.moments, other.moments);
+        }
+        assert_eq!(forward.count(), 50_000);
+    }
+
+    #[test]
+    fn hdr_never_drops_out_of_range_values() {
+        // The default histogram resizes: two hours exceeds the former 1 h bound.
+        let two_hours = Duration::from_secs(7_200).as_nanos() as u64;
+        let storage = storage_with(&SamplingPolicy::default(), [1_000, two_hours]);
+        assert_eq!(storage.count(), 2);
+        assert_eq!(storage.max(), Some(two_hours));
+        assert!(storage.percentile(1.0).abs_diff(two_hours) * 1000 <= two_hours);
+        assert_eq!(storage.clamped_count(), None);
+
+        // A configured bound clamps and counts instead of discarding.
+        let bounded = SamplingPolicy::HdrHistogram { sigfigs: 3, max_value_us: Some(1_000) };
+        let storage = storage_with(&bounded, [500_000, 5_000_000, 7_000_000]);
+        assert_eq!(storage.count(), 3);
+        assert_eq!(storage.clamped_count(), Some(2));
+        let p100 = storage.percentile(1.0);
+        assert!(p100.abs_diff(1_000_000) <= 1_000, "clamped to the bound: {p100}");
+        // Exact moments still see the true values.
+        assert_eq!(storage.max(), Some(7_000_000));
+        let mut merged = LatencyStorage::from_policy(&bounded);
+        merged.merge_ref(&storage);
+        merged.merge_ref(&storage);
+        assert_eq!(merged.clamped_count(), Some(4));
+        assert_eq!(LatencyStorage::from_policy(&bounded).clamped_count(), Some(0));
+    }
+
+    #[test]
+    fn mean_is_exact_for_a_skewed_distribution() {
+        // 99 x 1 us and 1 x 10 ms: the median is 1 us, the mean 100.99 us.
+        let latencies = std::iter::repeat_n(1_000, 99).chain([10_000_000]);
+        let latencies: Vec<u64> = latencies.collect();
+        for policy in [
+            SamplingPolicy::default(),
+            SamplingPolicy::Unlimited,
+            SamplingPolicy::Limited { max_samples: 10, rate: 1.0 },
+            SamplingPolicy::DdSketch { alpha: 0.01, max_bins: 1024 },
+            SamplingPolicy::TDigest { compression: 100 },
+        ] {
+            let storage = storage_with(&policy, latencies.iter().copied());
+            assert_eq!(storage.mean(), 100_990, "{policy:?}");
+        }
+    }
+
+    #[test]
+    fn aggregated_stats_report_std_dev_and_confidence_interval() {
+        let mut collector =
+            TupleStatsCollector::new(SamplingPolicy::default(), Duration::from_secs(3600));
+        for us in [2, 4, 4, 4, 5, 5, 7, 9] {
+            collector.record_latency(0, 0, Duration::from_micros(us));
+        }
+        let stats = collector.aggregate_global(Duration::from_secs(1));
+        // Sample variance: sum of squared deviations 32 over n - 1 = 7.
+        let sd = (32.0f64 / 7.0).sqrt();
+        let sd_us = stats.std_dev.unwrap().as_secs_f64() * 1e6;
+        // Durations hold whole nanoseconds.
+        assert!((sd_us - sd).abs() <= 1e-3, "{sd_us}");
+        let ci_us = stats.confidence_interval.unwrap().as_secs_f64() * 1e6;
+        assert!((ci_us - 1.96 * sd / 8f64.sqrt()).abs() <= 1e-3, "{ci_us}");
+        assert_eq!(stats.latency_sample_count, 8);
+        assert_eq!(stats.min_latency, Some(Duration::from_micros(2)));
+        assert_eq!(stats.max_latency, Some(Duration::from_micros(9)));
+        assert_eq!(stats.clamped_samples, None);
+
+        // Unavailable values are None rather than zero.
+        let mut single =
+            TupleStatsCollector::new(SamplingPolicy::default(), Duration::from_secs(3600));
+        single.record_latency(0, 0, Duration::from_micros(3));
+        let stats = single.aggregate_global(Duration::from_secs(1));
+        assert_eq!((stats.std_dev, stats.confidence_interval), (None, None));
+        let mut none = TupleStatsCollector::new(SamplingPolicy::None, Duration::from_secs(3600));
+        none.record_latency(0, 0, Duration::from_micros(3));
+        let stats = none.aggregate_global(Duration::from_secs(1));
+        assert_eq!(stats.total_requests, 1);
+        assert_eq!((stats.min_latency, stats.max_latency, stats.std_dev), (None, None, None));
+        assert_eq!(stats.latency_sample_count, 0);
     }
 
     #[test]
@@ -1373,8 +1609,9 @@ mod tests {
         let storage = record_tdigest(&latencies_ns);
         let exact_mean = latencies_ns.iter().sum::<u64>() / latencies_ns.len() as u64;
         assert_within_one_percent("mean", storage.mean(), exact_mean);
-        assert_within_one_percent("min", storage.min(), *latencies_ns.iter().min().unwrap());
-        assert_within_one_percent("max", storage.max(), *latencies_ns.iter().max().unwrap());
+        // Min and max are tracked exactly beside the digest.
+        assert_eq!(storage.min(), latencies_ns.iter().min().copied());
+        assert_eq!(storage.max(), latencies_ns.iter().max().copied());
     }
 
     #[test]
@@ -1396,8 +1633,8 @@ mod tests {
         collector.record_rx_bytes(0, 0, 50);
 
         assert_eq!(collector.group_ids(), vec![0, 1]);
-        assert_eq!(collector.connection_ids(0), vec![0, 1]);
-        assert_eq!(collector.connection_ids(1), vec![0]);
+        assert_eq!(collector.connection_ids(0), vec![(0, 0), (0, 1)]);
+        assert_eq!(collector.connection_ids(1), vec![(0, 0)]);
     }
 
     #[test]
@@ -1423,7 +1660,84 @@ mod tests {
 
         let merged = TupleStatsCollector::merge(vec![c1, c2]);
 
-        assert_eq!(merged.connection_ids(0), vec![0, 1]);
+        assert_eq!(merged.connection_ids(0), vec![(0, 0), (0, 1)]);
+    }
+
+    #[test]
+    fn connections_of_different_threads_stay_distinct_after_merge() {
+        let start = crate::timing::time_ns();
+        let collector_for = |thread_id: usize, latency_us: u64, requests: usize| {
+            let mut collector = TupleStatsCollector::with_start_time(
+                SamplingPolicy::default(),
+                Duration::from_secs(3600),
+                start,
+            );
+            collector.set_thread_id(thread_id);
+            for _ in 0..requests {
+                collector.record_tx_bytes(0, 0, 10);
+                collector.record_latency(0, 0, Duration::from_micros(latency_us));
+            }
+            collector
+        };
+        // Both threads' first connection has ID 0.
+        let merged =
+            TupleStatsCollector::merge(vec![collector_for(2, 10, 3), collector_for(5, 90, 7)]);
+        assert_eq!(merged.connection_ids(0), vec![(2, 0), (5, 0)]);
+        let connections = merged.aggregate_by_connection(0, Duration::from_secs(1));
+        let a = &connections[&(2, 0)];
+        let b = &connections[&(5, 0)];
+        assert_eq!((a.thread_id, a.request_count, a.tx_bytes), (2, 3, 30));
+        assert_eq!((b.thread_id, b.request_count, b.tx_bytes), (5, 7, 70));
+        assert_eq!(a.latency.max_latency, Some(Duration::from_micros(10)));
+        assert_eq!(b.latency.min_latency, Some(Duration::from_micros(90)));
+        assert_eq!(merged.time_series_by_connection(0, 5, 0)[0].request_count, 7);
+        // Group and global totals still include both threads.
+        assert_eq!(merged.aggregate_global(Duration::from_secs(1)).total_requests, 10);
+        assert_eq!(merged.aggregate_by_group(Duration::from_secs(1))[&0].total_requests, 10);
+    }
+
+    #[test]
+    fn measurement_window_merges_and_sets_edge_bucket_widths() {
+        const SEC: u64 = 1_000_000_000;
+        let epoch = 1_000 * SEC;
+        let collector = |first_s: f64, end_s: f64| {
+            let mut c = TupleStatsCollector::with_start_time(
+                SamplingPolicy::default(),
+                Duration::from_secs(1),
+                epoch,
+            );
+            c.first_record_ns = Some(epoch + (first_s * SEC as f64) as u64);
+            c.end_measurement(epoch + (end_s * SEC as f64) as u64);
+            c
+        };
+        // No window without a recorded event and an end.
+        let empty = TupleStatsCollector::with_start_time(
+            SamplingPolicy::default(),
+            Duration::from_secs(1),
+            epoch,
+        );
+        assert_eq!(empty.measured_duration(), None);
+        assert_eq!(empty.bucket_width(0), Duration::from_secs(1));
+
+        // Thread A measures from 0.5 s to 3.25 s, thread B from 0.25 s to 3.0 s.
+        let merged = TupleStatsCollector::merge(vec![collector(0.5, 3.25), collector(0.25, 3.0)]);
+        assert_eq!(merged.measurement_window_ns(), Some((epoch + SEC / 4, epoch + 13 * SEC / 4)));
+        assert_eq!(merged.measured_duration(), Some(Duration::from_secs(3)));
+        assert_eq!(merged.bucket_width(0), Duration::from_millis(750));
+        assert_eq!(merged.bucket_width(1), Duration::from_secs(1));
+        assert_eq!(merged.bucket_width(3), Duration::from_millis(250));
+        // Only drained responses: outside the window, full width.
+        assert_eq!(merged.bucket_width(4), Duration::from_secs(1));
+
+        // A bucket's rate divides by the time it covered.
+        let mut merged = merged;
+        let mut entry = StatsEntry::new(&SamplingPolicy::default());
+        for _ in 0..500 {
+            entry.record_latency(Duration::from_micros(10));
+        }
+        merged.global_entries.insert(3, entry);
+        let point = &merged.time_series_global()[0];
+        assert_eq!((point.time_bucket, point.throughput_rps), (3, 2_000.0));
     }
 
     #[test]

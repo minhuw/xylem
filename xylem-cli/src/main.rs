@@ -326,6 +326,9 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
     };
 
     let runtime = ThreadingRuntime::with_thread_ids(thread_ids.clone(), cpu_pinning.clone());
+    // One epoch for every thread's time buckets, so equal bucket numbers
+    // cover the same interval when the collectors are merged.
+    let stats_epoch_ns = xylem_core::timing::time_ns();
 
     // Support multiple traffic groups per thread with per-group protocols
     let results = runtime.run_workers_generic(move |thread_idx| {
@@ -356,10 +359,14 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
         // Initialize tuple stats collector
         // Global sampling policy: used for global aggregation (can be "none" to skip global latency)
         // Per-group sampling policies: each group aggregates using its own policy
-        let mut stats = xylem_core::stats::TupleStatsCollector::new(
+        let mut stats = xylem_core::stats::TupleStatsCollector::with_start_time(
             global_sampling_policy.clone(),
             config_for_worker.stats.bucket_duration,
+            stats_epoch_ns,
         );
+        // Connection IDs restart at 0 on every thread; the thread ID keeps
+        // per-connection statistics apart when the collectors are merged.
+        stats.set_thread_id(thread_idx);
 
         // Register per-group sampling policies for independent aggregation
         for (group_id, _) in groups_for_thread.iter() {

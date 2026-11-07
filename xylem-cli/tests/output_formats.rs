@@ -95,37 +95,54 @@ fn file_names(dir: &Path) -> Vec<String> {
 }
 
 /// Summary lines that end in a measured value, by their label.
-const MEASURED_LABELS: [&str; 16] = [
+const MEASURED_LABELS: [&str; 27] = [
+    "Measured: ",
     "Total Requests:  ",
     "Throughput:      ",
     "Bandwidth:       ",
     "  Mean:          ",
+    "  Min:           ",
+    "  Max:           ",
     "  p50:           ",
     "  p95:           ",
     "  p99:           ",
     "  p999:          ",
+    "  Std Dev:       ",
+    "  95% CI:        ",
+    "  Samples:       ",
     "  Requests:      ",
     "  Throughput:    ",
     "  Bandwidth:     ",
     "    Mean:        ",
+    "    Min:         ",
+    "    Max:         ",
     "    p50:         ",
     "    p95:         ",
     "    p99:         ",
     "    p999:        ",
+    "    Std Dev:     ",
+    "    95% CI:      ",
+    "    Samples:     ",
 ];
 
-/// Mask an integer as `#` and a number with two decimals as `#.##`. Any other
-/// text is returned unchanged so the comparison shows it.
-fn mask_number(value: &str) -> &str {
+/// Mask an integer as `#` and a number with two decimals as `#.##`, keeping a
+/// leading `±`. Any other text is returned unchanged so the comparison shows it.
+fn mask_number(value: &str) -> String {
+    if let Some(magnitude) = value.strip_prefix('±') {
+        return format!("±{}", mask_number(magnitude));
+    }
+    if let Some(seconds) = value.strip_suffix('s') {
+        return format!("{}s", mask_number(seconds));
+    }
     let is_digits = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
     match value.split_once('.') {
-        None if is_digits(value) => "#",
+        None if is_digits(value) => "#".into(),
         Some((whole, fraction))
             if is_digits(whole) && is_digits(fraction) && fraction.len() == 2 =>
         {
-            "#.##"
+            "#.##".into()
         }
-        _ => value,
+        _ => value.into(),
     }
 }
 
@@ -161,6 +178,7 @@ Xylem Detailed Experiment Results
 Experiment: output-formats
 Description: Output format characterization
 Duration: 1.00s
+Measured: #.##s
 Seed: 7
 
 Transport: tcp
@@ -175,10 +193,15 @@ Bandwidth:       #.## Mbps
 
 Latency (μs):
   Mean:          #.##
+  Min:           #.##
+  Max:           #.##
   p50:           #.##
   p95:           #.##
   p99:           #.##
   p999:          #.##
+  Std Dev:       #.##
+  95% CI:        ±#.##
+  Samples:       #
 
 {single}
 TRAFFIC GROUP 0: echo
@@ -195,10 +218,15 @@ Statistics:
 
   Latency (μs):
     Mean:        #.##
+    Min:         #.##
+    Max:         #.##
     p50:         #.##
     p95:         #.##
     p99:         #.##
     p999:        #.##
+    Std Dev:     #.##
+    95% CI:      ±#.##
+    Samples:     #
 
 {double}
 ",
@@ -230,29 +258,42 @@ fn json_sections(json_text: &str) -> (&str, &str) {
 /// serde_json's default parser may differ in the last bit.
 fn summary_values(json_text: &str) -> Vec<String> {
     let (global, group) = json_sections(json_text);
-    let mut values = Vec::new();
+    let measured: f64 = raw_number(global, "measured_duration_secs").parse().unwrap();
+    let mut values = vec![format!("{measured:.2}s")];
     for section in [global, group] {
         let requests: u64 = raw_number(section, "total_requests").parse().unwrap();
         values.push(requests.to_string());
+        for key in ["throughput_rps", "throughput_mbps"] {
+            let value: f64 = raw_number(section, key).parse().unwrap();
+            values.push(format!("{value:.2}"));
+        }
         for key in [
-            "throughput_rps",
-            "throughput_mbps",
             "mean_us",
+            "min_us",
+            "max_us",
             "p50_us",
             "p95_us",
             "p99_us",
             "p999_us",
+            "std_dev_us",
         ] {
             let value: f64 = raw_number(section, key).parse().unwrap();
             values.push(format!("{value:.2}"));
         }
+        let ci: f64 = raw_number(section, "confidence_interval_us").parse().unwrap();
+        values.push(format!("±{ci:.2}"));
+        values.push(raw_number(section, "sample_count").to_string());
     }
     values
 }
 
 /// JSON fields whose values are measured.
-const MEASURED_KEYS: [&str; 12] = [
+const MEASURED_KEYS: [&str; 16] = [
+    "measured_duration_secs",
     "total_requests",
+    "min_us",
+    "max_us",
+    "sample_count",
     "throughput_rps",
     "throughput_mbps",
     "mean_us",
@@ -297,6 +338,7 @@ const MASKED_JSON: &str = r#"{
     "name": "output-formats",
     "description": "Output format characterization",
     "duration_secs": 1.0,
+    "measured_duration_secs": #,
     "seed": 7
   },
   "target": {
@@ -309,8 +351,8 @@ const MASKED_JSON: &str = r#"{
     "throughput_rps": #,
     "throughput_mbps": #,
     "latency": {
-      "min_us": 0.0,
-      "max_us": 0.0,
+      "min_us": #,
+      "max_us": #,
       "mean_us": #,
       "p50_us": #,
       "p95_us": #,
@@ -320,7 +362,7 @@ const MASKED_JSON: &str = r#"{
       "p99999_us": #,
       "std_dev_us": #,
       "confidence_interval_us": #,
-      "sample_count": 0
+      "sample_count": #
     }
   },
   "traffic_groups": [
@@ -339,8 +381,8 @@ const MASKED_JSON: &str = r#"{
         "throughput_rps": #,
         "throughput_mbps": #,
         "latency": {
-          "min_us": 0.0,
-          "max_us": 0.0,
+          "min_us": #,
+          "max_us": #,
           "mean_us": #,
           "p50_us": #,
           "p95_us": #,
@@ -350,7 +392,7 @@ const MASKED_JSON: &str = r#"{
           "p99999_us": #,
           "std_dev_us": #,
           "confidence_interval_us": #,
-          "sample_count": 0
+          "sample_count": #
         }
       }
     }
@@ -376,10 +418,24 @@ fn assert_json_results(path: &Path, target: &str) -> String {
         ["connections", "id", "name", "policy", "protocol", "stats", "target", "threads"]
     );
     for latency in [&json["global"]["latency"], &groups[0]["stats"]["latency"]] {
-        assert_eq!(latency["min_us"], serde_json::json!(0.0));
-        assert_eq!(latency["max_us"], serde_json::json!(0.0));
-        assert_eq!(latency["sample_count"], serde_json::json!(0));
+        // The default HDR histogram records every latency, so min and max
+        // bracket the percentiles and the sample count is the request count.
+        let value = |key: &str| latency[key].as_f64().unwrap();
+        assert!(0.0 < value("min_us") && value("min_us") <= value("p50_us"));
+        assert!(value("p999_us") <= value("max_us") * 1.001);
+        assert!(value("std_dev_us") >= 0.0 && value("confidence_interval_us") >= 0.0);
+        assert!(latency.get("clamped_samples").is_none());
     }
+    // Rates cover the measured window, which ends with the 1 s run and
+    // starts at the first request, after connection setup.
+    let measured = json["experiment"]["measured_duration_secs"].as_f64().unwrap();
+    assert!(0.9 < measured && measured <= 1.0, "{measured}");
+    let rps = json["global"]["throughput_rps"].as_f64().unwrap();
+    let requests = json["global"]["total_requests"].as_f64().unwrap();
+    assert!((rps * measured - requests).abs() <= 1e-6 * requests, "{rps} * {measured}");
+    let requests = &json["global"]["total_requests"];
+    assert_eq!(&json["global"]["latency"]["sample_count"], requests);
+    assert_eq!(&groups[0]["stats"]["latency"]["sample_count"], requests);
     text
 }
 

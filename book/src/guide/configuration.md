@@ -84,9 +84,9 @@ file = "results.json"
 `output.format` accepts `json`, `html`, `both`, and `human`. JSON includes global
 and per-group statistics; set `stats.include_records = true` for raw time-bucket
 records. HTML currently supports only `output.html.library = "chartjs"` and
-`output.html.theme = "light"`. `output.real_time` must be false, and
-`stats.streaming` must be omitted: the CLI rejects these unsupported settings
-instead of silently ignoring them.
+`output.html.theme = "light"`. `output.real_time` must be false: the CLI
+rejects this unsupported setting instead of silently ignoring it. The `[stats]`
+section rejects unknown keys, including the removed `stats.streaming`.
 
 TCP and UDP targets require numeric IP addresses, such as `127.0.0.1:6379` or
 `[::1]:6379`. Set transport in each traffic group; there is no global `[target]`

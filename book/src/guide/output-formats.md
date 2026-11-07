@@ -16,6 +16,35 @@ file = "results"
 The CLI sets the file extension to `.json` or `.html` as appropriate. `file` is
 required even for `human`. All formats also print a human-readable summary.
 
+## Throughput and the measured window
+
+`experiment.duration_secs` is the configured duration. Throughput
+(`throughput_rps`, `throughput_mbps`) is computed over
+`experiment.measured_duration_secs`: from the first measured request, after
+connection setup and any protocol warmup (such as the Masstree insert phase),
+to the end of the run. Responses that arrive while the run drains its last
+requests are counted. With `stats.include_records = true`, every record's rate
+divides by the part of its time bucket inside the measured window, so the
+first and last buckets are not understated. All threads share one bucket epoch.
+
+## Latency fields
+
+Each `latency` object in JSON (global and per group) holds, in microseconds:
+
+- `p50_us` ... `p99999_us`: percentiles from the group's sampling policy.
+- `mean_us`, `min_us`, `max_us`: exact, from every recorded latency.
+- `std_dev_us`: sample standard deviation.
+- `confidence_interval_us`: half-width of the 95% confidence interval of the
+  mean, `1.96 * std_dev / sqrt(sample_count)`.
+- `sample_count`: number of latencies recorded, after any `limited` rate.
+- `clamped_samples`: present only for an HDR histogram with `max_value_us`;
+  the number of latencies above that bound, recorded as the bound.
+
+A value the run cannot provide is `null` in JSON and `n/a` in the console and
+HTML: `min_us` and `max_us` without recorded latencies (for example with
+`type = "none"`), and `std_dev_us` and `confidence_interval_us` with fewer than
+two.
+
 For raw per-time-bucket, per-connection records in JSON, use:
 
 ```toml
@@ -24,10 +53,15 @@ include_records = true
 bucket_duration = "1s"
 ```
 
+Each record names its connection by `group_id`, `thread_id` and
+`connection_id`. Connection IDs restart at 0 on every worker thread, so
+`thread_id` (the thread's entry in `threads`) is needed to tell connections
+apart.
+
 HTML uses Chart.js (loaded from a CDN) and the light theme. Only
 `output.html.library = "chartjs"` and `output.html.theme = "light"` are supported.
-`output.real_time` must remain false and `stats.streaming` must be omitted;
-these features are not implemented by the CLI and validation rejects them.
+`output.real_time` must remain false; the feature is not implemented by the CLI
+and validation rejects it.
 The obsolete `detailed-json` format has been replaced by `json`.
 
 Request CSV dumps are configured separately through `[request_dump]`; see the

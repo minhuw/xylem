@@ -28,8 +28,7 @@
       "default": {
         "bucket_duration": "1s",
         "include_records": false,
-        "sampling_policy": null,
-        "streaming": null
+        "sampling_policy": null
       }
     },
     "traffic_groups": {
@@ -506,7 +505,7 @@
           ]
         },
         {
-          "description": "Limited sampling with fixed rate and max samples",
+          "description": "Uniform random sample of at most `max_samples` latencies per entry.\nEach latency is first kept with probability `rate`; the kept latencies\nare reservoir-sampled, so the stored samples are a uniform sample of\nevery kept latency, not the first ones. Mean, min, max and standard\ndeviation are computed from every kept latency.",
           "type": "object",
           "properties": {
             "max_samples": {
@@ -542,51 +541,6 @@
           },
           "required": [
             "type"
-          ]
-        },
-        {
-          "description": "Adaptive sampling: dynamically adjust rate to maintain target CI width",
-          "type": "object",
-          "properties": {
-            "initial_rate": {
-              "description": "Initial sampling rate",
-              "type": "number",
-              "format": "double",
-              "default": 1.0
-            },
-            "max_rate": {
-              "description": "Maximum sampling rate",
-              "type": "number",
-              "format": "double",
-              "default": 1.0
-            },
-            "max_samples": {
-              "description": "Maximum number of samples to store",
-              "type": "integer",
-              "format": "uint",
-              "default": 131072,
-              "minimum": 0
-            },
-            "min_rate": {
-              "description": "Minimum sampling rate",
-              "type": "number",
-              "format": "double",
-              "default": 0.001
-            },
-            "target_ci_width_us": {
-              "description": "Target confidence interval width (in microseconds)",
-              "type": "integer",
-              "format": "uint64",
-              "minimum": 0
-            },
-            "type": {
-              "type": "string",
-              "const": "adaptive"
-            }
-          },
-          "required": [
-            "type",
-            "target_ci_width_us"
           ]
         },
         {
@@ -636,14 +590,16 @@
           ]
         },
         {
-          "description": "HDR Histogram: High dynamic range histogram for maximum accuracy\nHigher memory usage but excellent for all percentiles",
+          "description": "HDR Histogram: records every latency with bounded relative error.\nThis is the default policy.",
           "type": "object",
           "properties": {
             "max_value_us": {
-              "description": "Maximum expected value (in microseconds)",
-              "type": "integer",
+              "description": "Optional upper bound (in microseconds). When unset, the histogram\ngrows to fit every recorded value. When set, larger values are\nrecorded as this bound and counted in the `clamped_samples` output.",
+              "type": [
+                "integer",
+                "null"
+              ],
               "format": "uint64",
-              "default": 3600000000,
               "minimum": 0
             },
             "sigfigs": {
@@ -690,40 +646,9 @@
             }
           ],
           "default": null
-        },
-        "streaming": {
-          "description": "Reserved Parquet streaming configuration; not supported by the CLI.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/StreamingStatsConfig"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        }
-      }
-    },
-    "StreamingStatsConfig": {
-      "description": "Reserved streaming stats configuration. The CLI rejects profiles that set this.",
-      "type": "object",
-      "properties": {
-        "path": {
-          "description": "Output path prefix for Parquet files",
-          "type": "string"
-        },
-        "retention_buckets": {
-          "description": "Number of time buckets to retain in memory before flushing",
-          "type": "integer",
-          "format": "uint",
-          "default": 60,
-          "minimum": 0
         }
       },
-      "required": [
-        "path"
-      ]
+      "additionalProperties": false
     },
     "TrafficGroupConfig": {
       "description": "Traffic group configuration",
@@ -758,9 +683,8 @@
           "description": "Latency sampling policy",
           "$ref": "#/$defs/SamplingPolicy",
           "default": {
-            "max_samples": 131072,
-            "rate": 1.0,
-            "type": "limited"
+            "sigfigs": 3,
+            "type": "hdr-histogram"
           }
         },
         "target": {

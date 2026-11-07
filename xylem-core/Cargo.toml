@@ -20,6 +20,7 @@ serde_json = { workspace = true }
 schemars = { workspace = true, optional = true }
 tracing = { workspace = true }
 rand = { workspace = true }
+rand_distr = { workspace = true }
 core_affinity = { workspace = true }
 humantime-serde = { workspace = true }
 sha2 = "0.10"
@@ -27,8 +28,6 @@ hex = "0.4"
 sketches-ddsketch = "0.3.0"
 tdigest = "0.2"
 hdrhistogram = "7.5"
-parquet = { workspace = true }
-arrow = { workspace = true }
 
 [features]
 schema = ["schemars"]

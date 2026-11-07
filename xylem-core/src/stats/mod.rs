@@ -3,12 +3,10 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-pub mod dumper;
 pub mod policy;
 pub mod tuple_collector;
 
 // Re-export main types
-pub use dumper::{StatsDumper, StatsDumperError, StatsRow, StreamingConfig};
 pub use policy::SamplingPolicy;
 pub use tuple_collector::{
     ConnectionStats, LatencyStorage, StatsEntry, StatsKey, TimeSeriesPoint, TupleStatsCollector,
@@ -32,6 +30,10 @@ pub trait StatsRecorder: Send {
 
     /// Record received bytes
     fn record_rx_bytes(&mut self, group_id: usize, connection_id: usize, bytes: usize);
+
+    /// Mark the end of the measurement loop (a `timing::time_ns` value).
+    /// Responses drained after it are still recorded.
+    fn end_measurement(&mut self, _end_ns: u64) {}
 }
 
 // Implement StatsRecorder for TupleStatsCollector (uses all dimensions)
@@ -47,6 +49,10 @@ impl StatsRecorder for TupleStatsCollector {
     fn record_rx_bytes(&mut self, group_id: usize, connection_id: usize, bytes: usize) {
         TupleStatsCollector::record_rx_bytes(self, group_id, connection_id, bytes);
     }
+
+    fn end_measurement(&mut self, end_ns: u64) {
+        TupleStatsCollector::end_measurement(self, end_ns);
+    }
 }
 
 /// Aggregated statistics
@@ -58,9 +64,22 @@ pub struct AggregatedStats {
     pub latency_p999: Duration,
     pub latency_p9999: Duration,
     pub latency_p99999: Duration,
+    /// Exact mean of every recorded latency; zero when none were recorded.
     pub mean_latency: Duration,
-    pub std_dev: Duration,
-    pub confidence_interval: Duration,
+    /// Smallest recorded latency; `None` when none were recorded.
+    pub min_latency: Option<Duration>,
+    /// Largest recorded latency; `None` when none were recorded.
+    pub max_latency: Option<Duration>,
+    /// Sample standard deviation; `None` with fewer than two latencies.
+    pub std_dev: Option<Duration>,
+    /// Half-width of the 95% confidence interval of the mean
+    /// (1.96 * std_dev / sqrt(n)); `None` with fewer than two latencies.
+    pub confidence_interval: Option<Duration>,
+    /// Number of latencies recorded, after any sampling rate.
+    pub latency_sample_count: u64,
+    /// Latencies a bounded HDR histogram recorded at its `max_value_us`;
+    /// `None` unless the policy sets that bound.
+    pub clamped_samples: Option<u64>,
     pub throughput_rps: f64,
     pub throughput_mbps: f64,
     pub total_requests: u64,

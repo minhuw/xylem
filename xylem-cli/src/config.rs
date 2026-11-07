@@ -116,6 +116,7 @@ fn default_theme() -> String {
 
 /// Statistics collection configuration
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct StatsConfig {
     /// Time bucket duration for per-second per-connection records
     #[serde(default = "default_bucket_duration", with = "humantime_serde")]
@@ -129,9 +130,6 @@ pub struct StatsConfig {
     /// Set to "none" to disable global latency recording.
     #[serde(default)]
     pub sampling_policy: Option<xylem_core::stats::SamplingPolicy>,
-    /// Reserved Parquet streaming configuration; not supported by the CLI.
-    #[serde(default)]
-    pub streaming: Option<StreamingStatsConfig>,
 }
 
 impl Default for StatsConfig {
@@ -140,27 +138,12 @@ impl Default for StatsConfig {
             bucket_duration: default_bucket_duration(),
             include_records: false,
             sampling_policy: None,
-            streaming: None,
         }
     }
 }
 
 fn default_bucket_duration() -> Duration {
     Duration::from_secs(1)
-}
-
-/// Reserved streaming stats configuration. The CLI rejects profiles that set this.
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct StreamingStatsConfig {
-    /// Output path prefix for Parquet files
-    pub path: PathBuf,
-    /// Number of time buckets to retain in memory before flushing
-    #[serde(default = "default_retention_buckets")]
-    pub retention_buckets: usize,
-}
-
-fn default_retention_buckets() -> usize {
-    60 // 1 minute of 1-second buckets by default
 }
 
 /// Protocols a traffic group can name
@@ -242,9 +225,6 @@ impl ProfileConfig {
 
     /// Validate configuration and parse each group's protocol_config into `protocol_configs`
     pub fn validate(&mut self) -> Result<()> {
-        if self.stats.streaming.is_some() {
-            bail!("stats.streaming is not supported by the CLI; omit this section");
-        }
         if self.output.real_time {
             bail!("output.real_time is not supported by the CLI; use false");
         }
@@ -679,14 +659,15 @@ mod tests {
     fn unsupported_options_are_rejected_after_overrides() {
         let path = "../tests/redis/redis-get-zipfian.toml";
         for (option, expected) in [
-            ("stats.streaming.path=stats.parquet", "stats.streaming"),
+            // Parquet streaming was removed; its section is an unknown field.
+            ("stats.streaming.path=stats.parquet", "unknown field `streaming`"),
             ("output.real_time=true", "output.real_time"),
             ("output.html.library=plotly", "output.html.library"),
             ("output.html.theme=dark", "output.html.theme"),
         ] {
             let error =
                 ProfileConfig::from_file_with_overrides(path, &[option.into()]).expect_err(option);
-            assert!(error.to_string().contains(expected), "{option}: {error}");
+            assert!(format!("{error:#}").contains(expected), "{option}: {error:#}");
         }
         ProfileConfig::from_file_with_overrides(
             path,

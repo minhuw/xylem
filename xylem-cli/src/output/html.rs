@@ -295,6 +295,30 @@ fn generate_group_sections(groups: &[super::TrafficGroupResults]) -> String {
                     <td>p99 Latency</td>
                     <td>{tail:.2} μs</td>
                 </tr>
+                <tr>
+                    <td>Mean Latency</td>
+                    <td>{mean:.2} μs</td>
+                </tr>
+                <tr>
+                    <td>Min Latency</td>
+                    <td>{min}</td>
+                </tr>
+                <tr>
+                    <td>Max Latency</td>
+                    <td>{max}</td>
+                </tr>
+                <tr>
+                    <td>Latency Std Dev</td>
+                    <td>{std_dev}</td>
+                </tr>
+                <tr>
+                    <td>Mean 95% CI</td>
+                    <td>{ci}</td>
+                </tr>
+                <tr>
+                    <td>Latency Samples</td>
+                    <td>{samples}</td>
+                </tr>
             </table>
             <div class="chart-container">
                 <canvas id="groupLatencyChart{id}"></canvas>
@@ -310,10 +334,28 @@ fn generate_group_sections(groups: &[super::TrafficGroupResults]) -> String {
                 throughput = group.stats.throughput_rps,
                 median = group.stats.latency.p50_us,
                 tail = group.stats.latency.p99_us,
+                mean = group.stats.latency.mean_us,
+                min = micros_or_na(group.stats.latency.min_us),
+                max = micros_or_na(group.stats.latency.max_us),
+                std_dev = micros_or_na(group.stats.latency.std_dev_us),
+                ci = group
+                    .stats
+                    .latency
+                    .confidence_interval_us
+                    .map_or_else(|| "n/a".to_string(), |ci| format!("±{ci:.2} μs")),
+                samples = group.stats.latency.sample_count,
             )
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Format optional microseconds with two decimals and a unit, or `n/a`.
+fn micros_or_na(value: Option<f64>) -> String {
+    match value {
+        Some(_) => format!("{} μs", super::format_optional(value)),
+        None => "n/a".to_string(),
+    }
 }
 
 /// Escape text nodes, including quotes so this also remains safe in attributes.
