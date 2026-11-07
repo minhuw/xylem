@@ -177,3 +177,28 @@ fn run_compose(
         .stderr(Stdio::null())
         .status()
 }
+
+/// Host port that Docker published for `service`'s `container_port`
+///
+/// `compose_file` is relative to the workspace root, as in [`ComposeSpec`].
+/// Returns `None` if the service is not running. Stacks that publish
+/// `127.0.0.1::<port>` let Docker pick a free host port, and their guards
+/// find it here instead of assuming a fixed port is free.
+pub fn published_port(compose_file: &str, service: &str, container_port: u16) -> Option<u16> {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent()?;
+    let compose_cmd = detect_compose_command()?;
+    let output = Command::new(compose_cmd[0])
+        .args(&compose_cmd[1..])
+        .arg("-f")
+        .arg(workspace_root.join(compose_file))
+        .args(["port", service, &container_port.to_string()])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    // Prints the published address, such as 127.0.0.1:32768
+    let address = String::from_utf8(output.stdout).ok()?;
+    address.trim().rsplit_once(':')?.1.parse().ok().filter(|&port| port != 0)
+}

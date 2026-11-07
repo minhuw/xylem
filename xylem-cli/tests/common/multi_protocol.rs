@@ -3,10 +3,34 @@
 //! Provides helpers for managing multiple protocol services (Redis, Memcached, Nginx) in integration tests.
 //! Uses the shared docker-compose fixture for lifecycle management.
 
-use super::compose::{ComposeSpec, ComposeStack};
-use super::memcached::MemcachedGuard;
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::time::Duration;
+
+use super::compose::{published_port, ComposeSpec, ComposeStack};
 use super::nginx::NginxGuard;
-use super::redis::RedisGuard;
+
+/// Compose file of the multi-protocol stack, relative to the workspace root
+const COMPOSE_FILE: &str = "tests/multi-protocol/docker-compose.yml";
+
+/// Host ports Docker published for the Redis, Memcached and Nginx services
+#[derive(Clone, Copy)]
+struct Ports {
+    redis: u16,
+    memcached: u16,
+    http: u16,
+}
+
+impl Ports {
+    /// Ports of this stack's services, if all three are running
+    fn published() -> Option<Self> {
+        Some(Self {
+            redis: published_port(COMPOSE_FILE, "redis", 6379)?,
+            memcached: published_port(COMPOSE_FILE, "memcached", 11211)?,
+            http: published_port(COMPOSE_FILE, "nginx", 80)?,
+        })
+    }
+}
 
 /// Guard for multi-protocol services that ensures cleanup
 ///
@@ -14,6 +38,8 @@ use super::redis::RedisGuard;
 pub struct MultiProtocolGuard {
     /// Held for its drop, which stops the services if this guard started them
     _stack: ComposeStack,
+    /// Host ports Docker published for the services
+    ports: Ports,
 }
 
 impl MultiProtocolGuard {
@@ -21,11 +47,12 @@ impl MultiProtocolGuard {
     ///
     /// This will:
     /// 1. Check if Docker and docker-compose are available
-    /// 2. Start Redis (6379), Memcached (11211), Nginx (8080) via docker-compose
+    /// 2. Start Redis, Memcached and Nginx via docker-compose, on host ports
+    ///    Docker picks, so they never clash with the single-service stacks
     /// 3. Wait for all services to be ready
     ///
-    /// If all three services already answer, the guard uses them and leaves them
-    /// running on drop.
+    /// If this stack's three services already answer, the guard uses them and
+    /// leaves them running on drop.
     ///
     /// # Errors
     ///
@@ -36,36 +63,53 @@ impl MultiProtocolGuard {
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let stack = ComposeStack::start(&ComposeSpec {
             name: "Multi-protocol services",
-            compose_file: "tests/multi-protocol/docker-compose.yml",
+            compose_file: COMPOSE_FILE,
             build_images: false,
             is_ready: Self::are_services_ready,
         })?;
-        Ok(Self { _stack: stack })
+        let ports = Ports::published().ok_or("Multi-protocol host ports not published")?;
+        Ok(Self { _stack: stack, ports })
     }
 
     /// Check if all services are ready
-    ///
-    /// The services listen on the same ports as the single-service stacks, so their
-    /// probes apply unchanged.
     fn are_services_ready() -> bool {
-        RedisGuard::is_redis_ready()
-            && MemcachedGuard::is_memcached_ready()
-            && NginxGuard::is_nginx_ready()
+        Ports::published().is_some_and(|ports| {
+            answers(ports.redis, b"PING\r\n", "+PONG")
+                && answers(ports.memcached, b"stats\r\n", "STAT")
+                && NginxGuard::is_nginx_ready(ports.http)
+        })
     }
 
     /// Get the Redis port
     pub fn redis_port(&self) -> u16 {
-        6379
+        self.ports.redis
     }
 
     /// Get the Memcached port
     pub fn memcached_port(&self) -> u16 {
-        11211
+        self.ports.memcached
     }
 
     /// Get the HTTP port
     pub fn http_port(&self) -> u16 {
-        8080
+        self.ports.http
+    }
+}
+
+/// Whether the server on `port` of 127.0.0.1 answers `request` with a reply
+/// that starts with `expected`
+fn answers(port: u16, request: &[u8], expected: &str) -> bool {
+    let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+    if stream.write_all(request).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 1024];
+    match stream.read(&mut buf) {
+        Ok(n) if n > 0 => buf[..n].starts_with(expected.as_bytes()),
+        _ => false,
     }
 }
 
