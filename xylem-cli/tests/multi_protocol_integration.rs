@@ -69,14 +69,21 @@ fn test_multi_protocol_redis_memcached_http() {
     eprintln!("Testing multi-protocol with Redis + Memcached + HTTP on different targets");
 
     // Start all three servers using Docker Compose
-    let _services =
+    let services =
         common::multi_protocol::MultiProtocolGuard::new().expect("Failed to start services");
 
-    run_multi_protocol_test().expect("Multi-protocol test failed");
+    run_multi_protocol_test(&services).expect("Multi-protocol test failed");
 }
 
-fn run_multi_protocol_test() -> Result<(), Box<dyn std::error::Error>> {
+fn run_multi_protocol_test(
+    services: &common::multi_protocol::MultiProtocolGuard,
+) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Running multi-protocol integration test...");
+
+    // Docker publishes each service on a free host port
+    let redis_addr = SocketAddr::from(([127, 0, 0, 1], services.redis_port()));
+    let memcached_addr = SocketAddr::from(([127, 0, 0, 1], services.memcached_port()));
+    let http_addr = SocketAddr::from(([127, 0, 0, 1], services.http_port()));
 
     let duration = Duration::from_secs(2);
 
@@ -87,18 +94,19 @@ fn run_multi_protocol_test() -> Result<(), Box<dyn std::error::Error>> {
         // Each thread will handle all three protocols
         let mut protocols = HashMap::new();
 
-        // Group 0: Redis on port 6379
+        // Group 0: Redis
         let redis_selector =
             Box::new(xylem_protocols::FixedCommandSelector::new(xylem_protocols::RedisOp::Get));
         let redis_protocol = create_protocol("redis", None, Some(redis_selector))?;
         protocols.insert(0, redis_protocol);
 
-        // Group 1: Memcached on port 11211
+        // Group 1: Memcached
         let memcached_protocol = create_protocol("memcached-binary", None, None)?;
         protocols.insert(1, memcached_protocol);
 
-        // Group 2: HTTP on port 8080
-        let http_protocol = create_protocol("http", Some(("/", "127.0.0.1:8080")), None)?;
+        // Group 2: HTTP
+        let http_host = http_addr.to_string();
+        let http_protocol = create_protocol("http", Some(("/", &http_host)), None)?;
         protocols.insert(2, http_protocol);
 
         let mut stats = TupleStatsCollector::new(SamplingPolicy::default(), Duration::from_secs(1));
@@ -108,10 +116,6 @@ fn run_multi_protocol_test() -> Result<(), Box<dyn std::error::Error>> {
 
         // Build groups configuration with per-group targets
         // Each group now gets its own target address!
-        let redis_addr: SocketAddr = "127.0.0.1:6379".parse().unwrap();
-        let memcached_addr: SocketAddr = "127.0.0.1:11211".parse().unwrap();
-        let http_addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-
         let groups_config = if thread_idx == 0 {
             // Thread 0: Redis (group 0) and Memcached (group 1) with different targets
             vec![

@@ -3,7 +3,10 @@
 //! Provides helpers for managing Nginx instances in integration tests.
 //! Uses the shared docker-compose fixture for Nginx lifecycle management.
 
-use super::compose::{ComposeSpec, ComposeStack};
+use super::compose::{published_port, ComposeSpec, ComposeStack};
+
+/// Compose file of the Nginx stack, relative to the workspace root
+const COMPOSE_FILE: &str = "tests/nginx/docker-compose.yml";
 
 /// Guard for Nginx that ensures cleanup
 ///
@@ -11,6 +14,8 @@ use super::compose::{ComposeSpec, ComposeStack};
 pub struct NginxGuard {
     /// Held for its drop, which stops Nginx if this guard started it
     _stack: ComposeStack,
+    /// Host port Docker published for Nginx
+    port: u16,
 }
 
 impl NginxGuard {
@@ -18,10 +23,11 @@ impl NginxGuard {
     ///
     /// This will:
     /// 1. Check if Docker and docker-compose are available
-    /// 2. Start Nginx (port 8080) via docker-compose
+    /// 2. Start Nginx via docker-compose, on a host port Docker picks
     /// 3. Wait for Nginx to be ready
     ///
-    /// If Nginx is already running, the guard uses it and leaves it running on drop.
+    /// If this stack's Nginx is already running, the guard uses it and leaves
+    /// it running on drop.
     ///
     /// # Errors
     ///
@@ -32,19 +38,25 @@ impl NginxGuard {
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let stack = ComposeStack::start(&ComposeSpec {
             name: "Nginx",
-            compose_file: "tests/nginx/docker-compose.yml",
+            compose_file: COMPOSE_FILE,
             build_images: false,
-            is_ready: Self::is_nginx_ready,
+            is_ready: || Self::published_port().is_some_and(Self::is_nginx_ready),
         })?;
-        Ok(Self { _stack: stack })
+        let port = Self::published_port().ok_or("Nginx host port not published")?;
+        Ok(Self { _stack: stack, port })
     }
 
-    /// Check if Nginx is ready
-    pub(super) fn is_nginx_ready() -> bool {
+    /// Host port of this stack's Nginx, if it is running
+    fn published_port() -> Option<u16> {
+        published_port(COMPOSE_FILE, "nginx", 80)
+    }
+
+    /// Check if Nginx answers on `port` of 127.0.0.1
+    pub(super) fn is_nginx_ready(port: u16) -> bool {
         use std::io::{Read, Write};
         use std::net::TcpStream;
 
-        let stream = TcpStream::connect("127.0.0.1:8080");
+        let stream = TcpStream::connect(("127.0.0.1", port));
         match stream {
             Ok(mut stream) => {
                 // Send simple HTTP GET request
@@ -69,7 +81,7 @@ impl NginxGuard {
 
     /// Get the port Nginx is listening on
     pub fn get_port(&self) -> u16 {
-        8080
+        self.port
     }
 }
 
