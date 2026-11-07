@@ -936,7 +936,7 @@ fn complete_masstree_handshake(protocol: &mut MasstreeProtocol, conn_id: usize) 
     assert!(protocol.can_send(conn_id));
     assert_requests(
         protocol,
-        vec![(conn_id, Request::warmup(MASSTREE_HANDSHAKE.to_vec(), (conn_id, 0)))],
+        vec![(conn_id, Request::setup(MASSTREE_HANDSHAKE.to_vec(), (conn_id, 0)))],
     );
     assert!(!protocol.can_send(conn_id));
     assert_eq!(
@@ -963,8 +963,8 @@ fn masstree_new_and_default_handshake_each_connection_before_key_zero_gets() {
         assert_requests(
             &mut protocol,
             vec![
-                (0, Request::warmup(MASSTREE_HANDSHAKE.to_vec(), (0, 0))),
-                (1, Request::warmup(MASSTREE_HANDSHAKE.to_vec(), (1, 0))),
+                (0, Request::setup(MASSTREE_HANDSHAKE.to_vec(), (0, 0))),
+                (1, Request::setup(MASSTREE_HANDSHAKE.to_vec(), (1, 0))),
             ],
         );
         assert!(!protocol.can_send(0));
@@ -1285,7 +1285,7 @@ fn masstree_with_workload_and_options_inserts_before_measuring() {
         &mut protocol,
         vec![
             (0, Request::warmup(masstree_set(0, "mt:0", b"xx"), (0, 0))),
-            (1, Request::warmup(MASSTREE_HANDSHAKE.to_vec(), (1, 0))),
+            (1, Request::setup(MASSTREE_HANDSHAKE.to_vec(), (1, 0))),
         ],
     );
     assert_eq!(protocol.parse_response(1, MASSTREE_HANDSHAKE_REPLY).unwrap(), (9, Some((1, 0))));

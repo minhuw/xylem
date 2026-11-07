@@ -13,19 +13,32 @@ pub struct RequestMeta {
     /// - Data population/insertion phases
     /// - Cache warming
     pub is_warmup: bool,
+    /// True if this is a connection setup request (a handshake, AUTH, ...),
+    /// sent once per connection before any other request. Setup requests are
+    /// also warmup requests. The worker never records them in the request
+    /// dump and they do not advance the connection's intended send schedule,
+    /// which restarts once the connection's setup replies have arrived.
+    pub is_setup: bool,
 }
 
 impl RequestMeta {
     /// Create metadata for a normal measurement request.
     #[inline]
     pub fn measurement() -> Self {
-        Self { is_warmup: false }
+        Self { is_warmup: false, is_setup: false }
     }
 
     /// Create metadata for a warm-up request (stats not collected).
     #[inline]
     pub fn warmup() -> Self {
-        Self { is_warmup: true }
+        Self { is_warmup: true, is_setup: false }
+    }
+
+    /// Create metadata for a connection setup request (stats not collected,
+    /// not dumped, not scheduled).
+    #[inline]
+    pub fn setup() -> Self {
+        Self { is_warmup: true, is_setup: true }
     }
 }
 
@@ -64,6 +77,15 @@ impl<ReqId> Request<ReqId> {
             data,
             request_id,
             metadata: RequestMeta::warmup(),
+        }
+    }
+
+    /// Create a connection setup request (see [`RequestMeta::is_setup`]).
+    pub fn setup(data: Vec<u8>, request_id: ReqId) -> Self {
+        Self {
+            data,
+            request_id,
+            metadata: RequestMeta::setup(),
         }
     }
 }

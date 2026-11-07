@@ -630,8 +630,8 @@ fn masstree_set_with_value_size_random_data_and_insert_phase() {
     assert_eq!(
         masstree_requests(&mut protocol, &CONNECTIONS),
         vec![
-            Request::warmup(HANDSHAKE.to_vec(), (0, 0)),
-            Request::warmup(HANDSHAKE.to_vec(), (1, 0)),
+            Request::setup(HANDSHAKE.to_vec(), (0, 0)),
+            Request::setup(HANDSHAKE.to_vec(), (1, 0)),
             Request::warmup(
                 b"\x94\xce\x00\x00\x00\x00\xcc\x08\xa4mt:0\xa9m>}bkX,Y4".to_vec(),
                 (0, 0)
@@ -706,9 +706,9 @@ fn masstree_operations_from_config() {
         assert_eq!(
             masstree_requests(&mut protocol, &[0, 0, 1, 1]),
             vec![
-                Request::warmup(HANDSHAKE.to_vec(), (0, 0)),
+                Request::setup(HANDSHAKE.to_vec(), (0, 0)),
                 Request::measurement(first.to_vec(), (0, 0)),
-                Request::warmup(HANDSHAKE.to_vec(), (1, 0)),
+                Request::setup(HANDSHAKE.to_vec(), (1, 0)),
                 Request::measurement(second.to_vec(), (1, 0)),
             ],
             "{operation}"

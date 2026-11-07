@@ -512,12 +512,12 @@ impl Protocol for MasstreeProtocol {
     type RequestId = (usize, u16);
 
     fn next_request(&mut self, conn_id: usize) -> crate::Request<Self::RequestId> {
-        // Phase 1: Handshake (warmup)
+        // Phase 1: Handshake (connection setup)
         if !self.is_handshake_done(conn_id) {
             let handshake = self.build_handshake().expect("Failed to build handshake request");
             // Mark handshake as pending to prevent duplicate handshakes
             self.set_handshake_pending(conn_id);
-            return crate::Request::warmup(handshake, (conn_id, 0));
+            return crate::Request::setup(handshake, (conn_id, 0));
         }
 
         // Phase 2: Insert phase (warmup) - populate data before measurement
@@ -1199,6 +1199,7 @@ mod tests {
         let (_, seq) = request1.request_id;
         assert_eq!(seq, 0, "First request should be handshake with seq 0");
         assert!(request1.metadata.is_warmup, "Handshake should be warmup");
+        assert!(request1.metadata.is_setup, "Handshake should be connection setup");
 
         // Mark handshake done
         proto.mark_handshake_done(0);
@@ -1207,6 +1208,7 @@ mod tests {
         for i in 0..10 {
             let request = proto.next_request(0);
             assert!(request.metadata.is_warmup, "Insert phase request {} should be warmup", i);
+            assert!(!request.metadata.is_setup, "Insert phase request {} is not setup", i);
             // The request should be a SET operation during insert phase
             let req_str = String::from_utf8_lossy(&request.data);
             assert!(req_str.contains(&format!("key:{}", i)), "Should use sequential keys");

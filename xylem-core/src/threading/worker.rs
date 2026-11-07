@@ -224,31 +224,43 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
                 protocol.next_request(connection_id)
             };
 
-            // Record request to dump file if enabled
-            if let Some(ref dumper) = self.request_dumper {
-                let req_id_str = format!("{:?}", request.request_id);
-                self.record_request(dumper, group_id, connection_id, &request.data, &req_id_str);
-            }
+            if request.metadata.is_setup {
+                // Connection setup (a handshake, AUTH, ...) may carry
+                // credentials: it is never dumped, measured or scheduled.
+                self.pool.send_setup(connection_id, &request.data, request.request_id)?;
+            } else {
+                // Record request to dump file if enabled
+                if let Some(ref dumper) = self.request_dumper {
+                    let req_id_str = format!("{:?}", request.request_id);
+                    self.record_request(
+                        dumper,
+                        group_id,
+                        connection_id,
+                        &request.data,
+                        &req_id_str,
+                    );
+                }
 
-            // Send request (track warmup status for response handling). An
-            // open-loop request's latency starts at its intended send time.
-            let intended_ns = state.intended_send_time();
-            let lag = self.pool.send_scheduled(
-                connection_id,
-                &request.data,
-                request.request_id,
-                request.metadata.is_warmup,
-                intended_ns,
-            )?;
+                // Send request (track warmup status for response handling). An
+                // open-loop request's latency starts at its intended send time.
+                let intended_ns = state.intended_send_time();
+                let lag = self.pool.send_scheduled(
+                    connection_id,
+                    &request.data,
+                    request.request_id,
+                    request.metadata.is_warmup,
+                    intended_ns,
+                )?;
 
-            // Advance the policy's schedule and record stats (skip stats for
-            // warmup requests)
-            if let Some(state) = self.pool.get_state_mut(connection_id) {
-                state.on_request_sent(timing::time_ns());
-            }
-            if !request.metadata.is_warmup {
-                self.stats.record_tx_bytes(group_id, connection_id, request.data.len());
-                self.stats.record_sent(group_id, connection_id, lag);
+                // Advance the policy's schedule and record stats (skip stats for
+                // warmup requests)
+                if let Some(state) = self.pool.get_state_mut(connection_id) {
+                    state.on_request_sent(timing::time_ns());
+                }
+                if !request.metadata.is_warmup {
+                    self.stats.record_tx_bytes(group_id, connection_id, request.data.len());
+                    self.stats.record_sent(group_id, connection_id, lag);
+                }
             }
 
             // Try to re-add connection to heap if it still has capacity
@@ -482,6 +494,10 @@ mod tests {
         fail: bool,
         /// Requests with a lower ID are warmup requests.
         warmup: u64,
+        /// Requests with a lower ID are setup requests, sent one at a time:
+        /// the protocol cannot send while one is pending.
+        setup: u64,
+        setup_pending: bool,
     }
 
     impl Protocol for FakeProtocol {
@@ -490,6 +506,10 @@ mod tests {
         fn next_request(&mut self, _: usize) -> Request<u64> {
             let id = self.next_id;
             self.next_id += 1;
+            if id < self.setup {
+                self.setup_pending = true;
+                return Request::setup(id.to_le_bytes().to_vec(), id);
+            }
             if id < self.warmup {
                 return Request::new(id.to_le_bytes().to_vec(), id, RequestMeta::warmup());
             }
@@ -507,7 +527,15 @@ mod tests {
             if data.len() < 8 {
                 return Ok((0, None));
             }
-            Ok((8, Some(u64::from_le_bytes(data[..8].try_into().unwrap()))))
+            let id = u64::from_le_bytes(data[..8].try_into().unwrap());
+            if id < self.setup {
+                self.setup_pending = false;
+            }
+            Ok((8, Some(id)))
+        }
+
+        fn can_send(&self, _: usize) -> bool {
+            !self.setup_pending
         }
 
         fn name(&self) -> &'static str {
@@ -776,6 +804,58 @@ mod tests {
         assert_eq!(points.iter().map(|p| p.request_count).sum::<u64>(), 1);
         let counts = worker.stats.request_counts_global();
         assert_eq!((counts.sent, counts.completed, counts.timed_out), (2, 2, 0));
+    }
+
+    #[test]
+    fn setup_requests_neither_consume_nor_delay_the_open_loop_schedule() {
+        let factory = FakeFactory::default();
+        factory.0.lock().unwrap().live_timestamps = true;
+        let dir = tempfile::tempdir().unwrap();
+        let dumper = RequestDumper::new(
+            crate::request_dump::DumpConfigBuilder::new().directory(dir.path()).build(),
+        )
+        .unwrap();
+        // 1000 req/s: one intended send per millisecond
+        let mut worker =
+            fake_worker(&factory, 100, Box::new(UniformPolicyScheduler::fixed_rate(1000.0)));
+        worker.set_request_dumper(Arc::clone(&dumper), 0);
+        worker.protocols.get_mut(&0).unwrap().setup = 2;
+
+        // Each setup request goes out alone and waits 20 intervals for its reply
+        for id in 0u64..2 {
+            worker.send_requests().unwrap();
+            assert_eq!(factory.0.lock().unwrap().sent.len() as u64, id + 1);
+            thread::sleep(Duration::from_millis(20));
+            worker.send_requests().unwrap();
+            assert_eq!(factory.0.lock().unwrap().sent.len() as u64, id + 1, "setup is pending");
+            factory.0.lock().unwrap().responses.push_back(Ok(id.to_le_bytes().to_vec()));
+            worker.process_responses(Duration::ZERO).unwrap();
+        }
+        let setup_done_ns = timing::time_ns();
+
+        // The schedule restarted when setup completed, so the 40 ms spent on
+        // setup are neither a backlog of overdue sends nor send lag
+        let intended = worker.pool.get_state(0).unwrap().intended_send_time().unwrap();
+        assert!(intended + 1_000_000 >= setup_done_ns, "schedule restarted after setup");
+        worker.send_requests().unwrap();
+        assert_eq!(factory.0.lock().unwrap().sent.len(), 3, "one measured send, no burst");
+        let counts = worker.stats.request_counts_global();
+        assert_eq!((counts.sent, counts.completed), (1, 0), "setup requests are not counted");
+        let lag = worker.stats.send_lag_global();
+        assert_eq!(lag.sample_count, 1);
+        assert!(lag.max.unwrap() < Duration::from_millis(10), "{lag:?}");
+        assert_eq!(
+            worker.pool.get_state(0).unwrap().intended_send_time(),
+            Some(intended + 1_000_000),
+            "the first measured request took the first intended time"
+        );
+        // Setup bytes are neither dumped nor counted
+        assert_eq!(dumper.total_records(), 1);
+        factory.0.lock().unwrap().responses.push_back(Ok(2u64.to_le_bytes().to_vec()));
+        worker.process_responses(Duration::ZERO).unwrap();
+        assert_eq!(worker.stats.entries().values().map(|entry| entry.tx_bytes).sum::<u64>(), 8);
+        assert_eq!(worker.stats.entries().values().map(|entry| entry.rx_bytes).sum::<u64>(), 8);
+        assert_eq!(global(&worker).latency_sample_count, 1);
     }
 
     #[test]
