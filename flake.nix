@@ -11,7 +11,8 @@
   };
 
   outputs = { self, nixpkgs, rust-overlay, flake-utils }:
-    flake-utils.lib.eachDefaultSystem (system:
+    # nixpkgs unstable no longer supports x86_64-darwin
+    flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ] (system:
       let
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs {
@@ -23,13 +24,11 @@
           extensions = [ "rust-src" "rust-analyzer" "clippy" "rustfmt" "llvm-tools-preview" ];
         };
 
-        # Build inputs for the project
+        # Build inputs for the project; on macOS the stdenv's default SDK
+        # provides the system frameworks
         buildInputs = with pkgs; [
           openssl
           pkg-config
-        ] ++ lib.optionals stdenv.isDarwin [
-          darwin.apple_sdk.frameworks.Security
-          darwin.apple_sdk.frameworks.SystemConfiguration
         ];
 
         nativeBuildInputs = with pkgs; [
@@ -86,7 +85,10 @@
 
             # Testing tools
             pkgs.cargo-nextest
-            pkgs.cargo-llvm-cov
+            # Its tests fail in the nixpkgs sandbox, where nixpkgs' rustc writes
+            # newer raw profiles than the sandbox's llvm-profdata reads. Here it
+            # uses the toolchain's own llvm-tools-preview, which match rustc.
+            (pkgs.cargo-llvm-cov.overrideAttrs { doCheck = false; })
 
             # Pre-commit and formatting
             pkgs.pre-commit
@@ -95,12 +97,12 @@
             # Testing and benchmarking
             pkgs.hyperfine
 
-            # Profiling
-            pkgs.linuxPackages.perf # For flamegraph on Linux
-
             # Additional utilities
             pkgs.tokei # Code statistics
             pkgs.just # Command runner
+          ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+            # Profiling, for flamegraph
+            pkgs.perf
           ];
 
           inherit nativeBuildInputs;
