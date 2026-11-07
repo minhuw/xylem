@@ -23,6 +23,13 @@
           extensions = [ "rust-src" "rust-analyzer" "clippy" "rustfmt" "llvm-tools-preview" ];
         };
 
+        # Build the package with the same toolchain as the dev shell; nixpkgs'
+        # own rustc can be older than the workspace's rust-version
+        rustPlatform = pkgs.makeRustPlatform {
+          cargo = rustToolchain;
+          rustc = rustToolchain;
+        };
+
         # Build inputs for the project
         buildInputs = with pkgs; [
           openssl
@@ -108,7 +115,7 @@
         };
 
         # Package definition
-        packages.default = pkgs.rustPlatform.buildRustPackage {
+        packages.default = rustPlatform.buildRustPackage {
           pname = "xylem";
           version = "0.1.0";
 
@@ -116,6 +123,10 @@
 
           cargoLock = {
             lockFile = ./Cargo.lock;
+            # One hash covers every crate of a git repository at its pinned rev
+            outputHashes = {
+              "ntcp-native-0.0.1" = "sha256-U3JHYJVNvqnTfZOyolb+St7q8L8IMSSSwJggoq1z8+g=";
+            };
           };
 
           # Enable evalsync feature for coordinated benchmarking

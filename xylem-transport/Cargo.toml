@@ -16,11 +16,10 @@ libc = { workspace = true }
 # Linux-only: I/O multiplexing via nix (epoll)
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { workspace = true }
-# User-space TCP (the `ntcp` feature). The file:// URL is a temporary local
-# pin, to be replaced by the GitHub rev once ntcp pushes it.
-ntcp-native = { git = "file:///home/minhu/projects/ntcp", rev = "1df55bc6d5f5cd2363ba752a8af63cd906b6037c", optional = true }
-ntcp-io = { git = "file:///home/minhu/projects/ntcp", rev = "1df55bc6d5f5cd2363ba752a8af63cd906b6037c", optional = true }
-ntcp-io-tun = { git = "file:///home/minhu/projects/ntcp", rev = "1df55bc6d5f5cd2363ba752a8af63cd906b6037c", optional = true }
+# User-space TCP (the `ntcp` feature), pinned to one ntcp commit
+ntcp-native = { git = "https://github.com/minhuw/ntcp", rev = "1df55bc6d5f5cd2363ba752a8af63cd906b6037c", optional = true }
+ntcp-io = { git = "https://github.com/minhuw/ntcp", rev = "1df55bc6d5f5cd2363ba752a8af63cd906b6037c", optional = true }
+ntcp-io-tun = { git = "https://github.com/minhuw/ntcp", rev = "1df55bc6d5f5cd2363ba752a8af63cd906b6037c", optional = true }
 
 # Non-Linux: I/O multiplexing via mio (kqueue on macOS/BSD, IOCP on Windows)
 [target.'cfg(not(target_os = "linux"))'.dependencies]
