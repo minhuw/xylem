@@ -173,7 +173,6 @@ fn default_retention_buckets() -> usize {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProtocolKind {
     Redis,
-    RedisCluster,
     MemcachedBinary,
     MemcachedAscii,
     Http,
@@ -183,9 +182,8 @@ enum ProtocolKind {
 
 /// Every accepted traffic group protocol name. The invalid-protocol error lists
 /// the names in this order.
-const PROTOCOLS: [(&str, ProtocolKind); 7] = [
+const PROTOCOLS: [(&str, ProtocolKind); 6] = [
     ("redis", ProtocolKind::Redis),
-    ("redis-cluster", ProtocolKind::RedisCluster),
     ("memcached-binary", ProtocolKind::MemcachedBinary),
     ("memcached-ascii", ProtocolKind::MemcachedAscii),
     ("http", ProtocolKind::Http),
@@ -198,7 +196,6 @@ const PROTOCOLS: [(&str, ProtocolKind); 7] = [
 #[derive(Debug, Clone)]
 pub enum ProtocolConfig {
     Redis(xylem_protocols::RedisConfig),
-    RedisCluster(xylem_protocols::RedisConfig),
     MemcachedBinary(xylem_protocols::MemcachedConfig),
     MemcachedAscii(xylem_protocols::MemcachedConfig),
     Http(xylem_protocols::HttpConfig),
@@ -377,10 +374,7 @@ impl ProfileConfig {
             // HTTP and XylemEcho have sensible defaults and don't require protocol_config
             let requires_protocol_config = matches!(
                 protocol,
-                ProtocolKind::Redis
-                    | ProtocolKind::RedisCluster
-                    | ProtocolKind::MemcachedBinary
-                    | ProtocolKind::MemcachedAscii
+                ProtocolKind::Redis | ProtocolKind::MemcachedBinary | ProtocolKind::MemcachedAscii
             );
 
             if requires_protocol_config && group.protocol_config.is_none() {
@@ -457,40 +451,6 @@ fn parse_protocol_config(
                 );
             }
             Ok(ProtocolConfig::Redis(config))
-        }
-        ProtocolKind::RedisCluster => {
-            let config: xylem_protocols::RedisConfig =
-                parse_typed_config(pc, "Redis", group_idx, group_name)?;
-
-            // data_import needs an imported-data driver, which the CLI does not provide
-            if config.data_import.is_some() {
-                bail!(
-                    "Traffic group {} '{}': data_import is not supported for redis-cluster protocol. \
-                     Remove protocol_config.data_import.",
-                    group_idx,
-                    group_name
-                );
-            }
-
-            // redis-cluster protocol requires redis_cluster configuration in protocol_config
-            let Some(cluster) = &config.redis_cluster else {
-                bail!(
-                    "Traffic group {} '{}' uses redis-cluster protocol but \
-                     protocol_config.redis_cluster is missing. \
-                     Add a redis_cluster.nodes section with cluster node addresses.",
-                    group_idx,
-                    group_name
-                );
-            };
-            if cluster.nodes.is_empty() {
-                bail!(
-                    "Traffic group {} '{}' uses redis-cluster protocol but \
-                     protocol_config.redis_cluster.nodes is empty or missing. Add at least one cluster node.",
-                    group_idx,
-                    group_name
-                );
-            }
-            Ok(ProtocolConfig::RedisCluster(config))
         }
         ProtocolKind::MemcachedBinary => {
             let config = parse_typed_config(pc, "Memcached", group_idx, group_name)?;
@@ -1561,67 +1521,18 @@ duration = "10s""#,
     }
 
     #[test]
-    fn test_redis_cluster_requires_cluster_config() {
-        // Changing protocol to redis-cluster without providing cluster config should fail
-        let result = ProfileConfig::from_file_with_overrides(
+    fn redis_cluster_is_an_unknown_protocol() {
+        let err = ProfileConfig::from_file_with_overrides(
             "../tests/redis/redis-get-zipfian.toml",
             &["traffic_groups.0.protocol=redis-cluster".to_string()],
-        );
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
+        )
+        .unwrap_err();
         assert!(
-            err.contains("redis-cluster") && err.contains("redis_cluster"),
-            "Error should mention redis-cluster and redis_cluster: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn test_redis_cluster_rejects_data_import() {
-        // Create a minimal config with redis-cluster and data_import (should fail validation)
-        let toml_str = r#"
-[experiment]
-name = "test"
-duration = "10s"
-
-[[traffic_groups]]
-name = "main"
-protocol = "redis-cluster"
-target = "127.0.0.1:7000"
-threads = [0]
-connections_per_thread = 1
-
-[traffic_groups.protocol_config.keys]
-strategy = "sequential"
-start = 0
-value_size = 64
-
-[[traffic_groups.protocol_config.redis_cluster.nodes]]
-address = "127.0.0.1:7000"
-slot_start = 0
-slot_end = 16383
-
-[traffic_groups.protocol_config.data_import]
-file = "/tmp/test.csv"
-
-[traffic_groups.traffic_policy]
-type = "closed-loop"
-
-[output]
-format = "json"
-file = "/tmp/test.json"
-"#;
-        let config: Result<ProfileConfig, _> = toml::from_str(toml_str);
-        assert!(config.is_ok(), "TOML should parse");
-
-        let mut config = config.unwrap();
-        let result = config.validate();
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("data_import") && err.contains("redis-cluster"),
-            "Error should mention data_import not supported for redis-cluster: {}",
-            err
+            format!("{err:#}").contains(
+                "Invalid protocol 'redis-cluster' for traffic group 0 'main'. Valid options: \
+                 redis, memcached-binary, memcached-ascii, http, masstree, xylem-echo"
+            ),
+            "{err:#}"
         );
     }
 

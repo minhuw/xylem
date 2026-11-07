@@ -15,7 +15,6 @@ pub mod nginx;
 pub mod redis;
 pub mod redis_acl;
 pub mod redis_auth;
-pub mod redis_cluster;
 
 use std::time::Duration;
 use xylem_core::stats::{SamplingPolicy, TupleStatsCollector};

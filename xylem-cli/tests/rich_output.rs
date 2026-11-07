@@ -47,7 +47,7 @@ fn test_detailed_json_output_generation() {
             threads: vec![2],
             connections_per_thread: 5,
             max_pending_per_connection: 50,
-            protocol: "redis-cluster".to_string(),
+            protocol: "memcached-binary".to_string(),
             target: "127.0.0.1:6380".to_string(),
             transport: "tcp".to_string(),
             traffic_policy: PolicyConfig::FixedRate { rate: 1000.0 },
@@ -101,7 +101,7 @@ fn test_detailed_json_output_generation() {
     let group1 = &results.traffic_groups[1];
     assert_eq!(group1.id, 1);
     assert_eq!(group1.name, "slow-group");
-    assert_eq!(group1.protocol, "redis-cluster");
+    assert_eq!(group1.protocol, "memcached-binary");
     assert_eq!(group1.stats.total_requests, 300);
 
     // Verify records contain per-connection entries

@@ -1,50 +1,9 @@
 //! The CLI and its compatibility adapters must preserve the same bytes as
 //! shared constructors.
-use xylem_cli::multi_protocol::*;
 use xylem_protocols::configs::*;
 use xylem_protocols::factories::RedisFactory;
 use xylem_protocols::factory::ProtocolFactory;
-use xylem_protocols::{Protocol, RedisClusterProtocol};
-
-#[test]
-fn redis_cluster_constructor_preserves_seeded_sizes_commands_prefix_and_insert_defaults() {
-    for per_command_keys in [false, true] {
-        let keys = KeysConfig::RoundRobin {
-            max: 5,
-            value_size: 13,
-            prefix: "custom:".into(),
-        };
-        let config = RedisConfig {
-            keys: keys.clone(),
-            operations: Some(RedisOperationsConfig::Weighted {
-                commands: vec![RedisCommandWeight {
-                    name: "SET".into(),
-                    weight: 1.0,
-                    params: None,
-                    keys: per_command_keys.then_some(keys),
-                }],
-            }),
-            value_size: Some(ValueSizeConfig::Uniform { min: 3, max: 7 }),
-            insert_phase: Some(InsertPhaseConfig { key_count: Some(1), value_size: None }),
-            random_data: true,
-            ..Default::default()
-        };
-        let seed = Some(42);
-        let mut factory = RedisFactory.create(config.clone(), seed).unwrap();
-        let mut cluster_shared = RedisClusterProtocol::from_config(&config, seed).unwrap();
-        cluster_shared.register_connection("127.0.0.1:7000".parse().unwrap(), 0);
-        let mut lengths = std::collections::HashSet::new();
-        for i in 0..40 {
-            let expected = factory.next_request(0);
-            assert_eq!(cluster_shared.next_request(0).data, expected.data);
-            assert_eq!(expected.metadata.is_warmup, i == 0);
-            if i > 0 {
-                lengths.insert(expected.data.len());
-            }
-        }
-        assert!(lengths.len() > 1, "uniform value sizes must not collapse to a fixed size");
-    }
-}
+use xylem_protocols::Protocol;
 
 /// Capture complete requests from the real executable and reply without an
 /// external service. Both protocols are ordered, so one response releases the
@@ -199,28 +158,6 @@ fn real_cli_http_honors_body_size_and_host_fallback() {
         for request in requests {
             assert_eq!(request, factory.next_request(0).data);
         }
-    }
-}
-
-#[test]
-fn cluster_cli_adapter_rejects_overlapping_and_invalid_ranges() {
-    for ranges in [[(0, 100), (100, 200)], [(100, 99), (101, 200)], [(0, 100), (101, 16384)]] {
-        let config = xylem_cli::multi_protocol::RedisClusterConfig {
-            nodes: ranges
-                .into_iter()
-                .enumerate()
-                .map(|(index, (slot_start, slot_end))| RedisClusterNode {
-                    address: format!("127.0.0.1:{}", 7000 + index),
-                    slot_start,
-                    slot_end,
-                })
-                .collect(),
-        };
-        assert!(create_redis_cluster_protocol(
-            Box::new(xylem_protocols::FixedCommandSelector::new(xylem_protocols::RedisOp::Get)),
-            config,
-        )
-        .is_err());
     }
 }
 

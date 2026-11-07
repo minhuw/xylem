@@ -220,65 +220,6 @@ max = 2048
 
 This models scenarios like caching API responses (small reads) and storing rendered pages (large writes).
 
-## Cluster Benchmarking
-
-When you're testing Redis Cluster, you're really testing how well your client handles distributed systems. Redis Cluster shards data across nodes using hash slots. There are 16,384 slots, and every key hashes to one of them. Each node owns a range of slots. When you send a command to the wrong node, Redis tells you where to go with a MOVED or ASK redirect.
-
-Xylem handles this for you. You tell it about your cluster topology—which nodes own which slots—and it routes every request to the right node from the start. No trial and error, no unnecessary redirects.
-
-Here's the setup:
-```rust
-use xylem_protocols::*;
-use xylem_protocols::redis::cluster::calculate_slot_range;
-
-// Create a cluster-aware protocol
-let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
-let mut protocol = RedisClusterProtocol::new(selector);
-
-// Register your nodes
-protocol.register_connection("127.0.0.1:7000".parse()?, 0);
-protocol.register_connection("127.0.0.1:7001".parse()?, 1);
-protocol.register_connection("127.0.0.1:7002".parse()?, 2);
-
-// Define the topology
-let mut ranges = vec![];
-for i in 0..3 {
-    // Returns None only when the node index is not below the node count
-    let (start, end) = calculate_slot_range(i, 3).expect("node index is in range");
-    let master = format!("127.0.0.1:{}", 7000 + i).parse()?;
-    ranges.push(SlotRange { start, end, master, replicas: vec![] });
-}
-protocol.update_topology(ClusterTopology::from_slot_ranges(ranges));
-
-// Now every request goes to the right node
-let (request, req_id) = protocol.generate_request(0, key, value_size);
-```
-
-The slot calculation is CRC16-XMODEM of the key. Xylem does a binary search over slot ranges to find the owner—O(log N) in the number of ranges, but with typical cluster sizes (3-10 nodes), this is effectively free.
-
-### Hash Tags for Multi-Key Operations
-
-Sometimes you need multiple keys on the same node. MGET won't work across nodes—Redis can't fetch `{key:1, key:2, key:3}` if they're on different shards. Hash tags solve this.
-
-When you use curly braces in a key name, Redis only hashes what's inside the braces:
-```rust
-let key1 = "{user:1000}.profile";
-let key2 = "{user:1000}.settings";
-let key3 = "{user:1000}.preferences";
-```
-
-All three hash to the same slot because they share `{user:1000}`. Now you can MGET them together, or use MULTI/EXEC for atomic multi-key operations.
-
-### Handling Redirects
-
-Even with perfect topology knowledge, clusters reshard. Slots migrate between nodes during scale-up, rebalancing, or failover. When you hit a moving slot, Redis sends a redirect.
-
-**MOVED** means the slot permanently moved. Update your topology and retry. MOVED is a signal to refresh your cluster map.
-
-**ASK** means the slot is temporarily migrating. Retry on the new node (with an ASKING command first), but don't update your topology—the migration might not complete.
-
-Xylem detects both. It parses the redirect response, extracts the target node address, and returns this info so you can decide: update topology, retry immediately, log the event, whatever makes sense for your benchmark.
-
 ## Common Workload Patterns
 
 Let me paint some pictures of real-world workloads and how to model them.
@@ -295,15 +236,14 @@ Let me paint some pictures of real-world workloads and how to model them.
 
 ## Wrapping Up
 
-Redis benchmarking is about understanding your workload and translating it into RESP commands. Xylem gives you the tools: command mixes, key distributions, value sizes, pipelining control, cluster routing. The trick is using them to model what your production system actually does.
+Redis benchmarking is about understanding your workload and translating it into RESP commands. Xylem gives you the tools: command mixes, key distributions, value sizes, and pipelining control. The trick is using them to model what your production system actually does.
 
 Start simple. Benchmark pure GETs and SETs with uniform keys to understand Redis's baseline. Then add complexity: hot keys with Zipfian distribution, mixed command ratios, varied value sizes. Pipeline aggressively to see maximum throughput. Test failure modes: what happens during resharding, replication lag, eviction under memory pressure?
 
-Your benchmarks should tell a story. Not just "Redis can do 100K QPS," but "our session store can handle 10K users with P99 latency under 2ms, and we can lose a cluster node without dropping requests." That's the insight that lets you ship with confidence.
+Your benchmarks should tell a story. Not just "Redis can do 100K QPS," but "our session store can handle 10K users with P99 latency under 2ms, and we can lose a replica without dropping requests." That's the insight that lets you ship with confidence.
 
 ## See Also
 
 - [Workload Configuration](../configuration/workload.md) - Detailed configuration guide
 - [Configuration Schema](../../reference/schema.md) - Complete reference
 - [Redis Documentation](https://redis.io/docs/) - Official Redis protocol documentation
-- [Redis Cluster Tutorial](https://redis.io/docs/manual/scaling/) - Official cluster guide

@@ -39,7 +39,6 @@ threads = [2, 3]
 ## Supported Protocols
 
 - **redis** - Redis Serialization Protocol (RESP)
-- **redis-cluster** - Redis Cluster protocol with slot-based routing
 - **http** - HTTP/1.1
 - **memcached-binary** - Memcached binary protocol
 - **memcached-ascii** - Memcached text protocol

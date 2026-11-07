@@ -225,9 +225,6 @@ pub struct RedisConfig {
     /// Data import configuration (use real data from CSV)
     #[serde(default)]
     pub data_import: Option<DataImportConfig>,
-    /// Redis Cluster configuration (only for redis-cluster protocol)
-    #[serde(default)]
-    pub redis_cluster: Option<RedisClusterConfig>,
     /// Insert phase configuration (populate keys before measurement)
     ///
     /// When configured, the protocol will first insert all keys using SET
@@ -235,26 +232,6 @@ pub struct RedisConfig {
     /// that need pre-populated data (e.g., GET workloads).
     #[serde(default)]
     pub insert_phase: Option<InsertPhaseConfig>,
-}
-
-/// Redis Cluster configuration
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct RedisClusterConfig {
-    /// Cluster nodes with their slot assignments
-    pub nodes: Vec<RedisClusterNodeConfig>,
-}
-
-/// Redis Cluster node configuration
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct RedisClusterNodeConfig {
-    /// Node address (e.g., "127.0.0.1:7000")
-    pub address: String,
-    /// Start of slot range (0-16383)
-    pub slot_start: u16,
-    /// End of slot range (0-16383)
-    pub slot_end: u16,
 }
 
 /// Value size configuration

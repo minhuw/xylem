@@ -7,16 +7,16 @@
 //! - Single connection, single pending request: Simple closed-loop latency measurement
 //! - Multiple connections with pipelining: High-throughput load testing
 
-use crate::connection::{ConnectionPool, ReceivedResponse, RequestTiming, TrafficGroupConfig};
+use crate::connection::{ConnectionPool, TrafficGroupConfig};
 use crate::request_dump::RequestDumper;
 use crate::stats::{StatsRecorder, TupleStatsCollector};
 use crate::timing;
 use crate::Result;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use xylem_common::{Protocol, RetryRequest};
+use xylem_common::Protocol;
 use xylem_transport::{ConnectionGroup, TransportFactory};
 
 /// Configuration for worker
@@ -50,8 +50,6 @@ pub struct Worker<G: ConnectionGroup, P: Protocol, S: StatsRecorder = TupleStats
     thread_id: usize,
     /// Coarse maintenance deadline for stale TX timestamp correlation entries.
     next_tx_cleanup_ns: u64,
-    /// Redirects waiting for capacity on their target connection.
-    retry_queue: Vec<(usize, RetryRequest<P::RequestId>, RequestTiming)>,
     /// Reused buffer for the connection IDs each poll reports ready.
     ready_ids: Vec<usize>,
 }
@@ -132,32 +130,13 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             request_dumper: None,
             thread_id: 0,
             next_tx_cleanup_ns: timing::time_ns().saturating_add(1_000_000_000),
-            retry_queue: Vec::new(),
             ready_ids: Vec::new(),
         }
     }
 
     /// Get mapping of connection ID to target address
-    ///
-    /// Useful for wiring up protocols that need to know connection routing
-    /// (e.g., Redis Cluster). Call this after construction but before run().
     pub fn connection_targets(&self) -> Vec<(usize, SocketAddr)> {
         self.pool.connection_targets()
-    }
-
-    /// Get mapping of connection ID to target address for a specific traffic group
-    ///
-    /// Filters connections to only those belonging to the specified group_id.
-    /// Essential for Redis Cluster to avoid routing to connections from other groups.
-    pub fn connection_targets_for_group(&self, group_id: usize) -> Vec<(usize, SocketAddr)> {
-        self.pool.connection_targets_for_group(group_id)
-    }
-
-    /// Get mutable access to protocols map
-    ///
-    /// Useful for post-construction wiring (e.g., registering cluster connections).
-    pub fn protocols_mut(&mut self) -> &mut HashMap<usize, P> {
-        &mut self.protocols
     }
 
     /// Set the request dumper for recording all requests
@@ -218,11 +197,6 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
     }
 
     fn send_requests(&mut self) -> Result<()> {
-        // Give redirected requests capacity before generating new work. This
-        // also bounds the queue when a target is slower than the source nodes.
-        let blocked_groups: HashSet<_> =
-            self.retry_queue.iter().map(|(group, _, _)| *group).collect();
-        let mut blocked_connections = Vec::new();
         // SEND PHASE: Send requests to ready connections
         // Rate limiting is handled by connection-level policies via pool's ready_heap
         //
@@ -235,10 +209,6 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         while let Some(connection_id) = self.pool.pick_connection() {
             let state = self.pool.get_state(connection_id).expect("Connection state not found");
             let group_id = state.group_id();
-            if blocked_groups.contains(&group_id) {
-                blocked_connections.push((connection_id, group_id));
-                continue;
-            }
 
             let request = {
                 let protocol =
@@ -288,16 +258,6 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
                 break;
             }
         }
-        // Reinsert only after scanning: an immediately ready closed-loop entry
-        // would otherwise be popped forever. A short delay avoids busy polling
-        // when only blocked groups are ready; responses still wake the poll.
-        // Leave at least a millisecond for transports whose poll rounds down.
-        let retry_wakeup_ns = timing::time_ns().saturating_add(2_000_000);
-        for (connection_id, group_id) in blocked_connections {
-            let protocol = self.protocols.get(&group_id).expect("Protocol not found for group_id");
-            self.pool
-                .try_schedule_connection_after(connection_id, protocol, retry_wakeup_ns);
-        }
         Ok(())
     }
 
@@ -308,16 +268,10 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         let wait_ns = if self.pool.has_ready(now_ns) {
             0
         } else {
-            self.pool.peek_next_ready_time().map_or(remaining_ns, |next| {
-                // Retry-blocked entries need a real wait, not the precision spin
-                // used for ordinary rate-policy deadlines.
-                let spin_ns = if self.retry_queue.is_empty() {
-                    1_000_000
-                } else {
-                    0
-                };
-                next.saturating_sub(now_ns).saturating_sub(spin_ns)
-            })
+            // Wake a millisecond early and spin for rate-policy precision.
+            self.pool
+                .peek_next_ready_time()
+                .map_or(remaining_ns, |next| next.saturating_sub(now_ns).saturating_sub(1_000_000))
         };
         Duration::from_nanos(wait_ns.min(remaining_ns))
     }
@@ -340,9 +294,6 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         // This prevents memory leaks when TX timestamps are never received
         self.maintain_tx_queues(timing::time_ns());
 
-        // Collect retries to process after response handling
-        let mut retries = std::mem::take(&mut self.retry_queue);
-
         for &connection_id in &ready_ids {
             let state = match self.pool.get_state(connection_id) {
                 Some(s) => s,
@@ -356,13 +307,11 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
 
             let group_id = state.group_id();
 
-            // Preserve the parser's completion/retry distinction through pending
-            // tracking, so redirects neither record latency nor tune the policy.
             let responses = {
                 let protocol =
                     self.protocols.get_mut(&group_id).expect("Protocol not found for group_id");
-                match self.pool.recv_responses_extended(connection_id, |data| {
-                    protocol.parse_response_extended(connection_id, data).map_err(Into::into)
+                match self.pool.recv_responses(connection_id, |data| {
+                    protocol.parse_response(connection_id, data).map_err(Into::into)
                 }) {
                     Ok(responses) => responses,
                     Err(e @ crate::Error::Connection(_)) => {
@@ -374,26 +323,10 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
                 }
             };
 
-            for response in responses {
-                let (timing, bytes_consumed) = match &response {
-                    ReceivedResponse::Complete { timing, bytes_consumed, .. } => {
-                        (*timing, *bytes_consumed)
-                    }
-                    ReceivedResponse::Retry { request, timing } => {
-                        (*timing, request.bytes_consumed)
-                    }
-                };
-                if !timing.is_warmup {
+            for (_, latency, is_warmup, bytes_consumed) in responses {
+                if !is_warmup {
                     self.stats.record_rx_bytes(group_id, connection_id, bytes_consumed);
-                }
-                match response {
-                    ReceivedResponse::Complete { latency, .. } if !timing.is_warmup => {
-                        self.stats.record_latency(group_id, timing.origin_connection_id, latency);
-                    }
-                    ReceivedResponse::Retry { request, timing } => {
-                        retries.push((group_id, request, timing));
-                    }
-                    ReceivedResponse::Complete { .. } => {}
+                    self.stats.record_latency(group_id, connection_id, latency);
                 }
             }
 
@@ -406,11 +339,6 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         }
         self.ready_ids = ready_ids;
 
-        // Process all retries after response handling.
-        for (group_id, retry_req, timing) in retries {
-            self.handle_retry(group_id, retry_req, timing)?;
-        }
-
         Ok(())
     }
 
@@ -419,69 +347,6 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             self.pool.cleanup_stale_tx_queues_at(now_ns);
             self.next_tx_cleanup_ns = now_ns.saturating_add(1_000_000_000);
         }
-    }
-
-    /// Handle a retry request by sending preparation commands and retry request
-    fn handle_retry(
-        &mut self,
-        group_id: usize,
-        retry_req: RetryRequest<P::RequestId>,
-        timing: RequestTiming,
-    ) -> Result<()> {
-        let target_connection_id = match retry_req.target_conn_id {
-            Some(connection_id) => connection_id,
-            None => return Err(crate::Error::Connection("Retry target is not registered".into())),
-        };
-
-        // Check connection exists and belongs to the group
-        let state = match self.pool.get_state(target_connection_id) {
-            Some(s) if s.group_id() == group_id => s,
-            _ => {
-                return Err(crate::Error::Connection(
-                    "Retry target is outside the traffic group".into(),
-                ))
-            }
-        };
-
-        if state.is_closed() {
-            return Err(crate::Error::Connection("Retry target is closed".into()));
-        }
-        if !state.can_send() {
-            self.retry_queue.push((group_id, retry_req, timing));
-            return Ok(());
-        }
-
-        // Send preparation commands
-        for prep_cmd in &retry_req.prepare_commands {
-            self.pool.send_untracked(target_connection_id, prep_cmd)?;
-            if !timing.is_warmup {
-                self.stats.record_tx_bytes(group_id, target_connection_id, prep_cmd.len());
-            }
-        }
-
-        // Generate and send retry request using the original request ID
-        let protocol = self.protocols.get_mut(&group_id).expect("Protocol not found for group_id");
-
-        let request =
-            protocol.regenerate_request(target_connection_id, retry_req.original_request_id);
-
-        // Record retry request to dump file if enabled
-        if let Some(ref dumper) = self.request_dumper {
-            let req_id_str = format!("{:?}_retry{}", request.request_id, retry_req.attempt);
-            self.record_request(dumper, group_id, target_connection_id, &request.data, &req_id_str);
-        }
-
-        // Send the retry request
-        // Note: We intentionally do NOT call state.on_request_sent() or generator.mark_request_sent()
-        // because retries are already counted as in-flight from the original request. Double-counting
-        // would skew rate limiting and statistics (especially for Redis Cluster MOVED/ASK redirects).
-        self.pool
-            .send_retry(target_connection_id, &request.data, request.request_id, timing)?;
-        if !timing.is_warmup {
-            self.stats.record_tx_bytes(group_id, target_connection_id, request.data.len());
-        }
-
-        Ok(())
     }
 
     /// Drain any remaining responses after measurement period
@@ -502,15 +367,13 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             .sum();
         tracing::warn!(
             pending_requests = pending,
-            queued_retries = self.retry_queue.len(),
             "Response drain exhausted; retaining collected statistics"
         );
         Ok(())
     }
 
-    /// Single drain iteration. Redirect retries remain enabled, using the same
-    /// extended parser and error handling as measurement. They can add pending
-    /// work, but the outer drain loop still bounds the number of poll iterations.
+    /// Single drain iteration, using the same parser and error handling as
+    /// measurement. The outer drain loop bounds the number of poll iterations.
     fn drain_iteration(&mut self) -> Result<bool> {
         if !self.has_pending() {
             return Ok(false);
@@ -520,12 +383,10 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
     }
 
     fn has_pending(&self) -> bool {
-        !self.retry_queue.is_empty()
-            || self
-                .pool
-                .connection_ids()
-                .iter()
-                .any(|&id| self.pool.get_state(id).is_some_and(|state| state.pending_count() > 0))
+        self.pool
+            .connection_ids()
+            .iter()
+            .any(|&id| self.pool.get_state(id).is_some_and(|state| state.pending_count() > 0))
     }
 
     /// Get the stats collector
@@ -563,7 +424,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
-    use xylem_common::{ParseResult, Request};
+    use xylem_common::Request;
     use xylem_transport::TcpTransportFactory;
 
     use crate::connection::test_support::{FakeFactory, FakeGroup};
@@ -573,9 +434,6 @@ mod tests {
     #[derive(Default)]
     struct FakeProtocol {
         next_id: u64,
-        retry: bool,
-        retry_target: usize,
-        retry_prepare: Vec<Vec<u8>>,
         fail: bool,
     }
 
@@ -588,33 +446,18 @@ mod tests {
             Request::measurement(id.to_le_bytes().to_vec(), id)
         }
 
-        fn parse_response(&mut self, _: usize, _: &[u8]) -> anyhow::Result<(usize, Option<u64>)> {
-            panic!("worker must use extended parsing, including during drain")
-        }
-
-        fn parse_response_extended(
+        fn parse_response(
             &mut self,
             _: usize,
             data: &[u8],
-        ) -> anyhow::Result<ParseResult<u64>> {
+        ) -> anyhow::Result<(usize, Option<u64>)> {
             if self.fail {
                 anyhow::bail!("invalid test response");
             }
             if data.len() < 8 {
-                return Ok(ParseResult::Incomplete);
+                return Ok((0, None));
             }
-            let id = u64::from_le_bytes(data[..8].try_into().unwrap());
-            if std::mem::take(&mut self.retry) {
-                return Ok(ParseResult::Retry(RetryRequest {
-                    bytes_consumed: 8,
-                    original_request_id: id,
-                    is_warmup: false,
-                    target_conn_id: Some(self.retry_target),
-                    prepare_commands: self.retry_prepare.clone(),
-                    attempt: 0,
-                }));
-            }
-            Ok(ParseResult::Complete { bytes_consumed: 8, request_id: id })
+            Ok((8, Some(u64::from_le_bytes(data[..8].try_into().unwrap()))))
         }
 
         fn name(&self) -> &'static str {
@@ -646,165 +489,6 @@ mod tests {
     }
 
     #[test]
-    fn full_retry_target_defers_preparation_until_capacity_is_available() {
-        let factory = FakeFactory::default();
-        let mut worker = fake_worker(&factory, 1, Box::new(UniformPolicyScheduler::closed_loop()));
-        worker.send_requests().unwrap();
-        worker
-            .handle_retry(
-                0,
-                RetryRequest {
-                    bytes_consumed: 0,
-                    original_request_id: 99,
-                    is_warmup: false,
-                    target_conn_id: Some(0),
-                    prepare_commands: vec![b"ASKING".to_vec()],
-                    attempt: 0,
-                },
-                RequestTiming {
-                    send_ts: xylem_transport::Timestamp::now(),
-                    is_warmup: false,
-                    origin_connection_id: 0,
-                },
-            )
-            .unwrap();
-        assert_eq!(factory.0.lock().unwrap().sent.len(), 1);
-        assert_eq!(worker.retry_queue.len(), 1);
-        assert_eq!(worker.protocols[&0].next_id, 1);
-        factory.0.lock().unwrap().responses.push_back(Ok(0u64.to_le_bytes().to_vec()));
-        worker.process_responses(Duration::ZERO).unwrap();
-        assert!(worker.retry_queue.is_empty());
-        assert_eq!(
-            factory.0.lock().unwrap().sent,
-            [0u64.to_le_bytes().to_vec(), b"ASKING".to_vec(), 1u64.to_le_bytes().to_vec()]
-        );
-        assert_eq!(worker.pool.get_state(0).unwrap().pending_count(), 1);
-    }
-
-    #[test]
-    fn queued_retry_blocks_only_its_group_and_resumes_after_capacity_returns() {
-        let factory = FakeFactory::default();
-        let mut stats = TupleStatsCollector::default();
-        for group in 0..2 {
-            stats.register_group_policy(
-                group,
-                SamplingPolicy::Limited { max_samples: 1000, rate: 1.0 },
-            );
-        }
-        let mut worker = Worker::new_multi_group(
-            &factory,
-            HashMap::from([(0, FakeProtocol::default()), (1, FakeProtocol::default())]),
-            stats,
-            WorkerConfig {
-                target: "127.0.0.1:1".parse().unwrap(),
-                duration: Duration::ZERO,
-                conn_count: 3,
-                max_pending_per_conn: 1,
-            },
-            vec![
-                (0, 2, 1, Box::new(UniformPolicyScheduler::closed_loop())),
-                (1, 1, 1, Box::new(UniformPolicyScheduler::closed_loop())),
-            ],
-        )
-        .unwrap();
-        // Group 0 has a ready source and a full retry target. Group 1 is ready.
-        worker.pool.send(1, &99u64.to_le_bytes(), 99, true).unwrap();
-        worker
-            .handle_retry(
-                0,
-                RetryRequest {
-                    bytes_consumed: 8,
-                    original_request_id: 42,
-                    is_warmup: false,
-                    target_conn_id: Some(1),
-                    prepare_commands: vec![b"ASKING".to_vec()],
-                    attempt: 0,
-                },
-                RequestTiming {
-                    send_ts: xylem_transport::Timestamp::now(),
-                    is_warmup: false,
-                    origin_connection_id: 0,
-                },
-            )
-            .unwrap();
-        worker.send_requests().unwrap();
-        assert_eq!(worker.protocols[&0].next_id, 0);
-        assert_eq!(worker.protocols[&1].next_id, 1);
-        assert_eq!(worker.pool.get_state(0).unwrap().pending_count(), 0);
-        assert!(worker.pool.get_state(0).unwrap().is_on_heap());
-        assert_eq!(worker.pool.get_state(2).unwrap().pending_count(), 1);
-        let wakeup = worker.pool.peek_next_ready_time().unwrap();
-        assert_eq!(worker.poll_timeout(wakeup - 2_000_000, wakeup + 100), Duration::from_millis(2));
-        assert_eq!(worker.poll_timeout(wakeup - 1, wakeup + 100), Duration::from_nanos(1));
-        {
-            let mut io = factory.0.lock().unwrap();
-            io.response_connection_id = 2;
-            io.responses.push_back(Ok(0u64.to_le_bytes().to_vec()));
-        }
-        worker.process_responses(Duration::ZERO).unwrap();
-        assert_eq!(worker.stats.aggregate_by_group(Duration::from_secs(1))[&1].total_requests, 1);
-        assert_eq!(worker.retry_queue.len(), 1);
-        worker.send_requests().unwrap();
-        assert_eq!(worker.protocols[&1].next_id, 2);
-        assert_eq!(worker.protocols[&0].next_id, 0);
-        {
-            let mut io = factory.0.lock().unwrap();
-            io.response_connection_id = 1;
-            io.responses.push_back(Ok(99u64.to_le_bytes().to_vec()));
-        }
-        worker.process_responses(Duration::ZERO).unwrap();
-        assert!(worker.retry_queue.is_empty());
-        assert_eq!(worker.pool.get_state(1).unwrap().pending_count(), 1);
-        assert_eq!(worker.protocols[&0].next_id, 1);
-        assert_eq!(factory.0.lock().unwrap().sent.len(), 5);
-        // Advance the scheduler clock deterministically past the brief deferral.
-        assert_eq!(worker.pool.pick_connection_at(u64::MAX), Some(0));
-        assert!(!worker.pool.get_state(0).unwrap().is_on_heap());
-        worker.pool.try_schedule_connection(0, &worker.protocols[&0]);
-        worker.send_requests().unwrap();
-        assert_eq!(worker.pool.get_state(0).unwrap().pending_count(), 1);
-        assert_eq!(worker.pool.get_state(1).unwrap().pending_count(), 1);
-        assert_eq!(worker.protocols[&0].next_id, 2);
-    }
-
-    #[test]
-    fn queued_retry_still_errors_when_its_target_disconnects() {
-        let factory = FakeFactory::default();
-        let mut worker = fake_worker(&factory, 1, Box::new(UniformPolicyScheduler::closed_loop()));
-        worker.send_requests().unwrap();
-        worker
-            .handle_retry(
-                0,
-                RetryRequest {
-                    bytes_consumed: 8,
-                    original_request_id: 99,
-                    is_warmup: false,
-                    target_conn_id: Some(0),
-                    prepare_commands: vec![],
-                    attempt: 0,
-                },
-                RequestTiming {
-                    send_ts: xylem_transport::Timestamp::now(),
-                    is_warmup: false,
-                    origin_connection_id: 0,
-                },
-            )
-            .unwrap();
-        factory
-            .0
-            .lock()
-            .unwrap()
-            .responses
-            .push_back(Err(xylem_transport::Error::Connection("closed".into())));
-        assert!(worker
-            .drain_iteration()
-            .unwrap_err()
-            .to_string()
-            .contains("Retry target is closed"));
-        assert!(worker.pool.get_state(0).unwrap().is_closed());
-    }
-
-    #[test]
     fn run_preserves_completed_stats_and_closes_after_disconnect_or_drain_exhaustion() {
         for disconnect in [true, false] {
             let factory = FakeFactory::default();
@@ -832,131 +516,6 @@ mod tests {
             assert!(!worker.has_pending());
             assert_eq!(factory.0.lock().unwrap().timeouts.len(), if disconnect { 2 } else { 101 });
         }
-    }
-
-    #[test]
-    fn retry_preparation_precedes_request_and_propagates_send_errors() {
-        for fail in [false, true] {
-            let factory = FakeFactory::default();
-            let mut worker =
-                fake_worker(&factory, 2, Box::new(UniformPolicyScheduler::closed_loop()));
-            factory.0.lock().unwrap().fail_send = fail;
-            let result = worker.handle_retry(
-                0,
-                RetryRequest {
-                    bytes_consumed: 0,
-                    original_request_id: 99,
-                    is_warmup: false,
-                    target_conn_id: Some(0),
-                    prepare_commands: vec![b"ASKING".to_vec()],
-                    attempt: 0,
-                },
-                RequestTiming {
-                    send_ts: xylem_transport::Timestamp::now(),
-                    is_warmup: false,
-                    origin_connection_id: 0,
-                },
-            );
-            if fail {
-                assert!(result.is_err());
-                assert_eq!(
-                    worker.protocols[&0].next_id, 0,
-                    "failed preparation must not regenerate"
-                );
-                assert_eq!(worker.pool.get_state(0).unwrap().pending_count(), 0);
-                assert!(factory.0.lock().unwrap().sent.is_empty());
-            } else {
-                result.unwrap();
-                assert_eq!(
-                    factory.0.lock().unwrap().sent,
-                    [b"ASKING".to_vec(), 0u64.to_le_bytes().to_vec()]
-                );
-                assert_eq!(worker.pool.get_state(0).unwrap().pending_count(), 1);
-            }
-        }
-    }
-
-    #[test]
-    fn retry_rejects_missing_unknown_wrong_group_and_closed_targets() {
-        for (target_conn_id, group_id, closed) in
-            [(None, 0, false), (Some(99), 0, false), (Some(0), 1, false), (Some(0), 0, true)]
-        {
-            let factory = FakeFactory::default();
-            let mut worker =
-                fake_worker(&factory, 1, Box::new(UniformPolicyScheduler::closed_loop()));
-            if closed {
-                worker.pool.close(0).unwrap();
-            }
-            let result = worker.handle_retry(
-                group_id,
-                RetryRequest {
-                    bytes_consumed: 8,
-                    original_request_id: 99,
-                    is_warmup: false,
-                    target_conn_id,
-                    prepare_commands: vec![b"ASKING".to_vec()],
-                    attempt: 0,
-                },
-                RequestTiming {
-                    send_ts: xylem_transport::Timestamp::now(),
-                    is_warmup: false,
-                    origin_connection_id: 0,
-                },
-            );
-            assert!(result.is_err());
-            assert!(factory.0.lock().unwrap().sent.is_empty());
-            assert!(worker.retry_queue.is_empty());
-        }
-    }
-
-    #[test]
-    fn asking_ack_fragments_do_not_complete_or_stall_pending_request() {
-        let factory = FakeFactory::default();
-        let mut cluster = xylem_protocols::RedisClusterProtocol::new(Box::new(
-            xylem_protocols::FixedCommandSelector::new(xylem_protocols::RedisOp::Get),
-        ));
-        cluster.register_connection("127.0.0.1:1".parse().unwrap(), 0);
-        let mut stats = TupleStatsCollector::default();
-        stats.register_group_policy(0, SamplingPolicy::Limited { max_samples: 1000, rate: 1.0 });
-        let mut worker = Worker::with_closed_loop(
-            &factory,
-            cluster,
-            stats,
-            WorkerConfig {
-                target: "127.0.0.1:1".parse().unwrap(),
-                duration: Duration::from_millis(100),
-                conn_count: 1,
-                max_pending_per_conn: 1,
-            },
-        )
-        .unwrap();
-        worker.send_requests().unwrap();
-        factory
-            .0
-            .lock()
-            .unwrap()
-            .responses
-            .push_back(Ok(b"-ASK 1 127.0.0.1:1\r\n".to_vec()));
-        worker.process_responses(Duration::ZERO).unwrap();
-        assert_eq!(factory.0.lock().unwrap().sent[1], b"*1\r\n$6\r\nASKING\r\n");
-        assert_eq!(factory.0.lock().unwrap().sent.len(), 3);
-        for fragment in [b"+O".as_slice(), b"K\r\n", b"$-1\r"] {
-            factory.0.lock().unwrap().responses.push_back(Ok(fragment.to_vec()));
-            worker.process_responses(Duration::ZERO).unwrap();
-            assert_eq!(worker.pool.get_state(0).unwrap().pending_count(), 1);
-        }
-        factory.0.lock().unwrap().responses.push_back(Ok(b"\n".to_vec()));
-        worker.process_responses(Duration::ZERO).unwrap();
-        assert_eq!(worker.pool.get_state(0).unwrap().pending_count(), 0);
-        assert_eq!(worker.stats.aggregate_global(Duration::from_secs(1)).total_requests, 1);
-        assert_eq!(
-            worker.stats.entries().values().map(|entry| entry.tx_bytes).sum::<u64>(),
-            factory.0.lock().unwrap().sent.iter().map(|data| data.len() as u64).sum::<u64>()
-        );
-        assert_eq!(
-            worker.stats.entries().values().map(|entry| entry.rx_bytes).sum::<u64>(),
-            b"-ASK 1 127.0.0.1:1\r\n+OK\r\n$-1\r\n".len() as u64
-        );
     }
 
     #[test]
@@ -996,7 +555,7 @@ mod tests {
     }
 
     #[test]
-    fn drain_uses_extended_parser_records_response_and_polls_tx() {
+    fn drain_records_response_and_polls_tx() {
         let factory = FakeFactory::default();
         let mut worker = fake_worker(&factory, 1, Box::new(UniformPolicyScheduler::closed_loop()));
         worker.send_requests().unwrap();
@@ -1085,284 +644,12 @@ mod tests {
     }
 
     #[test]
-    fn drain_follows_redirect_and_waits_for_retry_response() {
+    fn bounded_drain_reports_unfinished_requests() {
         let factory = FakeFactory::default();
         let mut worker = fake_worker(&factory, 1, Box::new(UniformPolicyScheduler::closed_loop()));
         worker.send_requests().unwrap();
-        worker.protocols.get_mut(&0).unwrap().retry = true;
-        factory.0.lock().unwrap().responses.push_back(Ok(0u64.to_le_bytes().to_vec()));
-        assert!(worker.drain_iteration().unwrap());
-        assert_eq!(factory.0.lock().unwrap().sent.len(), 2);
-        // FakeProtocol's default regenerate_request assigns the next ID.
-        factory.0.lock().unwrap().responses.push_back(Ok(1u64.to_le_bytes().to_vec()));
-        assert!(!worker.drain_iteration().unwrap());
-        assert_eq!(worker.stats.aggregate_global(Duration::from_secs(1)).total_requests, 1);
-        assert_eq!(worker.stats.entries().values().map(|entry| entry.tx_bytes).sum::<u64>(), 16);
-        assert_eq!(worker.stats.entries().values().map(|entry| entry.rx_bytes).sum::<u64>(), 16);
-    }
-
-    #[cfg(target_os = "linux")]
-    struct FeedbackPolicy {
-        connection_id: usize,
-        feedback: Arc<std::sync::Mutex<Vec<(usize, Duration)>>>,
-    }
-
-    #[cfg(target_os = "linux")]
-    impl crate::scheduler::Policy for FeedbackPolicy {
-        fn next_send_time(&mut self, _: u64) -> Option<u64> {
-            None
-        }
-        fn on_request_sent(&mut self, _: u64) {}
-        fn on_response(&mut self, latency: Duration) {
-            self.feedback.lock().unwrap().push((self.connection_id, latency));
-        }
-        fn reset(&mut self) {}
-        fn name(&self) -> &'static str {
-            "Feedback"
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    struct FeedbackScheduler(Arc<std::sync::Mutex<Vec<(usize, Duration)>>>);
-
-    #[cfg(target_os = "linux")]
-    impl PolicyScheduler for FeedbackScheduler {
-        fn assign_policy(&mut self, connection_id: usize) -> Box<dyn crate::scheduler::Policy> {
-            Box::new(FeedbackPolicy { connection_id, feedback: self.0.clone() })
-        }
-        fn name(&self) -> &'static str {
-            "Feedback"
-        }
-    }
-
-    // Exact hardware clock values make queue/preparation/retry timing assertions
-    // deterministic. The first attempt's timestamp is the only permitted origin.
-    #[cfg(target_os = "linux")]
-    fn exercise_queued_redirects<S: StatsRecorder>(stats: S, warmup: bool, hardware_tx: bool) -> S {
-        use xylem_transport::{Timestamp, TxTimestampInfo};
-        let factory = FakeFactory::default();
-        let feedback = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut worker = Worker::new(
-            &factory,
-            FakeProtocol {
-                next_id: 1,
-                retry_target: 1,
-                retry_prepare: vec![b"ASKING".to_vec()],
-                ..Default::default()
-            },
-            stats,
-            WorkerConfig {
-                target: "127.0.0.1:1".parse().unwrap(),
-                duration: Duration::from_secs(1),
-                conn_count: 2,
-                max_pending_per_conn: 1,
-            },
-            Box::new(FeedbackScheduler(feedback.clone())),
-        )
-        .unwrap();
-        factory.0.lock().unwrap().timestamp = Timestamp::from_hardware(1, 100);
-        worker.pool.send(0, &0u64.to_le_bytes(), 0, warmup).unwrap();
-        if !warmup {
-            worker.stats.record_tx_bytes(0, 0, 8);
-        }
-        // A warmup request occupies the redirect destination's only slot.
-        worker.pool.send(1, &100u64.to_le_bytes(), 100, true).unwrap();
-        {
-            let mut io = factory.0.lock().unwrap();
-            io.timestamp = Timestamp::from_hardware(1, 300);
-            if hardware_tx {
-                io.tx_timestamps.push(TxTimestampInfo {
-                    conn_id: 0,
-                    tx_offset: 1,
-                    timestamp: Timestamp::from_hardware(1, 200),
-                });
-            }
-            io.responses.push_back(Ok(0u64.to_le_bytes().to_vec()));
-        }
-        worker.protocols.get_mut(&0).unwrap().retry = true;
-        assert!(worker.drain_iteration().unwrap());
-        assert!(feedback.lock().unwrap().is_empty(), "redirect is not feedback");
-        assert_eq!(worker.retry_queue.len(), 1);
-        assert_eq!(worker.pool.get_state(0).unwrap().pending_count(), 0);
-        assert_eq!(factory.0.lock().unwrap().sent.len(), 2, "preparation must wait for capacity");
-        assert!(
-            worker.drain_iteration().unwrap(),
-            "queued retry remains pending without new responses"
-        );
-        worker.send_requests().unwrap();
-        assert_eq!(factory.0.lock().unwrap().sent.len(), 2, "queued retries precede new work");
-        {
-            let mut io = factory.0.lock().unwrap();
-            io.timestamp = Timestamp::from_hardware(1, 500);
-            io.response_connection_id = 1;
-            io.responses.push_back(Ok(100u64.to_le_bytes().to_vec()));
-        }
-        assert!(worker.drain_iteration().unwrap());
-        assert!(worker.retry_queue.is_empty());
-        assert_eq!(factory.0.lock().unwrap().sent.len(), 4);
-        {
-            let mut io = factory.0.lock().unwrap();
-            io.timestamp = Timestamp::from_hardware(1, 700);
-            // This timestamp covers the retry, but must not reset logical timing.
-            io.tx_timestamps.push(TxTimestampInfo {
-                conn_id: 1,
-                tx_offset: 4,
-                timestamp: Timestamp::from_hardware(1, 600),
-            });
-            io.responses.push_back(Ok(1u64.to_le_bytes().to_vec()));
-        }
-        worker.protocols.get_mut(&0).unwrap().retry = true;
-        assert!(worker.drain_iteration().unwrap());
-        assert!(feedback.lock().unwrap().is_empty(), "repeated redirects are not feedback");
-        {
-            let mut io = factory.0.lock().unwrap();
-            io.timestamp = Timestamp::from_hardware(1, 1000);
-            io.tx_timestamps.push(TxTimestampInfo {
-                conn_id: 1,
-                tx_offset: 6,
-                timestamp: Timestamp::from_hardware(1, 800),
-            });
-            io.responses.push_back(Ok(2u64.to_le_bytes().to_vec()));
-        }
-        assert!(!worker.drain_iteration().unwrap());
-        let expected = if warmup {
-            vec![]
-        } else {
-            vec![(0, Duration::from_nanos(if hardware_tx { 800 } else { 900 }))]
-        };
-        assert_eq!(
-            *feedback.lock().unwrap(),
-            expected,
-            "only the original policy receives end-to-end feedback"
-        );
-        worker.into_stats()
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn queued_repeated_redirects_preserve_group_count_timing_bytes_and_warmup() {
-        for (warmup, hardware_tx) in [(false, false), (false, true), (true, false), (true, true)] {
-            let mut stats =
-                TupleStatsCollector::new(SamplingPolicy::Unlimited, Duration::from_secs(1));
-            stats.register_group_policy(0, SamplingPolicy::Unlimited);
-            let stats = exercise_queued_redirects(stats, warmup, hardware_tx);
-            let duration = Duration::from_secs(1);
-            let global = stats.aggregate_global(duration);
-            assert_eq!(global.total_requests, u64::from(!warmup));
-            // 36 TX bytes plus 24 RX bytes over one second.
-            assert_eq!(global.throughput_mbps, if warmup { 0.0 } else { 0.00048 });
-            let group_entries: Vec<_> = stats
-                .entries()
-                .iter()
-                .filter(|(key, _)| key.group_id == 0)
-                .map(|(_, entry)| entry)
-                .collect();
-            assert_eq!(
-                group_entries.iter().map(|entry| entry.request_count).sum::<u64>(),
-                u64::from(!warmup)
-            );
-            assert_eq!(
-                group_entries.iter().map(|entry| entry.tx_bytes).sum::<u64>(),
-                if warmup { 0 } else { 36 }
-            );
-            assert_eq!(
-                group_entries.iter().map(|entry| entry.rx_bytes).sum::<u64>(),
-                if warmup { 0 } else { 24 }
-            );
-            assert_eq!(
-                group_entries.iter().map(|entry| entry.latency.count()).sum::<u64>(),
-                u64::from(!warmup)
-            );
-            if !warmup {
-                // A single stored sample: its median and mean equal the expected latency.
-                let expected = Duration::from_nanos(if hardware_tx { 800 } else { 900 });
-                let group = &stats.aggregate_by_group(duration)[&0];
-                for aggregated in [&global, group] {
-                    assert_eq!(aggregated.latency_p50, expected);
-                    assert_eq!(aggregated.mean_latency, expected);
-                }
-            }
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn queued_repeated_redirects_preserve_tuple_count_timing_and_target_bytes() {
-        for (warmup, hardware_tx) in [(false, false), (false, true), (true, false), (true, true)] {
-            let stats = crate::stats::TupleStatsCollector::new(
-                crate::stats::SamplingPolicy::Unlimited,
-                Duration::from_secs(1),
-            );
-            let stats = exercise_queued_redirects(stats, warmup, hardware_tx);
-            assert_eq!(
-                stats.aggregate_global(Duration::from_secs(1)).total_requests,
-                u64::from(!warmup)
-            );
-            for connection_id in 0..2 {
-                let entries: Vec<_> = stats
-                    .entries()
-                    .iter()
-                    .filter(|(key, _)| key.connection_id == connection_id)
-                    .map(|(_, entry)| entry)
-                    .collect();
-                assert_eq!(
-                    entries.iter().map(|entry| entry.request_count).sum::<u64>(),
-                    u64::from(!warmup && connection_id == 0)
-                );
-                assert_eq!(
-                    entries.iter().map(|entry| entry.tx_bytes).sum::<u64>(),
-                    if warmup {
-                        0
-                    } else if connection_id == 0 {
-                        8
-                    } else {
-                        28
-                    }
-                );
-                assert_eq!(
-                    entries.iter().map(|entry| entry.rx_bytes).sum::<u64>(),
-                    if warmup {
-                        0
-                    } else if connection_id == 0 {
-                        8
-                    } else {
-                        16
-                    }
-                );
-            }
-            if !warmup {
-                assert_eq!(
-                    stats.aggregate_global(Duration::from_secs(1)).mean_latency,
-                    Duration::from_nanos(if hardware_tx { 800 } else { 900 })
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn bounded_drain_reports_unfinished_requests_and_keeps_retry_queue() {
-        let factory = FakeFactory::default();
-        let mut worker = fake_worker(&factory, 1, Box::new(UniformPolicyScheduler::closed_loop()));
-        worker.send_requests().unwrap();
-        worker.retry_queue.push((
-            0,
-            RetryRequest {
-                bytes_consumed: 8,
-                original_request_id: 99,
-                is_warmup: false,
-                target_conn_id: Some(0),
-                prepare_commands: vec![],
-                attempt: 0,
-            },
-            RequestTiming {
-                send_ts: xylem_transport::Timestamp::now(),
-                is_warmup: false,
-                origin_connection_id: 0,
-            },
-        ));
         worker.drain_responses().unwrap();
         assert!(worker.has_pending());
-        assert_eq!(worker.retry_queue.len(), 1);
         assert_eq!(factory.0.lock().unwrap().timeouts.len(), 100);
     }
 

@@ -1,11 +1,10 @@
 //! RESP encoding and framing
 //!
 //! Requests are written by [`encode_command`], the one RESP writer used by
-//! command encoding, command templates, and the cluster redirect commands.
+//! command encoding and command templates.
 //! Replies are framed by [`find_resp_message_end`] and classified by
 //! [`classify_reply`].
 
-use super::cluster::{parse_redirect, RedirectType};
 use anyhow::{anyhow, Result};
 use std::io::Write;
 
@@ -32,7 +31,6 @@ pub(crate) fn encode_command(args: &[&str]) -> Vec<u8> {
 
 pub(crate) enum ReplyKind {
     Success,
-    Redirect(RedirectType),
     Error(String),
 }
 
@@ -45,12 +43,7 @@ pub(crate) fn classify_reply(frame: &[u8]) -> Result<ReplyKind> {
         payload = &payload[offset..];
     }
     let kind = if payload[0] == b'-' {
-        match parse_redirect(payload) {
-            Ok(Some(redirect)) => ReplyKind::Redirect(redirect),
-            Ok(None) | Err(_) => ReplyKind::Error(
-                String::from_utf8_lossy(&payload[1..payload.len() - 2]).into_owned(),
-            ),
-        }
+        ReplyKind::Error(String::from_utf8_lossy(&payload[1..payload.len() - 2]).into_owned())
     } else if payload[0] == b'!' {
         ReplyKind::Error(String::from_utf8_lossy(payload).into_owned())
     } else {

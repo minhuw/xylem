@@ -77,7 +77,6 @@ type = "unlimited"
 - `name` (string, required): Name for this traffic group
 - `protocol` (string, required): Application protocol for this group. Supported values:
   - `"redis"`
-  - `"redis-cluster"`
   - `"http"`
   - `"memcached-binary"`
   - `"memcached-ascii"`

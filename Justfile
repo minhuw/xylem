@@ -53,13 +53,12 @@ test-integration: test-cleanup
 test-cleanup:
     @echo "🧹 Cleaning up test containers..."
     @(docker ps -aq --filter name=xylem-test | xargs -r docker rm -f || true) 2>/dev/null || true
-    @(docker ps -aq --filter name=xylem-redis-cluster | xargs -r docker rm -f || true) 2>/dev/null || true
     @echo "✅ Test containers cleaned up"
 
 # Run Redis-related integration tests
 test-redis: test-cleanup
     @echo "🎯 Running Redis integration tests..."
-    cargo nextest run --profile integration -E 'binary(redis_integration) or binary(redis_cluster_integration) or binary(redis_new_commands_integration) or binary(pipelining_integration)'
+    cargo nextest run --profile integration -E 'binary(redis_integration) or binary(redis_new_commands_integration) or binary(pipelining_integration)'
 
 # Run Memcached integration tests
 test-memcached: test-cleanup

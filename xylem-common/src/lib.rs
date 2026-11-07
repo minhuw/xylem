@@ -2,7 +2,7 @@
 //!
 //! This crate provides shared utilities used by multiple xylem crates:
 //! - `distributions`: Statistical distributions for workload generation
-//! - `protocol`: The `Protocol` trait and its parse and retry result types
+//! - `protocol`: The `Protocol` trait shared by protocols and the worker
 
 pub mod protocol;
 pub mod request;
@@ -14,5 +14,5 @@ pub use distributions::{
     ZipfianDistribution,
 };
 
-pub use protocol::{ParseResult, Protocol, RetryRequest};
+pub use protocol::Protocol;
 pub use request::{Request, RequestMeta};

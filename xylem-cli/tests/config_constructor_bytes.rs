@@ -8,8 +8,8 @@ use std::collections::{HashMap, HashSet};
 use xylem_cli::multi_protocol::MultiProtocol;
 use xylem_protocols::configs::*;
 use xylem_protocols::{
-    MasstreeProtocol, MemcachedAsciiProtocol, MemcachedBinaryProtocol, Protocol,
-    RedisClusterProtocol, RedisProtocol, Request,
+    MasstreeProtocol, MemcachedAsciiProtocol, MemcachedBinaryProtocol, Protocol, RedisProtocol,
+    Request,
 };
 
 const SEED: Option<u64> = Some(42);
@@ -137,36 +137,6 @@ fn redis_fixed_config() -> RedisConfig {
         insert_phase: Some(InsertPhaseConfig { key_count: Some(1), value_size: None }),
         ..Default::default()
     }
-}
-
-fn cluster_nodes(ranges: &[(u16, u16)]) -> RedisClusterConfig {
-    let mut nodes = Vec::new();
-    for (index, &(slot_start, slot_end)) in ranges.iter().enumerate() {
-        nodes.push(RedisClusterNodeConfig {
-            address: format!("127.0.0.1:{}", 7000 + index),
-            slot_start,
-            slot_end,
-        });
-    }
-    RedisClusterConfig { nodes }
-}
-
-/// Add a static topology: 127.0.0.1:7000 serves slots 0..=8191 and
-/// 127.0.0.1:7001 serves slots 8192..=16383.
-fn with_two_node_cluster(config: RedisConfig) -> RedisConfig {
-    RedisConfig {
-        redis_cluster: Some(cluster_nodes(&[(0, 8191), (8192, 16383)])),
-        ..config
-    }
-}
-
-/// Build a cluster protocol from config and register connection 0 for
-/// 127.0.0.1:7000 and connection 1 for 127.0.0.1:7001.
-fn redis_cluster(config: &RedisConfig, seed: Option<u64>) -> RedisClusterProtocol {
-    let mut protocol = RedisClusterProtocol::from_config(config, seed).unwrap();
-    protocol.register_connection("127.0.0.1:7000".parse().unwrap(), 0);
-    protocol.register_connection("127.0.0.1:7001".parse().unwrap(), 1);
-    protocol
 }
 
 /// Set one field of the first weighted command of `config`.
@@ -370,136 +340,8 @@ fn redis_standalone_fixed_command_with_sequential_keys_and_normal_value_sizes() 
 
 #[test]
 fn redis_standalone_rejects_unsupported_configs() {
-    let mut cases = redis_config_errors();
-    cases.push((
-        with_two_node_cluster(RedisConfig::default()),
-        "Use RedisClusterProtocol::from_config for cluster configuration",
-    ));
-    for (config, message) in cases {
+    for (config, message) in redis_config_errors() {
         let error = RedisProtocol::from_config(&config, SEED).err().expect(message);
-        assert_eq!(error.to_string(), message);
-    }
-}
-
-/// `Protocol::next_request` routes each request to the node owning its slot;
-/// the ID is (original connection, slot, (target connection, sequence)).
-#[test]
-fn redis_cluster_weighted_commands_route_by_slot() {
-    let mut protocol = redis_cluster(&with_two_node_cluster(redis_weighted_config()), SEED);
-    assert_eq!(
-        requests(&mut protocol, &CONNECTIONS),
-        vec![
-            Request::warmup(
-                b"*3\r\n$3\r\nSET\r\n$7\r\napp:728\r\n$4\r\nm>}b\r\n".to_vec(),
-                (0, 954, (0, 0)),
-            ),
-            Request::warmup(
-                b"*3\r\n$3\r\nSET\r\n$7\r\napp:394\r\n$4\r\nkX,Y\r\n".to_vec(),
-                (1, 524, (0, 1)),
-            ),
-            Request::measurement(
-                b"*3\r\n$4\r\nMGET\r\n$7\r\napp:728\r\n$7\r\napp:729\r\n".to_vec(),
-                (0, 954, (0, 2)),
-            ),
-            Request::measurement(
-                b"*2\r\n$3\r\nGET\r\n$7\r\napp:394\r\n".to_vec(),
-                (1, 524, (0, 3)),
-            ),
-            Request::measurement(
-                b"*3\r\n$4\r\nMGET\r\n$7\r\napp:704\r\n$7\r\napp:705\r\n".to_vec(),
-                (1, 9300, (1, 0)),
-            ),
-            Request::measurement(
-                b"*3\r\n$3\r\nSET\r\n$7\r\napp:393\r\n$8\r\n4xUp`'FT\r\n".to_vec(),
-                (0, 13035, (1, 1)),
-            ),
-            Request::measurement(
-                b"*3\r\n$3\r\nSET\r\n$7\r\napp:777\r\n$3\r\n5%W\r\n".to_vec(),
-                (0, 3488, (0, 4)),
-            ),
-            Request::measurement(
-                b"*3\r\n$3\r\nSET\r\n$7\r\napp:465\r\n$8\r\nL0r^Rm.I\r\n".to_vec(),
-                (1, 1923, (0, 5)),
-            ),
-            Request::measurement(
-                b"*2\r\n$3\r\nGET\r\n$6\r\napp:63\r\n".to_vec(),
-                (0, 11820, (1, 2)),
-            ),
-            Request::measurement(
-                b"*3\r\n$3\r\nSET\r\n$7\r\napp:977\r\n$9\r\nzRr(\\d;}d\r\n".to_vec(),
-                (1, 5793, (0, 6)),
-            ),
-        ]
-    );
-}
-
-/// `next_request_on_connection` is what the CLI worker calls: requests stay on
-/// the connection the worker chose, whatever their slot.
-#[test]
-fn redis_cluster_per_command_keys_on_the_chosen_connection() {
-    let mut protocol =
-        redis_cluster(&with_two_node_cluster(redis_per_command_keys_config()), Some(7));
-    let mut generated = Vec::new();
-    for conn_id in CONNECTIONS {
-        generated.push(protocol.next_request_on_connection(conn_id));
-    }
-    assert_eq!(
-        generated,
-        vec![
-            Request::warmup(
-                b"*3\r\n$3\r\nSET\r\n$4\r\npc:0\r\n$5\r\nxxxxx\r\n".to_vec(),
-                (0, 7235, (0, 0)),
-            ),
-            Request::warmup(
-                b"*3\r\n$3\r\nSET\r\n$4\r\npc:1\r\n$5\r\nxxxxx\r\n".to_vec(),
-                (1, 3170, (1, 0)),
-            ),
-            Request::warmup(
-                b"*3\r\n$3\r\nSET\r\n$4\r\npc:2\r\n$5\r\nxxxxx\r\n".to_vec(),
-                (0, 15361, (0, 1)),
-            ),
-            Request::measurement(b"*2\r\n$3\r\nGET\r\n$4\r\npc:2\r\n".to_vec(), (1, 15361, (1, 1))),
-            Request::measurement(
-                b"*2\r\n$3\r\nGET\r\n$5\r\npc:49\r\n".to_vec(),
-                (1, 13255, (1, 2)),
-            ),
-            Request::measurement(
-                b"*3\r\n$3\r\nSET\r\n$4\r\npc:5\r\n$4\r\nxxxx\r\n".to_vec(),
-                (0, 3302, (0, 2)),
-            ),
-            Request::measurement(
-                b"*2\r\n$3\r\nGET\r\n$5\r\npc:13\r\n".to_vec(),
-                (0, 11640, (0, 3)),
-            ),
-            Request::measurement(b"*2\r\n$4\r\nINCR\r\n$4\r\npc:0\r\n".to_vec(), (1, 7235, (1, 3))),
-            Request::measurement(b"*2\r\n$3\r\nGET\r\n$4\r\npc:0\r\n".to_vec(), (0, 7235, (0, 4))),
-            Request::measurement(
-                b"*3\r\n$3\r\nSET\r\n$5\r\npc:36\r\n$7\r\nxxxxxxx\r\n".to_vec(),
-                (1, 7103, (1, 4)),
-            ),
-        ]
-    );
-}
-
-#[test]
-fn redis_cluster_rejects_unsupported_configs() {
-    let mut cases = redis_config_errors();
-    cases.push((
-        RedisConfig {
-            redis_cluster: Some(cluster_nodes(&[(0, 100), (100, 200)])),
-            ..Default::default()
-        },
-        "Redis slot range 100..=200 for 127.0.0.1:7001 overlaps 0..=100 for 127.0.0.1:7000",
-    ));
-    cases.push((
-        RedisConfig {
-            redis_cluster: Some(cluster_nodes(&[(0, 16384)])),
-            ..Default::default()
-        },
-        "Invalid Redis slot range 0..=16384 for 127.0.0.1:7000",
-    ));
-    for (config, message) in cases {
-        let error = RedisClusterProtocol::from_config(&config, SEED).err().expect(message);
         assert_eq!(error.to_string(), message);
     }
 }

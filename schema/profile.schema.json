@@ -747,7 +747,7 @@
           "type": "string"
         },
         "protocol": {
-          "description": "Protocol for this group (redis, redis-cluster, memcached-binary, memcached-ascii, http, xylem-echo)",
+          "description": "Protocol for this group (redis, memcached-binary, memcached-ascii, http, xylem-echo)",
           "type": "string"
         },
         "protocol_config": {

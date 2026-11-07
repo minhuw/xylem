@@ -1,11 +1,11 @@
 //! Exact RESP request bytes and request ids for the Redis encoder: every
 //! `RedisOp` variant, command templates, random data, key prefixes, the insert
-//! phase, imported data, and the cluster helper commands.
+//! phase, and imported data.
 
 use xylem_protocols::workload::KeyGeneration;
 use xylem_protocols::{
-    generate_asking_command, generate_cluster_slots_command, CommandTemplate, FixedCommandSelector,
-    KeyGenerator, Protocol, RedisOp, RedisProtocol, Request, WeightedCommandSelector,
+    CommandTemplate, FixedCommandSelector, KeyGenerator, Protocol, RedisOp, RedisProtocol, Request,
+    WeightedCommandSelector,
 };
 
 /// Seed for the random-data tests.
@@ -1246,16 +1246,4 @@ fn per_command_key_generators_supply_the_key() {
         protocol.next_request(1),
         Request::measurement(b"*3\r\n$3\r\nSET\r\n$7\r\nkey:101\r\n$3\r\nxxx\r\n".to_vec(), (1, 0)),
     );
-}
-
-// Cluster helper commands
-
-#[test]
-fn asking_command_bytes() {
-    assert_bytes(&generate_asking_command(), b"*1\r\n$6\r\nASKING\r\n");
-}
-
-#[test]
-fn cluster_slots_command_bytes() {
-    assert_bytes(&generate_cluster_slots_command(), b"*2\r\n$7\r\nCLUSTER\r\n$5\r\nSLOTS\r\n");
 }

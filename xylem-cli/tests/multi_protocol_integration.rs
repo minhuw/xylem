@@ -58,7 +58,7 @@ fn create_protocol(
             xylem_protocols::xylem_echo::XylemEchoProtocol::default(),
         )),
         _ => anyhow::bail!(
-            "Unknown protocol '{}'. Supported: redis, redis-cluster, memcached-binary, memcached-ascii, http, xylem-echo",
+            "Unknown protocol '{}'. Supported: redis, memcached-binary, memcached-ascii, http, xylem-echo",
             name
         ),
     }

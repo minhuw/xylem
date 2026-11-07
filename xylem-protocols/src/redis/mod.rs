@@ -3,19 +3,15 @@
 //! Commands and their encoding live in `command.rs`; RESP request encoding and
 //! reply framing live in `resp.rs`.
 
-pub mod cluster;
 mod command;
 pub mod command_selector;
 pub mod command_template;
-pub mod crc16;
 mod resp;
-pub mod slot;
 
 pub use command::RedisOp;
 
 use crate::Protocol;
 use anyhow::{anyhow, Result};
-use cluster::RedirectType;
 use command_selector::CommandSelector;
 use resp::ReplyKind;
 
@@ -74,9 +70,6 @@ pub struct RedisProtocol {
     conn_send_seq: std::collections::HashMap<usize, u64>,
     /// Per-connection sequence numbers for receive
     conn_recv_seq: std::collections::HashMap<usize, u64>,
-    /// Track redirect statistics (for cluster support)
-    moved_redirects: u64,
-    ask_redirects: u64,
     /// Track connections currently in a transaction
     conn_in_transaction: std::collections::HashSet<usize>,
     /// Command execution statistics
@@ -103,8 +96,6 @@ impl RedisProtocol {
             command_selector,
             conn_send_seq: std::collections::HashMap::new(),
             conn_recv_seq: std::collections::HashMap::new(),
-            moved_redirects: 0,
-            ask_redirects: 0,
             conn_in_transaction: std::collections::HashSet::new(),
             command_stats: std::collections::HashMap::new(),
             key_gen: None,
@@ -157,8 +148,6 @@ impl RedisProtocol {
             command_selector,
             conn_send_seq: std::collections::HashMap::new(),
             conn_recv_seq: std::collections::HashMap::new(),
-            moved_redirects: 0,
-            ask_redirects: 0,
             conn_in_transaction: std::collections::HashSet::new(),
             command_stats: std::collections::HashMap::new(),
             key_gen: Some(key_gen),
@@ -227,27 +216,6 @@ impl RedisProtocol {
         // Use saturating_add to prevent overflow - will stick at u64::MAX
         *seq = seq.saturating_add(1);
         result
-    }
-
-    /// Request ID the next reply on a connection will be matched to
-    pub(crate) fn expected_reply_id(&self, conn_id: usize) -> (usize, u64) {
-        (conn_id, *self.conn_recv_seq.get(&conn_id).unwrap_or(&0))
-    }
-
-    /// Get redirect statistics (for monitoring cluster behavior)
-    pub fn redirect_stats(&self) -> (u64, u64) {
-        (self.moved_redirects, self.ask_redirects)
-    }
-
-    /// Reset redirect statistics
-    pub fn reset_redirect_stats(&mut self) {
-        self.moved_redirects = 0;
-        self.ask_redirects = 0;
-    }
-
-    /// Get mutable access to key generator (for cluster protocol delegation)
-    pub fn key_gen_mut(&mut self) -> Option<&mut crate::workload::KeyGeneration> {
-        self.key_gen.as_mut()
     }
 
     /// Get configured value size
@@ -389,8 +357,6 @@ impl RedisProtocol {
     }
 
     /// Generate a request with specific key and value size
-    ///
-    /// This is used internally and by RedisClusterProtocol for routing requests.
     pub fn generate_request_with_key(
         &mut self,
         conn_id: usize,
@@ -471,18 +437,6 @@ impl Protocol for RedisProtocol {
         };
         match reply.kind {
             ReplyKind::Success => Ok((reply.consumed, Some(reply.id))),
-            ReplyKind::Redirect(RedirectType::Moved { slot, addr }) => Err(anyhow!(
-                "MOVED redirect: slot {} moved to {} (total MOVED: {})",
-                slot,
-                addr,
-                self.moved_redirects
-            )),
-            ReplyKind::Redirect(RedirectType::Ask { slot, addr }) => Err(anyhow!(
-                "ASK redirect: slot {} temporarily at {} (total ASK: {})",
-                slot,
-                addr,
-                self.ask_redirects
-            )),
             ReplyKind::Error(error) => Err(anyhow!("Redis error: {}", error)),
         }
     }
@@ -510,9 +464,6 @@ impl Protocol for RedisProtocol {
                 gen.reset();
             }
         }
-        // Clear redirect statistics
-        self.moved_redirects = 0;
-        self.ask_redirects = 0;
     }
 }
 
@@ -534,12 +485,6 @@ impl RedisProtocol {
             return Ok(None);
         }
         let kind = resp::classify_reply(&data[..consumed])?;
-        if let ReplyKind::Redirect(redirect) = &kind {
-            match redirect {
-                RedirectType::Moved { .. } => self.moved_redirects += 1,
-                RedirectType::Ask { .. } => self.ask_redirects += 1,
-            }
-        }
         let id = (conn_id, self.next_recv_seq(conn_id));
         Ok(Some(FramedReply { consumed, id, kind }))
     }
@@ -903,86 +848,19 @@ mod tests {
     }
 
     #[test]
-    fn test_moved_redirect_detection() {
+    fn test_error_replies_are_redis_errors() {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
         let mut protocol = RedisProtocol::new(selector);
 
-        let moved_error = b"-MOVED 3999 127.0.0.1:7001\r\n";
-        let result = protocol.parse_response(0, moved_error);
-
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("MOVED redirect"));
-        assert!(err.contains("3999"));
-        assert!(err.contains("127.0.0.1:7001"));
-
-        // Check statistics
-        let (moved, ask) = protocol.redirect_stats();
-        assert_eq!(moved, 1);
-        assert_eq!(ask, 0);
-    }
-
-    #[test]
-    fn test_ask_redirect_detection() {
-        let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
-        let mut protocol = RedisProtocol::new(selector);
-
-        let ask_error = b"-ASK 5000 127.0.0.1:7002\r\n";
-        let result = protocol.parse_response(0, ask_error);
-
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("ASK redirect"));
-        assert!(err.contains("5000"));
-        assert!(err.contains("127.0.0.1:7002"));
-
-        // Check statistics
-        let (moved, ask) = protocol.redirect_stats();
-        assert_eq!(moved, 0);
-        assert_eq!(ask, 1);
-    }
-
-    #[test]
-    fn test_multiple_redirects_statistics() {
-        let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
-        let mut protocol = RedisProtocol::new(selector);
-
-        // Simulate multiple MOVED redirects
-        let _ = protocol.parse_response(0, b"-MOVED 100 127.0.0.1:7001\r\n");
-        let _ = protocol.parse_response(0, b"-MOVED 200 127.0.0.1:7002\r\n");
-
-        // Simulate ASK redirects
-        let _ = protocol.parse_response(0, b"-ASK 300 127.0.0.1:7003\r\n");
-
-        let (moved, ask) = protocol.redirect_stats();
-        assert_eq!(moved, 2);
-        assert_eq!(ask, 1);
-
-        // Reset stats
-        protocol.reset_redirect_stats();
-        let (moved, ask) = protocol.redirect_stats();
-        assert_eq!(moved, 0);
-        assert_eq!(ask, 0);
-    }
-
-    #[test]
-    fn test_regular_error_vs_redirect() {
-        let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
-        let mut protocol = RedisProtocol::new(selector);
-
-        // Regular error should not increment redirect stats
-        let regular_error = b"-ERR unknown command\r\n";
-        let result = protocol.parse_response(0, regular_error);
-
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("Redis error"));
-        assert!(!err.contains("redirect"));
-
-        // Stats should be zero
-        let (moved, ask) = protocol.redirect_stats();
-        assert_eq!(moved, 0);
-        assert_eq!(ask, 0);
+        // Every error reply, including MOVED and ASK, fails the same way
+        for (reply, message) in [
+            (b"-ERR unknown command\r\n".as_slice(), "Redis error: ERR unknown command"),
+            (b"-MOVED 3999 127.0.0.1:7001\r\n", "Redis error: MOVED 3999 127.0.0.1:7001"),
+            (b"-ASK 5000 127.0.0.1:7002\r\n", "Redis error: ASK 5000 127.0.0.1:7002"),
+        ] {
+            let err = protocol.parse_response(0, reply).unwrap_err();
+            assert_eq!(err.to_string(), message);
+        }
     }
 
     // Tests for new commands (AUTH, SELECT, HELLO, etc.)

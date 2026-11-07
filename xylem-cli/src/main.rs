@@ -11,7 +11,7 @@ use xylem_transport::{TcpTransportFactory, UdpTransportFactory};
 
 use xylem_cli::{completions, config, output};
 
-use config::{ProfileConfig, ProtocolConfig};
+use config::ProfileConfig;
 
 /// Xylem: Reproducible latency measurement tool
 ///
@@ -369,8 +369,6 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
 
         // Build group configurations for multi-group worker
         let mut groups_config = Vec::new();
-        // Track which groups are redis-cluster for post-creation wiring
-        let mut redis_cluster_groups: Vec<usize> = Vec::new();
         // Get transport from first group on this thread (validation ensures all groups use same transport)
         let thread_transport = groups_for_thread
             .first()
@@ -387,76 +385,27 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                 continue;
             }
 
-            // Non-cluster protocol: single target
-            let ProtocolConfig::RedisCluster(redis_config) =
-                &config_for_worker.protocol_configs[*group_id]
-            else {
-                // Calculate total connections for rate distribution
-                let total_connections =
-                    group_config.connections_per_thread * group_config.threads.len();
-                let policy_scheduler: Box<dyn xylem_core::scheduler::PolicyScheduler> =
-                    group_config.traffic_policy.create_scheduler(total_connections)?;
+            // Calculate total connections for rate distribution
+            let total_connections =
+                group_config.connections_per_thread * group_config.threads.len();
+            let policy_scheduler: Box<dyn xylem_core::scheduler::PolicyScheduler> =
+                group_config.traffic_policy.create_scheduler(total_connections)?;
 
-                let group_target: std::net::SocketAddr =
-                    group_config.target.parse().with_context(|| {
-                        format!(
-                            "Failed to parse target address '{}' for group {}",
-                            group_config.target, group_config.name
-                        )
-                    })?;
-
-                groups_config.push((
-                    *group_id,
-                    group_target,
-                    group_meta.connections_per_thread,
-                    group_meta.max_pending_per_connection,
-                    policy_scheduler,
-                ));
-                continue;
-            };
-
-            // Redis-cluster: create connections to ALL cluster nodes
-            redis_cluster_groups.push(*group_id);
-
-            let cluster_config = redis_config.redis_cluster.as_ref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "redis-cluster protocol requires protocol_config.redis_cluster configuration"
-                )
-            })?;
-
-            // Distribute connections across cluster nodes round-robin
-            let num_nodes = cluster_config.nodes.len();
-            let conns_per_node = group_meta.connections_per_thread / num_nodes;
-            let extra_conns = group_meta.connections_per_thread % num_nodes;
-
-            for (node_idx, node) in cluster_config.nodes.iter().enumerate() {
-                let node_addr: std::net::SocketAddr = node.address.parse().with_context(|| {
+            let group_target: std::net::SocketAddr =
+                group_config.target.parse().with_context(|| {
                     format!(
-                        "Failed to parse cluster node address '{}' for group {}",
-                        node.address, group_config.name
+                        "Failed to parse target address '{}' for group {}",
+                        group_config.target, group_config.name
                     )
                 })?;
 
-                // Distribute extra connections to first nodes
-                let node_conn_count = conns_per_node + usize::from(node_idx < extra_conns);
-                if node_conn_count == 0 {
-                    continue;
-                }
-
-                // Calculate total connections for rate distribution (across all cluster nodes)
-                let total_connections =
-                    group_config.connections_per_thread * group_config.threads.len();
-                let policy_scheduler: Box<dyn xylem_core::scheduler::PolicyScheduler> =
-                    group_config.traffic_policy.create_scheduler(total_connections)?;
-
-                groups_config.push((
-                    *group_id,
-                    node_addr,
-                    node_conn_count,
-                    group_meta.max_pending_per_connection,
-                    policy_scheduler,
-                ));
-            }
+            groups_config.push((
+                *group_id,
+                group_target,
+                group_meta.connections_per_thread,
+                group_meta.max_pending_per_connection,
+                policy_scheduler,
+            ));
         }
 
         // Calculate total connections for worker config
@@ -484,11 +433,10 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
             max_pending_per_conn: 1, // This will be overridden per-group
         };
 
-        // Helper function to wire a created worker, run it, and return its stats.
-        // Redis-cluster connections are wired first, then the request dumper.
+        // Helper function to wire the request dumper into a created worker, run it,
+        // and return its stats.
         fn run_worker<G, S>(
             mut worker: Worker<G, xylem_cli::multi_protocol::MultiProtocol, S>,
-            cluster_groups: &[usize],
             request_dumper: Option<&Arc<xylem_core::request_dump::RequestDumper>>,
             thread_idx: usize,
         ) -> xylem_core::Result<S>
@@ -496,15 +444,6 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
             G: xylem_transport::ConnectionGroup,
             S: xylem_core::stats::StatsRecorder,
         {
-            // Wire connections to each redis-cluster protocol, filtered by group_id
-            // to avoid cross-group socket confusion (e.g., routing Redis to HTTP socket)
-            for &group_id in cluster_groups {
-                let conn_targets = worker.connection_targets_for_group(group_id);
-                if let Some(protocol) = worker.protocols_mut().get_mut(&group_id) {
-                    protocol.register_cluster_connections(&conn_targets);
-                }
-            }
-
             // Wire request dumper if enabled
             if let Some(dumper) = request_dumper {
                 worker.set_request_dumper(Arc::clone(dumper), thread_idx);
@@ -525,12 +464,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                     worker_config,
                     groups_config,
                 )?;
-                run_worker(
-                    worker,
-                    &redis_cluster_groups,
-                    request_dumper_for_worker.as_ref(),
-                    thread_idx,
-                )
+                run_worker(worker, request_dumper_for_worker.as_ref(), thread_idx)
             }
             "udp" => {
                 let factory = UdpTransportFactory::default();
@@ -541,12 +475,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                     worker_config,
                     groups_config,
                 )?;
-                run_worker(
-                    worker,
-                    &redis_cluster_groups,
-                    request_dumper_for_worker.as_ref(),
-                    thread_idx,
-                )
+                run_worker(worker, request_dumper_for_worker.as_ref(), thread_idx)
             }
             "unix" => {
                 // Unix transport requires special handling - targets are paths, not SocketAddr
@@ -578,13 +507,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                     worker_config,
                     unix_groups_config,
                 )?;
-                // Redis-cluster wiring is unlikely for Unix but kept for consistency
-                run_worker(
-                    worker,
-                    &redis_cluster_groups,
-                    request_dumper_for_worker.as_ref(),
-                    thread_idx,
-                )
+                run_worker(worker, request_dumper_for_worker.as_ref(), thread_idx)
             }
             other => Err(xylem_core::Error::Config(format!("Unsupported transport: {}", other)))?,
         }
