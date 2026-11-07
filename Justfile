@@ -55,6 +55,12 @@ test-cleanup:
     @(docker ps -aq --filter name=xylem-test | xargs -r docker rm -f || true) 2>/dev/null || true
     @echo "✅ Test containers cleaned up"
 
+# Run the ntcp (user-space TCP) end-to-end test over TUN devices in an
+# unprivileged user + network namespace; needs no root and no Docker
+test-ntcp:
+    @echo "🧪 Running the ntcp TUN end-to-end test..."
+    tests/ntcp/tun_netns.sh
+
 # Run Redis-related integration tests
 test-redis: test-cleanup
     @echo "🎯 Running Redis integration tests..."

@@ -7,6 +7,7 @@ Each `[[traffic_groups]]` section specifies its own `transport` and `target`. Tr
 - `tcp` - TCP/IP connections
 - `udp` - UDP connections
 - `unix` - Unix domain sockets
+- `ntcp` - User-space TCP over a TUN device; needs the `ntcp` build feature and an `[ntcp]` section (see [ntcp](../transports/ntcp.md))
 
 ## Configuration
 

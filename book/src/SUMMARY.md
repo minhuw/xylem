@@ -23,6 +23,7 @@
   - [TCP](./guide/transports/tcp.md)
   - [UDP](./guide/transports/udp.md)
   - [Unix Domain Sockets](./guide/transports/unix.md)
+  - [ntcp (User-Space TCP)](./guide/transports/ntcp.md)
 - [Output Formats](./guide/output-formats.md)
 
 # Architecture

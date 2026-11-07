@@ -11,6 +11,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use xylem_core::traffic_group::PolicyConfig;
 
+pub mod ntcp;
+pub use ntcp::{NtcpBackend, NtcpConfig, NtcpEndpoint};
+
 /// Top-level profile configuration
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct ProfileConfig {
@@ -24,6 +27,9 @@ pub struct ProfileConfig {
     /// Statistics collection configuration
     #[serde(default)]
     pub stats: StatsConfig,
+    /// User-space TCP settings, required when a group uses transport "ntcp"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ntcp: Option<NtcpConfig>,
     /// Typed protocol_config of each traffic group, in group order.
     /// Empty until `validate` succeeds; not part of the profile format.
     #[serde(skip)]
@@ -252,7 +258,11 @@ impl ProfileConfig {
             bail!("Experiment duration must be > 0");
         }
 
-        let valid_transports = ["tcp", "udp", "unix"];
+        let valid_transports: &[&str] = if ntcp::SUPPORTED {
+            &["tcp", "udp", "unix", ntcp::TRANSPORT]
+        } else {
+            &["tcp", "udp", "unix"]
+        };
 
         // Traffic groups validation
         if self.traffic_groups.is_empty() {
@@ -272,6 +282,7 @@ impl ProfileConfig {
             }
 
             // Validate transport
+            ntcp::check_supported(group, i)?;
             if !valid_transports.contains(&group.transport.as_str()) {
                 bail!(
                     "Invalid transport '{}' for traffic group {} '{}'. Valid options: {}",
@@ -386,6 +397,8 @@ impl ProfileConfig {
         let assignment =
             xylem_core::traffic_group::ThreadGroupAssignment::from_configs(&self.traffic_groups);
         assignment.validate()?;
+
+        ntcp::validate(self.ntcp.as_ref(), &self.traffic_groups)?;
 
         // Output validation - format is now an enum, so always valid
 
