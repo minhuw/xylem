@@ -63,11 +63,6 @@ impl LatencyStorage {
                 max_samples: usize::MAX,
                 sampling_rate: 1.0,
             },
-            SamplingPolicy::Adaptive { max_samples, initial_rate, .. } => LatencyStorage::Samples {
-                samples: Vec::with_capacity((*max_samples).min(1024)),
-                max_samples: *max_samples,
-                sampling_rate: *initial_rate,
-            },
             SamplingPolicy::DdSketch { alpha, max_bins } => {
                 let config = DDSketchConfig::new(*alpha, *max_bins, 1.0);
                 LatencyStorage::DdSketch(DDSketch::new(config))
@@ -1098,43 +1093,12 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_sampling_policy_samples_at_initial_rate() {
-        let policy: SamplingPolicy = serde_json::from_str(
-            r#"{"type": "adaptive", "max_samples": 3, "initial_rate": 1.0, "target_ci_width_us": 10}"#,
+    fn adaptive_sampling_policy_is_rejected() {
+        let error = serde_json::from_str::<SamplingPolicy>(
+            r#"{"type": "adaptive", "initial_rate": 1.0, "target_ci_width_us": 10}"#,
         )
-        .unwrap();
-        let mut storage = LatencyStorage::from_policy(&policy);
-        match &storage {
-            LatencyStorage::Samples { max_samples, sampling_rate, .. } => {
-                assert_eq!(*max_samples, 3);
-                assert_eq!(*sampling_rate, 1.0);
-            }
-            _ => panic!("adaptive policy must store samples"),
-        }
-        for i in 1..=5 {
-            storage.record(Duration::from_micros(i));
-        }
-        // Every sample is kept until max_samples is reached.
-        assert_eq!(storage.count(), 3);
-        assert_eq!(storage.max(), 3_000);
-
-        // The rate stays at initial_rate: min_rate and target_ci_width_us do not adjust it.
-        let policy: SamplingPolicy = serde_json::from_str(
-            r#"{"type": "adaptive", "initial_rate": 0.0, "target_ci_width_us": 10, "min_rate": 0.5}"#,
-        )
-        .unwrap();
-        let mut storage = LatencyStorage::from_policy(&policy);
-        match &storage {
-            LatencyStorage::Samples { max_samples, sampling_rate, .. } => {
-                assert_eq!(*max_samples, 128 * 1024);
-                assert_eq!(*sampling_rate, 0.0);
-            }
-            _ => panic!("adaptive policy must store samples"),
-        }
-        for _ in 0..1000 {
-            storage.record(Duration::from_micros(1));
-        }
-        assert_eq!(storage.count(), 0);
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown variant `adaptive`"), "{error}");
     }
 
     #[test]

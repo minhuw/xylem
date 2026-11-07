@@ -21,23 +21,6 @@ pub enum SamplingPolicy {
     /// Zero sampling: record every latency (unlimited storage)
     /// WARNING: Can consume large amounts of memory for high-throughput workloads
     Unlimited,
-    /// Adaptive sampling: dynamically adjust rate to maintain target CI width
-    Adaptive {
-        /// Maximum number of samples to store
-        #[serde(default = "default_max_samples")]
-        max_samples: usize,
-        /// Initial sampling rate
-        #[serde(default = "default_rate")]
-        initial_rate: f64,
-        /// Target confidence interval width (in microseconds)
-        target_ci_width_us: u64,
-        /// Minimum sampling rate
-        #[serde(default = "default_min_rate")]
-        min_rate: f64,
-        /// Maximum sampling rate
-        #[serde(default = "default_max_rate")]
-        max_rate: f64,
-    },
     /// DDSketch: Distributed quantile sketch with relative-error guarantees
     /// Memory-efficient and fully mergeable across traffic groups
     DdSketch {
@@ -74,14 +57,6 @@ fn default_max_samples() -> usize {
 }
 
 fn default_rate() -> f64 {
-    1.0
-}
-
-fn default_min_rate() -> f64 {
-    0.001
-}
-
-fn default_max_rate() -> f64 {
     1.0
 }
 

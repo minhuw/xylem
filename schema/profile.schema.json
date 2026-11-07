@@ -544,51 +544,6 @@
           ]
         },
         {
-          "description": "Adaptive sampling: dynamically adjust rate to maintain target CI width",
-          "type": "object",
-          "properties": {
-            "initial_rate": {
-              "description": "Initial sampling rate",
-              "type": "number",
-              "format": "double",
-              "default": 1.0
-            },
-            "max_rate": {
-              "description": "Maximum sampling rate",
-              "type": "number",
-              "format": "double",
-              "default": 1.0
-            },
-            "max_samples": {
-              "description": "Maximum number of samples to store",
-              "type": "integer",
-              "format": "uint",
-              "default": 131072,
-              "minimum": 0
-            },
-            "min_rate": {
-              "description": "Minimum sampling rate",
-              "type": "number",
-              "format": "double",
-              "default": 0.001
-            },
-            "target_ci_width_us": {
-              "description": "Target confidence interval width (in microseconds)",
-              "type": "integer",
-              "format": "uint64",
-              "minimum": 0
-            },
-            "type": {
-              "type": "string",
-              "const": "adaptive"
-            }
-          },
-          "required": [
-            "type",
-            "target_ci_width_us"
-          ]
-        },
-        {
           "description": "DDSketch: Distributed quantile sketch with relative-error guarantees\nMemory-efficient and fully mergeable across traffic groups",
           "type": "object",
           "properties": {
