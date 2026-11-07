@@ -87,6 +87,7 @@ fn http_explicit_framing_and_bodyless_responses() {
         b"HTTP/1.1 204 No Content\r\n\r\n",
         b"HTTP/1.1 304 Not Modified\r\nContent-Length: 100\r\n\r\n",
         b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3;ext\r\nabc\r\n0\r\nTrailer: yes\r\n\r\n",
     ];
     for (seq, response) in responses.iter().enumerate() {
         for end in 0..response.len() {
@@ -103,7 +104,9 @@ fn http_explicit_framing_and_bodyless_responses() {
 #[test]
 fn http_rejects_unsupported_and_ambiguous_framing_before_success() {
     let responses: &[&[u8]] = &[
-        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nTrailer: yes\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n0\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\n0\r\n\r\n",
         b"HTTP/1.1 200 OK\r\n\r\nbody",
         b"HTTP/1.1 200 OK\r\nContent-Length: nope\r\n\r\n",
         b"HTTP/1.1 200 OK\r\nContent-Length: -1\r\n\r\n",

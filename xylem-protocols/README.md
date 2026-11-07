@@ -21,11 +21,14 @@ an explicit insertion count. Per-command key distributions are supported, but
 a different per-command prefix or legacy `keys.value_size` is rejected; use
 `value_size` for per-command sizing.
 
-HTTP supports Content-Length framing and bodyless 204/304 responses.
-Informational responses are retained until the final response arrives, which
-completes exactly one request. Chunked/other Transfer-Encoding, close-delimited
-bodies, protocol upgrades, and malformed or conflicting Content-Length headers
-produce an explicit error before a request is counted as successful.
+HTTP supports Content-Length framing, chunked framing (`Transfer-Encoding:
+chunked`, with chunk extensions and trailer fields skipped) and bodyless
+204/304 responses. Informational responses are retained until the final
+response arrives, which completes exactly one request. Other transfer codings,
+Transfer-Encoding together with Content-Length, malformed chunked framing,
+close-delimited bodies, protocol upgrades, and malformed or conflicting
+Content-Length headers produce an explicit error before a request is counted
+as successful.
 
 Redis maps count pairs. RESP3 attributes are consumed with their attached
 reply, including when nested. Error replies, including `-MOVED` and `-ASK`,
