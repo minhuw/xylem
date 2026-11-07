@@ -23,13 +23,6 @@
           extensions = [ "rust-src" "rust-analyzer" "clippy" "rustfmt" "llvm-tools-preview" ];
         };
 
-        # Build the package with the same toolchain as the dev shell; nixpkgs'
-        # own rustc can be older than the workspace's rust-version
-        rustPlatform = pkgs.makeRustPlatform {
-          cargo = rustToolchain;
-          rustc = rustToolchain;
-        };
-
         # Build inputs for the project
         buildInputs = with pkgs; [
           openssl
@@ -43,6 +36,37 @@
           pkg-config
           protobuf # Required for evalsync's prost-build
         ];
+
+        # The package is built with upstream Rust, whose prebuilt standard library has line tables
+        # (nixpkgs' rustc builds it without), so profilers can resolve std code to source lines.
+        rustVersion = "1.99.1";
+        rustPackageToolchain = pkgs.rust-bin.stable.${rustVersion}.minimal;
+        rustPlatform = pkgs.makeRustPlatform {
+          cargo = rustPackageToolchain;
+          rustc = rustPackageToolchain;
+        };
+
+        # Sources that standard library was compiled from: library/ and the crates its Cargo.lock
+        # takes from vendor/, except the Windows-only ones, which no Unix build compiles. Its DWARF
+        # paths are /rustc/<commit>/library/... and /rust/deps/<crate>-<version>/...
+        rustSrcTop = "rustc-${rustVersion}-src";
+        rustSrcTarball = pkgs.fetchurl {
+          url = "https://static.rust-lang.org/dist/${rustSrcTop}.tar.xz";
+          sha256 = "6451598a99e77f07571960f6b21d577399d3a30f33e80cbd2e3a4aae6535d265";
+        };
+        rustStdSrc = pkgs.runCommand "rust-std-src-${rustVersion}" { } ''
+          tar -tJf ${rustSrcTarball} > members
+          mkdir -p $out
+          tar -xJf ${rustSrcTarball} -C $out ${rustSrcTop}/library
+          # Registry packages of std's lockfile, as cargo vendor --versioned-dirs names them, without
+          # windows-sys, windows-targets and the windows_<target> import libraries
+          awk -F '"' '/^name = /{n=$2} /^version = /{v=$2} /^source = "registry/{print n "-" v}' \
+            $out/${rustSrcTop}/library/Cargo.lock | grep -vE '^windows[-_]' | sort -u > crates
+          grep -oE '^${rustSrcTop}/vendor/[^/]+/' members | sort -u > vendored
+          grep -F -f <(sed 's|.*|${rustSrcTop}/vendor/&/|' crates) -x vendored > needed
+          echo "$(wc -l < needed) of $(wc -l < crates) non-Windows crates of library/Cargo.lock are vendored"
+          tar -xJf ${rustSrcTarball} -C $out $(sed 's|/$||' needed)
+        '';
 
       in
       {
@@ -136,6 +160,26 @@
 
           # Skip tests that require external services (nginx) not available in sandbox
           doCheck = false;
+
+          # Move DWARF into a separate `debug` output for profile symbolization. separateDebugInfo
+          # asks for it through NIX_RUSTFLAGS, which only nixpkgs' wrapped rustc reads, so the level
+          # is set in the cargo profile (the cargo build hook already turns its stripping off).
+          separateDebugInfo = true;
+          CARGO_PROFILE_RELEASE_DEBUG = "limited";
+
+          # Rhea's bench packaging contract: debug/share/rhea/sources/<name> is the source tree the build
+          # had at <build dir>/<name>, which DWARF paths refer to; profilers then need nothing else.
+          # Upstream remaps the standard library to /rustc/<commit> and its crates to /rust/deps.
+          postFixup = ''
+            sources=$debug/share/rhea/sources
+            mkdir -p $sources
+            commit=$(rustc -vV | sed -n 's/^commit-hash: //p')
+            [ -n "$commit" ] || { echo "rustc -vV gives no commit-hash" >&2; exit 1; }
+            ln -s ${rustStdSrc}/${rustSrcTop} $sources/$commit
+            ln -s ${rustStdSrc}/${rustSrcTop}/vendor $sources/deps
+            ln -s $cargoDeps $sources/$(stripHash $cargoDeps)
+            ln -s $src $sources/$(stripHash $src)
+          '';
 
           meta = with pkgs.lib; {
             description = "A simple, high-performance latency measurement tool for single-machine deployments";

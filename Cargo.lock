@@ -354,9 +354,9 @@ dependencies = [
 
 [[package]]
 name = "evalsync"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42d5dcec64b8cd2011202e709df02531d769b53da7214c0b00645f687d989773"
+checksum = "e8b9da5fb08a3a0a92148123e396fb40dddfcac90e2049c6f6b308e7b0af22a1"
 dependencies = [
  "once_cell",
  "prost",

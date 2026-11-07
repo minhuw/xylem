@@ -45,7 +45,7 @@ humantime-serde.workspace = true
 toml.workspace = true
 
 # Optional evalsync integration for coordinated benchmarking
-evalsync = { version = "0.1", optional = true }
+evalsync = { version = "0.2", optional = true }
 
 [features]
 evalsync = ["dep:evalsync"]
