@@ -2,7 +2,8 @@
 //!
 //! Implements the Memcached binary protocol (memcache_bin.h).
 
-use super::{next_conn_seq, InsertPhaseState};
+use super::udp::UdpFraming;
+use super::{frame_udp_request, next_conn_seq, parse_udp_response, InsertPhaseState};
 use crate::Protocol;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -78,6 +79,8 @@ pub struct MemcachedBinaryProtocol {
     key_prefix: String,
     /// Insert phase state (None = no insert phase, go straight to measurement)
     insert_phase: Option<InsertPhaseState>,
+    /// UDP framing and reassembly; `None` over byte streams
+    udp: Option<UdpFraming>,
 }
 
 impl MemcachedBinaryProtocol {
@@ -90,6 +93,7 @@ impl MemcachedBinaryProtocol {
             value_size: 64,
             key_prefix: "key:".to_string(),
             insert_phase: None,
+            udp: None,
         }
     }
 
@@ -107,12 +111,19 @@ impl MemcachedBinaryProtocol {
             value_size,
             key_prefix: "key:".to_string(),
             insert_phase: None,
+            udp: None,
         }
     }
 
     /// Set the prefix used by all generated keys, including warmup requests.
     pub fn with_key_prefix(mut self, prefix: String) -> Self {
         self.key_prefix = prefix;
+        self
+    }
+
+    /// Frame requests and responses for UDP (memcached's 8-byte frame header)
+    pub fn with_udp_framing(mut self) -> Self {
+        self.udp = Some(UdpFraming::default());
         self
     }
 
@@ -173,6 +184,7 @@ impl Protocol for MemcachedBinaryProtocol {
                 let value_size = insert_state.value_size;
                 let seq = next_conn_seq(&mut self.conn_send_seq, conn_id);
                 let request_data = self.encode_set(key, value_size);
+                let request_data = frame_udp_request(seq, request_data, self.udp.as_ref());
                 return crate::Request::warmup(request_data, (conn_id, seq));
             }
         }
@@ -197,6 +209,7 @@ impl Protocol for MemcachedBinaryProtocol {
             }
             MemcachedOp::Set => self.encode_set(key, self.value_size),
         };
+        let request_data = frame_udp_request(seq, request_data, self.udp.as_ref());
 
         crate::Request::measurement(request_data, (conn_id, seq))
     }
@@ -206,28 +219,14 @@ impl Protocol for MemcachedBinaryProtocol {
         conn_id: usize,
         data: &[u8],
     ) -> Result<(usize, Option<Self::RequestId>)> {
-        if data.is_empty() {
-            return Ok((0, None));
+        if let Some(framing) = &mut self.udp {
+            return parse_udp_response(framing, &self.conn_send_seq, conn_id, data, |data| {
+                Ok(response_len(data))
+            });
         }
-
-        // Need at least the header
-        if data.len() < BmcHeader::SIZE {
+        let Some(total_len) = response_len(data) else {
             return Ok((0, None));
-        }
-
-        // Parse header
-        let header = match BmcHeader::from_bytes(data) {
-            Some(h) => h,
-            None => return Ok((0, None)),
         };
-
-        let body_len = header.body_len() as usize;
-        let total_len = BmcHeader::SIZE + body_len;
-
-        // Check if we have the complete message
-        if data.len() < total_len {
-            return Ok((0, None));
-        }
 
         // Complete response found
         let seq = next_conn_seq(&mut self.conn_recv_seq, conn_id);
@@ -244,5 +243,18 @@ impl Protocol for MemcachedBinaryProtocol {
         if let Some(ref mut key_gen) = self.key_gen {
             key_gen.reset();
         }
+        if let Some(framing) = &mut self.udp {
+            framing.reset();
+        }
     }
+}
+
+/// Length of the complete response at the start of `data`, `None` if it is
+/// incomplete
+fn response_len(data: &[u8]) -> Option<usize> {
+    // Need at least the header
+    let header = BmcHeader::from_bytes(data)?;
+    let total_len = BmcHeader::SIZE + header.body_len() as usize;
+    // Check if we have the complete message
+    (data.len() >= total_len).then_some(total_len)
 }
