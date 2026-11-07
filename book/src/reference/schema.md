@@ -32,6 +32,10 @@ seed = 42
 - `description` (string, optional): Description of the experiment
 - `duration` (string, required): Duration in format "Ns", "Nm", "Nh" (seconds, minutes, hours)
 - `seed` (integer, optional): Random seed for reproducibility
+- `drain_timeout` (string, default `"1s"`): after the measurement window, how
+  long to wait for responses that are still pending. Nothing is sent during the
+  drain. Requests still pending when it ends count as `timed_out`; see
+  [run phases](../guide/output-formats.md#run-phases).
 
 ## Transport and Target
 
@@ -157,6 +161,27 @@ max = 4096
   - `"fixed-rate"`: Fixed rate per connection
   - `"poisson"`: Poisson arrival process (open-loop)
 - `rate` (float, required for fixed-rate/poisson): Requests per second per connection
+
+Every policy except `closed-loop` is rate-driven, including `adaptive` and the
+time-varying `sinusoidal`, `ramp`, `spike` and `sawtooth` patterns. Each
+connection of a rate-driven group follows an *intended schedule* that starts
+when the connection is established: every request is due one inter-arrival
+time after the previous request's intended time, not after its actual send.
+Inter-arrival times are fixed (`fixed-rate`), exponential samples (`poisson`),
+one interval at the current rate (`adaptive`), or, for patterns, the time until
+the pattern's rate, held constant over 10 ms steps, accumulates one request.
+A pattern that drops to zero schedules nothing, so a pause leaves no backlog.
+
+A connection sends when its next intended time has arrived, its pipeline has
+room and its protocol is ready. When the sender falls behind (a full pipeline,
+a slow server, preemption), the overdue requests go out back to back as soon as
+it can send again; none is skipped. A request's latency is measured from its
+intended send time: the *send lag* (actual minus intended send time) plus the
+service latency from the send to the response. Without this, the delay of
+requests that could not be sent on time would be omitted from the results
+(coordinated omission). `adaptive` adjusts its rate from these latencies, so a
+growing backlog backs its rate off. `closed-loop` requests have no intended time
+and no send lag. See [request accounting](../guide/output-formats.md#request-accounting).
 
 ```toml
 [traffic_groups.traffic_policy]

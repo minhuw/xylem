@@ -190,6 +190,11 @@ impl TcpConnectionGroup {
             Err(e) => return Err(e.into()),
         }
 
+        // Requests are small and often pipelined: without TCP_NODELAY, Nagle's
+        // algorithm holds a request back until the previous one is
+        // acknowledged, which inflates the measured latency.
+        socket.set_tcp_nodelay(true)?;
+
         let stream: TcpStream = socket.into();
 
         self.core.wait_for_connect(&stream)?;
@@ -322,6 +327,17 @@ mod tests {
         let group = group.unwrap();
         assert_eq!(group.len(), 0);
         assert!(group.is_empty());
+    }
+
+    #[test]
+    fn group_connections_disable_nagle() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut group = TcpConnectionGroup::new().unwrap();
+        let ids = [group.add_connection(&addr).unwrap(), group.add_connection(&addr).unwrap()];
+        for id in ids {
+            assert!(group.core.conn_mut(id).unwrap().stream.nodelay().unwrap(), "connection {id}");
+        }
     }
 
     #[test]

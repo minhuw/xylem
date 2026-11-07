@@ -45,6 +45,15 @@ pub struct ExperimentConfig {
     #[serde(with = "humantime_serde")]
     #[schemars(with = "String")]
     pub duration: Duration,
+    /// Longest wait for pending responses after the measurement window
+    /// (default 1s). Requests still pending then count as timed out.
+    #[serde(with = "humantime_serde", default = "default_drain_timeout")]
+    #[schemars(with = "String")]
+    pub drain_timeout: Duration,
+}
+
+fn default_drain_timeout() -> Duration {
+    xylem_core::threading::DEFAULT_DRAIN_TIMEOUT
 }
 
 /// Re-export KeysConfig from xylem-protocols for use in config files

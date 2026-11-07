@@ -28,6 +28,7 @@ fn run_throughput_experiment(duration_secs: u64, conn_count: usize, pipeline_dep
         duration,
         conn_count,
         max_pending_per_conn: pipeline_depth,
+        drain_timeout: xylem_core::threading::DEFAULT_DRAIN_TIMEOUT,
     };
 
     let mut worker =
@@ -128,6 +129,7 @@ fn run_rate_limited_experiment(
         duration,
         conn_count,
         max_pending_per_conn: 1, // Single pending for rate-limited mode
+        drain_timeout: xylem_core::threading::DEFAULT_DRAIN_TIMEOUT,
     };
 
     // Use fixed-rate policy scheduler
@@ -208,6 +210,7 @@ fn test_poisson_rate_limiting() {
         duration,
         conn_count: 1,
         max_pending_per_conn: 1,
+        drain_timeout: xylem_core::threading::DEFAULT_DRAIN_TIMEOUT,
     };
 
     // Use Poisson policy scheduler

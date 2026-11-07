@@ -16,16 +16,79 @@ file = "results"
 The CLI sets the file extension to `.json` or `.html` as appropriate. `file` is
 required even for `human`. All formats also print a human-readable summary.
 
+## Run phases
+
+A run has three phases:
+
+1. **Warmup**: requests a protocol marks as warmup, such as the Masstree
+   handshake and insert phase, after connection setup. They are excluded from
+   every statistic and count.
+2. **Measurement**: from the first measured request to the end of
+   `experiment.duration`. Only responses that arrive in this window count
+   toward throughput.
+3. **Drain**: sending stops, and the run waits up to
+   `experiment.drain_timeout` (default 1 s) until no request is pending.
+   Requests completed during the drain contribute their latency to the
+   percentiles and statistics, but not to throughput. Requests still pending
+   when the drain ends count as `timed_out` and have no latency.
+
 ## Throughput and the measured window
 
 `experiment.duration_secs` is the configured duration. Throughput
 (`throughput_rps`, `throughput_mbps`) is computed over
 `experiment.measured_duration_secs`: from the first measured request, after
 connection setup and any protocol warmup (such as the Masstree insert phase),
-to the end of the run. Responses that arrive while the run drains its last
-requests are counted. With `stats.include_records = true`, every record's rate
-divides by the part of its time bucket inside the measured window, so the
-first and last buckets are not understated. All threads share one bucket epoch.
+to the end of the measurement phase. `total_requests` counts the requests
+completed inside that window, which is what throughput divides; requests
+completed during the drain are excluded from it and from the bytes behind
+`throughput_mbps`. Their latencies are recorded in the window's last time
+bucket. With `stats.include_records = true`, every record's rate divides by
+the part of its time bucket inside the measured window, so the first and last
+buckets are not understated. All threads share one bucket epoch.
+
+## Request accounting
+
+Each `requests` object in JSON (global and per group) counts measurement
+requests; warmup requests are excluded:
+
+- `sent`: requests sent.
+- `completed`: requests whose response arrived, in the window or the drain.
+  Equal to the latency `sample_count` unless the sampling policy is `none` or
+  a `limited` rate drops latencies.
+- `timed_out`: still pending when the drain timeout passed. Their latency is
+  unknown, so they are not in the latency statistics; the console prints a
+  warning when this is nonzero.
+- `failed`: pending on a connection that closed or failed.
+- `late_sends`: requests whose send lag exceeded 100 µs.
+- `unsent`: sends a rate-driven schedule intended before the end of the
+  measurement window that never went out, because the sender could not keep
+  up. Counting walks each connection's schedule from its next intended time to
+  the end of the window, at most 10,000,000 requests per connection; Poisson
+  schedules are sampled forward with the policy's own generator. Connections
+  that failed keep counting their schedule.
+- `unsent_capped`: whether that walk stopped at its cap on some connection, so
+  `unsent` is a lower bound.
+
+After a run, `sent = completed + timed_out + failed`.
+
+## Send lag
+
+With a rate-driven traffic policy, every request has an intended send time
+(see [traffic policies](../reference/schema.md#traffic-policy)), and its
+latency is measured from it: the send lag (actual minus intended send time,
+measured on xylem's cycle clock when the send completes) plus the service
+latency (from the send, or its kernel TX timestamp, to the response). Each
+`send_lag` object reports, in microseconds:
+
+- `sample_count`: open-loop requests sent.
+- `mean_us`, `max_us`: exact.
+- `p99_us`: from an HDR histogram with three significant digits.
+- `late_threshold_us`: the threshold of `late_sends`, 100 µs. An on-time send
+  lags by a loop iteration and a send call, a few microseconds; a lag above
+  100 µs means the generator could not keep its schedule.
+
+Closed-loop requests have no intended time: their values are `null` and their
+latency is the service latency alone.
 
 ## Latency fields
 

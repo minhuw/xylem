@@ -4,6 +4,7 @@
 //! enabling flexible post-hoc aggregation by any dimension.
 
 use super::policy::SamplingPolicy;
+use super::requests::{RequestCounts, SendLagStats, SendLagSummary, LATE_SEND_THRESHOLD};
 use super::AggregatedStats;
 use hdrhistogram::Histogram;
 use sketches_ddsketch::{Config as DDSketchConfig, DDSketch};
@@ -437,6 +438,12 @@ impl StatsEntry {
         self.latency.record(latency);
     }
 
+    /// Record the latency of a request completed after the measurement
+    /// window, which throughput does not count
+    pub fn record_drain_latency(&mut self, latency: Duration) {
+        self.latency.record(latency);
+    }
+
     /// Record transmitted bytes
     pub fn record_tx_bytes(&mut self, bytes: usize) {
         self.tx_bytes += bytes as u64;
@@ -527,6 +534,10 @@ pub struct TupleStatsCollector {
     ///
     /// [`StatsRecorder::end_measurement`]: super::StatsRecorder::end_measurement
     measurement_end_ns: Option<u64>,
+    /// Request counts per group
+    request_counts: HashMap<usize, RequestCounts>,
+    /// Send lags of open-loop requests per group
+    send_lags: HashMap<usize, SendLagStats>,
 }
 
 impl TupleStatsCollector {
@@ -542,6 +553,8 @@ impl TupleStatsCollector {
             experiment_start_ns: crate::timing::time_ns(),
             first_record_ns: None,
             measurement_end_ns: None,
+            request_counts: HashMap::new(),
+            send_lags: HashMap::new(),
         }
     }
 
@@ -561,6 +574,8 @@ impl TupleStatsCollector {
             experiment_start_ns: start_time_ns,
             first_record_ns: None,
             measurement_end_ns: None,
+            request_counts: HashMap::new(),
+            send_lags: HashMap::new(),
         }
     }
 
@@ -605,7 +620,11 @@ impl TupleStatsCollector {
         group_id: usize,
         connection_id: usize,
     ) -> (&mut StatsEntry, &mut StatsEntry) {
-        let now_ns = crate::timing::time_ns();
+        let mut now_ns = crate::timing::time_ns();
+        if let Some(end_ns) = self.measurement_end_ns {
+            // Responses drained after the window belong to its last bucket.
+            now_ns = now_ns.min(end_ns.saturating_sub(1));
+        }
         self.first_record_ns.get_or_insert(now_ns);
         let time_bucket = self.compute_bucket(now_ns);
         let policy = self.group_sampling_policies.get(&group_id).unwrap_or(&self.sampling_policy);
@@ -624,10 +643,67 @@ impl TupleStatsCollector {
     }
 
     /// Record latency independently under the group and global sampling policies.
+    ///
+    /// After [`Self::end_measurement`], the request completed during the
+    /// drain: its latency joins the distribution of the window's last bucket,
+    /// but it does not count toward that bucket's requests or throughput.
     pub fn record_latency(&mut self, group_id: usize, connection_id: usize, latency: Duration) {
+        self.request_counts_mut(group_id).completed += 1;
+        let draining = self.measurement_end_ns.is_some();
         let (entry, global) = self.recording_entries(group_id, connection_id);
-        entry.record_latency(latency);
-        global.record_latency(latency);
+        if draining {
+            entry.record_drain_latency(latency);
+            global.record_drain_latency(latency);
+        } else {
+            entry.record_latency(latency);
+            global.record_latency(latency);
+        }
+    }
+
+    /// Record a sent measurement request with its send lag (`None` without
+    /// an intended send time); lags above [`LATE_SEND_THRESHOLD`] are late.
+    pub fn record_sent(&mut self, group_id: usize, lag: Option<Duration>) {
+        let counts = self.request_counts.entry(group_id).or_default();
+        counts.sent += 1;
+        if let Some(lag) = lag {
+            if lag > LATE_SEND_THRESHOLD {
+                counts.late_sends += 1;
+            }
+            self.send_lags.entry(group_id).or_default().record(lag);
+        }
+    }
+
+    /// Request counts of a group, to add to
+    pub fn request_counts_mut(&mut self, group_id: usize) -> &mut RequestCounts {
+        self.request_counts.entry(group_id).or_default()
+    }
+
+    /// Request counts of a group; zero for a group that recorded none
+    pub fn request_counts(&self, group_id: usize) -> RequestCounts {
+        self.request_counts.get(&group_id).copied().unwrap_or_default()
+    }
+
+    /// Request counts of every group together
+    pub fn request_counts_global(&self) -> RequestCounts {
+        let mut total = RequestCounts::default();
+        for counts in self.request_counts.values() {
+            total.merge(counts);
+        }
+        total
+    }
+
+    /// Send lags of a group's open-loop requests
+    pub fn send_lag(&self, group_id: usize) -> SendLagSummary {
+        self.send_lags.get(&group_id).map(SendLagStats::summary).unwrap_or_default()
+    }
+
+    /// Send lags of every group's open-loop requests together
+    pub fn send_lag_global(&self) -> SendLagSummary {
+        let mut total = SendLagStats::default();
+        for lags in self.send_lags.values() {
+            total.merge(lags);
+        }
+        total.summary()
     }
 
     /// Record transmitted bytes
@@ -637,8 +713,12 @@ impl TupleStatsCollector {
         global.record_tx_bytes(bytes);
     }
 
-    /// Record received bytes
+    /// Record received bytes. Bytes of responses drained after the
+    /// measurement window are not recorded, as they count toward no rate.
     pub fn record_rx_bytes(&mut self, group_id: usize, connection_id: usize, bytes: usize) {
+        if self.measurement_end_ns.is_some() {
+            return;
+        }
         let (entry, global) = self.recording_entries(group_id, connection_id);
         entry.record_rx_bytes(bytes);
         global.record_rx_bytes(bytes);
@@ -920,6 +1000,8 @@ impl TupleStatsCollector {
             experiment_start_ns: first.experiment_start_ns,
             first_record_ns: collectors.iter().filter_map(|c| c.first_record_ns).min(),
             measurement_end_ns: collectors.iter().filter_map(|c| c.measurement_end_ns).max(),
+            request_counts: HashMap::new(),
+            send_lags: HashMap::new(),
         };
 
         // Validate policies before merging any entries.
@@ -946,6 +1028,12 @@ impl TupleStatsCollector {
             }
         }
         for collector in collectors {
+            for (group_id, counts) in &collector.request_counts {
+                merged.request_counts.entry(*group_id).or_default().merge(counts);
+            }
+            for (group_id, lags) in &collector.send_lags {
+                merged.send_lags.entry(*group_id).or_default().merge(lags);
+            }
             for (key, entry) in collector.entries {
                 merged.entries.entry(key).and_modify(|e| e.merge_from(&entry)).or_insert(entry);
             }
@@ -992,9 +1080,10 @@ impl TupleStatsCollector {
     }
 
     /// Time a bucket overlaps the measurement window, so the partial first
-    /// and last buckets report rates over the time they covered. A bucket
-    /// outside the window (such as one holding only responses drained after
-    /// the end), or any bucket without a known window, uses the full width.
+    /// and last buckets report rates over the time they covered. Responses
+    /// drained after the window are recorded in its last bucket, so no bucket
+    /// lies outside it; one that did, or any bucket without a known window,
+    /// would use the full width.
     pub fn bucket_width(&self, time_bucket: u64) -> Duration {
         let full = self.bucket_duration_ns;
         let Some((start, end)) = self.measurement_window_ns() else {
@@ -1757,5 +1846,55 @@ mod tests {
         let ts = collector.time_series_global();
         assert!(!ts.is_empty());
         assert_eq!(ts[0].request_count, 100);
+    }
+
+    #[test]
+    fn late_sends_and_send_lags_are_counted_per_group_and_merged() {
+        let mut first = TupleStatsCollector::default();
+        first.record_sent(0, None); // closed loop: no lag
+        first.record_sent(0, Some(Duration::from_micros(5)));
+        first.record_sent(0, Some(LATE_SEND_THRESHOLD)); // not above the threshold
+        first.record_sent(0, Some(Duration::from_millis(3)));
+        let mut second = TupleStatsCollector::default();
+        second.set_thread_id(1);
+        second.record_sent(1, Some(Duration::from_millis(7)));
+        second.request_counts_mut(1).unsent = 4;
+        second.request_counts_mut(1).unsent_capped = true;
+
+        let merged = TupleStatsCollector::merge(vec![first, second]);
+        let group0 = merged.request_counts(0);
+        assert_eq!((group0.sent, group0.late_sends, group0.unsent_capped), (4, 1, false));
+        assert_eq!(merged.send_lag(0).sample_count, 3);
+        assert_eq!(merged.send_lag(0).max, Some(Duration::from_millis(3)));
+        let global = merged.request_counts_global();
+        assert_eq!((global.sent, global.late_sends, global.unsent), (5, 2, 4));
+        assert!(global.unsent_capped);
+        let lag = merged.send_lag_global();
+        assert_eq!((lag.sample_count, lag.max), (4, Some(Duration::from_millis(7))));
+        assert_eq!(merged.send_lag(9), SendLagSummary::default());
+    }
+
+    #[test]
+    fn drained_latency_joins_the_last_bucket_without_counting_toward_throughput() {
+        let start = crate::timing::time_ns();
+        let mut collector = TupleStatsCollector::with_start_time(
+            SamplingPolicy::Unlimited,
+            Duration::from_secs(3600),
+            start,
+        );
+        collector.record_tx_bytes(0, 0, 10);
+        collector.record_latency(0, 0, Duration::from_micros(10));
+        collector.record_rx_bytes(0, 0, 10);
+        collector.end_measurement(crate::timing::time_ns());
+        collector.record_latency(0, 0, Duration::from_micros(30));
+        collector.record_rx_bytes(0, 0, 10);
+        let global = collector.aggregate_global(Duration::from_secs(1));
+        assert_eq!((global.total_requests, global.latency_sample_count), (1, 2));
+        assert_eq!(global.max_latency, Some(Duration::from_micros(30)));
+        let group = &collector.aggregate_by_group(Duration::from_secs(1))[&0];
+        assert_eq!((group.total_requests, group.latency_sample_count), (1, 2));
+        assert_eq!(collector.time_buckets(), vec![0]);
+        assert_eq!(collector.entries().values().map(|e| e.rx_bytes).sum::<u64>(), 10);
+        assert_eq!(collector.request_counts(0).completed, 2);
     }
 }

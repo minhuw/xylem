@@ -37,6 +37,7 @@ fn test_redis_pipelined_single_connection() {
         duration,
         conn_count: 1,
         max_pending_per_conn: 16, // Allow 16 pipelined requests
+        drain_timeout: xylem_core::threading::DEFAULT_DRAIN_TIMEOUT,
     };
 
     let mut worker =
@@ -84,6 +85,7 @@ fn test_redis_pipelined_multiple_connections() {
         duration,
         conn_count: 4,            // 4 connections
         max_pending_per_conn: 16, // 16 pipelined per connection
+        drain_timeout: xylem_core::threading::DEFAULT_DRAIN_TIMEOUT,
     };
 
     let mut worker =
@@ -136,6 +138,7 @@ fn test_redis_pipelined_closed_loop() {
         duration,
         conn_count: 2,
         max_pending_per_conn: 8,
+        drain_timeout: xylem_core::threading::DEFAULT_DRAIN_TIMEOUT,
     };
 
     let mut worker =

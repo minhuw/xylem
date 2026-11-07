@@ -150,6 +150,7 @@ fn run_multi_protocol_test() -> Result<(), Box<dyn std::error::Error>> {
             duration,
             conn_count: 10,
             max_pending_per_conn: 1,
+            drain_timeout: xylem_core::threading::DEFAULT_DRAIN_TIMEOUT,
         };
 
         // Filter protocols for this thread's groups
@@ -253,6 +254,7 @@ fn run_redis_memcached_test() -> Result<(), Box<dyn std::error::Error>> {
             duration,
             conn_count: 10,
             max_pending_per_conn: 1,
+            drain_timeout: xylem_core::threading::DEFAULT_DRAIN_TIMEOUT,
         };
 
         let mut worker = Worker::new_multi_group(

@@ -9,6 +9,21 @@
 //! - Designed for per-connection use (not global)
 //! - Simpler API: `next_send_time()` instead of complex `delay_until_next()`
 //! - Uses shared distributions from `xylem_common`
+//!
+//! # Open-loop schedules
+//!
+//! Every rate-driven policy (fixed rate, Poisson, adaptive and load patterns)
+//! follows an *intended schedule*: `intended[k + 1] = intended[k] + interarrival[k]`,
+//! starting at the connection's start time (the first `next_send_time` call).
+//! The schedule advances by intended times, never by actual send times. When
+//! the sender falls behind (full pipeline, slow loop, preemption, a server
+//! stall), the next intended time is simply in the past: the overdue requests
+//! go out back to back as soon as the connection can send, each carrying its
+//! own intended time, and nothing is skipped. The worker adds each request's
+//! send lag (actual minus intended send time) to its latency, so the delay of
+//! requests that could not go out on time is not omitted (coordinated omission).
+//!
+//! The closed-loop policy has no schedule: its requests have no intended time.
 
 use std::time::Duration;
 use xylem_common::ExponentialDistribution;
@@ -23,11 +38,15 @@ use xylem_common::ExponentialDistribution;
 pub trait Policy: Send {
     /// Get the absolute time (in nanoseconds) when this connection should next wake
     ///
+    /// The first call starts a rate-driven policy's intended schedule at
+    /// `current_time_ns`.
+    ///
     /// # Parameters
     /// - `current_time_ns`: Current time in nanoseconds (from `timing::time_ns()`)
     ///
     /// # Returns
     /// - `Some(time_ns)`: Wake at this absolute time, then check `ready_to_send`.
+    ///   It may be in the past when the connection is behind its schedule.
     /// - `None`: Send immediately (closed-loop, always ready)
     fn next_send_time(&mut self, current_time_ns: u64) -> Option<u64>;
 
@@ -39,14 +58,32 @@ pub trait Policy: Send {
         true
     }
 
-    /// Feedback from a completed measurement response. Warmup responses are excluded.
+    /// Intended send time of the next request, for a connection whose wakeup
+    /// permitted a send. `None` for policies without a schedule (closed loop).
+    fn intended_send_time(&self) -> Option<u64> {
+        None
+    }
+
+    /// Feedback from a completed measurement response, with its latency
+    /// measured from the intended send time. Warmup responses are excluded.
     fn on_response(&mut self, _latency: Duration) {}
 
     /// Notify policy that a request was sent on this connection
     ///
+    /// Rate-driven policies advance their intended schedule by one request;
+    /// `sent_time_ns` only starts a schedule that `next_send_time` never started.
+    ///
     /// # Parameters
     /// - `sent_time_ns`: When the request was sent (nanoseconds)
     fn on_request_sent(&mut self, sent_time_ns: u64);
+
+    /// Count the intended sends from the next one up to, but excluding,
+    /// `end_ns`, stopping at `cap`. Returns the count and whether the cap
+    /// stopped the walk. Consumes the schedule, so call it only once the
+    /// connection stops sending. Policies without a schedule return `(0, false)`.
+    fn count_intended_before(&mut self, _end_ns: u64, _cap: u64) -> (u64, bool) {
+        (0, false)
+    }
 
     /// Reset policy state
     fn reset(&mut self);
@@ -73,14 +110,51 @@ fn rate_to_interval_ns(rate: f64) -> Option<u64> {
     (rate > 0.0).then(|| (1_000_000_000.0 / rate) as u64)
 }
 
-/// Absolute time of the next send after `last_send_time_ns`
-///
-/// The first request is due immediately. Later requests are due one interval
-/// after the last send, saturating so a huge interval cannot wrap into the past.
-fn next_send_after(last_send_time_ns: Option<u64>, interval_ns: u64) -> u64 {
-    match last_send_time_ns {
-        Some(last_time) => last_time.saturating_add(interval_ns),
-        None => 0, // First request: send immediately (time 0 is always in past)
+/// Intended schedule with a constant interval between consecutive requests
+/// at any moment (the interval may change between requests)
+#[derive(Debug, Clone, Copy, Default)]
+struct IntervalSchedule {
+    /// Start of the schedule: the intended time of the first request
+    start_ns: Option<u64>,
+    /// Intended time of the last request sent
+    last_intended_ns: Option<u64>,
+}
+
+impl IntervalSchedule {
+    fn start(&mut self, current_time_ns: u64) {
+        self.start_ns.get_or_insert(current_time_ns);
+    }
+
+    /// Intended time of the next request: the start, then one interval after
+    /// the last intended time, saturating so a huge interval cannot wrap.
+    fn next(&self, interval_ns: u64) -> Option<u64> {
+        match self.last_intended_ns {
+            Some(last) => Some(last.saturating_add(interval_ns)),
+            None => self.start_ns,
+        }
+    }
+
+    fn advance(&mut self, interval_ns: u64, sent_time_ns: u64) {
+        self.last_intended_ns = Some(self.next(interval_ns).unwrap_or(sent_time_ns));
+    }
+
+    fn count_before(&self, interval_ns: u64, end_ns: u64, cap: u64) -> (u64, bool) {
+        let Some(next) = self.next(interval_ns) else {
+            return (0, false);
+        };
+        if next >= end_ns {
+            return (0, false);
+        }
+        let count = match (end_ns - next - 1).checked_div(interval_ns) {
+            Some(steps) => steps.saturating_add(1),
+            // A zero interval schedules every request at once.
+            None => u64::MAX,
+        };
+        if count > cap {
+            (cap, true)
+        } else {
+            (count, false)
+        }
     }
 }
 
@@ -88,7 +162,7 @@ fn next_send_after(last_send_time_ns: Option<u64>, interval_ns: u64) -> u64 {
 ///
 /// Always returns `None` (send immediately when connection is available).
 /// This creates a closed-loop system where the connection's pending limit
-/// naturally regulates the rate.
+/// naturally regulates the rate. Its requests have no intended send time.
 pub struct ClosedLoopPolicy;
 
 impl ClosedLoopPolicy {
@@ -124,13 +198,14 @@ impl Policy for ClosedLoopPolicy {
 /// Fixed-rate policy (constant inter-arrival time)
 ///
 /// Sends requests at a fixed rate (requests per second) with deterministic spacing.
-/// Each request is exactly `1/rate` seconds after the previous one.
+/// Each request is intended exactly `1/rate` seconds after the previous one's
+/// intended time, starting at the connection's start.
 /// A rate that is not greater than zero never sends (see `rate_to_interval_ns`).
 pub struct FixedRatePolicy {
     rate: f64,
     /// None means paused, not an infinite interval to add to a timestamp.
     inter_arrival_ns: Option<u64>,
-    last_send_time_ns: Option<u64>,
+    schedule: IntervalSchedule,
 }
 
 impl FixedRatePolicy {
@@ -143,7 +218,7 @@ impl FixedRatePolicy {
         Self {
             rate,
             inter_arrival_ns,
-            last_send_time_ns: None,
+            schedule: IntervalSchedule::default(),
         }
     }
 
@@ -154,21 +229,33 @@ impl FixedRatePolicy {
 }
 
 impl Policy for FixedRatePolicy {
-    fn next_send_time(&mut self, _current_time_ns: u64) -> Option<u64> {
+    fn next_send_time(&mut self, current_time_ns: u64) -> Option<u64> {
+        self.schedule.start(current_time_ns);
         match self.inter_arrival_ns {
-            Some(inter_arrival_ns) => {
-                Some(next_send_after(self.last_send_time_ns, inter_arrival_ns))
-            }
+            Some(inter_arrival_ns) => self.schedule.next(inter_arrival_ns),
             None => Some(u64::MAX), // Paused: a wakeup that never arrives
         }
     }
 
+    fn intended_send_time(&self) -> Option<u64> {
+        self.schedule.next(self.inter_arrival_ns?)
+    }
+
     fn on_request_sent(&mut self, sent_time_ns: u64) {
-        self.last_send_time_ns = Some(sent_time_ns);
+        if let Some(inter_arrival_ns) = self.inter_arrival_ns {
+            self.schedule.advance(inter_arrival_ns, sent_time_ns);
+        }
+    }
+
+    fn count_intended_before(&mut self, end_ns: u64, cap: u64) -> (u64, bool) {
+        match self.inter_arrival_ns {
+            Some(inter_arrival_ns) => self.schedule.count_before(inter_arrival_ns, end_ns, cap),
+            None => (0, false),
+        }
     }
 
     fn reset(&mut self) {
-        self.last_send_time_ns = None;
+        self.schedule = IntervalSchedule::default();
     }
 
     fn name(&self) -> &'static str {
@@ -179,10 +266,12 @@ impl Policy for FixedRatePolicy {
 /// Poisson policy (exponentially distributed inter-arrivals)
 ///
 /// Models realistic bursty traffic using exponential distribution.
-/// Creates a Poisson process with the given rate parameter (lambda).
+/// Creates a Poisson process with the given rate parameter (lambda): each
+/// intended send time is one sampled inter-arrival after the previous one.
 pub struct PoissonPolicy {
     dist: ExponentialDistribution,
-    last_send_time_ns: Option<u64>,
+    /// Intended time of the next request, once the schedule has started
+    next_intended_ns: Option<u64>,
 }
 
 impl PoissonPolicy {
@@ -207,34 +296,53 @@ impl PoissonPolicy {
     /// Error if lambda <= 0
     pub fn with_seed(lambda: f64, seed: Option<u64>) -> anyhow::Result<Self> {
         let dist = ExponentialDistribution::with_seed(lambda, seed)?;
-        Ok(Self { dist, last_send_time_ns: None })
+        Ok(Self { dist, next_intended_ns: None })
     }
 
     /// Get the current lambda (rate parameter)
     pub fn lambda(&self) -> f64 {
         self.dist.lambda()
     }
+
+    /// Sample one inter-arrival time in nanoseconds
+    fn sample_ns(&mut self) -> u64 {
+        (self.dist.sample_inter_arrival() * 1_000_000_000.0) as u64
+    }
 }
 
 impl Policy for PoissonPolicy {
-    fn next_send_time(&mut self, _current_time_ns: u64) -> Option<u64> {
-        match self.last_send_time_ns {
-            Some(last_time) => {
-                // Sample inter-arrival time from exponential distribution
-                let inter_arrival_secs = self.dist.sample_inter_arrival();
-                let inter_arrival_ns = (inter_arrival_secs * 1_000_000_000.0) as u64;
-                Some(last_time + inter_arrival_ns)
-            }
-            None => Some(0), // First request: send immediately
-        }
+    fn next_send_time(&mut self, current_time_ns: u64) -> Option<u64> {
+        Some(*self.next_intended_ns.get_or_insert(current_time_ns))
+    }
+
+    fn intended_send_time(&self) -> Option<u64> {
+        self.next_intended_ns
     }
 
     fn on_request_sent(&mut self, sent_time_ns: u64) {
-        self.last_send_time_ns = Some(sent_time_ns);
+        let intended = self.next_intended_ns.unwrap_or(sent_time_ns);
+        self.next_intended_ns = Some(intended.saturating_add(self.sample_ns()));
+    }
+
+    /// Samples the remaining schedule forward with the policy's own generator.
+    fn count_intended_before(&mut self, end_ns: u64, cap: u64) -> (u64, bool) {
+        let Some(mut next) = self.next_intended_ns else {
+            return (0, false);
+        };
+        let mut count = 0;
+        while next < end_ns {
+            if count == cap {
+                return (count, true);
+            }
+            count += 1;
+            next = next.saturating_add(self.sample_ns());
+        }
+        self.next_intended_ns = Some(next);
+        (count, false)
     }
 
     fn reset(&mut self) {
-        self.last_send_time_ns = None;
+        self.next_intended_ns = None;
     }
 
     fn name(&self) -> &'static str {
@@ -248,6 +356,11 @@ impl Policy for PoissonPolicy {
 /// - If latency > target: reduce rate (back off)
 /// - If latency < target: increase rate (push harder)
 ///
+/// The latency it receives is measured from each request's intended send
+/// time, so a backlog of overdue requests counts as high latency and backs
+/// the rate off. Each request is intended one interval at the current rate
+/// after the previous one's intended time.
+///
 /// A current rate that is not greater than zero never sends (see `rate_to_interval_ns`).
 pub struct AdaptivePolicy {
     target_latency: Duration,
@@ -255,7 +368,7 @@ pub struct AdaptivePolicy {
     min_rate: f64,
     max_rate: f64,
     adjustment_factor: f64,
-    last_send_time_ns: Option<u64>,
+    schedule: IntervalSchedule,
     sample_count: usize,
     latency_sum: Duration,
 }
@@ -275,7 +388,7 @@ impl AdaptivePolicy {
             min_rate,
             max_rate,
             adjustment_factor: 0.1, // 10% adjustment per iteration
-            last_send_time_ns: None,
+            schedule: IntervalSchedule::default(),
             sample_count: 0,
             latency_sum: Duration::ZERO,
         }
@@ -317,7 +430,8 @@ impl Policy for AdaptivePolicy {
         self.add_latency_sample(latency);
     }
 
-    fn next_send_time(&mut self, _current_time_ns: u64) -> Option<u64> {
+    fn next_send_time(&mut self, current_time_ns: u64) -> Option<u64> {
+        self.schedule.start(current_time_ns);
         // Check if we should adjust rate (every 100 requests)
         if self.sample_count >= 100 {
             let avg_latency = self.latency_sum / self.sample_count as u32;
@@ -327,19 +441,31 @@ impl Policy for AdaptivePolicy {
         }
 
         match rate_to_interval_ns(self.current_rate) {
-            Some(inter_arrival_ns) => {
-                Some(next_send_after(self.last_send_time_ns, inter_arrival_ns))
-            }
+            Some(inter_arrival_ns) => self.schedule.next(inter_arrival_ns),
             None => Some(u64::MAX), // Paused: a wakeup that never arrives
         }
     }
 
+    fn intended_send_time(&self) -> Option<u64> {
+        self.schedule.next(rate_to_interval_ns(self.current_rate)?)
+    }
+
     fn on_request_sent(&mut self, sent_time_ns: u64) {
-        self.last_send_time_ns = Some(sent_time_ns);
+        if let Some(inter_arrival_ns) = rate_to_interval_ns(self.current_rate) {
+            self.schedule.advance(inter_arrival_ns, sent_time_ns);
+        }
+    }
+
+    /// Counts at the current rate, which no longer changes once sending stops.
+    fn count_intended_before(&mut self, end_ns: u64, cap: u64) -> (u64, bool) {
+        match rate_to_interval_ns(self.current_rate) {
+            Some(inter_arrival_ns) => self.schedule.count_before(inter_arrival_ns, end_ns, cap),
+            None => (0, false),
+        }
     }
 
     fn reset(&mut self) {
-        self.last_send_time_ns = None;
+        self.schedule = IntervalSchedule::default();
         self.sample_count = 0;
         self.latency_sum = Duration::ZERO;
     }
@@ -444,20 +570,36 @@ impl PolicyScheduler for UniformPolicyScheduler {
     }
 }
 
-/// Pattern-aware policy that dynamically adjusts rate based on elapsed time
+/// Pattern-aware policy that follows a time-varying rate
 ///
-/// This policy wraps a `LoadPattern` and updates its target rate on each
-/// `next_send_time` call based on the pattern's rate at the current elapsed time.
+/// The pattern's rate is sampled at the start of every 10 ms step (aligned to
+/// the pattern's start) and held for that step. The intended schedule is a
+/// non-homogeneous process over that rate: the first request is intended at
+/// the first moment from the connection's start at which the rate is
+/// positive, and each later request once the rate integrated from the
+/// previous intended time reaches one request. For a constant rate this is
+/// one `1/rate` interval. Paused (zero-rate) steps contribute nothing, so a
+/// pause schedules no backlog, while a short spike is observed as soon as it
+/// accumulates a request even after a long low-rate gap. Intended times that
+/// passed while the connection could not send still go out, like every
+/// rate-driven policy.
+///
 /// This enables truly time-varying workloads like sinusoidal, ramp, spike patterns.
 pub struct PatternAwarePolicy {
     pattern: std::sync::Arc<dyn crate::workload::LoadPattern>,
     start_time_ns: u64,
-    /// None means paused, not an infinite interval to add to a timestamp.
-    inter_arrival_ns: Option<u64>,
-    last_send_time_ns: Option<u64>,
-    last_rate_update_ns: u64,
+    /// Time up to which the rate has been integrated; None before the
+    /// schedule starts
+    cursor_ns: Option<u64>,
+    /// Requests still to integrate before the next intended time; zero for
+    /// the first request, which is due as soon as the rate is positive
+    credit_needed: f64,
+    /// Intended time of the next request, once integration has found it
+    next_intended_ns: Option<u64>,
 }
 
+/// Length of the steps over which a pattern's rate is held constant, and the
+/// furthest ahead a pattern policy integrates its rate on each wakeup.
 const PATTERN_REFRESH_NS: u64 = 10_000_000;
 
 impl PatternAwarePolicy {
@@ -466,52 +608,105 @@ impl PatternAwarePolicy {
         pattern: std::sync::Arc<dyn crate::workload::LoadPattern>,
         start_time_ns: u64,
     ) -> Self {
-        let inter_arrival_ns = rate_to_interval_ns(pattern.rate_at(Duration::ZERO));
         Self {
             pattern,
             start_time_ns,
-            inter_arrival_ns,
-            last_send_time_ns: None,
-            last_rate_update_ns: start_time_ns,
+            cursor_ns: None,
+            credit_needed: 0.0,
+            next_intended_ns: None,
         }
     }
 
-    fn update_rate(&mut self, current_time_ns: u64) {
-        if current_time_ns.saturating_sub(self.last_rate_update_ns) < PATTERN_REFRESH_NS {
+    /// Integrate the rate until the next intended time is found or the
+    /// cursor reaches `horizon_ns`.
+    fn integrate_until(&mut self, horizon_ns: u64) {
+        let Some(mut cursor) = self.cursor_ns else {
             return;
+        };
+        while self.next_intended_ns.is_none() && cursor < horizon_ns {
+            let offset = cursor.saturating_sub(self.start_time_ns);
+            let step_start = cursor - offset % PATTERN_REFRESH_NS;
+            let step_end = step_start.saturating_add(PATTERN_REFRESH_NS);
+            let rate = self
+                .pattern
+                .rate_at(Duration::from_nanos(step_start.saturating_sub(self.start_time_ns)));
+            if rate > 0.0 {
+                let needed_ns = self.credit_needed * 1_000_000_000.0 / rate;
+                // A request that completes its step is due at the next
+                // step's start, if that step's rate is still positive.
+                if needed_ns < (step_end - cursor) as f64 {
+                    let next = cursor.saturating_add(needed_ns as u64);
+                    self.next_intended_ns = Some(next);
+                    cursor = next;
+                    break;
+                }
+                self.credit_needed -= rate * (step_end - cursor) as f64 / 1_000_000_000.0;
+            }
+            if step_end == u64::MAX {
+                // Nothing can be scheduled past the end of time.
+                cursor = u64::MAX;
+                break;
+            }
+            cursor = step_end;
         }
-        let elapsed = Duration::from_nanos(current_time_ns.saturating_sub(self.start_time_ns));
-        self.inter_arrival_ns = rate_to_interval_ns(self.pattern.rate_at(elapsed));
-        self.last_rate_update_ns = current_time_ns;
+        self.cursor_ns = Some(cursor);
     }
 
-    fn send_deadline(&self) -> Option<u64> {
-        self.inter_arrival_ns
-            .map(|interval| next_send_after(self.last_send_time_ns, interval))
+    fn advance(&mut self, sent_time_ns: u64) {
+        let intended = self.next_intended_ns.take().unwrap_or(sent_time_ns);
+        self.cursor_ns = Some(intended);
+        self.credit_needed = 1.0;
     }
 }
 
 impl Policy for PatternAwarePolicy {
     fn next_send_time(&mut self, current_time_ns: u64) -> Option<u64> {
-        self.update_rate(current_time_ns);
-        let refresh = self.last_rate_update_ns.saturating_add(PATTERN_REFRESH_NS);
-        // A refresh wakeup is not permission to send, including during idle phases.
-        Some(self.send_deadline().map_or(refresh, |send| send.min(refresh)))
+        self.cursor_ns.get_or_insert(current_time_ns);
+        let horizon = current_time_ns.saturating_add(PATTERN_REFRESH_NS);
+        self.integrate_until(horizon);
+        // Without a request due by the horizon, wake there to integrate on.
+        // That refresh wakeup is not permission to send.
+        Some(self.next_intended_ns.unwrap_or(horizon))
     }
 
     fn ready_to_send(&mut self, current_time_ns: u64) -> bool {
-        self.update_rate(current_time_ns);
-        self.send_deadline().is_some_and(|send| send <= current_time_ns)
+        self.cursor_ns.get_or_insert(current_time_ns);
+        self.integrate_until(current_time_ns.saturating_add(1));
+        self.next_intended_ns.is_some_and(|next| next <= current_time_ns)
+    }
+
+    fn intended_send_time(&self) -> Option<u64> {
+        self.next_intended_ns
     }
 
     fn on_request_sent(&mut self, sent_time_ns: u64) {
-        self.last_send_time_ns = Some(sent_time_ns);
+        self.advance(sent_time_ns);
+    }
+
+    fn count_intended_before(&mut self, end_ns: u64, cap: u64) -> (u64, bool) {
+        if self.cursor_ns.is_none() {
+            return (0, false);
+        }
+        let mut count = 0;
+        loop {
+            self.integrate_until(end_ns);
+            match self.next_intended_ns {
+                Some(next) if next < end_ns => {
+                    if count == cap {
+                        return (count, true);
+                    }
+                    count += 1;
+                    self.advance(next);
+                }
+                _ => return (count, false),
+            }
+        }
     }
 
     fn reset(&mut self) {
-        self.last_send_time_ns = None;
-        self.last_rate_update_ns = self.start_time_ns;
-        self.inter_arrival_ns = rate_to_interval_ns(self.pattern.rate_at(Duration::ZERO));
+        self.cursor_ns = None;
+        self.credit_needed = 0.0;
+        self.next_intended_ns = None;
     }
 
     fn name(&self) -> &'static str {
@@ -582,13 +777,14 @@ mod tests {
     fn test_fixed_rate_policy() {
         let mut policy = FixedRatePolicy::new(1000.0); // 1000 req/s = 1ms per request
 
-        // First request: time 0 (send immediately)
+        // The schedule starts at the first call: the first request is due then
         let next = policy.next_send_time(100_000);
-        assert_eq!(next, Some(0));
+        assert_eq!(next, Some(100_000));
+        assert_eq!(policy.intended_send_time(), Some(100_000));
 
-        policy.on_request_sent(100_000); // Sent at t=100μs
+        policy.on_request_sent(150_000); // Sent 50μs late
 
-        // Second request: should be at t=100μs + 1000μs = 1100μs
+        // The next request is 1ms after the intended time, not the actual send
         let next2 = policy.next_send_time(200_000);
         assert_eq!(next2, Some(100_000 + 1_000_000)); // +1ms in nanoseconds
 
@@ -620,7 +816,7 @@ mod tests {
     fn test_poisson_policy() {
         let mut policy = PoissonPolicy::new(1000.0).expect("Failed to create Poisson");
 
-        // First request
+        // First request: due at the start of the schedule
         let next = policy.next_send_time(0);
         assert_eq!(next, Some(0));
 
@@ -771,5 +967,118 @@ mod tests {
 
         // Should be able to assign policies through the trait object
         let _ = uniform.assign_policy(0);
+    }
+
+    /// Sends the requests due at `now` the way the pool and worker do,
+    /// returning their intended times.
+    fn send_due(policy: &mut dyn Policy, now: u64) -> Vec<u64> {
+        let mut intended = Vec::new();
+        while policy.next_send_time(now).is_some_and(|next| next <= now)
+            && policy.ready_to_send(now)
+        {
+            intended.push(policy.intended_send_time().unwrap());
+            policy.on_request_sent(now);
+        }
+        intended
+    }
+
+    #[test]
+    fn stalled_sender_sends_overdue_requests_with_their_intended_times() {
+        // 1000 req/s, then the sender stalls for 100 ms after its first send
+        let mut policy = FixedRatePolicy::new(1000.0);
+        assert_eq!(send_due(&mut policy, 0), vec![0]);
+        let overdue = send_due(&mut policy, 100_000_000);
+        // Nothing is skipped: every intended time up to now goes out
+        assert_eq!(overdue, (1..=100).map(|k| k * 1_000_000).collect::<Vec<_>>());
+        // Then the schedule continues where it was, not from the late send
+        assert_eq!(policy.next_send_time(100_000_000), Some(101_000_000));
+        assert_eq!(policy.count_intended_before(110_000_000, 1000), (9, false));
+    }
+
+    #[test]
+    fn closed_loop_has_no_intended_time_or_unsent_requests() {
+        let mut policy = ClosedLoopPolicy::new();
+        assert_eq!(policy.next_send_time(10), None);
+        assert_eq!(policy.intended_send_time(), None);
+        policy.on_request_sent(10);
+        assert_eq!(policy.count_intended_before(u64::MAX, 10), (0, false));
+    }
+
+    #[test]
+    fn poisson_schedule_keeps_its_mean_rate_when_sends_are_late() {
+        let mut policy = PoissonPolicy::with_seed(1000.0, Some(7)).unwrap();
+        assert_eq!(policy.next_send_time(0), Some(0));
+        let n = 20_000u64;
+        for k in 0..n {
+            // Every send is 5 ms late; the schedule must not drift with it.
+            let intended = policy.intended_send_time().unwrap();
+            policy.on_request_sent(intended + 5_000_000 + k);
+        }
+        let mean_interval = policy.intended_send_time().unwrap() as f64 / n as f64;
+        assert!((mean_interval - 1_000_000.0).abs() < 30_000.0, "{mean_interval}");
+
+        // Sampling the rest of a 1 s window forward counts about 1000 sends
+        let mut policy = PoissonPolicy::with_seed(1000.0, Some(9)).unwrap();
+        policy.next_send_time(0);
+        let (count, capped) = policy.count_intended_before(1_000_000_000, u64::MAX);
+        assert!(!capped && (900..=1100).contains(&count), "{count}");
+    }
+
+    #[test]
+    fn unsent_count_includes_the_next_intended_time_and_respects_the_cap() {
+        let mut policy = FixedRatePolicy::new(1000.0);
+        // Never started: nothing was intended
+        assert_eq!(policy.count_intended_before(10_000_000, 100), (0, false));
+        policy.next_send_time(0);
+        policy.on_request_sent(0);
+        // Due at 1, 2, ..., 9 ms; 10 ms is not before the end
+        assert_eq!(policy.count_intended_before(10_000_000, 100), (9, false));
+        assert_eq!(policy.count_intended_before(10_000_001, 100), (10, false));
+        assert_eq!(policy.count_intended_before(1_000_000, 100), (0, false));
+        assert_eq!(policy.count_intended_before(u64::MAX, 100), (100, true));
+
+        let mut paused = FixedRatePolicy::new(0.0);
+        paused.next_send_time(0);
+        assert_eq!(paused.count_intended_before(u64::MAX, 100), (0, false));
+
+        let mut poisson = PoissonPolicy::with_seed(1e6, Some(1)).unwrap();
+        poisson.next_send_time(0);
+        assert_eq!(poisson.count_intended_before(u64::MAX, 50), (50, true));
+    }
+
+    fn pattern(rate: f64) -> PatternAwarePolicy {
+        PatternAwarePolicy::new(
+            std::sync::Arc::new(crate::workload::patterns::SpikePattern::new(
+                rate,
+                1000.0,
+                Duration::from_millis(20),
+                Duration::from_millis(20),
+            )),
+            0,
+        )
+    }
+
+    #[test]
+    fn pattern_schedule_integrates_its_rate() {
+        // Constant 1000 req/s before the spike: one request per millisecond
+        let mut policy = pattern(1000.0);
+        policy.next_send_time(0);
+        assert_eq!(send_due(&mut policy, 5_000_000), [0, 1, 2, 3, 4, 5].map(|k| k * 1_000_000));
+
+        // A 20 ms spike at 1000 req/s after a pause schedules 20 requests,
+        // and the pause schedules none, even when the sender is late
+        let mut policy = pattern(0.0);
+        policy.next_send_time(0);
+        assert!(send_due(&mut policy, 19_999_999).is_empty());
+        let spike = send_due(&mut policy, 100_000_000);
+        assert_eq!(spike, (20..40).map(|k| k * 1_000_000).collect::<Vec<_>>());
+        assert_eq!(policy.count_intended_before(1_000_000_000, 100), (0, false));
+
+        let mut policy = pattern(0.0);
+        policy.next_send_time(0);
+        assert_eq!(policy.count_intended_before(1_000_000_000, 100), (20, false));
+        let mut policy = pattern(0.0);
+        policy.next_send_time(0);
+        assert_eq!(policy.count_intended_before(1_000_000_000, 5), (5, true));
     }
 }

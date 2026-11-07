@@ -66,6 +66,8 @@ const TX_QUEUE_STALE_TIMEOUT_NS: u64 = 60_000_000_000;
 struct PendingRequest {
     /// Cycles read when the send call completed
     send_ts: Timestamp,
+    /// Time from the intended send time to the send; zero without a schedule
+    send_lag: Duration,
     is_warmup: bool,
     /// Kernel TX timestamp of the send, once reported
     tx_kernel_ts: Option<KernelTimestamp>,
@@ -196,6 +198,16 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         self.policy.next_send_time(current_time_ns)
     }
 
+    /// Intended send time of the next request; `None` without a schedule
+    pub fn intended_send_time(&self) -> Option<u64> {
+        self.policy.intended_send_time()
+    }
+
+    /// Number of pending measurement (non-warmup) requests
+    pub fn measured_pending_count(&self) -> usize {
+        self.pending_map.values().filter(|pending| !pending.is_warmup).count()
+    }
+
     /// Notify the policy that a request was sent
     pub fn on_request_sent(&mut self, sent_time_ns: u64) {
         self.policy.on_request_sent(sent_time_ns);
@@ -228,6 +240,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         &mut self,
         req_id: ReqId,
         send_ts: Timestamp,
+        send_lag: Duration,
         tx: Option<TxRange>,
         is_warmup: bool,
     ) {
@@ -236,8 +249,15 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
             let now_ns = crate::timing::time_ns();
             self.tx_pending_queue.push_back((tx.end, req_id.clone(), now_ns));
         }
-        self.pending_map
-            .insert(req_id, PendingRequest { send_ts, is_warmup, tx_kernel_ts: None });
+        self.pending_map.insert(
+            req_id,
+            PendingRequest {
+                send_ts,
+                send_lag,
+                is_warmup,
+                tx_kernel_ts: None,
+            },
+        );
     }
 
     /// Clean up queue entry for a completed request that didn't receive its TX timestamp
@@ -390,7 +410,8 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
     /// Process `len` bytes the transport read into `recv_spare()`
     ///
     /// Returns (request_id, latency, is_warmup, bytes_consumed) for each
-    /// completed response.
+    /// completed response. The latency is the request's send lag plus its
+    /// service latency, from the send to the receive timestamp.
     fn process_received<F>(
         &mut self,
         len: usize,
@@ -445,7 +466,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
                     pending.send_ts
                 }
             };
-            let latency = recv_ts.duration_since(&send_ts);
+            let latency = pending.send_lag + recv_ts.duration_since(&send_ts);
             responses.push((req_id, latency, pending.is_warmup, consumed));
             cursor += consumed;
         }
@@ -548,7 +569,6 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         let mut connection_states = HashMap::with_capacity(total_connections);
         let mut connection_ids = Vec::with_capacity(total_connections);
         let mut ready_heap = ReadyHeap::new();
-        let current_time_ns = crate::timing::time_ns();
         let mut idx = 0;
 
         for (
@@ -563,8 +583,9 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
                 let (connection_id, address) = add_connection(&mut group, &target)?;
                 let mut policy = policy_scheduler.assign_policy(idx);
 
-                // Get initial next_send_time and add to heap
-                let next_send_time = policy.next_send_time(current_time_ns);
+                // The first call starts the connection's intended schedule once
+                // it is connected. Then add it to the heap.
+                let next_send_time = policy.next_send_time(crate::timing::time_ns());
                 ready_heap.push(connection_id, next_send_time);
 
                 let mut state = ConnectionState::new(
@@ -616,6 +637,23 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         req_id: ReqId,
         is_warmup: bool,
     ) -> Result<()> {
+        self.send_scheduled(connection_id, data, req_id, is_warmup, None).map(|_| ())
+    }
+
+    /// Send a request that was intended to go out at `intended_ns`
+    ///
+    /// The send lag is the time from `intended_ns` to the cycles the transport
+    /// read when the send completed, on the [`crate::timing::time_ns`] clock.
+    /// It is added to the request's latency. Returns the lag, or `None` for a
+    /// request without an intended time (closed loop), whose lag is zero.
+    pub fn send_scheduled(
+        &mut self,
+        connection_id: usize,
+        data: &[u8],
+        req_id: ReqId,
+        is_warmup: bool,
+        intended_ns: Option<u64>,
+    ) -> Result<Option<Duration>> {
         let state = self
             .connection_states
             .get_mut(&connection_id)
@@ -629,10 +667,20 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
 
         let receipt = self.group.send(connection_id, data)?;
 
-        let state = self.connection_states.get_mut(&connection_id).unwrap();
-        state.record_send(req_id, receipt.timestamp, receipt.tx, is_warmup);
+        let send_lag = intended_ns.map(|intended| {
+            Duration::from_nanos(receipt.timestamp.clock_ns().saturating_sub(intended))
+        });
 
-        Ok(())
+        let state = self.connection_states.get_mut(&connection_id).unwrap();
+        state.record_send(
+            req_id,
+            receipt.timestamp,
+            send_lag.unwrap_or_default(),
+            receipt.tx,
+            is_warmup,
+        );
+
+        Ok(send_lag)
     }
 
     /// Receive and process responses for a connection
@@ -811,6 +859,25 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         self.ready_heap.has_ready(current_time_ns)
     }
 
+    /// Count each connection's intended sends from its next intended time up
+    /// to `end_ns`, walking at most `cap` per connection
+    ///
+    /// Returns `(group_id, connection_id, count, capped)` for every connection
+    /// with a nonzero count, including closed ones. Consumes the schedules, so
+    /// call it only once the connections stop sending.
+    pub fn count_unsent(&mut self, end_ns: u64, cap: u64) -> Vec<(usize, usize, u64, bool)> {
+        let mut unsent: Vec<_> = self
+            .connection_states
+            .values_mut()
+            .filter_map(|state| {
+                let (count, capped) = state.policy.count_intended_before(end_ns, cap);
+                (count > 0).then_some((state.group_id, state.connection_id, count, capped))
+            })
+            .collect();
+        unsent.sort_unstable_by_key(|&(group_id, connection_id, _, _)| (group_id, connection_id));
+        unsent
+    }
+
     /// Get connection state by ID
     pub fn get_state(&self, connection_id: usize) -> Option<&ConnectionState<ReqId>> {
         self.connection_states.get(&connection_id)
@@ -941,8 +1008,8 @@ mod tests {
     fn fragmented_limit_frame_followed_by_coalesced_frame() {
         let mut state = state();
         let ts = Timestamp::now();
-        state.record_send(1, ts, tx(0, 1), false);
-        state.record_send(2, ts, tx(1, 2), false);
+        state.record_send(1, ts, Duration::ZERO, tx(0, 1), false);
+        state.record_send(2, ts, Duration::ZERO, tx(1, 2), false);
         let first = frame(1, MAX_PAYLOAD);
         assert!(state
             .process_recv(&first[..MAX_PAYLOAD - 4], ts, parse_frame)
@@ -963,7 +1030,7 @@ mod tests {
         for complete in [false, true] {
             let mut state = state();
             let ts = Timestamp::now();
-            state.record_send(1, ts, tx(0, 1), false);
+            state.record_send(1, ts, Duration::ZERO, tx(0, 1), false);
             let data = frame(1, MAX_PAYLOAD + 2);
             let len = if complete { data.len() } else { data.len() - 1 };
             let error = state.process_recv(&data[..len], ts, parse_frame).unwrap_err();
@@ -978,11 +1045,11 @@ mod tests {
         let ts = Timestamp::now();
         let mut data = Vec::new();
         for id in 0..100 {
-            state.record_send(id, ts, tx(0, id as u32), false);
+            state.record_send(id, ts, Duration::ZERO, tx(0, id as u32), false);
             data.extend(frame(id as u32, 8));
         }
         let tail = frame(100, 12);
-        state.record_send(100, ts, tx(0, 100), false);
+        state.record_send(100, ts, Duration::ZERO, tx(0, 100), false);
         data.extend_from_slice(&tail[..6]);
         assert_eq!(state.process_recv(&data, ts, parse_frame).unwrap().len(), 100);
         assert_eq!(state.buffered(), &tail[..6]);
@@ -994,7 +1061,7 @@ mod tests {
     fn invalid_parser_consumption_does_not_complete_request() {
         let mut state = state();
         let ts = Timestamp::now();
-        state.record_send(1, ts, tx(0, 1), false);
+        state.record_send(1, ts, Duration::ZERO, tx(0, 1), false);
         assert!(state.process_recv(&[0], ts, |_| Ok((2, Some(1)))).is_err());
         assert_eq!(state.pending_count(), 1);
     }
@@ -1003,7 +1070,7 @@ mod tests {
     fn consumed_bytes_without_request_id_is_an_error() {
         let mut state = state();
         let ts = Timestamp::now();
-        state.record_send(1, ts, tx(0, 1), false);
+        state.record_send(1, ts, Duration::ZERO, tx(0, 1), false);
         let error = state.process_recv(b"hello", ts, |_| Ok((5, None))).unwrap_err();
         assert_eq!(
             error.to_string(),
@@ -1014,7 +1081,7 @@ mod tests {
         // Consuming nothing is an incomplete response, with or without an ID
         for request_id in [None, Some(1)] {
             let mut state = self::state();
-            state.record_send(1, ts, tx(0, 1), false);
+            state.record_send(1, ts, Duration::ZERO, tx(0, 1), false);
             let responses = state.process_recv(b"hel", ts, |_| Ok((0, request_id))).unwrap();
             assert!(responses.is_empty());
             assert_eq!(state.buffered(), b"hel");
@@ -1100,7 +1167,13 @@ mod tests {
         ] {
             let mut state = state();
             let send_ts = Timestamp::now();
-            state.record_send(1, send_ts, Some(TxRange { start: 0, end: 8 }), false);
+            state.record_send(
+                1,
+                send_ts,
+                Duration::ZERO,
+                Some(TxRange { start: 0, end: 8 }),
+                false,
+            );
             std::thread::sleep(Duration::from_millis(10));
             // The TX stamp is decoded long after the send; its decode time
             // must not stand in for the send time
@@ -1141,8 +1214,8 @@ mod tests {
     fn cumulative_tx_stamp_maps_to_its_own_request() {
         let mut state = state();
         let ts = Timestamp::now();
-        state.record_send(1, ts, tx(0, 10), false);
-        state.record_send(2, ts, tx(10, 20), false);
+        state.record_send(1, ts, Duration::ZERO, tx(0, 10), false);
+        state.record_send(2, ts, Duration::ZERO, tx(10, 20), false);
         assert_eq!(state.set_tx_timestamp(10, true, sw(100)), 1);
         assert_eq!((stamped(&state, 1), stamped(&state, 2)), (Some(100), None));
         assert_eq!(state.set_tx_timestamp(20, true, sw(200)), 1);
@@ -1150,9 +1223,9 @@ mod tests {
         assert!(state.tx_pending_queue.is_empty());
 
         // A stamp for coalesced writes covers every request it ends past
-        state.record_send(3, ts, tx(20, 25), false);
-        state.record_send(4, ts, tx(25, 30), false);
-        state.record_send(5, ts, tx(30, 40), false);
+        state.record_send(3, ts, Duration::ZERO, tx(20, 25), false);
+        state.record_send(4, ts, Duration::ZERO, tx(25, 30), false);
+        state.record_send(5, ts, Duration::ZERO, tx(30, 40), false);
         assert_eq!(state.set_tx_timestamp(30, true, sw(300)), 2);
         assert_eq!(
             (stamped(&state, 3), stamped(&state, 4), stamped(&state, 5)),
@@ -1161,8 +1234,8 @@ mod tests {
 
         // Across the u32 wrap
         let mut state = self::state();
-        state.record_send(1, ts, tx(u32::MAX - 4, 5), false);
-        state.record_send(2, ts, tx(5, 15), false);
+        state.record_send(1, ts, Duration::ZERO, tx(u32::MAX - 4, 5), false);
+        state.record_send(2, ts, Duration::ZERO, tx(5, 15), false);
         assert_eq!(state.set_tx_timestamp(5, true, sw(1)), 1);
         assert_eq!((stamped(&state, 1), stamped(&state, 2)), (Some(1), None));
     }
@@ -1174,7 +1247,7 @@ mod tests {
         let mut state = state();
         let ts = Timestamp::now();
         for id in 0..4u64 {
-            state.record_send(id, ts, tx(id as u32, id as u32 + 1), false);
+            state.record_send(id, ts, Duration::ZERO, tx(id as u32, id as u32 + 1), false);
         }
         // Datagram 0's stamp is lost; 2 arrives before 1
         assert_eq!(state.set_tx_timestamp(3, false, sw(30)), 1);
@@ -1197,7 +1270,7 @@ mod tests {
     fn sends_without_tx_range_skip_correlation() {
         let mut state = state();
         let ts = Timestamp::now();
-        state.record_send(1, ts, None, false);
+        state.record_send(1, ts, Duration::ZERO, None, false);
         assert!(state.tx_pending_queue.is_empty());
         assert_eq!(state.set_tx_timestamp(1, true, sw(1)), 0);
         assert_eq!(state.process_recv(&frame(1, 8), ts, parse_frame).unwrap().len(), 1);
@@ -1240,6 +1313,15 @@ mod tests {
         pool
     }
 
+    /// Send on connection 0 as the worker does and put it back on the heap
+    fn send_and_reschedule(pool: &mut ConnectionPool<test_support::FakeGroup, u64>, now: u64) {
+        let state = pool.connection_states.get_mut(&0).unwrap();
+        state.on_request_sent(now);
+        let next = state.next_send_time(now);
+        state.set_on_heap(true);
+        pool.ready_heap.push(0, next);
+    }
+
     #[test]
     fn paused_pattern_refreshes_without_sending_and_resumes() {
         let mut pool = pattern_pool(0.0);
@@ -1248,27 +1330,73 @@ mod tests {
         assert_eq!(pool.peek_next_ready_time(), Some(20_000_100));
         assert_eq!(pool.pick_connection_at(20_000_100), Some(0));
         let state = pool.connection_states.get_mut(&0).unwrap();
-        state.on_request_sent(20_000_100);
-        let next = state.next_send_time(20_000_100);
-        state.set_on_heap(true);
-        pool.ready_heap.push(0, next);
-        // Even an overdue send must be revalidated if the pattern is now idle.
-        assert_eq!(pool.pick_connection_at(40_000_100), None);
-        assert_eq!(pool.peek_next_ready_time(), Some(50_000_100));
-        assert_eq!(pool.pick_connection_at(50_000_100), None);
+        assert_eq!(state.intended_send_time(), Some(20_000_100));
+        send_and_reschedule(&mut pool, 20_000_100);
+        // Requests intended during the spike are still sent after it ends,
+        // each with its own intended time, but the idle phase adds none.
+        let mut intended = Vec::new();
+        while pool.pick_connection_at(45_000_100).is_some() {
+            intended.push(pool.connection_states[&0].intended_send_time().unwrap());
+            send_and_reschedule(&mut pool, 45_000_100);
+        }
+        assert_eq!(intended, (21..40).map(|ms| ms * 1_000_000 + 100).collect::<Vec<_>>());
+        assert_eq!(pool.peek_next_ready_time(), Some(55_000_100));
+        assert_eq!(pool.pick_connection_at(55_000_100), None);
     }
 
     #[test]
     fn queued_low_rate_pattern_observes_short_spike() {
         let mut pool = pattern_pool(0.1); // Ten seconds between baseline requests.
         assert_eq!(pool.pick_connection_at(100), Some(0));
-        let state = pool.connection_states.get_mut(&0).unwrap();
-        state.on_request_sent(100);
-        let next = state.next_send_time(100);
-        state.set_on_heap(true);
-        pool.ready_heap.push(0, next);
+        send_and_reschedule(&mut pool, 100);
         assert_eq!(pool.pick_connection_at(10_000_100), None);
-        assert_eq!(pool.pick_connection_at(20_000_100), Some(0));
+        // The low rate accumulated 0.002 requests before the spike, so the
+        // spike's rate completes the next one 0.998 ms into it.
+        assert_eq!(pool.pick_connection_at(20_000_100), None);
+        assert_eq!(pool.pick_connection_at(21_000_100), Some(0));
+        assert_eq!(pool.connection_states[&0].intended_send_time(), Some(20_998_100));
+    }
+
+    #[test]
+    fn latency_adds_send_lag_to_the_service_latency() {
+        use xylem_transport::KernelClock;
+        let kernel = |nanos| KernelTimestamp { nanos, clock: KernelClock::Realtime };
+        let lag = Duration::from_millis(3);
+        let mut state = state();
+        let send_ts = Timestamp::now();
+        state.record_send(1, send_ts, lag, tx(0, 8), false);
+        state.record_send(2, send_ts, lag, tx(8, 16), false);
+        // A kernel TX stamp still measures the service part: 500 µs
+        assert_eq!(state.set_tx_timestamp(8, true, kernel(1_000_000)), 1);
+        let recv_ts = Timestamp::now().with_kernel(kernel(1_500_000));
+        let responses = state
+            .process_recv(&[frame(1, 8), frame(2, 8)].concat(), recv_ts, parse_frame)
+            .unwrap();
+        assert_eq!(responses[0].1, lag + Duration::from_micros(500));
+        // Without one, the service part is measured in cycles
+        assert_eq!(responses[1].1, lag + recv_ts.duration_since(&send_ts));
+    }
+
+    #[test]
+    fn scheduled_send_measures_lag_from_the_intended_time() {
+        let factory = test_support::FakeFactory::default();
+        factory.0.lock().unwrap().live_timestamps = true;
+        let mut pool = ConnectionPool::new(
+            &factory,
+            "127.0.0.1:1".parse().unwrap(),
+            1,
+            4,
+            Box::new(crate::scheduler::UniformPolicyScheduler::closed_loop()),
+            0,
+        )
+        .unwrap();
+        let intended = crate::timing::time_ns().saturating_sub(5_000_000);
+        let lag = pool.send_scheduled(0, &[0], 1u64, false, Some(intended)).unwrap().unwrap();
+        assert!(lag >= Duration::from_millis(5) && lag < Duration::from_secs(1), "{lag:?}");
+        // A request without an intended time has no lag
+        assert_eq!(pool.send_scheduled(0, &[0], 2u64, true, None).unwrap(), None);
+        assert_eq!(pool.get_state(0).unwrap().measured_pending_count(), 1);
+        assert_eq!(pool.get_state(0).unwrap().pending_count(), 2);
     }
 
     #[test]
@@ -1319,6 +1447,8 @@ pub(crate) mod test_support {
         pub tx_timestamps: Vec<xylem_transport::TxTimestampInfo>,
         /// Report EOF once `responses` is empty
         pub eof: bool,
+        /// Stamp sends and receives with the current time instead of `timestamp`
+        pub live_timestamps: bool,
     }
 
     impl Default for FakeIo {
@@ -1334,6 +1464,17 @@ pub(crate) mod test_support {
                 response_connection_id: 0,
                 tx_timestamps: Vec::new(),
                 eof: false,
+                live_timestamps: false,
+            }
+        }
+    }
+
+    impl FakeIo {
+        fn now(&self) -> Timestamp {
+            if self.live_timestamps {
+                Timestamp::now()
+            } else {
+                self.timestamp
             }
         }
     }
@@ -1376,7 +1517,7 @@ pub(crate) mod test_support {
             io.sent.push(data.to_vec());
             let end = io.sent.len() as u32;
             Ok(xylem_transport::SendReceipt {
-                timestamp: io.timestamp,
+                timestamp: io.now(),
                 tx: Some(TxRange { start: end - 1, end }),
             })
         }
@@ -1393,7 +1534,7 @@ pub(crate) mod test_support {
                 return Ok(RecvOutcome::WouldBlock);
             }
             buf[..data.len()].copy_from_slice(&data);
-            Ok(RecvOutcome::Data { len: data.len(), timestamp: io.timestamp })
+            Ok(RecvOutcome::Data { len: data.len(), timestamp: io.now() })
         }
 
         fn poll(

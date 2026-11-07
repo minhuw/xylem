@@ -4,10 +4,14 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 pub mod policy;
+pub mod requests;
 pub mod tuple_collector;
 
 // Re-export main types
 pub use policy::SamplingPolicy;
+pub use requests::{
+    RequestCounts, SendLagStats, SendLagSummary, LATE_SEND_THRESHOLD, UNSENT_WALK_CAP,
+};
 pub use tuple_collector::{
     ConnectionStats, LatencyStorage, StatsEntry, StatsKey, TimeSeriesPoint, TupleStatsCollector,
 };
@@ -17,7 +21,11 @@ pub use tuple_collector::{
 /// `TupleStatsCollector` implements this trait and groups stats by
 /// (time_bucket, group_id, connection_id).
 pub trait StatsRecorder: Send {
-    /// Record a latency sample
+    /// Record a latency sample of a completed request
+    ///
+    /// A latency recorded after [`Self::end_measurement`] belongs to a request
+    /// that completed during the drain: it counts toward the latency
+    /// distribution and the completed requests, but not toward throughput.
     ///
     /// # Arguments
     /// * `group_id` - Traffic group ID
@@ -32,8 +40,29 @@ pub trait StatsRecorder: Send {
     fn record_rx_bytes(&mut self, group_id: usize, connection_id: usize, bytes: usize);
 
     /// Mark the end of the measurement loop (a `timing::time_ns` value).
-    /// Responses drained after it are still recorded.
+    /// Responses drained after it still count toward latency, not throughput.
     fn end_measurement(&mut self, _end_ns: u64) {}
+
+    /// Record a measurement request that was sent, with its lag behind its
+    /// intended send time (`None` for a closed-loop request)
+    fn record_sent(&mut self, _group_id: usize, _connection_id: usize, _lag: Option<Duration>) {}
+
+    /// Record measurement requests still pending when the drain deadline passed
+    fn record_timed_out(&mut self, _group_id: usize, _connection_id: usize, _count: u64) {}
+
+    /// Record measurement requests pending on a connection that closed or failed
+    fn record_failed(&mut self, _group_id: usize, _connection_id: usize, _count: u64) {}
+
+    /// Record intended sends before the end of the window that were never
+    /// sent; `capped` when counting stopped at its cap
+    fn record_unsent(
+        &mut self,
+        _group_id: usize,
+        _connection_id: usize,
+        _count: u64,
+        _capped: bool,
+    ) {
+    }
 }
 
 // Implement StatsRecorder for TupleStatsCollector (uses all dimensions)
@@ -52,6 +81,24 @@ impl StatsRecorder for TupleStatsCollector {
 
     fn end_measurement(&mut self, end_ns: u64) {
         TupleStatsCollector::end_measurement(self, end_ns);
+    }
+
+    fn record_sent(&mut self, group_id: usize, _connection_id: usize, lag: Option<Duration>) {
+        TupleStatsCollector::record_sent(self, group_id, lag);
+    }
+
+    fn record_timed_out(&mut self, group_id: usize, _connection_id: usize, count: u64) {
+        self.request_counts_mut(group_id).timed_out += count;
+    }
+
+    fn record_failed(&mut self, group_id: usize, _connection_id: usize, count: u64) {
+        self.request_counts_mut(group_id).failed += count;
+    }
+
+    fn record_unsent(&mut self, group_id: usize, _connection_id: usize, count: u64, capped: bool) {
+        let counts = self.request_counts_mut(group_id);
+        counts.unsent += count;
+        counts.unsent_capped |= capped;
     }
 }
 
@@ -82,5 +129,7 @@ pub struct AggregatedStats {
     pub clamped_samples: Option<u64>,
     pub throughput_rps: f64,
     pub throughput_mbps: f64,
+    /// Requests completed inside the measurement window, which throughput
+    /// counts. Requests completed during the drain are excluded.
     pub total_requests: u64,
 }

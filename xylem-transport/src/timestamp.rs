@@ -92,6 +92,13 @@ impl Timestamp {
         Duration::from_nanos(nanos)
     }
 
+    /// This event's cycles on the [`time_ns`] clock, in nanoseconds
+    #[inline]
+    pub fn clock_ns(&self) -> u64 {
+        let calibration = get_calibration();
+        calibration.cycles_to_nanos(self.cycles.saturating_sub(calibration.start_cycles))
+    }
+
     /// Get the raw cycle count (for comparisons)
     #[inline]
     pub fn cycles(&self) -> u64 {

@@ -110,6 +110,7 @@ fn run_worker(
         duration,
         conn_count: num_connections,
         max_pending_per_conn: max_pending,
+        drain_timeout: xylem_core::threading::DEFAULT_DRAIN_TIMEOUT,
     };
 
     let mut worker =
