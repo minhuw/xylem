@@ -443,7 +443,16 @@ fn parse_protocol_config(
                     group_name
                 );
             }
-            let config = parse_typed_config(pc, "Redis", group_idx, group_name)?;
+            let config: xylem_protocols::RedisConfig =
+                parse_typed_config(pc, "Redis", group_idx, group_name)
+                    .map_err(|e| anyhow::anyhow!(redact_auth(pc, &e.to_string())))?;
+            // Check auth, db and resp now, including that password_env is set
+            config.connection_setup().with_context(|| {
+                format!(
+                    "Traffic group {} '{}' has invalid Redis protocol_config",
+                    group_idx, group_name
+                )
+            })?;
             Ok(ProtocolConfig::Redis(config))
         }
         ProtocolKind::MemcachedBinary => {
@@ -467,6 +476,60 @@ fn parse_protocol_config(
             Ok(ProtocolConfig::XylemEcho(config))
         }
     }
+}
+
+/// The secret values under a protocol_config's `auth`: every string in it,
+/// except a username
+fn auth_secrets(pc: Option<&serde_json::Value>) -> Vec<String> {
+    fn collect(value: &serde_json::Value, secrets: &mut Vec<String>) {
+        match value {
+            serde_json::Value::String(text) if !text.is_empty() => secrets.push(text.clone()),
+            serde_json::Value::Array(items) => items.iter().for_each(|item| collect(item, secrets)),
+            serde_json::Value::Object(fields) => fields
+                .iter()
+                .filter(|(name, _)| !matches!(name.as_str(), "username" | "password_env"))
+                .for_each(|(_, field)| collect(field, secrets)),
+            _ => {}
+        }
+    }
+    let mut secrets = Vec::new();
+    if let Some(auth) = pc.and_then(|pc| pc.get("auth")) {
+        collect(auth, &mut secrets);
+    }
+    secrets
+}
+
+/// `message` without the secret values of `pc`'s `auth`. Parse errors can
+/// quote a value, for example when `auth` is a string instead of a table.
+fn redact_auth(pc: Option<&serde_json::Value>, message: &str) -> String {
+    auth_secrets(pc).iter().fold(message.to_string(), |message, secret| {
+        message.replace(secret.as_str(), "<redacted>")
+    })
+}
+
+/// A copy of a protocol_config that is safe to log: the secret values of its
+/// `auth` are replaced
+pub fn redacted_protocol_config(pc: &serde_json::Value) -> serde_json::Value {
+    let mut pc = pc.clone();
+    if let Some(auth) = pc.get_mut("auth") {
+        *auth = match auth {
+            serde_json::Value::Object(fields) => serde_json::Value::Object(
+                fields
+                    .iter()
+                    .map(|(name, value)| {
+                        let value = if matches!(name.as_str(), "username" | "password_env") {
+                            value.clone()
+                        } else {
+                            serde_json::Value::String("<redacted>".to_string())
+                        };
+                        (name.clone(), value)
+                    })
+                    .collect(),
+            ),
+            _ => serde_json::Value::String("<redacted>".to_string()),
+        };
+    }
+    pc
 }
 
 /// Parse protocol_config as `T`; an omitted protocol_config uses `T`'s defaults
@@ -1614,6 +1677,106 @@ file = "/tmp/test.json"
             [ProtocolConfig::Masstree(masstree)] => assert_eq!(masstree.operation, "set"),
             other => panic!("Expected one Masstree protocol config, got {:?}", other),
         }
+    }
+
+    fn redis_profile(protocol_config: &str) -> ProfileConfig {
+        let toml_str = format!(
+            r#"
+[experiment]
+name = "test"
+duration = "10s"
+
+[[traffic_groups]]
+name = "main"
+protocol = "redis"
+target = "127.0.0.1:6379"
+threads = [0]
+connections_per_thread = 1
+
+[traffic_groups.protocol_config]
+{protocol_config}
+
+[traffic_groups.protocol_config.keys]
+strategy = "sequential"
+value_size = 8
+
+[traffic_groups.traffic_policy]
+type = "closed-loop"
+
+[output]
+format = "json"
+file = "/tmp/test.json"
+"#
+        );
+        toml::from_str(&toml_str).expect("TOML should parse")
+    }
+
+    #[test]
+    fn redis_connection_setup_is_parsed_and_validated() {
+        let mut config = redis_profile(
+            "auth = { username = \"bench\", password = \"s3cret\" }\ndb = 3\nresp = 3",
+        );
+        config.validate().expect("valid Redis connection setup");
+        let [ProtocolConfig::Redis(redis)] = &config.protocol_configs[..] else {
+            panic!("Expected one Redis protocol config");
+        };
+        assert_eq!((redis.db, redis.resp), (Some(3), Some(3)));
+        assert_eq!(redis.connection_setup().unwrap().step_names(), ["AUTH", "SELECT", "HELLO"]);
+        // Debug output of the validated profile never shows the password
+        assert!(!format!("{:?}", config.protocol_configs).contains("s3cret"));
+
+        // The variable password_env names must exist when the run starts
+        let mut config = redis_profile(
+            "auth = { password_env = \"XYLEM_TEST_REDIS_PASSWORD_THAT_IS_NEVER_SET\" }",
+        );
+        let err = format!("{:#}", config.validate().unwrap_err());
+        assert!(
+            err.starts_with("Traffic group 0 'main' has invalid Redis protocol_config"),
+            "{err}"
+        );
+        assert!(
+            err.contains(
+                "environment variable XYLEM_TEST_REDIS_PASSWORD_THAT_IS_NEVER_SET is not set"
+            ),
+            "{err}"
+        );
+
+        for (protocol_config, expected) in [
+            ("resp = 4", "Redis resp must be 2 or 3, got 4"),
+            ("db = 2147483648", "Redis db must be at most 2147483647, got 2147483648"),
+            ("db = -1", "invalid value: integer `-1`"),
+            ("auth = { password = \"s3cret\", password_env = \"X\" }", "set exactly one"),
+            ("auth = { username = \"bench\" }", "needs a password or password_env"),
+            ("auth = { pasword = \"s3cret\" }", "unknown field `pasword`"),
+        ] {
+            let err = format!("{:#}", redis_profile(protocol_config).validate().unwrap_err());
+            assert!(err.contains(expected), "{protocol_config}: {err}");
+            assert!(!err.contains("s3cret"), "{protocol_config}: {err}");
+        }
+    }
+
+    #[test]
+    fn redis_auth_secrets_are_redacted_from_errors_and_logs() {
+        // A parse error that would quote the value names no password
+        let err = redis_profile("auth = \"s3cret\"").validate().unwrap_err().to_string();
+        assert!(err.contains("invalid Redis protocol_config"), "{err}");
+        assert!(!err.contains("s3cret"), "{err}");
+
+        let pc = serde_json::json!({
+            "auth": { "username": "bench", "password": "s3cret", "password_env": "PW" },
+            "db": 3,
+        });
+        assert_eq!(
+            redacted_protocol_config(&pc),
+            serde_json::json!({
+                "auth": { "username": "bench", "password": "<redacted>", "password_env": "PW" },
+                "db": 3,
+            })
+        );
+        let pc = serde_json::json!({ "auth": "s3cret" });
+        assert_eq!(redacted_protocol_config(&pc), serde_json::json!({ "auth": "<redacted>" }));
+        let pc = serde_json::json!({ "keys": { "strategy": "sequential" } });
+        assert_eq!(redacted_protocol_config(&pc), pc);
     }
 
     #[test]

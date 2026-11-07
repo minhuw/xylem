@@ -17,8 +17,8 @@ pub mod xylem_echo;
 // Re-export commonly used types
 pub use configs::{
     CommandValueSizeConfig, HttpConfig, InsertPhaseConfig, KeysConfig, MasstreeConfig,
-    MasstreeScanConfig, MemcachedConfig, RedisCommandParams, RedisCommandWeight, RedisConfig,
-    RedisOperationsConfig, ValueSizeConfig, XylemEchoConfig,
+    MasstreeScanConfig, MemcachedConfig, RedisAuthConfig, RedisCommandParams, RedisCommandWeight,
+    RedisConfig, RedisOperationsConfig, ValueSizeConfig, XylemEchoConfig,
 };
 pub use http::HttpMethod;
 pub use http::HttpProtocol;

@@ -65,6 +65,7 @@ fn redis_weighted_config() -> RedisConfig {
         value_size: Some(ValueSizeConfig::Uniform { min: 2, max: 9 }),
         random_data: true,
         insert_phase: Some(InsertPhaseConfig { key_count: Some(2), value_size: Some(4) }),
+        ..Default::default()
     }
 }
 
@@ -118,6 +119,7 @@ fn redis_per_command_keys_config() -> RedisConfig {
         }),
         random_data: false,
         insert_phase: Some(InsertPhaseConfig { key_count: None, value_size: None }),
+        ..Default::default()
     }
 }
 
@@ -133,6 +135,7 @@ fn redis_fixed_config() -> RedisConfig {
         value_size: Some(ValueSizeConfig::Normal { mean: 6.0, std_dev: 2.0, min: 3, max: 9 }),
         random_data: true,
         insert_phase: Some(InsertPhaseConfig { key_count: Some(1), value_size: None }),
+        ..Default::default()
     }
 }
 

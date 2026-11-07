@@ -185,6 +185,7 @@ fn redis_constructor_retains_variable_sizes_random_data_and_per_command_keys() {
         }),
         random_data: true,
         insert_phase: Some(InsertPhaseConfig { key_count: Some(1), value_size: Some(9) }),
+        ..Default::default()
     };
     let mut first = RedisProtocol::from_config(&config, Some(42)).unwrap();
     let mut second = RedisProtocol::from_config(&config, Some(42)).unwrap();

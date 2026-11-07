@@ -1,6 +1,6 @@
 //! Config-aware Redis construction.
 use crate::configs::{RedisConfig, RedisOperationsConfig};
-use crate::redis::{RedisOp, RedisProtocol};
+use crate::redis::{ConnectionSetup, RedisOp, RedisProtocol};
 use crate::{CommandSelector, FixedCommandSelector, WeightedCommandSelector};
 use anyhow::Result;
 
@@ -49,6 +49,19 @@ impl RedisConfig {
     }
 }
 
+impl RedisConfig {
+    /// Validate the connection setup fields (auth, db, resp) and build the
+    /// setup sequence. Reads the password from the environment when
+    /// `auth.password_env` is set.
+    pub fn connection_setup(&self) -> Result<ConnectionSetup> {
+        let auth = match &self.auth {
+            Some(auth) => Some((auth.username.clone(), auth.resolve_password()?)),
+            None => None,
+        };
+        ConnectionSetup::new(auth, self.db, self.resp)
+    }
+}
+
 impl RedisProtocol {
     /// Construct a standalone Redis workload from all supported configuration fields.
     pub fn from_config(config: &RedisConfig, seed: Option<u64>) -> Result<Self> {
@@ -67,7 +80,7 @@ impl RedisProtocol {
             let (count, size) = insert.resolve(&config.keys)?;
             protocol = protocol.with_insert_phase(count, size);
         }
-        Ok(protocol)
+        Ok(protocol.with_connection_setup(config.connection_setup()?))
     }
 }
 
@@ -187,6 +200,96 @@ mod tests {
         };
         let protocol = RedisProtocol::from_config(&config, None).unwrap();
         assert_eq!(Protocol::name(&protocol), "redis");
+    }
+
+    fn auth(username: Option<&str>, password: Option<&str>, env: Option<&str>) -> RedisConfig {
+        RedisConfig {
+            auth: Some(crate::RedisAuthConfig {
+                username: username.map(str::to_string),
+                password: password.map(str::to_string),
+                password_env: env.map(str::to_string),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn connection_setup_from_config() {
+        let first_request = |config: &RedisConfig| {
+            RedisProtocol::from_config(config, None).unwrap().next_request(0)
+        };
+        let request = first_request(&auth(None, Some("pw"), None));
+        assert_eq!(
+            request,
+            crate::Request::setup(b"*2\r\n$4\r\nAUTH\r\n$2\r\npw\r\n".to_vec(), (0, 0))
+        );
+
+        // Cargo sets CARGO_PKG_NAME for the test process
+        let request = first_request(&auth(Some("bench"), None, Some("CARGO_PKG_NAME")));
+        let expected = b"*3\r\n$4\r\nAUTH\r\n$5\r\nbench\r\n$15\r\nxylem-protocols\r\n";
+        assert_eq!(request, crate::Request::setup(expected.to_vec(), (0, 0)));
+
+        let config = RedisConfig {
+            db: Some(3),
+            resp: Some(3),
+            ..Default::default()
+        };
+        assert_eq!(config.connection_setup().unwrap().step_names(), ["SELECT", "HELLO"]);
+        assert!(first_request(&config).metadata.is_setup);
+        assert!(!first_request(&RedisConfig::default()).metadata.is_warmup);
+    }
+
+    #[test]
+    fn connection_setup_validation_errors_never_show_the_password() {
+        for (config, expected) in [
+            (
+                auth(None, None, Some("XYLEM_TEST_UNSET_REDIS_PASSWORD")),
+                "Redis auth.password_env: environment variable XYLEM_TEST_UNSET_REDIS_PASSWORD \
+                 is not set",
+            ),
+            (auth(None, None, Some("")), "Redis auth.password_env must not be empty"),
+            (
+                auth(None, Some("s3cret"), Some("X")),
+                "Redis auth sets both password and password_env; set exactly one",
+            ),
+            (
+                auth(Some("bench"), None, None),
+                "Redis auth needs a password or password_env; set exactly one",
+            ),
+            (
+                RedisConfig { resp: Some(0), ..Default::default() },
+                "Redis resp must be 2 or 3, got 0",
+            ),
+            (
+                RedisConfig { db: Some(u32::MAX), ..Default::default() },
+                "Redis db must be at most 2147483647, got 4294967295",
+            ),
+        ] {
+            let err = config.connection_setup().unwrap_err().to_string();
+            assert_eq!(err, expected);
+            assert!(RedisProtocol::from_config(&config, None).is_err());
+        }
+        let debug = format!("{:?}", auth(Some("bench"), Some("s3cret"), None));
+        assert!(debug.contains("bench") && debug.contains("<redacted>"), "{debug}");
+        assert!(!debug.contains("s3cret"), "{debug}");
+    }
+
+    #[test]
+    fn auth_config_accepts_exactly_the_documented_fields() {
+        let config: RedisConfig = serde_json::from_value(serde_json::json!({
+            "auth": { "username": "bench", "password_env": "REDIS_PASSWORD" },
+            "db": 3,
+            "resp": 3,
+        }))
+        .unwrap();
+        let auth = config.auth.unwrap();
+        assert_eq!(auth.username.as_deref(), Some("bench"));
+        assert_eq!(auth.password_env.as_deref(), Some("REDIS_PASSWORD"));
+        assert_eq!((config.db, config.resp), (Some(3), Some(3)));
+        let unknown = serde_json::json!({ "auth": { "user": "bench", "password": "pw" } });
+        assert!(serde_json::from_value::<RedisConfig>(unknown).is_err());
+        let negative = serde_json::json!({ "db": -1 });
+        assert!(serde_json::from_value::<RedisConfig>(negative).is_err());
     }
 
     #[test]
