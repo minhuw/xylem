@@ -17,8 +17,7 @@ pub mod workload;
 
 // Re-export transport types from xylem-transport
 pub use xylem_transport::{
-    ConnectionGroup, RecvOutcome, SendReceipt, Timestamp as TransportTimestamp, Transport,
-    TransportFactory,
+    ConnectionGroup, RecvOutcome, SendReceipt, Timestamp as TransportTimestamp, TransportFactory,
 };
 
 pub use error::{Error, Result};

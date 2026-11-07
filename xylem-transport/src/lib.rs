@@ -26,35 +26,7 @@
 //! - `Poll`: Portable, no fd limit, good performance
 //! - `Select`: Portable, but limited to ~1024 file descriptors
 //!
-//! ## Transport APIs
-//!
-//! This crate provides two APIs:
-//!
-//! ### Single-Connection API (`Transport` trait)
-//!
-//! Simple API for managing individual connections. Each transport owns its own
-//! multiplexer instance, so polling N connections requires N syscalls.
-//!
-//! ```rust,no_run
-//! use xylem_transport::{TcpTransport, Transport, Timestamp};
-//! use std::net::SocketAddr;
-//!
-//! let mut transport = TcpTransport::new();
-//! let addr: SocketAddr = "127.0.0.1:6379".parse().unwrap();
-//!
-//! transport.connect(&addr).unwrap();
-//! let send_ts = transport.send(b"PING\r\n").unwrap();
-//!
-//! while !transport.poll_readable().unwrap() {
-//!     std::hint::spin_loop();
-//! }
-//!
-//! let (response, recv_ts) = transport.recv().unwrap();
-//! let latency = recv_ts.duration_since(&send_ts);
-//! println!("Latency: {:?}", latency);
-//! ```
-//!
-//! ### Connection Group API (`ConnectionGroup` trait)
+//! ## Connection Group API
 //!
 //! Efficient API for managing multiple connections. A single multiplexer is
 //! shared across all connections in the group, so polling N connections requires
@@ -132,55 +104,6 @@ impl From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Self {
         Error::Io(err)
     }
-}
-
-// =============================================================================
-// Single-Connection API (Transport trait)
-// =============================================================================
-
-/// Transport protocol trait for single connections
-///
-/// This trait defines the interface for transport layer implementations.
-/// All methods are blocking/synchronous to enable tight control over timing
-/// and busy-waiting in the event loop.
-///
-/// Each `Transport` instance owns its own poll/epoll instance. For managing
-/// multiple connections efficiently, use the `ConnectionGroup` API instead.
-pub trait Transport: Send {
-    /// Connect to a target
-    ///
-    /// Establishes a connection to the specified target address.
-    /// Returns immediately after connection is established.
-    fn connect(&mut self, target: &SocketAddr) -> Result<()>;
-
-    /// Send data and return timestamp
-    ///
-    /// Sends the provided data and captures a nanosecond-precision timestamp
-    /// immediately after the send operation completes.
-    ///
-    /// For non-blocking transports, this may return immediately without
-    /// guaranteeing the data has been written to the network.
-    fn send(&mut self, data: &[u8]) -> Result<Timestamp>;
-
-    /// Receive data and return timestamp
-    ///
-    /// Attempts to receive data from the transport. Returns the received data
-    /// and a timestamp captured immediately after the receive operation.
-    ///
-    /// For non-blocking transports, this returns immediately even if no data
-    /// is available (returning empty buffer or error).
-    fn recv(&mut self) -> Result<(Vec<u8>, Timestamp)>;
-
-    /// Check if there is data ready to read
-    ///
-    /// Non-blocking check for read readiness. Returns true if recv() will
-    /// likely return data without blocking.
-    fn poll_readable(&mut self) -> Result<bool>;
-
-    /// Close the connection
-    ///
-    /// Closes the transport and releases resources.
-    fn close(&mut self) -> Result<()>;
 }
 
 // =============================================================================
@@ -352,11 +275,6 @@ pub mod hw_timestamp;
 
 pub use mux::{Multiplexer, MultiplexerType};
 pub use timestamp::{time_ns, Timestamp};
-
-pub use tcp::TcpTransport;
-pub use udp::UdpTransport;
-#[cfg(unix)]
-pub use unix::UnixTransport;
 
 pub use tcp::{TcpConnectionGroup, TcpTransportFactory};
 pub use udp::{UdpConnectionGroup, UdpTransportFactory};

@@ -1,8 +1,6 @@
 //! UDP transport implementation using non-blocking I/O
 //!
-//! This module provides two APIs:
-//! - `UdpTransport`: Single-connection API (one multiplexer per connection)
-//! - `UdpConnectionGroup`: Multi-connection API (one multiplexer per group)
+//! `UdpConnectionGroup` manages many UDP sockets behind one multiplexer.
 //!
 //! ## Hardware Timestamping (Linux only)
 //!
@@ -12,11 +10,8 @@
 //! Configure via `UdpTimestampConfig`.
 
 use crate::group::{GroupCore, GroupSocket, TimestampConfig};
-use crate::mux::{Interest, Multiplexer, MultiplexerType};
-use crate::{
-    ConnectionGroup, Error, RecvOutcome, Result, SendReceipt, Timestamp, Transport,
-    TransportFactory,
-};
+use crate::mux::MultiplexerType;
+use crate::{ConnectionGroup, RecvOutcome, Result, SendReceipt, Timestamp, TransportFactory};
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -25,114 +20,10 @@ use std::time::Duration;
 #[cfg(target_os = "linux")]
 use crate::hw_timestamp;
 
-const DEFAULT_UDP_BUFFER_SIZE: usize = 65535;
-
 /// Configuration for UDP timestamping (Linux only)
 ///
 /// The same configuration type as `TcpTimestampConfig`.
 pub type UdpTimestampConfig = TimestampConfig;
-
-pub struct UdpTransport {
-    socket: Option<UdpSocket>,
-    target: Option<SocketAddr>,
-    mux: Multiplexer,
-    recv_buffer: Vec<u8>,
-}
-
-impl UdpTransport {
-    pub fn new() -> Self {
-        Self::with_multiplexer(MultiplexerType::default())
-    }
-
-    pub fn with_multiplexer(mux_type: MultiplexerType) -> Self {
-        Self {
-            socket: None,
-            target: None,
-            mux: Multiplexer::new(mux_type).expect("Failed to create multiplexer"),
-            recv_buffer: vec![0u8; DEFAULT_UDP_BUFFER_SIZE],
-        }
-    }
-}
-
-impl Default for UdpTransport {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Transport for UdpTransport {
-    fn connect(&mut self, target: &SocketAddr) -> Result<()> {
-        let bind_addr: SocketAddr = if target.is_ipv4() {
-            "0.0.0.0:0".parse().unwrap()
-        } else {
-            "[::]:0".parse().unwrap()
-        };
-
-        let socket = UdpSocket::bind(bind_addr)?;
-        socket.set_nonblocking(true)?;
-
-        self.mux.register_fd(&socket, 0, Interest::READABLE)?;
-
-        self.socket = Some(socket);
-        self.target = Some(*target);
-
-        Ok(())
-    }
-
-    fn send(&mut self, data: &[u8]) -> Result<Timestamp> {
-        let socket = self
-            .socket
-            .as_ref()
-            .ok_or_else(|| Error::Connection("Not connected".to_string()))?;
-
-        let target = self
-            .target
-            .ok_or_else(|| Error::Connection("No target address set".to_string()))?;
-
-        loop {
-            match socket.send_to(data, target) {
-                Ok(_) => break,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    std::hint::spin_loop();
-                    continue;
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-
-        Ok(Timestamp::now())
-    }
-
-    fn recv(&mut self) -> Result<(Vec<u8>, Timestamp)> {
-        let socket = self
-            .socket
-            .as_ref()
-            .ok_or_else(|| Error::Connection("Not connected".to_string()))?;
-
-        match socket.recv_from(&mut self.recv_buffer) {
-            Ok((n, _src_addr)) => {
-                let timestamp = Timestamp::now();
-                let data = self.recv_buffer[..n].to_vec();
-                Ok((data, timestamp))
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok((Vec::new(), Timestamp::now())),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    fn poll_readable(&mut self) -> Result<bool> {
-        let events = self.mux.wait(Some(Duration::ZERO))?;
-        Ok(!events.is_empty())
-    }
-
-    fn close(&mut self) -> Result<()> {
-        if let Some(socket) = self.socket.take() {
-            let _ = self.mux.deregister_fd(&socket);
-        }
-        self.target = None;
-        Ok(())
-    }
-}
 
 // =============================================================================
 // Connection Group API
@@ -400,118 +291,9 @@ impl TransportFactory for UdpTransportFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Error;
     use std::net::UdpSocket as StdUdpSocket;
     use std::thread;
-
-    #[test]
-    fn test_udp_connect() {
-        let server = StdUdpSocket::bind("127.0.0.1:0").unwrap();
-        let addr = server.local_addr().unwrap();
-
-        let mut transport = UdpTransport::new();
-        assert!(transport.connect(&addr).is_ok());
-        assert!(transport.target.is_some());
-        assert_eq!(transport.target.unwrap(), addr);
-    }
-
-    #[test]
-    fn test_udp_send_recv() {
-        let server = StdUdpSocket::bind("127.0.0.1:0").unwrap();
-        let addr = server.local_addr().unwrap();
-
-        thread::spawn(move || {
-            let mut buf = vec![0u8; 65535];
-            while let Ok((n, src)) = server.recv_from(&mut buf) {
-                server.send_to(&buf[..n], src).unwrap();
-            }
-        });
-
-        thread::sleep(Duration::from_millis(10));
-
-        let mut transport = UdpTransport::new();
-        transport.connect(&addr).unwrap();
-
-        let test_data = b"Hello, UDP!";
-        let send_ts = transport.send(test_data).unwrap();
-
-        thread::sleep(Duration::from_millis(10));
-
-        for _ in 0..100 {
-            if transport.poll_readable().unwrap() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(1));
-        }
-
-        let (recv_data, recv_ts) = transport.recv().unwrap();
-        assert_eq!(recv_data, test_data);
-        assert!(recv_ts.cycles() >= send_ts.cycles());
-    }
-
-    #[test]
-    fn test_udp_send_without_connect() {
-        let mut transport = UdpTransport::new();
-        let result = transport.send(b"test");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_udp_recv_without_connect() {
-        let mut transport = UdpTransport::new();
-        let result = transport.recv();
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_udp_close() {
-        let server = StdUdpSocket::bind("127.0.0.1:0").unwrap();
-        let addr = server.local_addr().unwrap();
-
-        let mut transport = UdpTransport::new();
-        transport.connect(&addr).unwrap();
-        assert!(transport.close().is_ok());
-        assert!(transport.socket.is_none());
-        assert!(transport.target.is_none());
-    }
-
-    #[test]
-    fn test_udp_multiple_packets() {
-        let server = StdUdpSocket::bind("127.0.0.1:0").unwrap();
-        let addr = server.local_addr().unwrap();
-
-        thread::spawn(move || {
-            let mut buf = vec![0u8; 65535];
-            for _ in 0..5 {
-                if let Ok((n, src)) = server.recv_from(&mut buf) {
-                    server.send_to(&buf[..n], src).unwrap();
-                } else {
-                    break;
-                }
-            }
-        });
-
-        thread::sleep(Duration::from_millis(10));
-
-        let mut transport = UdpTransport::new();
-        transport.connect(&addr).unwrap();
-
-        for i in 0..5 {
-            let test_data = format!("Packet {}", i);
-            transport.send(test_data.as_bytes()).unwrap();
-
-            thread::sleep(Duration::from_millis(5));
-
-            for _ in 0..100 {
-                if transport.poll_readable().unwrap() {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(1));
-            }
-
-            let (recv_data, _) = transport.recv().unwrap();
-            assert_eq!(recv_data, test_data.as_bytes());
-        }
-    }
 
     // =========================================================================
     // Connection Group Tests
@@ -684,6 +466,35 @@ mod tests {
 
         assert!(matches!(group.recv(99, &mut buf), Err(Error::Connection(_))));
         assert!(matches!(group.send(99, b"x"), Err(Error::Connection(_))));
+    }
+
+    #[test]
+    fn test_udp_group_echoes_datagrams_in_order() {
+        let server = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        thread::spawn(move || {
+            let mut buf = vec![0u8; 65535];
+            while let Ok((n, src)) = server.recv_from(&mut buf) {
+                server.send_to(&buf[..n], src).unwrap();
+            }
+        });
+
+        let mut group = UdpConnectionGroup::new().unwrap();
+        let conn_id = group.add_connection(&addr).unwrap();
+        let mut buf = vec![0u8; 65536];
+        let mut ready = Vec::new();
+        for i in 0..5 {
+            let packet = format!("Packet {i}");
+            let receipt = group.send(conn_id, packet.as_bytes()).unwrap();
+            group.poll(Duration::from_secs(1), &mut ready).unwrap();
+            assert_eq!(ready, vec![conn_id]);
+            let RecvOutcome::Data { len, timestamp } = group.recv(conn_id, &mut buf).unwrap()
+            else {
+                panic!("expected data");
+            };
+            assert_eq!(&buf[..len], packet.as_bytes());
+            assert!(timestamp.cycles() >= receipt.timestamp.cycles());
+        }
     }
 
     #[test]
