@@ -222,9 +222,6 @@ pub struct RedisConfig {
     /// When true, generates pseudo-random bytes for each request
     #[serde(default)]
     pub random_data: bool,
-    /// Data import configuration (use real data from CSV)
-    #[serde(default)]
-    pub data_import: Option<DataImportConfig>,
     /// Insert phase configuration (populate keys before measurement)
     ///
     /// When configured, the protocol will first insert all keys using SET
@@ -392,37 +389,6 @@ pub enum RedisCommandParams {
     },
     /// Custom command template
     Custom { template: String },
-}
-
-/// Data import configuration for loading test data from CSV
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct DataImportConfig {
-    /// Path to CSV file containing test data
-    pub file: std::path::PathBuf,
-    /// Verification mode
-    #[serde(default)]
-    pub verification: Option<VerificationConfig>,
-}
-
-/// Verification configuration
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct VerificationConfig {
-    /// When to verify: "during", "after", or "only"
-    #[serde(default = "default_verification_mode")]
-    pub mode: String,
-    /// Sample rate for "during" mode (0.0-1.0)
-    #[serde(default = "default_sample_rate")]
-    pub sample_rate: f64,
-}
-
-fn default_verification_mode() -> String {
-    "after".to_string()
-}
-
-fn default_sample_rate() -> f64 {
-    0.1
 }
 
 /// Memcached protocol configuration

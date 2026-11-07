@@ -18,9 +18,9 @@ pub mod xylem_echo;
 
 // Re-export commonly used types
 pub use configs::{
-    CommandValueSizeConfig, DataImportConfig, HttpConfig, InsertPhaseConfig, KeysConfig,
-    MasstreeConfig, MasstreeScanConfig, MemcachedConfig, RedisCommandParams, RedisCommandWeight,
-    RedisConfig, RedisOperationsConfig, ValueSizeConfig, VerificationConfig, XylemEchoConfig,
+    CommandValueSizeConfig, HttpConfig, InsertPhaseConfig, KeysConfig, MasstreeConfig,
+    MasstreeScanConfig, MemcachedConfig, RedisCommandParams, RedisCommandWeight, RedisConfig,
+    RedisOperationsConfig, ValueSizeConfig, XylemEchoConfig,
 };
 pub use factories::{
     HttpFactory, MemcachedAsciiFactory, MemcachedBinaryFactory, RedisFactory, XylemEchoFactory,

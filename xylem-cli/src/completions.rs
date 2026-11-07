@@ -379,13 +379,6 @@ fn add_protocol_config_paths(paths: &mut BTreeSet<String>) {
     paths.insert(format!("{}.value_size.mean", base));
     paths.insert(format!("{}.value_size.std_dev", base));
 
-    // Data import configuration (Redis)
-    paths.insert(format!("{}.data_import", base));
-    paths.insert(format!("{}.data_import.file", base));
-    paths.insert(format!("{}.data_import.verification", base));
-    paths.insert(format!("{}.data_import.verification.mode", base));
-    paths.insert(format!("{}.data_import.verification.sample_rate", base));
-
     // HTTP configuration
     paths.insert(format!("{}.method", base));
     paths.insert(format!("{}.path", base));

@@ -193,7 +193,6 @@ fn redis_factory_retains_variable_sizes_random_data_and_per_command_keys() {
         }),
         random_data: true,
         insert_phase: Some(InsertPhaseConfig { key_count: Some(1), value_size: Some(9) }),
-        ..Default::default()
     };
     let mut first = RedisFactory.create(config.clone(), Some(42)).unwrap();
     let mut second = RedisFactory.create(config, Some(42)).unwrap();
@@ -223,7 +222,7 @@ fn redis_factory_retains_variable_sizes_random_data_and_per_command_keys() {
 
 #[test]
 fn redis_factory_uses_command_parameters_and_rejects_ignored_settings() {
-    let mut config = RedisConfig {
+    let config = RedisConfig {
         operations: Some(RedisOperationsConfig::Weighted {
             commands: vec![RedisCommandWeight {
                 name: "MGET".into(),
@@ -239,11 +238,6 @@ fn redis_factory_uses_command_parameters_and_rejects_ignored_settings() {
         protocol.next_request(0).data,
         b"*3\r\n$4\r\nMGET\r\n$5\r\nkey:0\r\n$5\r\nkey:1\r\n"
     );
-    config.data_import = Some(DataImportConfig {
-        file: "unused.csv".into(),
-        verification: None,
-    });
-    assert!(RedisFactory.create(config, None).is_err());
     let bad = RedisConfig {
         keys: KeysConfig::Random {
             max: 0,

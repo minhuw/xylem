@@ -20,8 +20,7 @@ fixed size. Command names for size lookup are case-insensitive. Insertion uses
 its explicit size or `keys.value_size`; an unbounded sequential keyspace needs
 an explicit insertion count. Per-command key distributions are supported, but
 a different per-command prefix or legacy `keys.value_size` is rejected; use
-`value_size` for per-command sizing. Imported-data workloads require a separate
-driver and are rejected by these constructors.
+`value_size` for per-command sizing.
 
 HTTP supports Content-Length framing and bodyless 204/304 responses.
 Informational responses are retained until the final response arrives, which

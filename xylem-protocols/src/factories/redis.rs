@@ -71,12 +71,7 @@ impl RedisConfig {
 
 impl RedisProtocol {
     /// Construct a standalone Redis workload from all supported configuration fields.
-    /// Data import requires a separate imported-data driver.
     pub fn from_config(config: &RedisConfig, seed: Option<u64>) -> Result<Self> {
-        anyhow::ensure!(
-            config.data_import.is_none(),
-            "data_import requires an imported-data driver and is unsupported by this constructor"
-        );
         let mut protocol = Self::with_workload_and_options(
             config.command_selector(seed)?,
             config.keys.to_key_gen(seed)?,

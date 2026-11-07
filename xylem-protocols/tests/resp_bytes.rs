@@ -1,6 +1,6 @@
 //! Exact RESP request bytes and request ids for the Redis encoder: every
-//! `RedisOp` variant, command templates, random data, key prefixes, the insert
-//! phase, and imported data.
+//! `RedisOp` variant, command templates, random data, key prefixes and the
+//! insert phase.
 
 use xylem_protocols::workload::KeyGeneration;
 use xylem_protocols::{
@@ -1198,26 +1198,6 @@ fn insert_phase_sends_set_warmups_then_replays_workload_keys() {
     assert_request(
         protocol.next_request(1),
         Request::measurement(b"*2\r\n$3\r\nGET\r\n$5\r\nkey:8\r\n".to_vec(), (1, 1)),
-    );
-}
-
-#[test]
-fn imported_data_set_and_get_carry_key_and_value_bytes_verbatim() {
-    let mut protocol = RedisProtocol::new(Box::new(FixedCommandSelector::new(RedisOp::Get)));
-    assert_request(
-        protocol.generate_set_with_imported_data(0, "user:1", b"v\x00\r\n\xff"),
-        Request::measurement(
-            b"*3\r\n$3\r\nSET\r\n$6\r\nuser:1\r\n$5\r\nv\x00\r\n\xff\r\n".to_vec(),
-            (0, 0),
-        ),
-    );
-    assert_request(
-        protocol.generate_get_with_imported_data(1, "user:1"),
-        Request::measurement(b"*2\r\n$3\r\nGET\r\n$6\r\nuser:1\r\n".to_vec(), (1, 0)),
-    );
-    assert_request(
-        protocol.generate_set_with_imported_data(0, "", b""),
-        Request::measurement(b"*3\r\n$3\r\nSET\r\n$0\r\n\r\n$0\r\n\r\n".to_vec(), (0, 1)),
     );
 }
 
