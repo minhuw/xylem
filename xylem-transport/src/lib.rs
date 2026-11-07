@@ -10,6 +10,8 @@
 //! - **TCP**: Non-blocking TCP sockets
 //! - **UDP**: Non-blocking UDP sockets
 //! - **Unix**: Unix domain sockets (Unix only)
+//! - **ntcp**: User-space TCP over a packet backend, here a Linux TUN device
+//!   (Linux only, `ntcp` feature)
 //!
 //! ## Kernel Timestamping (Linux only)
 //!
@@ -299,6 +301,10 @@ pub mod unix;
 #[cfg(target_os = "linux")]
 pub mod hw_timestamp;
 
+// User-space TCP transport (Linux only, opt-in)
+#[cfg(all(target_os = "linux", feature = "ntcp"))]
+pub mod ntcp;
+
 // =============================================================================
 // Re-exports
 // =============================================================================
@@ -308,6 +314,8 @@ pub use timestamp::{time_ns, KernelClock, KernelTimestamp, Timestamp};
 #[cfg(target_os = "linux")]
 pub use group::TimestampSource;
 
+#[cfg(all(target_os = "linux", feature = "ntcp"))]
+pub use ntcp::{NtcpConnectionGroup, NtcpTunFactory};
 pub use tcp::{TcpConnectionGroup, TcpTransportFactory};
 pub use udp::{UdpConnectionGroup, UdpTransportFactory};
 #[cfg(unix)]
