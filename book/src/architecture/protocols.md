@@ -4,36 +4,46 @@ The protocol layer (`xylem-protocols`) implements application-level protocols fo
 
 ## Protocol Trait
 
-All protocol implementations conform to the `Protocol` trait interface:
+All protocol implementations conform to the `Protocol` trait, defined in
+[`xylem-common/src/protocol.rs`](https://github.com/minhuw/xylem/blob/main/xylem-common/src/protocol.rs)
+and re-exported by `xylem-protocols` and `xylem-core`:
 
 ```rust
 pub trait Protocol: Send {
     type RequestId: Eq + Hash + Clone + Copy + Debug;
-    
-    /// Generate a request with an ID
-    fn generate_request(
-        &mut self,
-        conn_id: usize,
-        key: u64,
-        value_size: usize,
-    ) -> (Vec<u8>, Self::RequestId);
-    
-    /// Parse a response and return the request ID
+
+    fn next_request(&mut self, conn_id: usize) -> Request<Self::RequestId>;
+
     fn parse_response(
         &mut self,
         conn_id: usize,
         data: &[u8],
-    ) -> Result<(usize, Option<Self::RequestId>)>;
-    
-    /// Protocol name
+    ) -> anyhow::Result<(usize, Option<Self::RequestId>)>;
+
+    fn can_send(&self, _conn_id: usize) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str;
-    
-    /// Reset protocol state
+
     fn reset(&mut self);
 }
 ```
 
-The trait provides a uniform interface for protocol implementations, enabling the core engine to interact with any protocol through a consistent API.
+- `next_request` builds the next request for a connection from the protocol's
+  own workload state (command selection, keys, value sizes, insert phase). The
+  returned `Request` carries the bytes, the request ID, and metadata that marks
+  warm-up requests, whose latency is not recorded.
+- `parse_response` returns the bytes consumed and the ID of the completed
+  request, or `(0, None)` when the response is still incomplete. Consuming
+  bytes without returning an ID is an error.
+- `can_send` lets a protocol hold back requests on a connection, for example
+  until the Masstree handshake completes.
+- `name` returns the protocol name, and `reset` clears per-connection state.
+
+The core engine decides when to send; the protocol decides what to send. The
+Redis, Memcached, HTTP and Masstree protocols have a `from_config` constructor
+that builds them from their `protocol_config` section.
 
 ## Protocol Design
 
@@ -46,6 +56,8 @@ The following protocol implementations are available:
 - **Redis** - RESP (Redis Serialization Protocol) for key-value operations
 - **HTTP** - HTTP/1.1 for web service testing
 - **Memcached** - Binary and text protocol variants for cache testing
+- **Masstree** - MessagePack-based protocol for the Masstree key-value store
+- **Xylem Echo** - Echo protocol for testing xylem itself
 
 Detailed documentation for each protocol is available in the [Protocols](../guide/protocols.md) section of the User Guide.
 
