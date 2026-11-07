@@ -1,6 +1,7 @@
-//! Integration tests for new Redis commands
+//! Integration tests for Redis connection setup and newer commands
 //!
-//! Tests: AUTH, SELECT, HELLO, SETEX, SETRANGE, GETRANGE, CLUSTER SLOTS
+//! Tests: connection setup from the profile (auth, db, resp), SETEX,
+//! SETRANGE, GETRANGE, CLUSTER SLOTS
 //!
 //! These tests use Docker Compose to manage Redis servers with various configurations:
 //! - Standard Redis (port 6379)
@@ -9,8 +10,9 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::process::Command;
 use xylem_protocols::redis::{RedisOp, RedisProtocol};
-use xylem_protocols::{FixedCommandSelector, Protocol};
+use xylem_protocols::FixedCommandSelector;
 
 mod common;
 
@@ -34,202 +36,218 @@ fn send_command_and_read_response(
     Ok(buffer)
 }
 
+/// Result of one run of the xylem CLI
+struct CliRun {
+    success: bool,
+    /// stdout and stderr together
+    output: String,
+    /// The JSON results, when the run succeeded
+    results: Option<serde_json::Value>,
+}
+
+impl CliRun {
+    /// Completed measurement requests
+    fn completed(&self) -> u64 {
+        let results = self.results.as_ref().expect("successful run has results");
+        results["global"]["requests"]["completed"].as_u64().unwrap()
+    }
+}
+
+/// Run the xylem CLI for one second against `port` with a GET/SET mix on
+/// two threads of two pipelined connections each. `protocol_config` is
+/// TOML for `[traffic_groups.protocol_config]`; `envs` are set for the run.
+fn run_xylem(port: u16, protocol_config: &str, envs: &[(&str, &str)]) -> CliRun {
+    let dir = tempfile::tempdir().unwrap();
+    let results_path = dir.path().join("results.json");
+    let profile = format!(
+        r#"
+[experiment]
+name = "redis-setup"
+duration = "1s"
+seed = 1
+
+[[traffic_groups]]
+name = "setup"
+protocol = "redis"
+target = "127.0.0.1:{port}"
+threads = [0, 1]
+connections_per_thread = 2
+max_pending_per_connection = 4
+
+[traffic_groups.protocol_config]
+{protocol_config}
+
+[traffic_groups.protocol_config.operations]
+strategy = "weighted"
+commands = [{{ name = "get", weight = 0.5 }}, {{ name = "set", weight = 0.5 }}]
+
+[traffic_groups.traffic_policy]
+type = "closed-loop"
+
+[output]
+format = "json"
+file = "{}"
+"#,
+        results_path.display()
+    );
+    let profile_path = dir.path().join("profile.toml");
+    std::fs::write(&profile_path, profile).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_xylem"))
+        .arg("-P")
+        .arg(&profile_path)
+        .envs(envs.iter().copied())
+        .output()
+        .expect("run xylem");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let results = output
+        .status
+        .success()
+        .then(|| serde_json::from_str(&std::fs::read_to_string(&results_path).unwrap()).unwrap());
+    CliRun {
+        success: output.status.success(),
+        output: text,
+        results,
+    }
+}
+
+/// The keys config of the CLI runs: `prefix:0` .. `prefix:99`
+fn keys_config(prefix: &str) -> String {
+    format!(
+        "[traffic_groups.protocol_config.keys]\nstrategy = \"random\"\nmax = 100\nvalue_size = 16\nprefix = \"{prefix}\"\n"
+    )
+}
+
+/// Number of the keys `prefix:0` .. `prefix:99` that exist in database `db`
+fn existing_keys(redis_cli_args: &[&str], db: u32, prefix: &str) -> u64 {
+    let mut args: Vec<String> = redis_cli_args.iter().map(|arg| arg.to_string()).collect();
+    args.extend(["--no-auth-warning".into(), "-n".into(), db.to_string(), "EXISTS".into()]);
+    args.extend((0..100).map(|key| format!("{prefix}{key}")));
+    let output = Command::new("redis-cli").args(&args).output().expect("run redis-cli");
+    String::from_utf8_lossy(&output.stdout).trim().parse().expect("EXISTS count")
+}
+
 #[test]
 fn test_auth_simple_password() {
-    let _redis =
-        common::redis_auth::RedisAuthGuard::new().expect("Failed to start Redis with auth");
+    let redis = common::redis_auth::RedisAuthGuard::new().expect("Failed to start Redis with auth");
+    let password = redis.get_password();
+    let keys = keys_config("auth-test:");
 
-    println!("Testing simple password authentication...");
+    // Without auth, the first request fails the run
+    let run = run_xylem(redis.get_port(), &keys, &[]);
+    assert!(!run.success, "{}", run.output);
+    assert!(run.output.contains("NOAUTH"), "{}", run.output);
 
-    // Try without AUTH - should fail
-    let mut get_protocol = RedisProtocol::new(Box::new(FixedCommandSelector::new(RedisOp::Get)));
-    let mut stream = TcpStream::connect("127.0.0.1:6380").unwrap();
-    let request = get_protocol.generate_request_with_key(0, 1, 64);
-    stream.write_all(&request.data).unwrap();
-
-    let mut buffer = vec![0u8; 1024];
-    let n = stream.read(&mut buffer).unwrap();
-    let response = String::from_utf8_lossy(&buffer[..n]);
+    // A wrong password fails setup, naming the step but not the password
+    let config = format!("auth = {{ password = \"wrong-{password}-x\" }}\n{keys}");
+    let run = run_xylem(redis.get_port(), &config, &[]);
+    assert!(!run.success, "{}", run.output);
     assert!(
-        response.contains("NOAUTH") || response.contains("authentication"),
-        "Should get auth error without AUTH"
+        run.output.contains("Redis connection setup failed: AUTH on connection"),
+        "{}",
+        run.output
     );
+    assert!(run.output.contains("WRONGPASS"), "{}", run.output);
+    assert!(!run.output.contains(password), "{}", run.output);
 
-    println!("✓ Verified NOAUTH error without authentication");
-
-    // Now authenticate
-    let mut auth_protocol =
-        RedisProtocol::new(Box::new(FixedCommandSelector::new(RedisOp::Auth {
-            username: None,
-            password: "testpassword".to_string(),
-        })));
-
-    let mut stream = TcpStream::connect("127.0.0.1:6380").unwrap();
-    let auth_request = auth_protocol.generate_request_with_key(0, 1, 64);
-    stream.write_all(&auth_request.data).unwrap();
-
-    let mut buffer = vec![0u8; 1024];
-    let n = stream.read(&mut buffer).unwrap();
-    let response = String::from_utf8_lossy(&buffer[..n]);
-    assert!(response.contains("+OK"), "AUTH should succeed with correct password");
-
-    println!("✓ Simple password authentication successful");
-
-    // Now GET should work
-    let get_request = get_protocol.generate_request_with_key(0, 1, 64);
-    stream.write_all(&get_request.data).unwrap();
-
-    let mut buffer = vec![0u8; 1024];
-    let n = stream.read(&mut buffer).unwrap();
-    // Should get a valid response (not auth error)
-    assert!(
-        !String::from_utf8_lossy(&buffer[..n]).contains("NOAUTH"),
-        "Should be able to execute commands after AUTH"
-    );
-
-    println!("✓ Commands work after authentication");
+    // The right password authenticates every connection before the workload
+    let config = format!("auth = {{ password = \"{password}\" }}\n{keys}");
+    let run = run_xylem(redis.get_port(), &config, &[]);
+    assert!(run.success, "{}", run.output);
+    assert!(run.completed() > 0);
+    assert!(!run.output.contains(password), "{}", run.output);
+    println!("✓ requirepass authentication: {} requests", run.completed());
 }
 
 #[test]
 fn test_auth_acl_username_password() {
-    let _redis = common::redis_acl::RedisAclGuard::new().expect("Failed to start Redis with ACL");
+    let redis = common::redis_acl::RedisAclGuard::new().expect("Failed to start Redis with ACL");
+    let (username, password) = (redis.get_username(), redis.get_password());
+    let keys = keys_config("acl-test:");
 
-    println!("Testing ACL authentication (username + password)...");
+    // The password comes from the environment
+    let config = format!(
+        "auth = {{ username = \"{username}\", password_env = \"XYLEM_TEST_REDIS_PASSWORD\" }}\n{keys}"
+    );
+    let run = run_xylem(redis.get_port(), &config, &[("XYLEM_TEST_REDIS_PASSWORD", password)]);
+    assert!(run.success, "{}", run.output);
+    assert!(run.completed() > 0);
+    assert!(!run.output.contains(password), "{}", run.output);
 
-    // Authenticate with username and password
-    let mut auth_protocol =
-        RedisProtocol::new(Box::new(FixedCommandSelector::new(RedisOp::Auth {
-            username: Some("testuser".to_string()),
-            password: "testpassword".to_string(),
-        })));
-
-    let mut stream = TcpStream::connect("127.0.0.1:6381").unwrap();
-    let auth_request = auth_protocol.generate_request_with_key(0, 1, 64);
-    stream.write_all(&auth_request.data).unwrap();
-
-    let mut buffer = vec![0u8; 1024];
-    let n = stream.read(&mut buffer).unwrap();
-    let response = String::from_utf8_lossy(&buffer[..n]);
+    // An unset variable fails validation, naming the variable
+    let run = run_xylem(redis.get_port(), &config, &[]);
+    assert!(!run.success);
     assert!(
-        response.contains("+OK"),
-        "ACL AUTH should succeed with correct username and password"
+        run.output.contains("environment variable XYLEM_TEST_REDIS_PASSWORD is not set"),
+        "{}",
+        run.output
     );
 
-    println!("✓ ACL authentication successful");
-
-    // Verify we can execute commands
-    let mut get_protocol = RedisProtocol::new(Box::new(FixedCommandSelector::new(RedisOp::Get)));
-    let get_request = get_protocol.generate_request_with_key(0, 1, 64);
-    stream.write_all(&get_request.data).unwrap();
-
-    let mut buffer = vec![0u8; 1024];
-    let n = stream.read(&mut buffer).unwrap();
-    // Should get valid response
-    assert!(
-        !String::from_utf8_lossy(&buffer[..n]).contains("NOAUTH"),
-        "Should be able to execute commands after ACL AUTH"
-    );
-
-    println!("✓ Commands work after ACL authentication");
+    // An unknown user fails setup
+    let config = format!("auth = {{ username = \"nobody\", password = \"{password}\" }}\n{keys}");
+    let run = run_xylem(redis.get_port(), &config, &[]);
+    assert!(!run.success);
+    assert!(run.output.contains("AUTH on connection"), "{}", run.output);
+    assert!(run.output.contains("WRONGPASS"), "{}", run.output);
+    assert!(!run.output.contains(password), "{}", run.output);
+    println!("✓ ACL authentication with password_env");
 }
 
 #[test]
 fn test_select_database() {
-    let _redis = common::redis::RedisGuard::new().expect("Failed to start Redis");
+    let redis = common::redis_auth::RedisAuthGuard::new().expect("Failed to start Redis with auth");
+    let password = redis.get_password();
+    let cli: &[&str] = &["-p", "6380", "-a", password];
+    let prefix = "select-test:";
 
-    println!("Testing SELECT database command...");
+    // AUTH then SELECT: the workload's SETs land in database 5 only
+    let config = format!("auth = {{ password = \"{password}\" }}\ndb = 5\n{}", keys_config(prefix));
+    let run = run_xylem(redis.get_port(), &config, &[]);
+    assert!(run.success, "{}", run.output);
+    assert!(existing_keys(cli, 5, prefix) > 0, "SETs land in database 5");
+    assert_eq!(existing_keys(cli, 0, prefix), 0, "database 0 is untouched");
 
-    // SELECT database 5
-    let mut select_protocol =
-        RedisProtocol::new(Box::new(FixedCommandSelector::new(RedisOp::SelectDb { db: 5 })));
-
-    let response = send_command_and_read_response(&mut select_protocol, "127.0.0.1:6379", 0, 1, 64)
-        .expect("SELECT failed");
-    let response_str = String::from_utf8_lossy(&response);
-    assert!(response_str.contains("+OK"), "SELECT should return +OK");
-
-    println!("✓ SELECT database 5 successful");
-
-    // Verify we're in DB 5 by setting/getting a key
-    let mut stream = TcpStream::connect("127.0.0.1:6379").unwrap();
-
-    // SELECT 5 again
-    let select_req = select_protocol.generate_request_with_key(0, 1, 64);
-    stream.write_all(&select_req.data).unwrap();
-    let _ = stream.read(&mut vec![0u8; 1024]).unwrap();
-
-    // SET key in DB 5
-    let mut set_protocol = RedisProtocol::new(Box::new(FixedCommandSelector::new(RedisOp::Set)));
-    let set_req = set_protocol.generate_request_with_key(0, 999, 10);
-    stream.write_all(&set_req.data).unwrap();
-    let _ = stream.read(&mut vec![0u8; 1024]).unwrap();
-
-    println!("✓ SET key in database 5");
-
-    // SELECT 0 (default)
-    let mut select0_protocol =
-        RedisProtocol::new(Box::new(FixedCommandSelector::new(RedisOp::SelectDb { db: 0 })));
-    let select0_req = select0_protocol.generate_request_with_key(0, 1, 64);
-    stream.write_all(&select0_req.data).unwrap();
-    let _ = stream.read(&mut vec![0u8; 1024]).unwrap();
-
-    // GET key:999 in DB 0 should return nil
-    let mut get_protocol = RedisProtocol::new(Box::new(FixedCommandSelector::new(RedisOp::Get)));
-    let get_req = get_protocol.generate_request_with_key(0, 999, 64);
-    stream.write_all(&get_req.data).unwrap();
-
-    let mut buffer = vec![0u8; 1024];
-    let n = stream.read(&mut buffer).unwrap();
-    let response = String::from_utf8_lossy(&buffer[..n]);
-    assert!(response.contains("$-1"), "Key should not exist in DB 0 (it's in DB 5)");
-
-    println!("✓ Database isolation verified");
+    // An out-of-range database fails setup at SELECT
+    let config =
+        format!("auth = {{ password = \"{password}\" }}\ndb = 99\n{}", keys_config(prefix));
+    let run = run_xylem(redis.get_port(), &config, &[]);
+    assert!(!run.success);
+    assert!(run.output.contains("SELECT on connection"), "{}", run.output);
+    assert!(run.output.contains("DB index is out of range"), "{}", run.output);
+    println!("✓ SELECT from the profile");
 }
 
 #[test]
 fn test_hello_resp2() {
     let _redis = common::redis::RedisGuard::new().expect("Failed to start Redis");
-
-    println!("Testing HELLO command for RESP2...");
-
-    let mut hello_protocol =
-        RedisProtocol::new(Box::new(FixedCommandSelector::new(RedisOp::Hello { version: 2 })));
-
-    let response = send_command_and_read_response(&mut hello_protocol, "127.0.0.1:6379", 0, 1, 64)
-        .expect("HELLO failed");
-
-    // HELLO 2 returns a map/array with server info
-    // In RESP2 it returns an array
-    let response_str = String::from_utf8_lossy(&response);
-    assert!(
-        response_str.starts_with('*') || response_str.starts_with('%'),
-        "HELLO should return array or map, got: {}",
-        response_str.chars().next().unwrap_or('?')
-    );
-
-    println!("✓ HELLO 2 (RESP2) successful");
+    // resp = 2 is the default protocol and sends no HELLO
+    let run = run_xylem(6379, &format!("resp = 2\n{}", keys_config("resp2-test:")), &[]);
+    assert!(run.success, "{}", run.output);
+    assert!(run.completed() > 0);
+    println!("✓ RESP2 run: {} requests", run.completed());
 }
 
 #[test]
 fn test_hello_resp3() {
-    let _redis = common::redis::RedisGuard::new().expect("Failed to start Redis");
-
-    println!("Testing HELLO command for RESP3...");
-
-    let mut hello_protocol =
-        RedisProtocol::new(Box::new(FixedCommandSelector::new(RedisOp::Hello { version: 3 })));
-
-    let response = send_command_and_read_response(&mut hello_protocol, "127.0.0.1:6379", 0, 1, 64)
-        .expect("HELLO failed");
-
-    // HELLO 3 returns a map in RESP3 format
-    let response_str = String::from_utf8_lossy(&response);
-    assert!(
-        response_str.starts_with('%') || response_str.starts_with('*'),
-        "HELLO 3 should return map or array"
+    let redis = common::redis_acl::RedisAclGuard::new().expect("Failed to start Redis with ACL");
+    let (username, password) = (redis.get_username(), redis.get_password());
+    // AUTH, SELECT, HELLO 3, then a pipelined GET/SET mix after an insert
+    // phase on four connections over two threads, all with RESP3 replies
+    // (GET misses reply with the RESP3 null `_`)
+    let config = format!(
+        "auth = {{ username = \"{username}\", password = \"{password}\" }}\ndb = 2\nresp = 3\n\
+         insert_phase = {{ key_count = 50 }}\n{}",
+        keys_config("resp3-test:")
     );
-
-    println!("✓ HELLO 3 (RESP3) successful");
+    let run = run_xylem(redis.get_port(), &config, &[]);
+    assert!(run.success, "{}", run.output);
+    assert!(run.completed() > 0);
+    let cli: &[&str] = &["-p", "6381", "--user", username, "-a", password];
+    assert!(existing_keys(cli, 2, "resp3-test:") > 0, "keys land in database 2");
+    println!("✓ RESP3 run: {} requests", run.completed());
 }
 
 #[test]
@@ -353,41 +371,4 @@ fn test_cluster_slots_non_cluster() {
     );
 
     println!("✓ CLUSTER SLOTS correctly returns error on non-cluster instance");
-}
-
-#[test]
-fn test_resp3_parsing_integration() {
-    let _redis = common::redis::RedisGuard::new().expect("Failed to start Redis");
-
-    println!("Testing RESP3 protocol parsing...");
-
-    // Enable RESP3 with HELLO 3
-    let mut stream = TcpStream::connect("127.0.0.1:6379").unwrap();
-
-    let mut hello_protocol =
-        RedisProtocol::new(Box::new(FixedCommandSelector::new(RedisOp::Hello { version: 3 })));
-    let hello_req = hello_protocol.generate_request_with_key(0, 1, 64);
-    stream.write_all(&hello_req.data).unwrap();
-    let _ = stream.read(&mut vec![0u8; 8192]).unwrap();
-
-    println!("✓ RESP3 protocol enabled");
-
-    // Now responses should be in RESP3 format
-    // Test GET with null response (RESP3 null is _\r\n)
-    let mut get_protocol = RedisProtocol::new(Box::new(FixedCommandSelector::new(RedisOp::Get)));
-    let get_req = get_protocol.generate_request_with_key(0, 99999, 64);
-    stream.write_all(&get_req.data).unwrap();
-
-    let mut buffer = vec![0u8; 1024];
-    let n = stream.read(&mut buffer).unwrap();
-
-    // Parse with protocol
-    let (consumed, id) = get_protocol
-        .parse_response(0, &buffer[..n])
-        .expect("Should parse RESP3 response");
-
-    assert!(consumed > 0, "Should consume bytes");
-    assert!(id.is_some(), "Should return request ID");
-
-    println!("✓ RESP3 response parsed successfully");
 }

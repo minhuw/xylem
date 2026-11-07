@@ -379,6 +379,14 @@ fn add_protocol_config_paths(paths: &mut BTreeSet<String>) {
     paths.insert(format!("{}.value_size.mean", base));
     paths.insert(format!("{}.value_size.std_dev", base));
 
+    // Connection setup (Redis)
+    paths.insert(format!("{}.auth", base));
+    paths.insert(format!("{}.auth.username", base));
+    paths.insert(format!("{}.auth.password", base));
+    paths.insert(format!("{}.auth.password_env", base));
+    paths.insert(format!("{}.db", base));
+    paths.insert(format!("{}.resp", base));
+
     // HTTP configuration
     paths.insert(format!("{}.method", base));
     paths.insert(format!("{}.path", base));
@@ -534,6 +542,11 @@ mod tests {
             paths.contains(&"traffic_groups.0.protocol_config.operations.strategy".to_string()),
             "Missing protocol_config.operations.strategy path"
         );
+
+        for path in ["auth.password_env", "auth.username", "db", "resp"] {
+            let path = format!("traffic_groups.0.protocol_config.{path}");
+            assert!(paths.contains(&path), "Missing {path} path");
+        }
 
         // Ensure we have a reasonable number of paths (should be > 60 with protocol_config)
         assert!(paths.len() > 60, "Expected > 60 paths, got {}", paths.len());

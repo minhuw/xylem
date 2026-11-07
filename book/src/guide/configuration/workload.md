@@ -163,6 +163,19 @@ min = 64
 max = 4096
 ```
 
+## Redis Connection Setup
+
+Redis groups can authenticate, select a database and switch to RESP3 on every connection before the workload starts:
+
+```toml
+[traffic_groups.protocol_config]
+auth = { password = "secret" }   # or { username = "bench", password_env = "REDIS_PASSWORD" }
+db = 3
+resp = 3
+```
+
+These commands are connection setup, not part of the operation mix. See [Redis connection setup](../protocols/redis.md#connection-setup-auth-select-and-hello).
+
 ## Complete Example
 
 Here's a complete traffic group configuration for a session store workload:

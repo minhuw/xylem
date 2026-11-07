@@ -152,6 +152,24 @@ min = 64
 max = 4096
 ```
 
+**Redis connection setup** - Optional fields directly in `[traffic_groups.protocol_config]`, sent once by every connection before any other request:
+
+- `auth` (table, optional): Authenticate with `AUTH`. Set exactly one of `password` and `password_env`.
+  - `username` (string, optional): ACL user (Redis 6+); without it, `AUTH <password>` checks `requirepass`
+  - `password` (string): Password
+  - `password_env` (string): Environment variable holding the password, read when the run starts; an unset variable fails validation
+- `db` (integer, optional): Database to `SELECT`, 0 to 2147483647 (default: none, so database 0)
+- `resp` (integer, optional): `2` (default, no HELLO) or `3` (sends `HELLO 3`)
+
+```toml
+[traffic_groups.protocol_config]
+auth = { username = "bench", password_env = "REDIS_PASSWORD" }
+db = 3
+resp = 3
+```
+
+Setup requests are not measured, counted or dumped, and an error reply to one fails the run. See [Redis connection setup](../guide/protocols/redis.md#connection-setup-auth-select-and-hello).
+
 ### Traffic Policy
 
 **`[traffic_groups.traffic_policy]`** - Rate control:
