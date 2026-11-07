@@ -13,7 +13,9 @@ use std::hash::Hash;
 use std::net::SocketAddr;
 use std::time::Duration;
 use xylem_common::Protocol;
-use xylem_transport::{ConnectionGroup, RecvOutcome, Timestamp, TransportFactory, TxTimestampInfo};
+use xylem_transport::{
+    ConnectionGroup, KernelTimestamp, RecvOutcome, Timestamp, TransportFactory, TxTimestampInfo,
+};
 
 /// Wrapping less-than-or-equal comparison for u32 counters
 ///
@@ -61,9 +63,11 @@ const TX_QUEUE_STALE_TIMEOUT_NS: u64 = 60_000_000_000;
 /// Pending request tracking
 #[derive(Debug)]
 struct PendingRequest {
+    /// Cycles read when the send call completed
     send_ts: Timestamp,
     is_warmup: bool,
-    tx_hw_ts: Option<Timestamp>,
+    /// Kernel TX timestamp of the send, once reported
+    tx_kernel_ts: Option<KernelTimestamp>,
 }
 
 /// Per-connection application state (no transport - I/O goes through ConnectionGroup)
@@ -82,7 +86,7 @@ struct PendingRequest {
 ///
 /// Flow:
 /// - send() -> push_back to tx_pending_queue, insert into pending_map
-/// - poll_tx_timestamps() -> pop from front while tx_end <= offset, set pending_map[req_id].tx_hw_ts
+/// - poll_tx_timestamps() -> pop from front while tx_end <= offset, set pending_map[req_id].tx_kernel_ts
 /// - recv() -> lookup pending_map by req_id, clean up queue if needed, compute latency
 ///
 /// Queue cleanup: When a response arrives before its TX timestamp (or for transports without
@@ -229,7 +233,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         // Push to queue for TX timestamp correlation (tx_end increases monotonically)
         self.tx_pending_queue.push_back((tx_end, req_id.clone(), now_ns));
         self.pending_map
-            .insert(req_id, PendingRequest { send_ts, is_warmup, tx_hw_ts: None });
+            .insert(req_id, PendingRequest { send_ts, is_warmup, tx_kernel_ts: None });
     }
 
     /// Clean up queue entry for a completed request that didn't receive its TX timestamp
@@ -296,7 +300,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
     ///
     /// Returns the number of pending requests that were updated with the TX timestamp.
     /// A single TX timestamp may cover multiple small requests.
-    pub fn set_tx_timestamp(&mut self, offset: u32, tx_ts: Timestamp) -> usize {
+    pub fn set_tx_timestamp(&mut self, offset: u32, tx_ts: KernelTimestamp) -> usize {
         let mut updated_count = 0;
 
         // Pop from front while tx_end <= offset (queue is ordered by tx_end)
@@ -306,7 +310,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
                 // Update pending_map if request still exists (might have been completed already
                 // if response arrived before TX timestamp)
                 if let Some(pending) = self.pending_map.get_mut(req_id) {
-                    pending.tx_hw_ts = Some(tx_ts);
+                    pending.tx_kernel_ts = Some(tx_ts);
                     updated_count += 1;
                 }
                 self.tx_pending_queue.pop_front();
@@ -403,10 +407,16 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
                     "Received response for unknown request ID: {req_id:?}"
                 ))
             })?;
-            if pending.tx_hw_ts.is_none() {
-                self.cleanup_tx_queue_entry(&req_id);
-            }
-            let send_ts = pending.tx_hw_ts.unwrap_or(pending.send_ts);
+            // The kernel TX timestamp joins the send's own cycles, so the
+            // latency falls back to cycles unless the receive has a kernel
+            // timestamp from the same clock
+            let send_ts = match pending.tx_kernel_ts {
+                Some(kernel) => pending.send_ts.with_kernel(kernel),
+                None => {
+                    self.cleanup_tx_queue_entry(&req_id);
+                    pending.send_ts
+                }
+            };
             let latency = recv_ts.duration_since(&send_ts);
             responses.push((req_id, latency, pending.is_warmup, consumed));
             cursor += consumed;
@@ -1043,6 +1053,38 @@ mod tests {
         io.lock().unwrap().eof = true;
         assert!(matches!(pool.recv_responses(0, parse_frame), Err(crate::Error::Connection(_))));
         assert!(matches!(pool.send(9, &[0], 4, false), Err(crate::Error::Connection(_))));
+    }
+
+    #[test]
+    fn kernel_tx_timestamp_keeps_send_cycles() {
+        use xylem_transport::KernelClock;
+        let kernel = |nanos, clock| KernelTimestamp { nanos, clock };
+        // TX has a software kernel stamp: (RX clock, whether the kernel delta is used)
+        for (rx_clock, kernel_used) in [
+            (None, false),
+            (Some(KernelClock::NicHardware), false),
+            (Some(KernelClock::Realtime), true),
+        ] {
+            let mut state = state();
+            let send_ts = Timestamp::now();
+            state.record_send(1, send_ts, 0, 8, false);
+            std::thread::sleep(Duration::from_millis(10));
+            // The TX stamp is decoded long after the send; its decode time
+            // must not stand in for the send time
+            assert_eq!(state.set_tx_timestamp(8, kernel(1_000_000, KernelClock::Realtime)), 1);
+            let recv_ts = Timestamp::now();
+            let recv_ts = match rx_clock {
+                Some(clock) => recv_ts.with_kernel(kernel(1_500_000, clock)),
+                None => recv_ts,
+            };
+            let latency = state.process_recv(&frame(1, 8), recv_ts, parse_frame).unwrap()[0].1;
+            if kernel_used {
+                assert_eq!(latency, Duration::from_micros(500));
+            } else {
+                assert_eq!(latency, recv_ts.duration_since(&send_ts));
+                assert!(latency >= Duration::from_millis(5), "{rx_clock:?}: {latency:?}");
+            }
+        }
     }
 
     #[test]

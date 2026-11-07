@@ -116,8 +116,9 @@ pub struct TxTimestampInfo {
     pub conn_id: usize,
     /// Byte offset (opt_id) for correlating with the send operation
     pub tx_offset: u32,
-    /// The kernel-provided TX timestamp
-    pub timestamp: Timestamp,
+    /// The kernel-provided TX timestamp; attach it to the send's own
+    /// `Timestamp` with [`Timestamp::with_kernel`]
+    pub timestamp: KernelTimestamp,
 }
 
 /// What a send handed to the transport
@@ -145,8 +146,9 @@ pub struct SendReceipt {
 /// Result of one receive attempt
 #[derive(Debug, Clone, Copy)]
 pub enum RecvOutcome {
-    /// `len` bytes were written to the front of the buffer; `timestamp` is the
-    /// receive time (kernel/HW when available, else software)
+    /// `len` bytes were written to the front of the buffer; `timestamp` holds
+    /// the cycles read when the receive completed, plus the kernel/HW receive
+    /// timestamp when one was reported
     Data { len: usize, timestamp: Timestamp },
     /// No data available right now
     WouldBlock,
@@ -268,7 +270,7 @@ pub mod hw_timestamp;
 // Re-exports
 // =============================================================================
 
-pub use timestamp::{time_ns, Timestamp};
+pub use timestamp::{time_ns, KernelClock, KernelTimestamp, Timestamp};
 
 pub use tcp::{TcpConnectionGroup, TcpTransportFactory};
 pub use udp::{UdpConnectionGroup, UdpTransportFactory};

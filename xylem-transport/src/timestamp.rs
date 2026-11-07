@@ -1,28 +1,49 @@
 //! Timestamp types for latency measurement
 //!
-//! This module provides timestamp types that support both software (RDTSC-based)
-//! and hardware (NIC-based) timestamps for precise latency measurement.
+//! A [`Timestamp`] always holds the user-space cycle count (RDTSC) read when
+//! its send or receive call completed. It may also carry a kernel or NIC
+//! timestamp for the same event, tagged with the clock it was taken from.
 
 use std::time::{Duration, Instant};
 
+/// Clock that a kernel-reported timestamp was taken from
+///
+/// Timestamps from different clocks are not comparable: the NIC's PTP
+/// hardware clock is not synchronised to the system clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelClock {
+    /// Kernel software timestamp (`SOF_TIMESTAMPING_SOFTWARE`), CLOCK_REALTIME
+    Realtime,
+    /// Raw NIC hardware timestamp (`SOF_TIMESTAMPING_RAW_HARDWARE`), the NIC's PHC
+    NicHardware,
+}
+
+/// A timestamp reported by the kernel or the NIC for one send or receive
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KernelTimestamp {
+    /// Nanoseconds since the epoch of `clock`
+    pub nanos: u64,
+    /// Clock the timestamp was taken from
+    pub clock: KernelClock,
+}
+
 /// Timestamp for request/response tracking
 ///
-/// Supports two timestamp sources:
-/// - **Software timestamps**: Uses RDTSC (Read Time-Stamp Counter) on x86_64 for
-///   minimal overhead (~20 cycles). Falls back to `Instant` on other architectures.
-/// - **Hardware timestamps**: Uses NIC hardware timestamps via SO_TIMESTAMPING
-///   (Linux only) for microsecond-precision measurement at the network interface.
+/// Holds two views of one send or receive event:
+/// - **Cycles**: the CPU timestamp counter (RDTSC on x86_64, `Instant`
+///   elsewhere), read in user space when the call completed. Always present.
+/// - **Kernel timestamp**: optional, from SO_TIMESTAMPING (Linux) or another
+///   source of NIC/stack timestamps, with the clock it was taken from.
 ///
-/// When hardware timestamps are available, they provide more accurate latency
-/// measurements by capturing time at the NIC rather than in userspace.
+/// [`duration_since`](Self::duration_since) uses kernel timestamps only when
+/// both events have one from the same clock; otherwise it uses the cycles of
+/// both events. It never mixes a kernel timestamp with cycles, or two clocks.
 #[derive(Debug, Clone, Copy)]
 pub struct Timestamp {
-    /// CPU cycle count (RDTSC) or nanoseconds since epoch
+    /// CPU cycle count (RDTSC) or nanoseconds since first use
     cycles: u64,
-    /// Hardware timestamp from NIC (nanoseconds since Unix epoch)
-    /// When present, this takes precedence for latency calculation
-    #[cfg(target_os = "linux")]
-    hw_nanos: Option<u64>,
+    /// Kernel or NIC timestamp for the same event, if one was reported
+    kernel: Option<KernelTimestamp>,
 }
 
 impl Timestamp {
@@ -31,54 +52,41 @@ impl Timestamp {
     /// Uses RDTSC for minimal overhead (~20 cycles vs ~200+ for clock_gettime).
     #[inline(always)]
     pub fn now() -> Self {
-        Self {
-            cycles: rdtsc(),
-            #[cfg(target_os = "linux")]
-            hw_nanos: None,
-        }
+        Self { cycles: rdtsc(), kernel: None }
     }
 
-    /// Create a timestamp from hardware NIC timestamp
+    /// This event's timestamp with a kernel timestamp for the same event
     ///
-    /// Hardware timestamps are provided by the NIC and represent the time
-    /// when the packet was sent/received at the network interface.
-    #[cfg(target_os = "linux")]
-    pub fn from_hardware(tv_sec: i64, tv_nsec: i64) -> Self {
-        let hw_nanos = (tv_sec as u64) * 1_000_000_000 + (tv_nsec as u64);
-        Self {
-            cycles: rdtsc(), // Also capture SW timestamp for fallback
-            hw_nanos: Some(hw_nanos),
-        }
+    /// Keeps the cycles of `self`, so that the result can still be compared
+    /// with timestamps that have no kernel timestamp from the same clock.
+    #[inline]
+    pub fn with_kernel(self, kernel: KernelTimestamp) -> Self {
+        Self { kernel: Some(kernel), ..self }
     }
 
-    /// Check if this timestamp has hardware timestamp data
-    #[cfg(target_os = "linux")]
-    pub fn is_hardware(&self) -> bool {
-        self.hw_nanos.is_some()
+    /// The kernel timestamp for this event, if one was reported
+    #[inline]
+    pub fn kernel(&self) -> Option<KernelTimestamp> {
+        self.kernel
     }
 
-    /// Check if this timestamp has hardware timestamp data (always false without feature)
-    #[cfg(not(target_os = "linux"))]
+    /// Check if this timestamp carries a NIC hardware timestamp
     pub fn is_hardware(&self) -> bool {
-        false
+        matches!(self.kernel, Some(KernelTimestamp { clock: KernelClock::NicHardware, .. }))
     }
 
     /// Calculate duration since another timestamp
     ///
-    /// If both timestamps have hardware timestamps, uses those for calculation.
-    /// Otherwise, falls back to software (RDTSC-based) timestamps.
+    /// Uses the kernel timestamps if both have one from the same clock.
+    /// Otherwise uses the cycles of both, read when each call completed.
     #[inline]
     pub fn duration_since(&self, earlier: &Timestamp) -> Duration {
-        #[cfg(target_os = "linux")]
-        {
-            // Use hardware timestamps if both are available
-            if let (Some(hw_self), Some(hw_earlier)) = (self.hw_nanos, earlier.hw_nanos) {
-                let delta_nanos = hw_self.saturating_sub(hw_earlier);
-                return Duration::from_nanos(delta_nanos);
+        if let (Some(later), Some(earlier)) = (self.kernel, earlier.kernel) {
+            if later.clock == earlier.clock {
+                return Duration::from_nanos(later.nanos.saturating_sub(earlier.nanos));
             }
         }
 
-        // Fall back to software timestamps
         let delta_cycles = self.cycles.saturating_sub(earlier.cycles);
         let nanos = get_calibration().cycles_to_nanos(delta_cycles);
         Duration::from_nanos(nanos)
@@ -88,12 +96,6 @@ impl Timestamp {
     #[inline]
     pub fn cycles(&self) -> u64 {
         self.cycles
-    }
-
-    /// Get hardware timestamp in nanoseconds (if available)
-    #[cfg(target_os = "linux")]
-    pub fn hw_nanos(&self) -> Option<u64> {
-        self.hw_nanos
     }
 }
 
@@ -194,30 +196,64 @@ mod tests {
         assert!(duration.as_millis() >= 5 && duration.as_millis() <= 50);
     }
 
-    #[test]
-    fn test_is_hardware_default() {
-        let _ts = Timestamp::now();
-        // On non-Linux, should always be false
-        #[cfg(not(target_os = "linux"))]
-        assert!(!_ts.is_hardware());
+    fn kernel(nanos: u64, clock: KernelClock) -> KernelTimestamp {
+        KernelTimestamp { nanos, clock }
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn test_hardware_timestamp() {
-        // Create a hardware timestamp (simulated)
-        let ts = Timestamp::from_hardware(1_700_000_000, 500_000_000);
-        assert!(ts.is_hardware());
-        assert_eq!(ts.hw_nanos(), Some(1_700_000_000_500_000_000));
+    fn test_with_kernel_keeps_event_cycles() {
+        let ts = Timestamp::now();
+        let stamped = ts.with_kernel(kernel(5, KernelClock::NicHardware));
+        assert_eq!(stamped.cycles(), ts.cycles());
+        assert_eq!(stamped.kernel(), Some(kernel(5, KernelClock::NicHardware)));
+        assert!(stamped.is_hardware());
+        assert!(!ts.is_hardware());
+        assert!(!ts.with_kernel(kernel(5, KernelClock::Realtime)).is_hardware());
     }
 
-    #[cfg(target_os = "linux")]
+    /// Every pairing of send and receive timestamp sources: kernel time is
+    /// used only when both sides come from the same clock, and otherwise each
+    /// side's own event cycles are, never a time read at decode.
     #[test]
-    fn test_hardware_duration() {
-        let t1 = Timestamp::from_hardware(1_700_000_000, 0);
-        let t2 = Timestamp::from_hardware(1_700_000_000, 1_000_000); // 1ms later
+    fn test_duration_since_every_source_pairing() {
+        use KernelClock::{NicHardware as Hw, Realtime as Sw};
+        let send = Timestamp::now();
+        std::thread::sleep(Duration::from_millis(20));
+        let recv = Timestamp::now();
+        let cycles = recv.duration_since(&send);
+        assert!(cycles >= Duration::from_millis(15), "{cycles:?}");
 
-        let duration = t2.duration_since(&t1);
-        assert_eq!(duration, Duration::from_millis(1));
+        // Kernel times 1 ms apart, far from the 20 ms between the cycles
+        let kernel_delta = Duration::from_millis(1);
+        for (send_clock, recv_clock, kernel_used) in [
+            (None, None, false),
+            (Some(Sw), None, false),
+            (None, Some(Sw), false),
+            (Some(Hw), None, false),
+            (None, Some(Hw), false),
+            (Some(Sw), Some(Hw), false),
+            (Some(Hw), Some(Sw), false),
+            (Some(Sw), Some(Sw), true),
+            (Some(Hw), Some(Hw), true),
+        ] {
+            let send = match send_clock {
+                Some(clock) => send.with_kernel(kernel(1_000_000_000, clock)),
+                None => send,
+            };
+            let recv = match recv_clock {
+                Some(clock) => recv.with_kernel(kernel(1_001_000_000, clock)),
+                None => recv,
+            };
+            let expected = if kernel_used { kernel_delta } else { cycles };
+            assert_eq!(recv.duration_since(&send), expected, "{send_clock:?} -> {recv_clock:?}");
+        }
+    }
+
+    #[test]
+    fn test_kernel_duration_saturates() {
+        let ts = Timestamp::now();
+        let earlier = ts.with_kernel(kernel(10, KernelClock::Realtime));
+        let later = ts.with_kernel(kernel(5, KernelClock::Realtime));
+        assert_eq!(later.duration_since(&earlier), Duration::ZERO);
     }
 }

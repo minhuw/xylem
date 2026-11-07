@@ -150,8 +150,9 @@ impl TcpConn {
                 Ok(RecvOutcome::Eof)
             }
             Ok((len, ts_opt)) => {
-                // Use hardware timestamp if available, otherwise software
-                let timestamp = ts_opt.unwrap_or_else(Timestamp::now);
+                // Cycles of this read, plus the kernel timestamp if attached
+                let timestamp = Timestamp::now();
+                let timestamp = ts_opt.map_or(timestamp, |kernel| timestamp.with_kernel(kernel));
                 Ok(RecvOutcome::Data { len, timestamp })
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(RecvOutcome::WouldBlock),
