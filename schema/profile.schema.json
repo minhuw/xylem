@@ -7,6 +7,17 @@
     "experiment": {
       "$ref": "#/$defs/ExperimentConfig"
     },
+    "ntcp": {
+      "description": "User-space TCP settings, required when a group uses transport \"ntcp\"",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/NtcpConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "output": {
       "$ref": "#/$defs/OutputConfig"
     },
@@ -164,6 +175,65 @@
           "default": "light"
         }
       }
+    },
+    "NtcpBackend": {
+      "description": "Packet backend of the ntcp transport",
+      "oneOf": [
+        {
+          "description": "An existing Linux TUN device (IFF_TUN | IFF_NO_PI)",
+          "type": "string",
+          "const": "tun"
+        }
+      ]
+    },
+    "NtcpConfig": {
+      "description": "User-space TCP (ntcp) settings, required when a traffic group uses\n`transport = \"ntcp\"`",
+      "type": "object",
+      "properties": {
+        "backend": {
+          "description": "Packet backend; only \"tun\" (an existing Linux TUN device) for now",
+          "$ref": "#/$defs/NtcpBackend",
+          "default": "tun"
+        },
+        "endpoints": {
+          "description": "One endpoint per worker thread that runs ntcp traffic groups, in\nascending thread-id order",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/NtcpEndpoint"
+          }
+        },
+        "mtu": {
+          "description": "IP MTU of every endpoint's link",
+          "type": "integer",
+          "format": "uint32",
+          "default": 1500,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "endpoints"
+      ]
+    },
+    "NtcpEndpoint": {
+      "description": "The device and address one worker thread's ntcp stack uses",
+      "type": "object",
+      "properties": {
+        "ifname": {
+          "description": "Name of the TUN interface (e.g. \"ntcp0\")",
+          "type": "string"
+        },
+        "local_ip": {
+          "description": "ntcp's own IP address on that link, not one of the kernel's",
+          "type": "string",
+          "format": "ip"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "ifname",
+        "local_ip"
+      ]
     },
     "OutputConfig": {
       "description": "Output configuration",

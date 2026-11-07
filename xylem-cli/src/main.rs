@@ -516,6 +516,30 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                 )?;
                 run_worker(worker, request_dumper_for_worker.as_ref(), thread_idx)
             }
+            #[cfg(all(target_os = "linux", feature = "ntcp"))]
+            "ntcp" => {
+                // Validation guarantees the section and one endpoint per ntcp thread.
+                // The factory opens the TUN and builds the stack on this thread.
+                let ntcp = config_for_worker.ntcp.as_ref().expect("validated [ntcp] section");
+                let endpoint = ntcp
+                    .endpoint_for_thread(&config_for_worker.traffic_groups, thread_idx)
+                    .expect("validated ntcp endpoint for this thread");
+                let factory = xylem_transport::NtcpTunFactory::new(
+                    endpoint.ifname.clone(),
+                    endpoint.local_ip,
+                    ntcp.mtu,
+                )
+                // Each drive costs time per connection slot: size it to this thread
+                .with_max_connections(total_conn_count);
+                let worker = Worker::new_multi_group_with_targets(
+                    &factory,
+                    protocols,
+                    stats,
+                    worker_config,
+                    groups_config,
+                )?;
+                run_worker(worker, request_dumper_for_worker.as_ref(), thread_idx)
+            }
             other => Err(xylem_core::Error::Config(format!("Unsupported transport: {}", other)))?,
         }
     })?;
