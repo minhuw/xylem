@@ -16,6 +16,17 @@ file = "results"
 The CLI sets the file extension to `.json` or `.html` as appropriate. `file` is
 required even for `human`. All formats also print a human-readable summary.
 
+## Throughput and the measured window
+
+`experiment.duration_secs` is the configured duration. Throughput
+(`throughput_rps`, `throughput_mbps`) is computed over
+`experiment.measured_duration_secs`: from the first measured request, after
+connection setup and any protocol warmup (such as the Masstree insert phase),
+to the end of the run. Responses that arrive while the run drains its last
+requests are counted. With `stats.include_records = true`, every record's rate
+divides by the part of its time bucket inside the measured window, so the
+first and last buckets are not understated. All threads share one bucket epoch.
+
 ## Latency fields
 
 Each `latency` object in JSON (global and per group) holds, in microseconds:

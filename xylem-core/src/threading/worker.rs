@@ -174,6 +174,7 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
 
             // Check if duration exceeded
             if now_ns >= end_ns {
+                self.stats.end_measurement(end_ns);
                 break;
             }
 
@@ -424,7 +425,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
-    use xylem_common::Request;
+    use xylem_common::{Request, RequestMeta};
     use xylem_transport::TcpTransportFactory;
 
     use crate::connection::test_support::{FakeFactory, FakeGroup};
@@ -435,6 +436,8 @@ mod tests {
     struct FakeProtocol {
         next_id: u64,
         fail: bool,
+        /// Requests with a lower ID are warmup requests.
+        warmup: u64,
     }
 
     impl Protocol for FakeProtocol {
@@ -443,6 +446,9 @@ mod tests {
         fn next_request(&mut self, _: usize) -> Request<u64> {
             let id = self.next_id;
             self.next_id += 1;
+            if id < self.warmup {
+                return Request::new(id.to_le_bytes().to_vec(), id, RequestMeta::warmup());
+            }
             Request::measurement(id.to_le_bytes().to_vec(), id)
         }
 
@@ -486,6 +492,32 @@ mod tests {
             scheduler,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn measurement_window_starts_after_warmup_and_ends_with_the_loop() {
+        let factory = FakeFactory::default();
+        let mut worker = fake_worker(&factory, 1, Box::new(UniformPolicyScheduler::closed_loop()));
+        worker.protocols.get_mut(&0).unwrap().warmup = 1;
+        let created_ns = timing::time_ns();
+
+        // A warmup request and its response record nothing.
+        worker.send_requests().unwrap();
+        factory.0.lock().unwrap().responses.push_back(Ok(0u64.to_le_bytes().to_vec()));
+        worker.process_responses(Duration::ZERO).unwrap();
+        assert_eq!(worker.stats.measured_duration(), None);
+        thread::sleep(Duration::from_millis(50));
+
+        // The first measured send opens the window; the loop's end closes it.
+        let measured_send_ns = timing::time_ns();
+        worker.send_requests().unwrap();
+        worker.config.duration = Duration::ZERO;
+        worker.run().unwrap();
+        let (start, end) = worker.stats.measurement_window_ns().unwrap();
+        assert!(start >= measured_send_ns, "window starts at the first measured send");
+        assert!(start - created_ns >= 50_000_000, "warmup time is outside the window");
+        assert!(end >= start && end <= timing::time_ns());
+        assert_eq!(worker.stats.aggregate_global(Duration::from_secs(1)).total_requests, 0);
     }
 
     #[test]

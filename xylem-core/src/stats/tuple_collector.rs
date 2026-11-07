@@ -520,6 +520,13 @@ pub struct TupleStatsCollector {
     bucket_duration_ns: u64,
     /// Experiment start time in nanoseconds
     experiment_start_ns: u64,
+    /// Time of the first recorded event: the first measured request's send.
+    /// Warmup requests are not recorded, so they fall before this.
+    first_record_ns: Option<u64>,
+    /// End of the measurement loop, set by [`StatsRecorder::end_measurement`].
+    ///
+    /// [`StatsRecorder::end_measurement`]: super::StatsRecorder::end_measurement
+    measurement_end_ns: Option<u64>,
 }
 
 impl TupleStatsCollector {
@@ -533,6 +540,8 @@ impl TupleStatsCollector {
             group_sampling_policies: HashMap::new(),
             bucket_duration_ns: bucket_duration.as_nanos() as u64,
             experiment_start_ns: crate::timing::time_ns(),
+            first_record_ns: None,
+            measurement_end_ns: None,
         }
     }
 
@@ -550,6 +559,8 @@ impl TupleStatsCollector {
             group_sampling_policies: HashMap::new(),
             bucket_duration_ns: bucket_duration.as_nanos() as u64,
             experiment_start_ns: start_time_ns,
+            first_record_ns: None,
+            measurement_end_ns: None,
         }
     }
 
@@ -594,7 +605,9 @@ impl TupleStatsCollector {
         group_id: usize,
         connection_id: usize,
     ) -> (&mut StatsEntry, &mut StatsEntry) {
-        let time_bucket = self.compute_bucket(crate::timing::time_ns());
+        let now_ns = crate::timing::time_ns();
+        self.first_record_ns.get_or_insert(now_ns);
+        let time_bucket = self.compute_bucket(now_ns);
         let policy = self.group_sampling_policies.get(&group_id).unwrap_or(&self.sampling_policy);
         let key = StatsKey {
             time_bucket,
@@ -787,11 +800,11 @@ impl TupleStatsCollector {
 
     /// Get time series for global statistics (collapse group and connection)
     pub fn time_series_global(&self) -> Vec<TimeSeriesPoint> {
-        let bucket_duration_secs = self.bucket_duration_ns as f64 / 1_000_000_000.0;
         let mut points: Vec<TimeSeriesPoint> = self
             .global_entries
             .iter()
             .map(|(&bucket, entry)| {
+                let bucket_duration_secs = self.bucket_width(bucket).as_secs_f64();
                 let total_bytes = (entry.tx_bytes + entry.rx_bytes) as f64;
                 let latency_percentiles = entry.latency.percentiles(&[0.5, 0.99, 0.999]);
                 TimeSeriesPoint {
@@ -813,7 +826,6 @@ impl TupleStatsCollector {
 
     /// Get time series for a specific group
     pub fn time_series_by_group(&self, group_id: usize) -> Vec<TimeSeriesPoint> {
-        let bucket_duration_secs = self.bucket_duration_ns as f64 / 1_000_000_000.0;
         let mut bucket_data: HashMap<u64, (u64, u64, u64, LatencyStorage)> = HashMap::new();
 
         for (key, entry) in &self.entries {
@@ -831,6 +843,7 @@ impl TupleStatsCollector {
         let mut points: Vec<TimeSeriesPoint> = bucket_data
             .into_iter()
             .map(|(bucket, (requests, tx, rx, latency))| {
+                let bucket_duration_secs = self.bucket_width(bucket).as_secs_f64();
                 let total_bytes = (tx + rx) as f64;
                 let latency_percentiles = latency.percentiles(&[0.5, 0.99, 0.999]);
                 TimeSeriesPoint {
@@ -857,8 +870,6 @@ impl TupleStatsCollector {
         thread_id: usize,
         connection_id: usize,
     ) -> Vec<TimeSeriesPoint> {
-        let bucket_duration_secs = self.bucket_duration_ns as f64 / 1_000_000_000.0;
-
         let mut points: Vec<TimeSeriesPoint> = self
             .entries
             .iter()
@@ -868,6 +879,7 @@ impl TupleStatsCollector {
                     && k.connection_id == connection_id
             })
             .map(|(key, entry)| {
+                let bucket_duration_secs = self.bucket_width(key.time_bucket).as_secs_f64();
                 let total_bytes = (entry.tx_bytes + entry.rx_bytes) as f64;
                 let latency_percentiles = entry.latency.percentiles(&[0.5, 0.99, 0.999]);
                 TimeSeriesPoint {
@@ -906,6 +918,8 @@ impl TupleStatsCollector {
             group_sampling_policies: HashMap::new(),
             bucket_duration_ns: first.bucket_duration_ns,
             experiment_start_ns: first.experiment_start_ns,
+            first_record_ns: collectors.iter().filter_map(|c| c.first_record_ns).min(),
+            measurement_end_ns: collectors.iter().filter_map(|c| c.measurement_end_ns).max(),
         };
 
         // Validate policies before merging any entries.
@@ -955,6 +969,42 @@ impl TupleStatsCollector {
     /// Take ownership of entries
     pub fn into_entries(self) -> HashMap<StatsKey, StatsEntry> {
         self.entries
+    }
+
+    /// Record the end of the measurement loop; a merge keeps the latest end.
+    pub fn end_measurement(&mut self, end_ns: u64) {
+        self.measurement_end_ns = Some(self.measurement_end_ns.map_or(end_ns, |e| e.max(end_ns)));
+    }
+
+    /// The measurement window in nanoseconds: from the first recorded event
+    /// (the first measured send, after any warmup) to the end of the
+    /// measurement loop. `None` until both are known.
+    pub fn measurement_window_ns(&self) -> Option<(u64, u64)> {
+        let (start, end) = (self.first_record_ns?, self.measurement_end_ns?);
+        Some((start, end.max(start)))
+    }
+
+    /// Length of [`Self::measurement_window_ns`]. Divide by this, not the
+    /// configured duration, so warmup and setup time do not lower throughput.
+    pub fn measured_duration(&self) -> Option<Duration> {
+        self.measurement_window_ns()
+            .map(|(start, end)| Duration::from_nanos(end - start))
+    }
+
+    /// Time a bucket overlaps the measurement window, so the partial first
+    /// and last buckets report rates over the time they covered. A bucket
+    /// outside the window (such as one holding only responses drained after
+    /// the end), or any bucket without a known window, uses the full width.
+    pub fn bucket_width(&self, time_bucket: u64) -> Duration {
+        let full = self.bucket_duration_ns;
+        let Some((start, end)) = self.measurement_window_ns() else {
+            return Duration::from_nanos(full);
+        };
+        let bucket_start =
+            self.experiment_start_ns.saturating_add(time_bucket.saturating_mul(full));
+        let bucket_end = bucket_start.saturating_add(full);
+        let overlap = bucket_end.min(end).saturating_sub(bucket_start.max(start));
+        Duration::from_nanos(if overlap > 0 { overlap } else { full })
     }
 
     /// Get bucket duration
@@ -1644,6 +1694,50 @@ mod tests {
         // Group and global totals still include both threads.
         assert_eq!(merged.aggregate_global(Duration::from_secs(1)).total_requests, 10);
         assert_eq!(merged.aggregate_by_group(Duration::from_secs(1))[&0].total_requests, 10);
+    }
+
+    #[test]
+    fn measurement_window_merges_and_sets_edge_bucket_widths() {
+        const SEC: u64 = 1_000_000_000;
+        let epoch = 1_000 * SEC;
+        let collector = |first_s: f64, end_s: f64| {
+            let mut c = TupleStatsCollector::with_start_time(
+                SamplingPolicy::default(),
+                Duration::from_secs(1),
+                epoch,
+            );
+            c.first_record_ns = Some(epoch + (first_s * SEC as f64) as u64);
+            c.end_measurement(epoch + (end_s * SEC as f64) as u64);
+            c
+        };
+        // No window without a recorded event and an end.
+        let empty = TupleStatsCollector::with_start_time(
+            SamplingPolicy::default(),
+            Duration::from_secs(1),
+            epoch,
+        );
+        assert_eq!(empty.measured_duration(), None);
+        assert_eq!(empty.bucket_width(0), Duration::from_secs(1));
+
+        // Thread A measures from 0.5 s to 3.25 s, thread B from 0.25 s to 3.0 s.
+        let merged = TupleStatsCollector::merge(vec![collector(0.5, 3.25), collector(0.25, 3.0)]);
+        assert_eq!(merged.measurement_window_ns(), Some((epoch + SEC / 4, epoch + 13 * SEC / 4)));
+        assert_eq!(merged.measured_duration(), Some(Duration::from_secs(3)));
+        assert_eq!(merged.bucket_width(0), Duration::from_millis(750));
+        assert_eq!(merged.bucket_width(1), Duration::from_secs(1));
+        assert_eq!(merged.bucket_width(3), Duration::from_millis(250));
+        // Only drained responses: outside the window, full width.
+        assert_eq!(merged.bucket_width(4), Duration::from_secs(1));
+
+        // A bucket's rate divides by the time it covered.
+        let mut merged = merged;
+        let mut entry = StatsEntry::new(&SamplingPolicy::default());
+        for _ in 0..500 {
+            entry.record_latency(Duration::from_micros(10));
+        }
+        merged.global_entries.insert(3, entry);
+        let point = &merged.time_series_global()[0];
+        assert_eq!((point.time_bucket, point.throughput_rps), (3, 2_000.0));
     }
 
     #[test]

@@ -122,6 +122,10 @@ pub struct ExperimentMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub duration_secs: f64,
+    /// Seconds from the first measured request to the end of the run, which
+    /// throughput is computed over. Excludes connection setup and warmup.
+    #[serde(default)]
+    pub measured_duration_secs: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
 }
@@ -187,12 +191,15 @@ impl DetailedExperimentResults {
     ) -> Self {
         let duration_secs = duration.as_secs_f64();
         let bucket_duration_secs = tuple_stats.bucket_duration().as_secs_f64();
+        // Rates cover the measurement window, which excludes setup and
+        // warmup; collectors that never ran a worker fall back to `duration`.
+        let measured = tuple_stats.measured_duration().unwrap_or(duration);
 
         // Aggregate global stats
-        let global_aggregated = tuple_stats.aggregate_global(duration);
+        let global_aggregated = tuple_stats.aggregate_global(measured);
 
         // Aggregate per-group stats
-        let per_group_aggregated = tuple_stats.aggregate_by_group(duration);
+        let per_group_aggregated = tuple_stats.aggregate_by_group(measured);
 
         // Build raw records from entries (only if requested)
         let mut records: Vec<StatsRecord> = if include_records {
@@ -200,6 +207,7 @@ impl DetailedExperimentResults {
                 .entries()
                 .iter()
                 .map(|(key, entry)| {
+                    let width_secs = tuple_stats.bucket_width(key.time_bucket).as_secs_f64();
                     let total_bytes = (entry.tx_bytes + entry.rx_bytes) as f64;
                     let latency_percentiles = entry.latency.percentiles(&[0.5, 0.99, 0.999]);
                     StatsRecord {
@@ -208,8 +216,8 @@ impl DetailedExperimentResults {
                         thread_id: key.thread_id,
                         connection_id: key.connection_id,
                         request_count: entry.request_count,
-                        throughput_rps: entry.request_count as f64 / bucket_duration_secs,
-                        throughput_mbps: (total_bytes * 8.0) / (bucket_duration_secs * 1_000_000.0),
+                        throughput_rps: entry.request_count as f64 / width_secs,
+                        throughput_mbps: (total_bytes * 8.0) / (width_secs * 1_000_000.0),
                         latency_p50_us: latency_percentiles[0] as f64 / 1000.0,
                         latency_p99_us: latency_percentiles[1] as f64 / 1000.0,
                         latency_p999_us: latency_percentiles[2] as f64 / 1000.0,
@@ -273,6 +281,7 @@ impl DetailedExperimentResults {
                 name: experiment_name,
                 description: experiment_description,
                 duration_secs,
+                measured_duration_secs: measured.as_secs_f64(),
                 seed,
             },
             target: TargetMetadata {
@@ -385,6 +394,7 @@ impl DetailedExperimentResults {
             println!("Description: {}", desc);
         }
         println!("Duration: {:.2}s", self.experiment.duration_secs);
+        println!("Measured: {:.2}s", self.experiment.measured_duration_secs);
         if let Some(seed) = self.experiment.seed {
             println!("Seed: {}", seed);
         }

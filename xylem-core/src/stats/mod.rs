@@ -30,6 +30,10 @@ pub trait StatsRecorder: Send {
 
     /// Record received bytes
     fn record_rx_bytes(&mut self, group_id: usize, connection_id: usize, bytes: usize);
+
+    /// Mark the end of the measurement loop (a `timing::time_ns` value).
+    /// Responses drained after it are still recorded.
+    fn end_measurement(&mut self, _end_ns: u64) {}
 }
 
 // Implement StatsRecorder for TupleStatsCollector (uses all dimensions)
@@ -44,6 +48,10 @@ impl StatsRecorder for TupleStatsCollector {
 
     fn record_rx_bytes(&mut self, group_id: usize, connection_id: usize, bytes: usize) {
         TupleStatsCollector::record_rx_bytes(self, group_id, connection_id, bytes);
+    }
+
+    fn end_measurement(&mut self, end_ns: u64) {
+        TupleStatsCollector::end_measurement(self, end_ns);
     }
 }
 

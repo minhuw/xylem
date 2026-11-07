@@ -95,7 +95,8 @@ fn file_names(dir: &Path) -> Vec<String> {
 }
 
 /// Summary lines that end in a measured value, by their label.
-const MEASURED_LABELS: [&str; 26] = [
+const MEASURED_LABELS: [&str; 27] = [
+    "Measured: ",
     "Total Requests:  ",
     "Throughput:      ",
     "Bandwidth:       ",
@@ -129,6 +130,9 @@ const MEASURED_LABELS: [&str; 26] = [
 fn mask_number(value: &str) -> String {
     if let Some(magnitude) = value.strip_prefix('±') {
         return format!("±{}", mask_number(magnitude));
+    }
+    if let Some(seconds) = value.strip_suffix('s') {
+        return format!("{}s", mask_number(seconds));
     }
     let is_digits = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
     match value.split_once('.') {
@@ -174,6 +178,7 @@ Xylem Detailed Experiment Results
 Experiment: output-formats
 Description: Output format characterization
 Duration: 1.00s
+Measured: #.##s
 Seed: 7
 
 Transport: tcp
@@ -253,7 +258,8 @@ fn json_sections(json_text: &str) -> (&str, &str) {
 /// serde_json's default parser may differ in the last bit.
 fn summary_values(json_text: &str) -> Vec<String> {
     let (global, group) = json_sections(json_text);
-    let mut values = Vec::new();
+    let measured: f64 = raw_number(global, "measured_duration_secs").parse().unwrap();
+    let mut values = vec![format!("{measured:.2}s")];
     for section in [global, group] {
         let requests: u64 = raw_number(section, "total_requests").parse().unwrap();
         values.push(requests.to_string());
@@ -282,7 +288,8 @@ fn summary_values(json_text: &str) -> Vec<String> {
 }
 
 /// JSON fields whose values are measured.
-const MEASURED_KEYS: [&str; 15] = [
+const MEASURED_KEYS: [&str; 16] = [
+    "measured_duration_secs",
     "total_requests",
     "min_us",
     "max_us",
@@ -331,6 +338,7 @@ const MASKED_JSON: &str = r#"{
     "name": "output-formats",
     "description": "Output format characterization",
     "duration_secs": 1.0,
+    "measured_duration_secs": #,
     "seed": 7
   },
   "target": {
@@ -418,6 +426,13 @@ fn assert_json_results(path: &Path, target: &str) -> String {
         assert!(value("std_dev_us") >= 0.0 && value("confidence_interval_us") >= 0.0);
         assert!(latency.get("clamped_samples").is_none());
     }
+    // Rates cover the measured window, which ends with the 1 s run and
+    // starts at the first request, after connection setup.
+    let measured = json["experiment"]["measured_duration_secs"].as_f64().unwrap();
+    assert!(0.9 < measured && measured <= 1.0, "{measured}");
+    let rps = json["global"]["throughput_rps"].as_f64().unwrap();
+    let requests = json["global"]["total_requests"].as_f64().unwrap();
+    assert!((rps * measured - requests).abs() <= 1e-6 * requests, "{rps} * {measured}");
     let requests = &json["global"]["total_requests"];
     assert_eq!(&json["global"]["latency"]["sample_count"], requests);
     assert_eq!(&groups[0]["stats"]["latency"]["sample_count"], requests);
