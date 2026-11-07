@@ -49,11 +49,6 @@ pub struct UniformSize {
 }
 
 impl UniformSize {
-    /// Create a new uniform size generator with entropy-based seed
-    pub fn new(min: usize, max: usize) -> anyhow::Result<Self> {
-        Self::with_seed(min, max, None)
-    }
-
     /// Create a new uniform size generator with explicit seed
     pub fn with_seed(min: usize, max: usize, seed: Option<u64>) -> anyhow::Result<Self> {
         if min > max {
@@ -80,11 +75,6 @@ pub struct NormalSize {
 }
 
 impl NormalSize {
-    /// Create a new normal size generator with entropy-based seed
-    pub fn new(mean: f64, std_dev: f64, min: usize, max: usize) -> anyhow::Result<Self> {
-        Self::with_seed(mean, std_dev, min, max, None)
-    }
-
     /// Create a new normal size generator with explicit seed
     pub fn with_seed(
         mean: f64,
@@ -168,7 +158,7 @@ mod tests {
 
     #[test]
     fn test_uniform_size() {
-        let mut gen = UniformSize::new(100, 200).expect("Failed to create UniformSize");
+        let mut gen = UniformSize::with_seed(100, 200, None).expect("Failed to create UniformSize");
         for _ in 0..1000 {
             let size = gen.next_size();
             assert!((100..=200).contains(&size), "Size {} out of range [100, 200]", size);
@@ -177,13 +167,14 @@ mod tests {
 
     #[test]
     fn test_uniform_size_validation() {
-        let result = UniformSize::new(200, 100);
+        let result = UniformSize::with_seed(200, 100, None);
         assert!(result.is_err(), "Should reject min > max");
     }
 
     #[test]
     fn test_normal_size() {
-        let mut gen = NormalSize::new(150.0, 30.0, 50, 250).expect("Failed to create NormalSize");
+        let mut gen =
+            NormalSize::with_seed(150.0, 30.0, 50, 250, None).expect("Failed to create NormalSize");
         for _ in 0..1000 {
             let size = gen.next_size();
             assert!((50..=250).contains(&size), "Size {} out of range [50, 250]", size);
@@ -192,7 +183,7 @@ mod tests {
 
     #[test]
     fn test_normal_size_validation() {
-        let result = NormalSize::new(100.0, 20.0, 200, 100);
+        let result = NormalSize::with_seed(100.0, 20.0, 200, 100, None);
         assert!(result.is_err(), "Should reject min > max");
     }
 
@@ -234,6 +225,6 @@ mod integer_uniform_tests {
                 assert!(seen.contains(&max));
             }
         }
-        assert!(UniformSize::new(2, 1).is_err());
+        assert!(UniformSize::with_seed(2, 1, None).is_err());
     }
 }

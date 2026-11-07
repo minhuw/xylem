@@ -48,21 +48,6 @@ pub enum ResultCode {
     ScanDone = 4,
 }
 
-impl ResultCode {
-    pub fn from_i8(value: i8) -> Option<Self> {
-        match value {
-            -2 => Some(ResultCode::NotFound),
-            -1 => Some(ResultCode::Retry),
-            0 => Some(ResultCode::OutOfDate),
-            1 => Some(ResultCode::Inserted),
-            2 => Some(ResultCode::Updated),
-            3 => Some(ResultCode::Found),
-            4 => Some(ResultCode::ScanDone),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub enum MasstreeOp {
     Get,
@@ -227,11 +212,6 @@ impl MasstreeProtocol {
         self
     }
 
-    /// Check if currently in insert phase (warmup)
-    pub fn is_in_insert_phase(&self) -> bool {
-        self.insert_phase.as_ref().is_some_and(|p| !p.is_complete())
-    }
-
     fn next_send_seq(&mut self, conn_id: usize) -> u16 {
         let seq = self.conn_send_seq.entry(conn_id).or_insert(0);
         let result = *seq;
@@ -255,16 +235,6 @@ impl MasstreeProtocol {
     /// This is useful for testing to skip the handshake phase
     pub fn mark_handshake_done(&mut self, conn_id: usize) {
         self.conn_handshake_state.insert(conn_id, HandshakeState::Done);
-    }
-
-    /// Get the key prefix
-    pub fn key_prefix(&self) -> &str {
-        &self.key_prefix
-    }
-
-    /// Check if random data is enabled
-    pub fn random_data(&self) -> bool {
-        self.random_data
     }
 
     /// Format a key with the configured prefix
@@ -997,18 +967,6 @@ mod tests {
     }
 
     #[test]
-    fn test_result_code_conversion() {
-        assert_eq!(ResultCode::from_i8(-2), Some(ResultCode::NotFound));
-        assert_eq!(ResultCode::from_i8(-1), Some(ResultCode::Retry));
-        assert_eq!(ResultCode::from_i8(0), Some(ResultCode::OutOfDate));
-        assert_eq!(ResultCode::from_i8(1), Some(ResultCode::Inserted));
-        assert_eq!(ResultCode::from_i8(2), Some(ResultCode::Updated));
-        assert_eq!(ResultCode::from_i8(3), Some(ResultCode::Found));
-        assert_eq!(ResultCode::from_i8(4), Some(ResultCode::ScanDone));
-        assert_eq!(ResultCode::from_i8(99), None);
-    }
-
-    #[test]
     fn test_multiple_operations() {
         // Test that different operations work on same protocol instance
         let mut proto1 = MasstreeProtocol::new(MasstreeOp::Get);
@@ -1134,50 +1092,6 @@ mod tests {
     }
 
     #[test]
-    fn test_key_prefix_accessor() {
-        use crate::workload::KeyGeneration;
-
-        let key_gen = KeyGeneration::sequential(0);
-        let proto = MasstreeProtocol::with_workload_and_options(
-            MasstreeOp::Get,
-            key_gen,
-            64,
-            "custom:".to_string(),
-            false,
-            None,
-            None, // no insert phase
-        );
-
-        assert_eq!(proto.key_prefix(), "custom:");
-        assert!(!proto.random_data());
-    }
-
-    #[test]
-    fn test_random_data_accessor() {
-        use crate::workload::KeyGeneration;
-
-        let key_gen = KeyGeneration::sequential(0);
-        let proto = MasstreeProtocol::with_workload_and_options(
-            MasstreeOp::Set,
-            key_gen,
-            64,
-            "key:".to_string(),
-            true,
-            Some(42),
-            None, // no insert phase
-        );
-
-        assert!(proto.random_data());
-    }
-
-    #[test]
-    fn test_default_key_prefix() {
-        let proto = MasstreeProtocol::new(MasstreeOp::Get);
-        assert_eq!(proto.key_prefix(), "key:");
-        assert!(!proto.random_data());
-    }
-
-    #[test]
     fn test_insert_phase_warmup() {
         use crate::workload::KeyGeneration;
 
@@ -1222,13 +1136,14 @@ mod tests {
 
     #[test]
     fn test_insert_phase_with_builder() {
-        // Test the builder method
-        let proto = MasstreeProtocol::new(MasstreeOp::Get).with_insert_phase(100, 128);
-
-        assert!(proto.is_in_insert_phase());
+        // Test the builder method: after the handshake, the first request is an insert
+        let mut proto = MasstreeProtocol::new(MasstreeOp::Get).with_insert_phase(100, 128);
+        proto.mark_handshake_done(0);
+        assert!(proto.next_request(0).metadata.is_warmup);
 
         // Create without insert phase
-        let proto2 = MasstreeProtocol::new(MasstreeOp::Get);
-        assert!(!proto2.is_in_insert_phase());
+        let mut proto2 = MasstreeProtocol::new(MasstreeOp::Get);
+        proto2.mark_handshake_done(0);
+        assert!(!proto2.next_request(0).metadata.is_warmup);
     }
 }

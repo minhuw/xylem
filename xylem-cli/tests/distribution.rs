@@ -32,7 +32,7 @@ mod key_selection {
     /// Test random key generation stays within bounds
     #[test]
     fn test_random_keys_bounds() {
-        let mut keygen = KeyGeneration::random(10000);
+        let mut keygen = KeyGeneration::random_with_seed(10000, None);
 
         for _ in 0..10000 {
             let key = keygen.next_key();
@@ -43,7 +43,7 @@ mod key_selection {
     /// Test random key generation produces variety
     #[test]
     fn test_random_keys_distribution() {
-        let mut keygen = KeyGeneration::random(1000);
+        let mut keygen = KeyGeneration::random_with_seed(1000, None);
 
         let keys: Vec<u64> = (0..10000).map(|_| keygen.next_key()).collect();
         let unique_keys: std::collections::HashSet<_> = keys.iter().collect();
@@ -70,7 +70,8 @@ mod key_selection {
     /// Test Zipfian distribution produces skewed access pattern
     #[test]
     fn test_zipfian_skew() {
-        let mut keygen = KeyGeneration::zipfian(1000, 0.99).expect("Failed to create Zipfian");
+        let mut keygen =
+            KeyGeneration::zipfian_with_seed(1000, 0.99, None).expect("Failed to create Zipfian");
 
         let mut counts: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
         for _ in 0..100000 {
@@ -109,8 +110,8 @@ mod key_selection {
     #[test]
     fn test_gaussian_centered() {
         // Mean at 50%, std_dev at 10%, max 10000
-        let mut keygen =
-            KeyGeneration::gaussian(0.5, 0.1, 10000).expect("Failed to create Gaussian");
+        let mut keygen = KeyGeneration::gaussian_with_seed(0.5, 0.1, 10000, None)
+            .expect("Failed to create Gaussian");
 
         let keys: Vec<u64> = (0..100000).map(|_| keygen.next_key()).collect();
 
@@ -168,7 +169,7 @@ mod value_size {
     /// Test uniform size stays within bounds
     #[test]
     fn test_uniform_size_bounds() {
-        let mut gen = UniformSize::new(100, 200).expect("Failed to create UniformSize");
+        let mut gen = UniformSize::with_seed(100, 200, None).expect("Failed to create UniformSize");
 
         for _ in 0..10000 {
             let size = gen.next_size();
@@ -180,7 +181,7 @@ mod value_size {
     #[test]
     fn test_uniform_size_distribution() {
         // Note: Uniform distribution is [min, max) - exclusive of max
-        let mut gen = UniformSize::new(100, 110).expect("Failed to create UniformSize");
+        let mut gen = UniformSize::with_seed(100, 110, None).expect("Failed to create UniformSize");
 
         let mut counts = [0usize; 10];
         for _ in 0..100000 {
@@ -206,7 +207,8 @@ mod value_size {
     /// Test normal size distribution centers around mean
     #[test]
     fn test_normal_size_centered() {
-        let mut gen = NormalSize::new(500.0, 50.0, 100, 900).expect("Failed to create NormalSize");
+        let mut gen = NormalSize::with_seed(500.0, 50.0, 100, 900, None)
+            .expect("Failed to create NormalSize");
 
         let sizes: Vec<usize> = (0..100000).map(|_| gen.next_size()).collect();
 
@@ -227,7 +229,8 @@ mod value_size {
     #[test]
     fn test_normal_size_clamping() {
         // Very wide std dev to test clamping
-        let mut gen = NormalSize::new(500.0, 500.0, 100, 900).expect("Failed to create NormalSize");
+        let mut gen = NormalSize::with_seed(500.0, 500.0, 100, 900, None)
+            .expect("Failed to create NormalSize");
 
         for _ in 0..10000 {
             let size = gen.next_size();
@@ -301,8 +304,16 @@ mod redis_distributions {
     #[test]
     fn test_redis_zipfian_distribution() {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
-        let key_gen = KeyGeneration::zipfian(1000, 0.99).expect("Failed to create Zipfian");
-        let mut protocol = RedisProtocol::with_workload(selector, key_gen, 64);
+        let key_gen =
+            KeyGeneration::zipfian_with_seed(1000, 0.99, None).expect("Failed to create Zipfian");
+        let mut protocol = RedisProtocol::with_workload_and_options(
+            selector,
+            key_gen,
+            64,
+            "key:".to_string(),
+            false,
+            None,
+        );
 
         let mut key_counts: HashMap<String, usize> = HashMap::new();
 
@@ -336,8 +347,16 @@ mod redis_distributions {
     #[test]
     fn test_redis_gaussian_distribution() {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
-        let key_gen = KeyGeneration::gaussian(0.5, 0.1, 10000).expect("Failed to create Gaussian");
-        let mut protocol = RedisProtocol::with_workload(selector, key_gen, 64);
+        let key_gen = KeyGeneration::gaussian_with_seed(0.5, 0.1, 10000, None)
+            .expect("Failed to create Gaussian");
+        let mut protocol = RedisProtocol::with_workload_and_options(
+            selector,
+            key_gen,
+            64,
+            "key:".to_string(),
+            false,
+            None,
+        );
 
         let mut keys: Vec<u64> = Vec::new();
 
@@ -462,7 +481,8 @@ mod masstree_distributions {
     /// Test Masstree with Zipfian key distribution
     #[test]
     fn test_masstree_zipfian_distribution() {
-        let key_gen = KeyGeneration::zipfian(1000, 0.99).expect("Failed to create Zipfian");
+        let key_gen =
+            KeyGeneration::zipfian_with_seed(1000, 0.99, None).expect("Failed to create Zipfian");
         let mut protocol = MasstreeProtocol::with_workload(MasstreeOp::Get, key_gen, 64);
         protocol.mark_handshake_done(0);
 
@@ -503,7 +523,8 @@ mod masstree_distributions {
     /// Test Masstree with Gaussian key distribution
     #[test]
     fn test_masstree_gaussian_distribution() {
-        let key_gen = KeyGeneration::gaussian(0.5, 0.1, 10000).expect("Failed to create Gaussian");
+        let key_gen = KeyGeneration::gaussian_with_seed(0.5, 0.1, 10000, None)
+            .expect("Failed to create Gaussian");
         let mut protocol = MasstreeProtocol::with_workload(MasstreeOp::Get, key_gen, 64);
         protocol.mark_handshake_done(0);
 
@@ -613,7 +634,14 @@ mod cross_protocol {
             KeyGeneration::zipfian_with_seed(1000, 0.99, Some(42)).expect("Failed");
 
         let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
-        let mut redis = RedisProtocol::with_workload(selector, redis_keygen, 64);
+        let mut redis = RedisProtocol::with_workload_and_options(
+            selector,
+            redis_keygen,
+            64,
+            "key:".to_string(),
+            false,
+            None,
+        );
 
         let mut masstree = MasstreeProtocol::with_workload(MasstreeOp::Get, masstree_keygen, 64);
         masstree.mark_handshake_done(0);

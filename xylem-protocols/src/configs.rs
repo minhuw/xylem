@@ -546,16 +546,6 @@ impl InsertPhaseConfig {
         })?;
         Ok((count, self.value_size.unwrap_or_else(|| keys.value_size())))
     }
-
-    /// Resolve key_count with fallback to provided default
-    pub fn key_count_or(&self, default: u64) -> u64 {
-        self.key_count.unwrap_or(default)
-    }
-
-    /// Resolve value_size with fallback to provided default
-    pub fn value_size_or(&self, default: usize) -> usize {
-        self.value_size.unwrap_or(default)
-    }
 }
 
 /// Masstree scan configuration

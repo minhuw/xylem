@@ -630,23 +630,6 @@ fn new_without_workload_uses_key_zero_and_64_byte_values() {
     assert_request(protocol.next_request(0), Request::measurement(set, (0, 1)));
 }
 
-#[test]
-fn with_workload_uses_key_prefix_and_x_values() {
-    let mut protocol = RedisProtocol::with_workload(
-        Box::new(FixedCommandSelector::new(RedisOp::Set)),
-        KeyGeneration::sequential(7),
-        3,
-    );
-    assert_request(
-        protocol.next_request(1),
-        Request::measurement(b"*3\r\n$3\r\nSET\r\n$5\r\nkey:7\r\n$3\r\nxxx\r\n".to_vec(), (1, 0)),
-    );
-    assert_request(
-        protocol.next_request(0),
-        Request::measurement(b"*3\r\n$3\r\nSET\r\n$5\r\nkey:8\r\n$3\r\nxxx\r\n".to_vec(), (0, 0)),
-    );
-}
-
 // Command templates
 
 #[test]
@@ -723,15 +706,6 @@ fn template_lengths_count_bytes() {
     assert_bytes(
         &first_template_bytes("SET cl\u{e9} __key__"),
         b"*3\r\n$3\r\nSET\r\n$4\r\ncl\xc3\xa9\r\n$5\r\nkey:7\r\n",
-    );
-}
-
-#[test]
-fn template_generate_request_uses_key_prefix_and_x_data() {
-    let template = CommandTemplate::parse("SET __key__ __data__ __value_size__").unwrap();
-    assert_bytes(
-        &template.generate_request(42, 5),
-        b"*4\r\n$3\r\nSET\r\n$6\r\nkey:42\r\n$5\r\nxxxxx\r\n$1\r\n5\r\n",
     );
 }
 
@@ -963,7 +937,6 @@ fn multibyte_key_prefix_lengths_count_bytes() {
 #[test]
 fn insert_phase_sends_set_warmups_then_replays_workload_keys() {
     let mut protocol = protocol_with_prefix(RedisOp::Get, "key:").with_insert_phase(2, 4);
-    assert!(protocol.is_in_insert_phase());
     assert_request(
         protocol.next_request(0),
         Request::warmup(b"*3\r\n$3\r\nSET\r\n$5\r\nkey:7\r\n$4\r\nxxxx\r\n".to_vec(), (0, 0)),
@@ -972,7 +945,6 @@ fn insert_phase_sends_set_warmups_then_replays_workload_keys() {
         protocol.next_request(1),
         Request::warmup(b"*3\r\n$3\r\nSET\r\n$5\r\nkey:8\r\n$4\r\nxxxx\r\n".to_vec(), (1, 0)),
     );
-    assert!(!protocol.is_in_insert_phase());
     assert_request(
         protocol.next_request(0),
         Request::measurement(b"*2\r\n$3\r\nGET\r\n$5\r\nkey:7\r\n".to_vec(), (0, 1)),

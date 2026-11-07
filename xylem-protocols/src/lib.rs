@@ -9,7 +9,6 @@ pub mod configs;
 pub mod http;
 pub mod masstree;
 pub mod memcached;
-pub mod protocol;
 pub mod redis;
 pub mod workload;
 pub mod xylem_echo;

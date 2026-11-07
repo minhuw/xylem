@@ -119,11 +119,6 @@ impl KeyGeneration {
         Self::RoundRobin { max, current: 0 }
     }
 
-    /// Create a random key generator with entropy-based seed
-    pub fn random(max: u64) -> Self {
-        Self::random_with_seed(max, None)
-    }
-
     /// Create a random key generator with explicit seed
     pub fn random_with_seed(max: u64, seed: Option<u64>) -> Self {
         let rng = match seed {
@@ -133,20 +128,10 @@ impl KeyGeneration {
         Self::Random { max, rng }
     }
 
-    /// Create a Zipfian key generator with entropy-based seed
-    pub fn zipfian(n: u64, s: f64) -> anyhow::Result<Self> {
-        Self::zipfian_with_seed(n, s, None)
-    }
-
     /// Create a Zipfian key generator with explicit seed
     pub fn zipfian_with_seed(n: u64, s: f64, seed: Option<u64>) -> anyhow::Result<Self> {
         let dist = ZipfianDistribution::with_seed(n, s, seed)?;
         Ok(Self::Zipfian(dist))
-    }
-
-    /// Create a Gaussian (Normal) key generator with entropy-based seed
-    pub fn gaussian(mean_pct: f64, std_dev_pct: f64, max: u64) -> anyhow::Result<Self> {
-        Self::gaussian_with_seed(mean_pct, std_dev_pct, max, None)
     }
 
     /// Create a Gaussian (Normal) key generator with explicit seed
@@ -216,7 +201,7 @@ mod tests {
 
     #[test]
     fn test_random_keys() {
-        let mut keygen = KeyGeneration::random(10000);
+        let mut keygen = KeyGeneration::random_with_seed(10000, None);
         let k1 = keygen.next_key();
         let k2 = keygen.next_key();
         assert!(k1 < 10000);
@@ -226,7 +211,8 @@ mod tests {
 
     #[test]
     fn test_zipfian_basic() {
-        let mut keygen = KeyGeneration::zipfian(100, 0.99).expect("Failed to create Zipfian");
+        let mut keygen =
+            KeyGeneration::zipfian_with_seed(100, 0.99, None).expect("Failed to create Zipfian");
         for _ in 0..1000 {
             let key = keygen.next_key();
             assert!(key < 100, "Key {} out of range [0, 100)", key);
@@ -235,21 +221,21 @@ mod tests {
 
     #[test]
     fn test_zipfian_parameter_validation() {
-        let result = KeyGeneration::zipfian(0, 0.99);
+        let result = KeyGeneration::zipfian_with_seed(0, 0.99, None);
         assert!(result.is_err());
 
-        let result = KeyGeneration::zipfian(100, -0.5);
+        let result = KeyGeneration::zipfian_with_seed(100, -0.5, None);
         assert!(result.is_err());
 
-        let result = KeyGeneration::zipfian(100, 0.99);
+        let result = KeyGeneration::zipfian_with_seed(100, 0.99, None);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_gaussian_basic() {
         // Mean at 50% of keyspace, std_dev at 10% of keyspace, max 1000
-        let mut keygen =
-            KeyGeneration::gaussian(0.5, 0.1, 1000).expect("Failed to create Gaussian");
+        let mut keygen = KeyGeneration::gaussian_with_seed(0.5, 0.1, 1000, None)
+            .expect("Failed to create Gaussian");
         for _ in 0..1000 {
             let key = keygen.next_key();
             assert!(key < 1000, "Key {} out of range [0, 1000)", key);
@@ -274,25 +260,25 @@ mod tests {
     #[test]
     fn test_gaussian_parameter_validation() {
         // max = 0 should fail
-        let result = KeyGeneration::gaussian(0.5, 0.1, 0);
+        let result = KeyGeneration::gaussian_with_seed(0.5, 0.1, 0, None);
         assert!(result.is_err());
 
         // mean_pct out of range should fail
-        let result = KeyGeneration::gaussian(1.5, 0.1, 1000);
+        let result = KeyGeneration::gaussian_with_seed(1.5, 0.1, 1000, None);
         assert!(result.is_err());
 
-        let result = KeyGeneration::gaussian(-0.1, 0.1, 1000);
+        let result = KeyGeneration::gaussian_with_seed(-0.1, 0.1, 1000, None);
         assert!(result.is_err());
 
         // std_dev_pct out of range should fail
-        let result = KeyGeneration::gaussian(0.5, 1.5, 1000);
+        let result = KeyGeneration::gaussian_with_seed(0.5, 1.5, 1000, None);
         assert!(result.is_err());
 
-        let result = KeyGeneration::gaussian(0.5, -0.1, 1000);
+        let result = KeyGeneration::gaussian_with_seed(0.5, -0.1, 1000, None);
         assert!(result.is_err());
 
         // Valid parameters should succeed
-        let result = KeyGeneration::gaussian(0.5, 0.1, 1000);
+        let result = KeyGeneration::gaussian_with_seed(0.5, 0.1, 1000, None);
         assert!(result.is_ok());
     }
 

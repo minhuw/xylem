@@ -957,7 +957,6 @@ fn masstree_new_and_default_handshake_each_connection_before_key_zero_gets() {
     ];
     assert_eq!(masstree_get(1, "key:0"), second_get);
     for mut protocol in [MasstreeProtocol::new(MasstreeOp::Get), MasstreeProtocol::default()] {
-        assert!(!protocol.is_in_insert_phase());
         assert!(protocol.can_send(0));
         assert!(protocol.can_send(1));
         assert_requests(
@@ -1141,7 +1140,6 @@ fn masstree_new_scan_sends_first_key_count_and_fields() {
 fn masstree_with_workload_get_draws_keys_across_connections() {
     let mut protocol =
         MasstreeProtocol::with_workload(MasstreeOp::Get, KeyGeneration::sequential(7), 3);
-    assert!(!protocol.is_in_insert_phase());
     complete_masstree_handshake(&mut protocol, 0);
     complete_masstree_handshake(&mut protocol, 1);
     assert_requests(
@@ -1279,7 +1277,6 @@ fn masstree_with_workload_and_options_inserts_before_measuring() {
         Some(42),
         Some(InsertPhaseState::new(3, 2)),
     );
-    assert!(protocol.is_in_insert_phase());
     complete_masstree_handshake(&mut protocol, 0);
     assert_requests(
         &mut protocol,
@@ -1300,13 +1297,11 @@ fn masstree_with_workload_and_options_inserts_before_measuring() {
             (0, Request::measurement(masstree_get(3, "mt:0"), (0, 3))),
         ],
     );
-    assert!(!protocol.is_in_insert_phase());
 }
 
 #[test]
 fn masstree_with_insert_phase_without_workload_counts_up_from_key_zero() {
     let mut protocol = MasstreeProtocol::new(MasstreeOp::Get).with_insert_phase(2, 3);
-    assert!(protocol.is_in_insert_phase());
     complete_masstree_handshake(&mut protocol, 0);
     complete_masstree_handshake(&mut protocol, 1);
     assert_requests(
@@ -1318,7 +1313,6 @@ fn masstree_with_insert_phase_without_workload_counts_up_from_key_zero() {
             (0, Request::measurement(masstree_get(1, "key:0"), (0, 1))),
         ],
     );
-    assert!(!protocol.is_in_insert_phase());
 }
 
 #[test]
@@ -1379,7 +1373,6 @@ fn masstree_reset_restarts_handshakes_ids_and_keys_but_not_insert_phase() {
         vec![(0, Request::warmup(masstree_set(0, "key:0", b"x"), (0, 0)))],
     );
     protocol.reset();
-    assert!(protocol.is_in_insert_phase());
     complete_masstree_handshake(&mut protocol, 0);
     complete_masstree_handshake(&mut protocol, 1);
     assert_requests(
@@ -1391,7 +1384,6 @@ fn masstree_reset_restarts_handshakes_ids_and_keys_but_not_insert_phase() {
         ],
     );
     protocol.reset();
-    assert!(!protocol.is_in_insert_phase());
     complete_masstree_handshake(&mut protocol, 1);
     complete_masstree_handshake(&mut protocol, 0);
     assert_requests(

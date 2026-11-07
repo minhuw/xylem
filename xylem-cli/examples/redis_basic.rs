@@ -67,8 +67,14 @@ fn main() -> anyhow::Result<()> {
     let selector =
         Box::new(xylem_protocols::FixedCommandSelector::new(xylem_protocols::redis::RedisOp::Get));
     let key_gen = xylem_protocols::workload::KeyGeneration::sequential(0);
-    let protocol =
-        xylem_protocols::redis::RedisProtocol::with_workload(selector, key_gen, value_size);
+    let protocol = xylem_protocols::redis::RedisProtocol::with_workload_and_options(
+        selector,
+        key_gen,
+        value_size,
+        "key:".to_string(),
+        false,
+        None,
+    );
 
     // Create stats collector with unlimited sampling (collect all latencies)
     let stats = TupleStatsCollector::new(SamplingPolicy::Unlimited, Duration::from_secs(1));
