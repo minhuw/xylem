@@ -175,11 +175,7 @@ fn run_worker(
         }
     }
 
-    let avg_latency_ns = if total_rx > 0 {
-        total_latency_ns / total_rx
-    } else {
-        0
-    };
+    let avg_latency_ns = total_latency_ns.checked_div(total_rx).unwrap_or(0);
 
     (total_tx, total_rx, avg_latency_ns, max_latency_ns)
 }
