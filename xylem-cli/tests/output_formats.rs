@@ -95,7 +95,7 @@ fn file_names(dir: &Path) -> Vec<String> {
 }
 
 /// Summary lines that end in a measured value, by their label.
-const MEASURED_LABELS: [&str; 27] = [
+const MEASURED_LABELS: [&str; 39] = [
     "Measured: ",
     "Total Requests:  ",
     "Throughput:      ",
@@ -123,6 +123,18 @@ const MEASURED_LABELS: [&str; 27] = [
     "    Std Dev:     ",
     "    95% CI:      ",
     "    Samples:     ",
+    "  Sent:          ",
+    "  Completed:     ",
+    "  Timed out:     ",
+    "  Failed:        ",
+    "  Late sends:    ",
+    "  Unsent:        ",
+    "    Sent:        ",
+    "    Completed:   ",
+    "    Timed out:   ",
+    "    Failed:      ",
+    "    Late sends:  ",
+    "    Unsent:      ",
 ];
 
 /// Mask an integer as `#` and a number with two decimals as `#.##`, keeping a
@@ -203,6 +215,19 @@ Latency (μs):
   95% CI:        ±#.##
   Samples:       #
 
+Requests:
+  Sent:          #
+  Completed:     #
+  Timed out:     #
+  Failed:        #
+  Late sends:    #
+  Unsent:        #
+
+Send lag (μs, late above 100):
+  Mean:          n/a
+  p99:           n/a
+  Max:           n/a
+
 {single}
 TRAFFIC GROUP 0: echo
 {single}
@@ -227,6 +252,19 @@ Statistics:
     Std Dev:     #.##
     95% CI:      ±#.##
     Samples:     #
+
+  Requests:
+    Sent:        #
+    Completed:   #
+    Timed out:   #
+    Failed:      #
+    Late sends:  #
+    Unsent:      #
+
+  Send lag (μs, late above 100):
+    Mean:        n/a
+    p99:         n/a
+    Max:         n/a
 
 {double}
 ",
@@ -261,6 +299,8 @@ fn summary_values(json_text: &str) -> Vec<String> {
     let measured: f64 = raw_number(global, "measured_duration_secs").parse().unwrap();
     let mut values = vec![format!("{measured:.2}s")];
     for section in [global, group] {
+        // Latency keys before the request counts; send lag keys after them
+        let (section, accounting) = section.split_once("\"requests\"").unwrap();
         let requests: u64 = raw_number(section, "total_requests").parse().unwrap();
         values.push(requests.to_string());
         for key in ["throughput_rps", "throughput_mbps"] {
@@ -283,12 +323,20 @@ fn summary_values(json_text: &str) -> Vec<String> {
         let ci: f64 = raw_number(section, "confidence_interval_us").parse().unwrap();
         values.push(format!("±{ci:.2}"));
         values.push(raw_number(section, "sample_count").to_string());
+        for key in ["sent", "completed", "timed_out", "failed", "late_sends", "unsent"] {
+            values.push(raw_number(accounting, key).to_string());
+        }
+        // A closed-loop run has no send lags
+        for key in ["mean_us", "p99_us", "max_us"] {
+            assert_eq!(raw_number(accounting, key), "null");
+            values.push("n/a".to_string());
+        }
     }
     values
 }
 
 /// JSON fields whose values are measured.
-const MEASURED_KEYS: [&str; 16] = [
+const MEASURED_KEYS: [&str; 22] = [
     "measured_duration_secs",
     "total_requests",
     "min_us",
@@ -305,6 +353,12 @@ const MEASURED_KEYS: [&str; 16] = [
     "p99999_us",
     "std_dev_us",
     "confidence_interval_us",
+    "sent",
+    "completed",
+    "timed_out",
+    "failed",
+    "late_sends",
+    "unsent",
 ];
 
 /// Mask the numbers of measured fields in pretty-printed JSON as `#`.
@@ -363,6 +417,22 @@ const MASKED_JSON: &str = r#"{
       "std_dev_us": #,
       "confidence_interval_us": #,
       "sample_count": #
+    },
+    "requests": {
+      "sent": #,
+      "completed": #,
+      "timed_out": #,
+      "failed": #,
+      "late_sends": #,
+      "unsent": #,
+      "unsent_capped": false
+    },
+    "send_lag": {
+      "sample_count": #,
+      "mean_us": null,
+      "p99_us": null,
+      "max_us": null,
+      "late_threshold_us": 100.0
     }
   },
   "traffic_groups": [
@@ -393,6 +463,22 @@ const MASKED_JSON: &str = r#"{
           "std_dev_us": #,
           "confidence_interval_us": #,
           "sample_count": #
+        },
+        "requests": {
+          "sent": #,
+          "completed": #,
+          "timed_out": #,
+          "failed": #,
+          "late_sends": #,
+          "unsent": #,
+          "unsent_capped": false
+        },
+        "send_lag": {
+          "sample_count": #,
+          "mean_us": null,
+          "p99_us": null,
+          "max_us": null,
+          "late_threshold_us": 100.0
         }
       }
     }
@@ -433,9 +519,20 @@ fn assert_json_results(path: &Path, target: &str) -> String {
     let rps = json["global"]["throughput_rps"].as_f64().unwrap();
     let requests = json["global"]["total_requests"].as_f64().unwrap();
     assert!((rps * measured - requests).abs() <= 1e-6 * requests, "{rps} * {measured}");
-    let requests = &json["global"]["total_requests"];
-    assert_eq!(&json["global"]["latency"]["sample_count"], requests);
-    assert_eq!(&groups[0]["stats"]["latency"]["sample_count"], requests);
+    for stats in [&json["global"], &groups[0]["stats"]] {
+        // Every completed request has a latency, including one completed
+        // during the drain, which throughput does not count. Every sent
+        // request is accounted for; a closed loop has no schedule to lag.
+        let count = |key: &str| stats["requests"][key].as_u64().unwrap();
+        assert_eq!(stats["latency"]["sample_count"].as_u64().unwrap(), count("completed"));
+        let in_window = stats["total_requests"].as_u64().unwrap();
+        assert!(in_window <= count("completed") && count("completed") <= in_window + 1);
+        assert_eq!(count("sent"), count("completed") + count("timed_out") + count("failed"));
+        assert_eq!((count("timed_out"), count("failed")), (0, 0));
+        assert_eq!((count("late_sends"), count("unsent")), (0, 0));
+        assert_eq!(stats["send_lag"]["sample_count"], 0);
+    }
+    assert_eq!(json["global"]["requests"], groups[0]["stats"]["requests"]);
     text
 }
 
@@ -558,6 +655,9 @@ fn both_format_strips_one_extension_then_replaces_the_next() {
         // The HTML report shows the same results as the JSON file. Both write
         // numbers with serde_json, so the chart data repeats the JSON text.
         let (global, group) = json_sections(&json_text);
+        // The send lag has percentiles too; read the latencies before it
+        let latencies = |section| -> &str { str::split_once(section, "\"requests\"").unwrap().0 };
+        let (global, group) = (latencies(global), latencies(group));
         let global_latencies: Vec<&str> = ["p50_us", "p95_us", "p99_us", "p999_us", "p9999_us"]
             .iter()
             .map(|key| raw_number(global, key))

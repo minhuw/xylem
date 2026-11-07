@@ -31,6 +31,7 @@ fn test_memcached_binary_single_thread() {
                 duration: Duration::from_secs(1),
                 conn_count: 1,
                 max_pending_per_conn: 1,
+                drain_timeout: xylem_core::threading::DEFAULT_DRAIN_TIMEOUT,
             };
 
             let mut worker =
@@ -75,6 +76,7 @@ fn test_memcached_ascii_single_thread() {
                 duration: Duration::from_secs(1),
                 conn_count: 1,
                 max_pending_per_conn: 1,
+                drain_timeout: xylem_core::threading::DEFAULT_DRAIN_TIMEOUT,
             };
 
             let mut worker =
@@ -119,6 +121,7 @@ fn test_memcached_binary_multi_thread() {
                 duration: Duration::from_secs(2),
                 conn_count: 1,
                 max_pending_per_conn: 1,
+                drain_timeout: xylem_core::threading::DEFAULT_DRAIN_TIMEOUT,
             };
 
             let mut worker =
@@ -167,6 +170,7 @@ fn test_memcached_ascii_rate_limited() {
                 duration: Duration::from_secs(2),
                 conn_count: 1,
                 max_pending_per_conn: 1,
+                drain_timeout: xylem_core::threading::DEFAULT_DRAIN_TIMEOUT,
             };
 
             // Use fixed-rate policy for rate limiting

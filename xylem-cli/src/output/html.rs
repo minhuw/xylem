@@ -138,6 +138,11 @@ pub fn generate_html_report(results: &DetailedExperimentResults, path: &str) -> 
             </div>
         </div>
 
+        <h3>Requests</h3>
+        <table>
+            {global_requests}
+        </table>
+
         <div class="chart-container">
             <canvas id="globalLatencyChart"></canvas>
         </div>
@@ -223,6 +228,7 @@ pub fn generate_html_report(results: &DetailedExperimentResults, path: &str) -> 
         throughput = results.global.throughput_rps,
         bandwidth = results.global.throughput_mbps,
         median = results.global.latency.p50_us,
+        global_requests = request_rows(&results.global.requests, &results.global.send_lag),
         group_sections = generate_group_sections(&results.traffic_groups),
         global_latencies = script_json(&[
             results.global.latency.p50_us,
@@ -319,6 +325,7 @@ fn generate_group_sections(groups: &[super::TrafficGroupResults]) -> String {
                     <td>Latency Samples</td>
                     <td>{samples}</td>
                 </tr>
+                {requests_rows}
             </table>
             <div class="chart-container">
                 <canvas id="groupLatencyChart{id}"></canvas>
@@ -344,10 +351,38 @@ fn generate_group_sections(groups: &[super::TrafficGroupResults]) -> String {
                     .confidence_interval_us
                     .map_or_else(|| "n/a".to_string(), |ci| format!("±{ci:.2} μs")),
                 samples = group.stats.latency.sample_count,
+                requests_rows = request_rows(&group.stats.requests, &group.stats.send_lag),
             )
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Table rows for request counts and send lags
+fn request_rows(requests: &xylem_core::stats::RequestCounts, lag: &super::SendLagStats) -> String {
+    let capped = if requests.unsent_capped {
+        " (lower bound)"
+    } else {
+        ""
+    };
+    [
+        ("Requests Sent", requests.sent.to_string()),
+        ("Requests Completed", requests.completed.to_string()),
+        ("Requests Timed Out (no latency)", requests.timed_out.to_string()),
+        ("Requests Failed", requests.failed.to_string()),
+        (
+            "Late Sends",
+            format!("{} (send lag above {:.0} μs)", requests.late_sends, lag.late_threshold_us),
+        ),
+        ("Unsent Requests", format!("{}{capped}", requests.unsent)),
+        ("Mean Send Lag", micros_or_na(lag.mean_us)),
+        ("p99 Send Lag", micros_or_na(lag.p99_us)),
+        ("Max Send Lag", micros_or_na(lag.max_us)),
+    ]
+    .iter()
+    .map(|(label, value)| format!("<tr>\n<td>{label}</td>\n<td>{value}</td>\n</tr>"))
+    .collect::<Vec<_>>()
+    .join("\n")
 }
 
 /// Format optional microseconds with two decimals and a unit, or `n/a`.

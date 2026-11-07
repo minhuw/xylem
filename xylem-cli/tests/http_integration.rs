@@ -43,6 +43,7 @@ fn test_http_get_single_thread() {
         duration,
         conn_count: 1,
         max_pending_per_conn: 1,
+        drain_timeout: xylem_core::threading::DEFAULT_DRAIN_TIMEOUT,
     };
 
     let mut worker =
@@ -102,6 +103,7 @@ fn test_http_post_single_thread() {
         duration,
         conn_count: 1,
         max_pending_per_conn: 1,
+        drain_timeout: xylem_core::threading::DEFAULT_DRAIN_TIMEOUT,
     };
 
     let mut worker =
@@ -153,6 +155,7 @@ fn test_http_multi_thread() {
             duration,
             conn_count: 1,
             max_pending_per_conn: 1,
+            drain_timeout: xylem_core::threading::DEFAULT_DRAIN_TIMEOUT,
         };
         let mut worker = Worker::with_closed_loop(
             &TcpTransportFactory::default(),
@@ -220,6 +223,7 @@ fn test_http_rate_limited() {
         duration,
         conn_count: 1,
         max_pending_per_conn: 1,
+        drain_timeout: xylem_core::threading::DEFAULT_DRAIN_TIMEOUT,
     };
 
     let scheduler =
@@ -270,6 +274,7 @@ fn test_http_put_request() {
         duration,
         conn_count: 1,
         max_pending_per_conn: 1,
+        drain_timeout: xylem_core::threading::DEFAULT_DRAIN_TIMEOUT,
     };
 
     let mut worker =
@@ -314,6 +319,7 @@ fn test_http_pipelined() {
         duration,
         conn_count: 2,
         max_pending_per_conn: 16, // Allow HTTP pipelining
+        drain_timeout: xylem_core::threading::DEFAULT_DRAIN_TIMEOUT,
     };
 
     let mut worker =

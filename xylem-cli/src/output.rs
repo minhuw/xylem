@@ -10,7 +10,9 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
-use xylem_core::stats::{AggregatedStats, TupleStatsCollector};
+use xylem_core::stats::{
+    AggregatedStats, RequestCounts, SendLagSummary, TupleStatsCollector, LATE_SEND_THRESHOLD,
+};
 
 /// Latency summary in microseconds. Values the sampling policy cannot provide
 /// are `None`, written as `null` in JSON and `n/a` in text and HTML.
@@ -38,6 +40,32 @@ pub struct LatencyStats {
     /// were recorded at that bound. Omitted unless the bound is configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clamped_samples: Option<u64>,
+}
+
+/// Lag of open-loop requests behind their intended send times, in
+/// microseconds. The values are null when no open-loop request was sent
+/// (closed loop).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SendLagStats {
+    /// Number of open-loop measurement requests sent
+    pub sample_count: u64,
+    pub mean_us: Option<f64>,
+    pub p99_us: Option<f64>,
+    pub max_us: Option<f64>,
+    /// Lag above which a send counts in `requests.late_sends`
+    pub late_threshold_us: f64,
+}
+
+impl SendLagStats {
+    fn new(summary: &SendLagSummary) -> Self {
+        Self {
+            sample_count: summary.sample_count,
+            mean_us: summary.mean.map(micros),
+            p99_us: summary.p99.map(micros),
+            max_us: summary.max.map(micros),
+            late_threshold_us: micros(LATE_SEND_THRESHOLD),
+        }
+    }
 }
 
 /// Microseconds in a duration.
@@ -118,10 +146,18 @@ pub struct TargetMetadata {
 /// Global aggregated statistics
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GlobalStats {
+    /// Requests completed inside the measurement window, which throughput counts
     pub total_requests: u64,
     pub throughput_rps: f64,
     pub throughput_mbps: f64,
+    /// Latencies of every completed request, including those completed
+    /// during the drain after the window
     pub latency: LatencyStats,
+    /// What happened to every measurement request
+    #[serde(default)]
+    pub requests: RequestCounts,
+    #[serde(default)]
+    pub send_lag: SendLagStats,
 }
 
 /// Per-traffic-group results
@@ -142,10 +178,18 @@ pub struct TrafficGroupResults {
 /// Per-group statistics
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GroupStats {
+    /// Requests completed inside the measurement window, which throughput counts
     pub total_requests: u64,
     pub throughput_rps: f64,
     pub throughput_mbps: f64,
+    /// Latencies of every completed request, including those completed
+    /// during the drain after the window
     pub latency: LatencyStats,
+    /// What happened to every measurement request
+    #[serde(default)]
+    pub requests: RequestCounts,
+    #[serde(default)]
+    pub send_lag: SendLagStats,
 }
 
 impl DetailedExperimentResults {
@@ -222,6 +266,8 @@ impl DetailedExperimentResults {
             throughput_rps: global_aggregated.throughput_rps,
             throughput_mbps: global_aggregated.throughput_mbps,
             latency: Self::latency_stats(&global_aggregated),
+            requests: tuple_stats.request_counts_global(),
+            send_lag: SendLagStats::new(&tuple_stats.send_lag_global()),
         };
 
         // Build per-group results
@@ -245,6 +291,8 @@ impl DetailedExperimentResults {
                         throughput_rps: aggregated.throughput_rps,
                         throughput_mbps: aggregated.throughput_mbps,
                         latency: Self::latency_stats(aggregated),
+                        requests: tuple_stats.request_counts(group_id),
+                        send_lag: SendLagStats::new(&tuple_stats.send_lag(group_id)),
                     },
                     protocol_metadata: None,
                 };
@@ -312,6 +360,36 @@ impl DetailedExperimentResults {
         if let Some(clamped) = latency.clamped_samples {
             line("Clamped:", clamped.to_string());
         }
+    }
+
+    /// Print the request counts and send lags with `indent` before each label.
+    fn print_requests(requests: &RequestCounts, send_lag: &SendLagStats, indent: &str) {
+        let width = 17 - indent.len();
+        let line = |label: &str, value: String| println!("{indent}{label:<width$}{value}");
+        println!("{indent}Requests:");
+        line("  Sent:", requests.sent.to_string());
+        line("  Completed:", requests.completed.to_string());
+        line("  Timed out:", requests.timed_out.to_string());
+        line("  Failed:", requests.failed.to_string());
+        line("  Late sends:", requests.late_sends.to_string());
+        let capped = if requests.unsent_capped {
+            " (lower bound)"
+        } else {
+            ""
+        };
+        line("  Unsent:", format!("{}{capped}", requests.unsent));
+        if requests.timed_out > 0 {
+            println!(
+                "{indent}  WARNING: {} requests got no response within the drain timeout; \
+                 they have no latency",
+                requests.timed_out
+            );
+        }
+        println!();
+        println!("{indent}Send lag (μs, late above {:.0}):", send_lag.late_threshold_us);
+        line("  Mean:", format_optional(send_lag.mean_us));
+        line("  p99:", format_optional(send_lag.p99_us));
+        line("  Max:", format_optional(send_lag.max_us));
     }
 
     /// Format a policy config as a human-readable string
@@ -390,6 +468,8 @@ impl DetailedExperimentResults {
         println!("Latency (μs):");
         Self::print_latency(&self.global.latency, "  ");
         println!();
+        Self::print_requests(&self.global.requests, &self.global.send_lag, "");
+        println!();
 
         for (i, group) in self.traffic_groups.iter().enumerate() {
             println!("{}", "-".repeat(70));
@@ -407,6 +487,8 @@ impl DetailedExperimentResults {
             println!();
             println!("  Latency (μs):");
             Self::print_latency(&group.stats.latency, "    ");
+            println!();
+            Self::print_requests(&group.stats.requests, &group.stats.send_lag, "  ");
 
             if let Some(ref metadata) = group.protocol_metadata {
                 println!();

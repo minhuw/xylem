@@ -75,6 +75,7 @@ fn test_redis_single_thread() {
         duration,
         conn_count: 1,
         max_pending_per_conn: 1,
+        drain_timeout: xylem_core::threading::DEFAULT_DRAIN_TIMEOUT,
     };
 
     let mut worker =
@@ -167,6 +168,7 @@ fn test_global_sampling_none_disables_latency() {
         duration,
         conn_count: 1,
         max_pending_per_conn: 1,
+        drain_timeout: xylem_core::threading::DEFAULT_DRAIN_TIMEOUT,
     };
 
     let mut worker =
@@ -241,6 +243,7 @@ fn test_redis_multi_thread() {
             duration,
             conn_count: 1,
             max_pending_per_conn: 1,
+            drain_timeout: xylem_core::threading::DEFAULT_DRAIN_TIMEOUT,
         };
         let mut worker = Worker::with_closed_loop(
             &TcpTransportFactory::default(),
@@ -331,6 +334,7 @@ fn test_redis_closed_loop_minimal() {
         duration,
         conn_count: 1,
         max_pending_per_conn: 1, // Minimal pipelining - one request at a time
+        drain_timeout: xylem_core::threading::DEFAULT_DRAIN_TIMEOUT,
     };
 
     let mut worker =

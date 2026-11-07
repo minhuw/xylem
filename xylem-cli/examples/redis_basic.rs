@@ -79,6 +79,7 @@ fn main() -> anyhow::Result<()> {
         duration,
         conn_count,
         max_pending_per_conn,
+        drain_timeout: xylem_core::threading::DEFAULT_DRAIN_TIMEOUT,
     };
 
     // Create and configure the worker

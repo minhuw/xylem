@@ -438,6 +438,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
             duration,
             conn_count: total_conn_count,
             max_pending_per_conn: 1, // This will be overridden per-group
+            drain_timeout: config_for_worker.experiment.drain_timeout,
         };
 
         // Helper function to wire the request dumper into a created worker, run it,

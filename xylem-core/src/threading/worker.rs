@@ -9,7 +9,7 @@
 
 use crate::connection::{ConnectionPool, TrafficGroupConfig};
 use crate::request_dump::RequestDumper;
-use crate::stats::{StatsRecorder, TupleStatsCollector};
+use crate::stats::{StatsRecorder, TupleStatsCollector, UNSENT_WALK_CAP};
 use crate::timing;
 use crate::Result;
 use std::collections::HashMap;
@@ -29,7 +29,13 @@ pub struct WorkerConfig {
     pub conn_count: usize,
     /// Maximum pending requests per connection
     pub max_pending_per_conn: usize,
+    /// Longest wait for pending responses after the measurement window;
+    /// requests still pending then count as timed out
+    pub drain_timeout: Duration,
 }
+
+/// Default for [`WorkerConfig::drain_timeout`]
+pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Worker with connection pooling and request pipelining
 ///
@@ -175,6 +181,7 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             // Check if duration exceeded
             if now_ns >= end_ns {
                 self.stats.end_measurement(end_ns);
+                self.record_unsent(end_ns);
                 break;
             }
 
@@ -188,7 +195,7 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             self.process_responses(poll_timeout)?;
         }
 
-        // Drain remaining responses
+        // Stop sending and wait for the responses still pending
         self.drain_responses()?;
 
         // Close all connections
@@ -223,21 +230,25 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
                 self.record_request(dumper, group_id, connection_id, &request.data, &req_id_str);
             }
 
-            // Send request (track warmup status for response handling)
-            let sent_time_ns = timing::time_ns();
-            self.pool.send(
+            // Send request (track warmup status for response handling). An
+            // open-loop request's latency starts at its intended send time.
+            let intended_ns = state.intended_send_time();
+            let lag = self.pool.send_scheduled(
                 connection_id,
                 &request.data,
                 request.request_id,
                 request.metadata.is_warmup,
+                intended_ns,
             )?;
 
-            // Notify policy and record stats (skip stats for warmup requests)
+            // Advance the policy's schedule and record stats (skip stats for
+            // warmup requests)
             if let Some(state) = self.pool.get_state_mut(connection_id) {
-                state.on_request_sent(sent_time_ns);
+                state.on_request_sent(timing::time_ns());
             }
             if !request.metadata.is_warmup {
                 self.stats.record_tx_bytes(group_id, connection_id, request.data.len());
+                self.stats.record_sent(group_id, connection_id, lag);
             }
 
             // Try to re-add connection to heap if it still has capacity
@@ -316,7 +327,7 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
                 }) {
                     Ok(responses) => responses,
                     Err(e @ crate::Error::Connection(_)) => {
-                        let _ = self.pool.close(connection_id);
+                        self.close_failed(connection_id, group_id);
                         tracing::warn!(connection_id, "Connection disconnected: {}", e);
                         continue;
                     }
@@ -350,37 +361,70 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         }
     }
 
-    /// Drain any remaining responses after measurement period
-    fn drain_responses(&mut self) -> Result<()> {
-        for _ in 0..100 {
-            let has_pending = self.drain_iteration()?;
-            if !has_pending {
-                return Ok(());
+    /// Close a connection that failed, counting its pending measurement
+    /// requests as failed
+    fn close_failed(&mut self, connection_id: usize, group_id: usize) {
+        if let Some(state) = self.pool.get_state(connection_id) {
+            let failed = state.measured_pending_count() as u64;
+            if failed > 0 {
+                self.stats.record_failed(group_id, connection_id, failed);
             }
-            std::thread::sleep(Duration::from_micros(100));
         }
-        let pending: usize = self
-            .pool
-            .connection_ids()
-            .iter()
-            .filter_map(|&id| self.pool.get_state(id))
-            .map(|state| state.pending_count())
-            .sum();
-        tracing::warn!(
-            pending_requests = pending,
-            "Response drain exhausted; retaining collected statistics"
-        );
-        Ok(())
+        let _ = self.pool.close(connection_id);
     }
 
-    /// Single drain iteration, using the same parser and error handling as
-    /// measurement. The outer drain loop bounds the number of poll iterations.
-    fn drain_iteration(&mut self) -> Result<bool> {
-        if !self.has_pending() {
-            return Ok(false);
+    /// Count the intended sends of every connection scheduled before the end
+    /// of the window that were never sent
+    fn record_unsent(&mut self, end_ns: u64) {
+        for (group_id, connection_id, count, capped) in
+            self.pool.count_unsent(end_ns, UNSENT_WALK_CAP)
+        {
+            if capped {
+                tracing::warn!(
+                    connection_id,
+                    cap = UNSENT_WALK_CAP,
+                    "Unsent request count stopped at its cap; it is a lower bound"
+                );
+            }
+            self.stats.record_unsent(group_id, connection_id, count, capped);
         }
-        self.process_responses(Duration::from_millis(10))?;
-        Ok(self.has_pending())
+    }
+
+    /// Wait for pending responses after the measurement window, until none
+    /// is pending or `drain_timeout` passes. Sends nothing. Measurement
+    /// requests still pending then are counted as timed out, without a latency.
+    fn drain_responses(&mut self) -> Result<()> {
+        let timeout_ns = self.config.drain_timeout.as_nanos().min(u64::MAX as u128) as u64;
+        let deadline_ns = timing::time_ns().saturating_add(timeout_ns);
+        while self.has_pending() {
+            let now_ns = timing::time_ns();
+            if now_ns >= deadline_ns {
+                break;
+            }
+            // Short waits keep TX timestamp polling and the deadline responsive.
+            let wait_ns = (deadline_ns - now_ns).min(10_000_000);
+            self.process_responses(Duration::from_nanos(wait_ns))?;
+        }
+
+        let mut timed_out = 0;
+        for &connection_id in self.pool.connection_ids() {
+            let Some(state) = self.pool.get_state(connection_id) else {
+                continue;
+            };
+            let pending = state.measured_pending_count() as u64;
+            if pending > 0 {
+                self.stats.record_timed_out(state.group_id(), connection_id, pending);
+                timed_out += pending;
+            }
+        }
+        if timed_out > 0 {
+            tracing::warn!(
+                timed_out_requests = timed_out,
+                drain_timeout = ?self.config.drain_timeout,
+                "Requests still pending after the drain timeout count as timed out"
+            );
+        }
+        Ok(())
     }
 
     fn has_pending(&self) -> bool {
@@ -472,6 +516,13 @@ mod tests {
         fn reset(&mut self) {}
     }
 
+    /// The fake transport never blocks in poll, so keep its drain short.
+    const FAKE_DRAIN_TIMEOUT: Duration = Duration::from_millis(20);
+
+    fn global(worker: &Worker<FakeGroup, FakeProtocol>) -> crate::stats::AggregatedStats {
+        worker.stats.aggregate_global(Duration::from_secs(1))
+    }
+
     fn fake_worker(
         factory: &FakeFactory,
         max_pending: usize,
@@ -488,6 +539,7 @@ mod tests {
                 duration: Duration::from_millis(100),
                 conn_count: 1,
                 max_pending_per_conn: max_pending,
+                drain_timeout: FAKE_DRAIN_TIMEOUT,
             },
             scheduler,
         )
@@ -521,7 +573,7 @@ mod tests {
     }
 
     #[test]
-    fn run_preserves_completed_stats_and_closes_after_disconnect_or_drain_exhaustion() {
+    fn run_preserves_completed_stats_and_closes_after_disconnect_or_drain_timeout() {
         for disconnect in [true, false] {
             let factory = FakeFactory::default();
             let mut worker =
@@ -529,7 +581,7 @@ mod tests {
             worker.send_requests().unwrap();
             factory.0.lock().unwrap().responses.push_back(Ok(0u64.to_le_bytes().to_vec()));
             worker.process_responses(Duration::ZERO).unwrap();
-            assert_eq!(worker.stats.aggregate_global(Duration::from_secs(1)).total_requests, 1);
+            assert_eq!(global(&worker).total_requests, 1);
             if disconnect {
                 factory
                     .0
@@ -540,13 +592,18 @@ mod tests {
             }
             worker.config.duration = Duration::ZERO;
             worker.run().unwrap();
-            assert_eq!(worker.stats.aggregate_global(Duration::from_secs(1)).total_requests, 1);
+            assert_eq!(global(&worker).total_requests, 1);
             assert_eq!(worker.stats.entries().values().map(|entry| entry.rx_bytes).sum::<u64>(), 8);
             assert!(factory.0.lock().unwrap().closed);
             assert!(worker.pool.get_state(0).unwrap().is_closed());
             assert_eq!(worker.pool.get_state(0).unwrap().pending_count(), 0);
             assert!(!worker.has_pending());
-            assert_eq!(factory.0.lock().unwrap().timeouts.len(), if disconnect { 2 } else { 101 });
+            // The second request was pending on a dropped connection, or
+            // still pending at the drain deadline; either way it is counted
+            let counts = worker.stats.request_counts_global();
+            assert_eq!((counts.sent, counts.completed), (2, 1));
+            assert_eq!((counts.failed, counts.timed_out), if disconnect { (1, 0) } else { (0, 1) });
+            assert_eq!(global(&worker).latency_sample_count, 1, "no invented latency");
         }
     }
 
@@ -568,14 +625,16 @@ mod tests {
         let factory = FakeFactory::default();
         let mut worker =
             fake_worker(&factory, 2, Box::new(UniformPolicyScheduler::fixed_rate(0.001)));
-        assert_eq!(worker.pool.pick_connection_at(100), Some(0));
-        worker.pool.get_state_mut(0).unwrap().on_request_sent(100);
+        // The first request is due at the connection's start
+        assert_eq!(worker.pool.pick_connection(), Some(0));
+        worker.pool.get_state_mut(0).unwrap().on_request_sent(timing::time_ns());
         worker.pool.try_schedule_connection(0, &worker.protocols[&0]);
-        let timeout = worker.poll_timeout(100, 5_000_100);
+        let now = timing::time_ns();
+        let timeout = worker.poll_timeout(now, now + 5_000_000);
         assert_eq!(timeout, Duration::from_millis(5));
         worker.process_responses(timeout).unwrap();
         assert_eq!(factory.0.lock().unwrap().timeouts, vec![Duration::from_millis(5)]);
-        assert_eq!(worker.poll_timeout(5_000_101, 5_000_100), Duration::ZERO);
+        assert_eq!(worker.poll_timeout(now + 5_000_001, now + 5_000_000), Duration::ZERO);
     }
 
     #[test]
@@ -592,12 +651,13 @@ mod tests {
         let mut worker = fake_worker(&factory, 1, Box::new(UniformPolicyScheduler::closed_loop()));
         worker.send_requests().unwrap();
         factory.0.lock().unwrap().responses.push_back(Ok(0u64.to_le_bytes().to_vec()));
-        assert!(!worker.drain_iteration().unwrap());
-        assert_eq!(worker.stats.aggregate_global(Duration::from_secs(1)).total_requests, 1);
+        worker.drain_responses().unwrap();
+        assert_eq!(global(&worker).total_requests, 1);
         assert_eq!(factory.0.lock().unwrap().tx_polls, 1);
         // Already drained: no extra blocking poll.
-        assert!(!worker.drain_iteration().unwrap());
+        worker.drain_responses().unwrap();
         assert_eq!(factory.0.lock().unwrap().timeouts.len(), 1);
+        assert_eq!(worker.stats.request_counts_global().timed_out, 0);
     }
 
     #[test]
@@ -613,13 +673,13 @@ mod tests {
             } else {
                 Err(xylem_transport::Error::Io(std::io::Error::other("test I/O error")))
             });
-            assert!(worker.drain_iteration().is_err());
-            assert_eq!(worker.stats.aggregate_global(Duration::from_secs(1)).total_requests, 0);
+            assert!(worker.drain_responses().is_err());
+            assert_eq!(global(&worker).total_requests, 0);
         }
     }
 
     #[test]
-    fn drain_closes_disconnected_connection() {
+    fn drain_closes_disconnected_connection_and_counts_its_requests_as_failed() {
         let factory = FakeFactory::default();
         let mut worker = fake_worker(&factory, 1, Box::new(UniformPolicyScheduler::closed_loop()));
         worker.send_requests().unwrap();
@@ -629,9 +689,11 @@ mod tests {
             .unwrap()
             .responses
             .push_back(Err(xylem_transport::Error::Connection("closed".into())));
-        assert!(!worker.drain_iteration().unwrap());
+        worker.drain_responses().unwrap();
         assert!(factory.0.lock().unwrap().closed);
         assert_eq!(worker.pool.get_state(0).unwrap().pending_count(), 0);
+        let counts = worker.stats.request_counts_global();
+        assert_eq!((counts.sent, counts.failed, counts.timed_out), (1, 1, 0));
     }
 
     #[test]
@@ -648,6 +710,7 @@ mod tests {
                 duration: Duration::ZERO,
                 conn_count: 2,
                 max_pending_per_conn: 1,
+                drain_timeout: DEFAULT_DRAIN_TIMEOUT,
             },
         )
         .unwrap();
@@ -667,22 +730,122 @@ mod tests {
             io.response_connection_id = 1;
             io.responses.push_back(Ok(1u64.to_le_bytes().to_vec()));
         }
+        worker.process_responses(Duration::ZERO).unwrap();
         worker.run().unwrap();
         assert_eq!(worker.stats.aggregate_global(Duration::from_secs(1)).total_requests, 1);
         assert_eq!(worker.stats.entries().values().map(|entry| entry.rx_bytes).sum::<u64>(), 8);
+        assert_eq!(worker.stats.request_counts_global().failed, 1);
         assert_eq!(factory.0.lock().unwrap().timeouts.len(), 2);
         assert!(!worker.has_pending());
         assert!(worker.pool.get_state(1).unwrap().is_closed());
     }
 
     #[test]
-    fn bounded_drain_reports_unfinished_requests() {
+    fn unanswered_request_times_out_at_the_drain_deadline() {
         let factory = FakeFactory::default();
-        let mut worker = fake_worker(&factory, 1, Box::new(UniformPolicyScheduler::closed_loop()));
+        let mut worker = fake_worker(&factory, 2, Box::new(UniformPolicyScheduler::closed_loop()));
+        // One warmup request and one measured request never get a response
+        worker.protocols.get_mut(&0).unwrap().warmup = 1;
         worker.send_requests().unwrap();
+        let start = std::time::Instant::now();
         worker.drain_responses().unwrap();
+        assert!(start.elapsed() >= FAKE_DRAIN_TIMEOUT);
         assert!(worker.has_pending());
-        assert_eq!(factory.0.lock().unwrap().timeouts.len(), 100);
+        let counts = worker.stats.request_counts_global();
+        assert_eq!((counts.sent, counts.completed, counts.timed_out), (1, 0, 1));
+        assert_eq!(worker.stats.request_counts(0), counts);
+        assert_eq!(global(&worker).latency_sample_count, 0);
+    }
+
+    #[test]
+    fn drain_completion_counts_toward_latency_but_not_throughput() {
+        let factory = FakeFactory::default();
+        let mut worker = fake_worker(&factory, 2, Box::new(UniformPolicyScheduler::closed_loop()));
+        worker.send_requests().unwrap();
+        // The first response arrives in the window, the second during the drain
+        factory.0.lock().unwrap().responses.push_back(Ok(0u64.to_le_bytes().to_vec()));
+        worker.process_responses(Duration::ZERO).unwrap();
+        factory.0.lock().unwrap().responses.push_back(Ok(1u64.to_le_bytes().to_vec()));
+        worker.config.duration = Duration::ZERO;
+        worker.run().unwrap();
+        let stats = global(&worker);
+        assert_eq!(stats.total_requests, 1);
+        assert_eq!(stats.latency_sample_count, 2);
+        assert_eq!(worker.stats.entries().values().map(|entry| entry.rx_bytes).sum::<u64>(), 8);
+        let points = worker.stats.time_series_global();
+        assert_eq!(points.iter().map(|p| p.request_count).sum::<u64>(), 1);
+        let counts = worker.stats.request_counts_global();
+        assert_eq!((counts.sent, counts.completed, counts.timed_out), (2, 2, 0));
+    }
+
+    #[test]
+    fn closed_loop_requests_have_no_send_lag_or_unsent_requests() {
+        let factory = FakeFactory::default();
+        let mut worker = fake_worker(&factory, 4, Box::new(UniformPolicyScheduler::closed_loop()));
+        worker.send_requests().unwrap();
+        let responses: Vec<u8> = (0u64..4).flat_map(u64::to_le_bytes).collect();
+        factory.0.lock().unwrap().responses.push_back(Ok(responses));
+        worker.config.duration = Duration::ZERO;
+        worker.run().unwrap();
+        let counts = worker.stats.request_counts_global();
+        assert_eq!((counts.sent, counts.completed, counts.late_sends, counts.unsent), (4, 4, 0, 0));
+        assert_eq!(worker.stats.send_lag_global(), crate::stats::SendLagSummary::default());
+        // Latency is the service latency alone, as before
+        assert_eq!(global(&worker).max_latency, Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn stalled_sender_sends_overdue_requests_and_their_latency_includes_the_lag() {
+        let factory = FakeFactory::default();
+        factory.0.lock().unwrap().live_timestamps = true;
+        let mut worker =
+            fake_worker(&factory, 1000, Box::new(UniformPolicyScheduler::fixed_rate(1000.0)));
+        let start_ns = worker.pool.get_state(0).unwrap().intended_send_time().unwrap();
+        worker.send_requests().unwrap();
+        assert_eq!(factory.0.lock().unwrap().sent.len(), 1);
+
+        // The sender stalls for 100 ms at 1000 req/s
+        thread::sleep(Duration::from_millis(100));
+        while worker.pool.has_ready(timing::time_ns()) {
+            worker.send_requests().unwrap();
+        }
+        let sent = factory.0.lock().unwrap().sent.len() as u64;
+        assert!(sent >= 101, "the overdue requests go out: {sent}");
+        assert_eq!(
+            worker.pool.get_state(0).unwrap().intended_send_time(),
+            Some(start_ns + sent * 1_000_000),
+            "each request took its own intended time"
+        );
+        let lag = worker.stats.send_lag_global();
+        assert_eq!(lag.sample_count, sent);
+        assert!(lag.max.unwrap() >= Duration::from_millis(99), "{lag:?}");
+        let counts = worker.stats.request_counts_global();
+        assert!(counts.late_sends >= 90, "{counts:?}");
+
+        // Each latency is its send lag plus the service latency
+        let responses: Vec<u8> = (0..sent).flat_map(u64::to_le_bytes).collect();
+        factory.0.lock().unwrap().responses.push_back(Ok(responses));
+        worker.process_responses(Duration::ZERO).unwrap();
+        let stats = global(&worker);
+        assert_eq!(stats.total_requests, sent);
+        assert!(stats.max_latency.unwrap() >= lag.max.unwrap());
+        assert!(stats.mean_latency >= lag.mean.unwrap());
+        assert!(stats.mean_latency >= Duration::from_millis(40), "{:?}", stats.mean_latency);
+    }
+
+    #[test]
+    fn intended_sends_that_never_went_out_count_as_unsent() {
+        let factory = FakeFactory::default();
+        let mut worker =
+            fake_worker(&factory, 1, Box::new(UniformPolicyScheduler::fixed_rate(1000.0)));
+        let start_ns = worker.pool.get_state(0).unwrap().intended_send_time().unwrap();
+        // The only request never gets a response, so the pipeline stays full
+        worker.send_requests().unwrap();
+        let end_ns = start_ns + 50_000_000;
+        worker.record_unsent(end_ns);
+        let counts = worker.stats.request_counts_global();
+        assert_eq!((counts.sent, counts.unsent, counts.unsent_capped), (1, 49, false));
+        assert_eq!(worker.stats.request_counts(0).unsent, 49);
     }
 
     #[test]
@@ -700,8 +863,10 @@ mod tests {
                 )),
             );
             // Remove the initial heap entry so response processing can reschedule.
-            assert_eq!(worker.pool.pick_connection_at(100), Some(0));
-            worker.pool.get_state_mut(0).unwrap().on_request_sent(100);
+            assert_eq!(worker.pool.pick_connection(), Some(0));
+            let state = worker.pool.get_state_mut(0).unwrap();
+            let start = state.intended_send_time().unwrap();
+            state.on_request_sent(timing::time_ns());
             let mut responses = Vec::new();
             for id in 0u64..100 {
                 worker.pool.send(0, &id.to_le_bytes(), id, warmup).unwrap();
@@ -713,14 +878,15 @@ mod tests {
             // call the adaptive policy directly to apply or simulate feedback.
             let next = worker.pool.peek_next_ready_time().unwrap();
             if warmup {
-                assert_eq!(next, 10_000_100, "warmup must not change the adaptive rate");
-                assert_eq!(worker.stats.aggregate_global(Duration::from_secs(1)).total_requests, 0);
+                assert_eq!(next - start, 10_000_000, "warmup must not change the adaptive rate");
+                assert_eq!(global(&worker).total_requests, 0);
             } else {
-                assert_eq!(next, 9_091_009, "100 zero-latency responses increase rate to 110/s");
                 assert_eq!(
-                    worker.stats.aggregate_global(Duration::from_secs(1)).total_requests,
-                    100
+                    next - start,
+                    9_090_909,
+                    "100 zero-latency responses increase rate to 110/s"
                 );
+                assert_eq!(global(&worker).total_requests, 100);
             }
         }
     }
@@ -774,6 +940,7 @@ mod tests {
             duration: Duration::from_millis(100),
             conn_count: 1,
             max_pending_per_conn: 1,
+            drain_timeout: DEFAULT_DRAIN_TIMEOUT,
         };
 
         let factory = TcpTransportFactory::default();
@@ -827,6 +994,7 @@ mod tests {
             duration: Duration::from_millis(200),
             conn_count: 1,
             max_pending_per_conn: 10,
+            drain_timeout: DEFAULT_DRAIN_TIMEOUT,
         };
 
         // Fixed rate: 100 req/s = 10ms per request

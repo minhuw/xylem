@@ -125,6 +125,11 @@
           ],
           "default": null
         },
+        "drain_timeout": {
+          "description": "Longest wait for pending responses after the measurement window\n(default 1s). Requests still pending then count as timed out.",
+          "type": "string",
+          "default": "1s"
+        },
         "duration": {
           "description": "Experiment duration",
           "type": "string"

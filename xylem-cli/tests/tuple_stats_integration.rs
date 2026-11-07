@@ -37,6 +37,7 @@ fn test_tuple_stats_single_thread_redis() {
         duration,
         conn_count,
         max_pending_per_conn: 1,
+        drain_timeout: xylem_core::threading::DEFAULT_DRAIN_TIMEOUT,
     };
 
     let mut worker =
@@ -120,6 +121,7 @@ fn test_tuple_stats_multi_thread_redis() {
                 duration,
                 conn_count,
                 max_pending_per_conn: 1,
+                drain_timeout: xylem_core::threading::DEFAULT_DRAIN_TIMEOUT,
             };
 
             let mut worker = Worker::with_closed_loop(
@@ -197,6 +199,7 @@ fn test_tuple_stats_output_generation() {
         duration,
         conn_count,
         max_pending_per_conn: 1,
+        drain_timeout: xylem_core::threading::DEFAULT_DRAIN_TIMEOUT,
     };
 
     let mut worker =
@@ -305,6 +308,7 @@ fn test_tuple_stats_time_buckets() {
         duration,
         conn_count: 2,
         max_pending_per_conn: 1,
+        drain_timeout: xylem_core::threading::DEFAULT_DRAIN_TIMEOUT,
     };
 
     let mut worker =
