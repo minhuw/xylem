@@ -275,18 +275,42 @@ pub fn disable_nic_timestamping(interface: &str) -> Result<()> {
     result
 }
 
-fn configure_nic_timestamping(
-    fd: RawFd,
-    interface: &str,
-    rx_filter: i32,
-    tx_type: i32,
-) -> Result<()> {
-    let config = HwtstampConfig { flags: 0, tx_type, rx_filter };
+/// Whether `interface` currently has hardware timestamping switched on
+///
+/// Reads the NIC configuration with `SIOCGHWTSTAMP`, which needs no
+/// privilege, and reports true only when TX timestamping is on and the RX
+/// filter is not `HWTSTAMP_FILTER_NONE`. Socket-level `SO_TIMESTAMPING`
+/// requests succeed whether or not the NIC is configured, so this is the
+/// check that decides whether hardware timestamps will actually arrive.
+///
+/// Returns an error when the interface does not exist or its driver does
+/// not support hardware timestamping.
+pub fn nic_timestamping_enabled(interface: &str) -> Result<bool> {
+    use hwtstamp::*;
 
-    // Create ifreq structure
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_UDP) };
+    if fd < 0 {
+        return Err(Error::Io(io::Error::last_os_error()));
+    }
+
+    let mut config = HwtstampConfig::default();
+    let mut ifr = ifreq_for(interface, &mut config);
+    const SIOCGHWTSTAMP: libc::c_ulong = 0x89b1;
+    let ret = unsafe { libc::ioctl(fd, SIOCGHWTSTAMP, &mut ifr) };
+    let err = io::Error::last_os_error();
+    unsafe { libc::close(fd) };
+
+    if ret < 0 {
+        return Err(Error::Config(format!(
+            "Could not read hardware timestamping configuration of '{interface}': {err}"
+        )));
+    }
+    Ok(config.tx_type != HWTSTAMP_TX_OFF && config.rx_filter != HWTSTAMP_FILTER_NONE)
+}
+
+/// An `ifreq` naming `interface` (truncated to 15 bytes) whose data points at `config`
+fn ifreq_for(interface: &str, config: &mut HwtstampConfig) -> libc::ifreq {
     let mut ifr: libc::ifreq = unsafe { mem::MaybeUninit::zeroed().assume_init() };
-
-    // Copy interface name (max 15 chars + null terminator)
     let if_bytes = interface.as_bytes();
     let copy_len = std::cmp::min(if_bytes.len(), 15);
     unsafe {
@@ -296,9 +320,18 @@ fn configure_nic_timestamping(
             copy_len,
         );
     }
+    ifr.ifr_ifru.ifru_data = config as *mut HwtstampConfig as *mut libc::c_char;
+    ifr
+}
 
-    // Set ifr_data to point to config
-    ifr.ifr_ifru.ifru_data = &config as *const HwtstampConfig as *mut libc::c_char;
+fn configure_nic_timestamping(
+    fd: RawFd,
+    interface: &str,
+    rx_filter: i32,
+    tx_type: i32,
+) -> Result<()> {
+    let mut config = HwtstampConfig { flags: 0, tx_type, rx_filter };
+    let ifr = ifreq_for(interface, &mut config);
 
     // SIOCSHWTSTAMP ioctl
     const SIOCSHWTSTAMP: libc::c_ulong = 0x89b0;
@@ -604,6 +637,73 @@ mod tests {
         // Omit final alignment padding, as recvmsg is permitted to do.
         buf.truncate(buf.len() - (mem::size_of::<usize>() - 1));
         assert!(extract_rx_timestamp(&buf, buf.len()).is_some());
+    }
+
+    /// Wait for the next TX timestamp on `fd`'s error queue
+    pub(crate) fn wait_tx_timestamp(fd: RawFd) -> (KernelTimestamp, u32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if let Some(stamp) = recv_tx_timestamp(fd).unwrap() {
+                return stamp;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("no TX timestamp within 5 s");
+    }
+
+    /// Pins what Linux reports with SOF_TIMESTAMPING_OPT_ID on TCP: the
+    /// counter starts at zero and each stamp's ID is the offset of the LAST
+    /// byte of the write (`seq + len - 1`), not the exclusive end.
+    /// Loopback generates software TX timestamps (loopback_xmit).
+    #[test]
+    fn loopback_tcp_opt_id_is_last_byte_offset() {
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        client.set_nodelay(true).unwrap();
+        let fd = client.as_raw_fd();
+        enable_software_timestamping(fd).unwrap();
+
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            client.write_all(&[0; 10]).unwrap();
+            let (ts, id) = wait_tx_timestamp(fd);
+            assert_eq!(ts.clock, KernelClock::Realtime);
+            ids.push(id);
+            server.read_exact(&mut [0; 10]).unwrap();
+        }
+        assert_eq!(ids, vec![9, 19]);
+        assert_eq!(recv_tx_timestamp(fd).unwrap(), None);
+    }
+
+    /// Pins what Linux reports with SOF_TIMESTAMPING_OPT_ID on UDP: one
+    /// stamp per datagram, IDs counting datagrams from zero.
+    #[test]
+    fn loopback_udp_opt_id_counts_datagrams() {
+        use std::os::fd::AsRawFd;
+        let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let fd = client.as_raw_fd();
+        enable_software_timestamping(fd).unwrap();
+
+        let mut ids = Vec::new();
+        for len in [10, 10, 3] {
+            client.send_to(&vec![0; len], server.local_addr().unwrap()).unwrap();
+            let (ts, id) = wait_tx_timestamp(fd);
+            assert_eq!(ts.clock, KernelClock::Realtime);
+            ids.push(id);
+        }
+        assert_eq!(ids, vec![0, 1, 2]);
+        assert_eq!(recv_tx_timestamp(fd).unwrap(), None);
+    }
+
+    #[test]
+    fn loopback_has_no_hardware_timestamping() {
+        // lo has no PHC: either the driver rejects the query or reports it off
+        assert!(!nic_timestamping_enabled("lo").unwrap_or(false));
+        assert!(nic_timestamping_enabled("xylem-no-such-if").is_err());
     }
 
     #[test]

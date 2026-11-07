@@ -2,14 +2,13 @@
 //!
 //! `TcpConnectionGroup` manages many TCP connections behind one multiplexer.
 //!
-//! ## Hardware Timestamping (Linux only)
+//! ## Kernel Timestamping (Linux only)
 //!
-//! On Linux, this transport can use kernel timestamps (SO_TIMESTAMPING) for
-//! more accurate latency measurement. Hardware timestamps are used when the
-//! NIC supports them, with automatic fallback to software timestamps.
-//! Configure via `TcpTimestampConfig`.
+//! On Linux, this transport can use kernel timestamps (SO_TIMESTAMPING):
+//! hardware timestamps from a configured interface that has them enabled, or
+//! kernel software timestamps on request. Configure via `TcpTimestampConfig`.
 
-use crate::group::{GroupCore, GroupSocket, TimestampConfig};
+use crate::group::{GroupCore, GroupSocket, TimestampConfig, TxCounter};
 use crate::{
     ConnectionGroup, Error, RecvOutcome, Result, SendReceipt, Timestamp, TransportFactory,
 };
@@ -19,6 +18,8 @@ use std::net::{SocketAddr, TcpStream};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
+use crate::group::TimestampSource;
 #[cfg(target_os = "linux")]
 use crate::hw_timestamp;
 
@@ -35,32 +36,17 @@ pub type TcpTimestampConfig = TimestampConfig;
 pub(crate) struct TcpConn {
     stream: TcpStream,
     connected: bool,
-    /// TX byte counter for correlating TX timestamps (wrapping)
-    tx_byte_counter: u32,
-    /// Whether kernel timestamping is enabled for this connection
-    #[cfg(target_os = "linux")]
-    timestamps_enabled: bool,
+    /// TX byte counter, present only when kernel timestamping is enabled
+    tx: Option<TxCounter>,
 }
 
 impl TcpConn {
-    #[allow(dead_code)] // Used on non-Linux or when timestamps not configured
-    fn new(stream: TcpStream) -> Self {
+    /// `timestamps_enabled`: kernel timestamping is enabled on `stream`
+    fn new(stream: TcpStream, timestamps_enabled: bool) -> Self {
         Self {
             stream,
             connected: true,
-            tx_byte_counter: 0,
-            #[cfg(target_os = "linux")]
-            timestamps_enabled: false,
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn with_timestamps(stream: TcpStream, timestamps_enabled: bool) -> Self {
-        Self {
-            stream,
-            connected: true,
-            tx_byte_counter: 0,
-            timestamps_enabled,
+            tx: timestamps_enabled.then(TxCounter::default),
         }
     }
 }
@@ -71,8 +57,8 @@ impl GroupSocket for TcpConn {
     }
 
     #[cfg(target_os = "linux")]
-    fn timestamps_enabled(&self) -> bool {
-        self.timestamps_enabled
+    fn tx_counter(&mut self) -> Option<&mut TxCounter> {
+        self.tx.as_mut()
     }
 }
 
@@ -81,10 +67,6 @@ impl TcpConn {
         if !self.connected {
             return Err(Error::Connection("Connection closed".to_string()));
         }
-
-        // Record TX byte range [tx_start, tx_end)
-        let tx_start = self.tx_byte_counter;
-        let tx_end = tx_start.wrapping_add(data.len() as u32);
 
         let mut total_written = 0;
         while total_written < data.len() {
@@ -98,16 +80,11 @@ impl TcpConn {
             }
         }
 
-        // Update byte counter after successful send
-        self.tx_byte_counter = tx_end;
-
-        // Return software timestamp and TX byte range for correlation
-        // The actual HW TX timestamp will arrive via error queue with offset >= tx_end
-        Ok(SendReceipt {
-            timestamp: Timestamp::now(),
-            tx_start,
-            tx_end,
-        })
+        let timestamp = Timestamp::now();
+        // Byte range [start, end) of this send; its kernel TX timestamp
+        // arrives later with a cumulative tx_end >= end
+        let tx = self.tx.as_mut().map(|counter| counter.advance(data.len() as u32));
+        Ok(SendReceipt { timestamp, tx })
     }
 
     fn recv(&mut self, buf: &mut [u8]) -> Result<RecvOutcome> {
@@ -118,7 +95,7 @@ impl TcpConn {
 
         // Use kernel timestamps when available
         #[cfg(target_os = "linux")]
-        if self.timestamps_enabled {
+        if self.tx.is_some() {
             return self.recv_with_timestamp(buf);
         }
 
@@ -167,15 +144,18 @@ pub struct TcpConnectionGroup {
     /// Timestamp configuration for new connections
     #[cfg(target_os = "linux")]
     timestamp_config: TcpTimestampConfig,
+    /// Timestamp source resolved from the configuration at creation
+    #[cfg(target_os = "linux")]
+    timestamp_source: TimestampSource,
 }
 
 impl TcpConnectionGroup {
     pub fn new() -> Result<Self> {
-        Ok(Self {
-            core: GroupCore::new()?,
-            #[cfg(target_os = "linux")]
-            timestamp_config: TcpTimestampConfig::default(),
-        })
+        #[cfg(target_os = "linux")]
+        return Self::with_timestamp_config(TcpTimestampConfig::default());
+
+        #[cfg(not(target_os = "linux"))]
+        Ok(Self { core: GroupCore::new()? })
     }
 
     /// Create with timestamp configuration (Linux only)
@@ -183,8 +163,15 @@ impl TcpConnectionGroup {
     pub fn with_timestamp_config(timestamp_config: TcpTimestampConfig) -> Result<Self> {
         Ok(Self {
             core: GroupCore::new()?,
+            timestamp_source: timestamp_config.resolve_source("TCP"),
             timestamp_config,
         })
+    }
+
+    /// The timestamp source this group's connections use (Linux only)
+    #[cfg(target_os = "linux")]
+    pub fn timestamp_source(&self) -> TimestampSource {
+        self.timestamp_source
     }
 
     fn connect_with_timeout(&mut self, target: &SocketAddr, conn_id: usize) -> Result<TcpStream> {
@@ -229,22 +216,19 @@ impl ConnectionGroup for TcpConnectionGroup {
 
         let stream = self.connect_with_timeout(target, conn_id)?;
 
-        // Configure timestamping if enabled
+        // Configure timestamping before the first send, so the kernel's TX
+        // counter starts at zero like the connection's
         #[cfg(target_os = "linux")]
-        let conn = {
-            let timestamps_enabled = if self.timestamp_config.enable_timestamps {
-                self.timestamp_config.configure_timestamping(stream.as_raw_fd(), "TCP", conn_id)
-            } else {
-                false
-            };
-
-            TcpConn::with_timestamps(stream, timestamps_enabled)
-        };
-
+        let timestamps_enabled = self.timestamp_config.configure_socket(
+            stream.as_raw_fd(),
+            self.timestamp_source,
+            "TCP",
+            conn_id,
+        );
         #[cfg(not(target_os = "linux"))]
-        let conn = TcpConn::new(stream);
+        let timestamps_enabled = false;
 
-        self.core.insert(conn_id, conn);
+        self.core.insert(conn_id, TcpConn::new(stream, timestamps_enabled));
 
         Ok(conn_id)
     }
@@ -263,7 +247,8 @@ impl ConnectionGroup for TcpConnectionGroup {
 
     #[cfg(target_os = "linux")]
     fn poll_tx_timestamps(&mut self, out: &mut Vec<crate::TxTimestampInfo>) -> Result<()> {
-        self.core.poll_tx_timestamps("TCP", out);
+        // The kernel stamps the last segment sent together: cumulative
+        self.core.poll_tx_timestamps(true, "TCP", out);
         Ok(())
     }
 
@@ -320,6 +305,8 @@ impl TransportFactory for TcpTransportFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use crate::{KernelClock, TxRange, TxTimestampInfo};
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
@@ -580,6 +567,7 @@ mod tests {
         assert!(matches!(group.send(conn_id, b"x"), Err(Error::Connection(_))));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_tcp_group_tx_range_tracks_bytes() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -588,10 +576,110 @@ mod tests {
 
         let mut group = TcpConnectionGroup::new().unwrap();
         let conn_id = group.add_connection(&addr).unwrap();
+        // No TX timestamps by default, so no TX range
+        assert_eq!(group.timestamp_source(), TimestampSource::UserSpace);
+        assert_eq!(group.send(conn_id, b"hello").unwrap().tx, None);
+
+        let mut group = TcpConnectionGroup::with_timestamp_config(
+            TcpTimestampConfig::with_software_timestamps(),
+        )
+        .unwrap();
+        let conn_id = group.add_connection(&addr).unwrap();
         let first = group.send(conn_id, b"hello").unwrap();
         let second = group.send(conn_id, b"abc").unwrap();
-        assert_eq!((first.tx_start, first.tx_end), (0, 5));
-        assert_eq!((second.tx_start, second.tx_end), (5, 8));
+        assert_eq!(first.tx, Some(TxRange { start: 0, end: 5 }));
+        assert_eq!(second.tx, Some(TxRange { start: 5, end: 8 }));
+    }
+
+    /// Wait for the next TX timestamps from `group`
+    #[cfg(target_os = "linux")]
+    fn wait_tx_stamps(group: &mut TcpConnectionGroup) -> Vec<TxTimestampInfo> {
+        let mut out = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            group.poll_tx_timestamps(&mut out).unwrap();
+            if !out.is_empty() {
+                return out;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!("no TX timestamp within 5 s");
+    }
+
+    /// Kernel IDs 9 and 19 (last byte of each 10-byte write, pinned in
+    /// hw_timestamp's tests) reach the caller as exclusive ends 10 and 20,
+    /// equal to the receipts' ends: each stamp maps to its own send.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_tcp_group_loopback_tx_stamps_match_receipts() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (peer_tx, peer_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || peer_tx.send(listener.accept().unwrap().0).unwrap());
+
+        let config = TcpTimestampConfig::with_software_timestamps();
+        let mut group = TcpConnectionGroup::with_timestamp_config(config).unwrap();
+        assert_eq!(group.timestamp_source(), TimestampSource::KernelSoftware);
+        let conn_id = group.add_connection(&addr).unwrap();
+        let mut peer = peer_rx.recv().unwrap();
+        group.core.conn_mut(conn_id).unwrap().stream.set_nodelay(true).unwrap();
+
+        for expected in [TxRange { start: 0, end: 10 }, TxRange { start: 10, end: 20 }] {
+            let receipt = group.send(conn_id, &[0; 10]).unwrap();
+            assert_eq!(receipt.tx, Some(expected));
+            let stamps = wait_tx_stamps(&mut group);
+            assert_eq!(stamps.len(), 1);
+            assert_eq!(stamps[0].conn_id, conn_id);
+            assert_eq!(stamps[0].tx_end, expected.end);
+            assert!(stamps[0].cumulative);
+            assert_eq!(stamps[0].timestamp.clock, KernelClock::Realtime);
+            peer.read_exact(&mut [0; 10]).unwrap();
+        }
+
+        // Everything stamped: polling does no work and finds nothing
+        let mut out = Vec::new();
+        group.poll_tx_timestamps(&mut out).unwrap();
+        assert!(out.is_empty());
+
+        // RX carries a kernel timestamp from the same clock
+        peer.write_all(b"pong").unwrap();
+        let mut ready = Vec::new();
+        group.poll(Duration::from_secs(5), &mut ready).unwrap();
+        let mut buf = [0u8; 16];
+        let RecvOutcome::Data { timestamp, .. } = group.recv(conn_id, &mut buf).unwrap() else {
+            panic!("expected data");
+        };
+        assert_eq!(timestamp.kernel().map(|k| k.clock), Some(KernelClock::Realtime));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_tcp_group_default_uses_user_space_timestamps() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || echo_handler(listener.accept().unwrap().0));
+
+        let mut group = TcpTransportFactory::default().create_group().unwrap();
+        assert_eq!(group.timestamp_source(), TimestampSource::UserSpace);
+        let conn_id = group.add_connection(&addr).unwrap();
+        assert!(group.core.conn_mut(conn_id).unwrap().tx.is_none());
+        assert_eq!(group.send(conn_id, b"ping").unwrap().tx, None);
+
+        let mut ready = Vec::new();
+        group.poll(Duration::from_secs(5), &mut ready).unwrap();
+        let mut buf = [0u8; 16];
+        let RecvOutcome::Data { timestamp, .. } = group.recv(conn_id, &mut buf).unwrap() else {
+            panic!("expected data");
+        };
+        assert_eq!(timestamp.kernel(), None);
+        let mut out = Vec::new();
+        group.poll_tx_timestamps(&mut out).unwrap();
+        assert!(out.is_empty());
+
+        // An interface without hardware timestamping does not switch it on
+        let config = TcpTimestampConfig::with_interface("lo");
+        let group = TcpConnectionGroup::with_timestamp_config(config).unwrap();
+        assert_eq!(group.timestamp_source(), TimestampSource::UserSpace);
     }
 
     #[test]

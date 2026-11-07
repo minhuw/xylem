@@ -26,17 +26,11 @@ use std::time::Duration;
 pub(crate) struct UnixConn {
     stream: UnixStream,
     connected: bool,
-    /// TX byte counter for timestamp correlation (monotonically increasing)
-    tx_byte_counter: u32,
 }
 
 impl UnixConn {
     fn new(stream: UnixStream) -> Self {
-        Self {
-            stream,
-            connected: true,
-            tx_byte_counter: 0,
-        }
+        Self { stream, connected: true }
     }
 }
 
@@ -52,10 +46,6 @@ impl UnixConn {
             return Err(Error::Connection("Connection closed".to_string()));
         }
 
-        // Record TX byte range before send
-        let tx_start = self.tx_byte_counter;
-        let tx_end = tx_start.wrapping_add(data.len() as u32);
-
         let mut total_written = 0;
         while total_written < data.len() {
             match self.stream.write(&data[total_written..]) {
@@ -68,13 +58,8 @@ impl UnixConn {
             }
         }
 
-        // Update byte counter and capture software timestamp
-        self.tx_byte_counter = tx_end;
-        Ok(SendReceipt {
-            timestamp: Timestamp::now(),
-            tx_start,
-            tx_end,
-        })
+        // Unix sockets report no TX timestamps
+        Ok(SendReceipt { timestamp: Timestamp::now(), tx: None })
     }
 
     fn recv(&mut self, buf: &mut [u8]) -> Result<RecvOutcome> {

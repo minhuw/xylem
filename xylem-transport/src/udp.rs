@@ -2,20 +2,21 @@
 //!
 //! `UdpConnectionGroup` manages many UDP sockets behind one multiplexer.
 //!
-//! ## Hardware Timestamping (Linux only)
+//! ## Kernel Timestamping (Linux only)
 //!
-//! On Linux, this transport can use kernel timestamps (SO_TIMESTAMPING) for
-//! more accurate latency measurement. Hardware timestamps are used when the
-//! NIC supports them, with automatic fallback to software timestamps.
-//! Configure via `UdpTimestampConfig`.
+//! On Linux, this transport can use kernel timestamps (SO_TIMESTAMPING):
+//! hardware timestamps from a configured interface that has them enabled, or
+//! kernel software timestamps on request. Configure via `UdpTimestampConfig`.
 
-use crate::group::{GroupCore, GroupSocket, TimestampConfig};
+use crate::group::{GroupCore, GroupSocket, TimestampConfig, TxCounter};
 use crate::{ConnectionGroup, RecvOutcome, Result, SendReceipt, Timestamp, TransportFactory};
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
+use crate::group::TimestampSource;
 #[cfg(target_os = "linux")]
 use crate::hw_timestamp;
 
@@ -32,33 +33,17 @@ pub type UdpTimestampConfig = TimestampConfig;
 pub(crate) struct UdpConn {
     socket: UdpSocket,
     target: SocketAddr,
-    /// TX packet counter for correlating TX timestamps (wrapping)
-    /// For UDP, each datagram gets its own timestamp, so we use a simple counter
-    tx_packet_counter: u32,
-    /// Whether kernel timestamping is enabled for this connection
-    #[cfg(target_os = "linux")]
-    timestamps_enabled: bool,
+    /// TX datagram counter, present only when kernel timestamping is enabled
+    tx: Option<TxCounter>,
 }
 
 impl UdpConn {
-    #[allow(dead_code)] // Used on non-Linux or when timestamps not configured
-    fn new(socket: UdpSocket, target: SocketAddr) -> Self {
+    /// `timestamps_enabled`: kernel timestamping is enabled on `socket`
+    fn new(socket: UdpSocket, target: SocketAddr, timestamps_enabled: bool) -> Self {
         Self {
             socket,
             target,
-            tx_packet_counter: 0,
-            #[cfg(target_os = "linux")]
-            timestamps_enabled: false,
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn with_timestamps(socket: UdpSocket, target: SocketAddr, timestamps_enabled: bool) -> Self {
-        Self {
-            socket,
-            target,
-            tx_packet_counter: 0,
-            timestamps_enabled,
+            tx: timestamps_enabled.then(TxCounter::default),
         }
     }
 }
@@ -69,23 +54,13 @@ impl GroupSocket for UdpConn {
     }
 
     #[cfg(target_os = "linux")]
-    fn timestamps_enabled(&self) -> bool {
-        self.timestamps_enabled
+    fn tx_counter(&mut self) -> Option<&mut TxCounter> {
+        self.tx.as_mut()
     }
 }
 
 impl UdpConn {
     fn send(&mut self, data: &[u8]) -> Result<SendReceipt> {
-        // For UDP, kernel's SOF_TIMESTAMPING_OPT_ID returns a packet counter (not byte offset).
-        // The kernel reports packet ID N after the Nth sendmsg (0-indexed).
-        // Unlike TCP where opt_id = cumulative bytes sent, UDP opt_id = packet sequence number.
-        //
-        // We store tx_end = packet_id so that when kernel reports opt_id = N, the comparison
-        // `tx_end <= offset` (i.e., `N <= N`) is true and we match correctly.
-        let packet_id = self.tx_packet_counter;
-        let tx_start = packet_id;
-        let tx_end = packet_id;
-
         loop {
             match self.socket.send_to(data, self.target) {
                 Ok(_) => break,
@@ -97,22 +72,18 @@ impl UdpConn {
             }
         }
 
-        // Increment packet counter for next send
-        self.tx_packet_counter = packet_id.wrapping_add(1);
-
-        // Return software timestamp and packet ID for correlation
-        Ok(SendReceipt {
-            timestamp: Timestamp::now(),
-            tx_start,
-            tx_end,
-        })
+        let timestamp = Timestamp::now();
+        // One datagram: [id, id + 1). The kernel reports datagram index id,
+        // which the group normalises to tx_end = id + 1.
+        let tx = self.tx.as_mut().map(|counter| counter.advance(1));
+        Ok(SendReceipt { timestamp, tx })
     }
 
     /// Read one datagram into `buf`; the kernel truncates it to `buf`'s length
     fn recv(&mut self, buf: &mut [u8]) -> Result<RecvOutcome> {
         // On Linux with timestamps enabled, use recvmsg to get kernel timestamp
         #[cfg(target_os = "linux")]
-        if self.timestamps_enabled {
+        if self.tx.is_some() {
             let fd = self.socket.as_raw_fd();
             return match hw_timestamp::recvmsg_with_timestamp(fd, buf, 0) {
                 Ok((len, ts_opt)) => {
@@ -142,15 +113,18 @@ pub struct UdpConnectionGroup {
     /// Timestamp configuration for new connections
     #[cfg(target_os = "linux")]
     timestamp_config: UdpTimestampConfig,
+    /// Timestamp source resolved from the configuration at creation
+    #[cfg(target_os = "linux")]
+    timestamp_source: TimestampSource,
 }
 
 impl UdpConnectionGroup {
     pub fn new() -> Result<Self> {
-        Ok(Self {
-            core: GroupCore::new()?,
-            #[cfg(target_os = "linux")]
-            timestamp_config: UdpTimestampConfig::default(),
-        })
+        #[cfg(target_os = "linux")]
+        return Self::with_timestamp_config(UdpTimestampConfig::default());
+
+        #[cfg(not(target_os = "linux"))]
+        Ok(Self { core: GroupCore::new()? })
     }
 
     /// Create with timestamp configuration (Linux only)
@@ -158,8 +132,15 @@ impl UdpConnectionGroup {
     pub fn with_timestamp_config(timestamp_config: UdpTimestampConfig) -> Result<Self> {
         Ok(Self {
             core: GroupCore::new()?,
+            timestamp_source: timestamp_config.resolve_source("UDP"),
             timestamp_config,
         })
+    }
+
+    /// The timestamp source this group's connections use (Linux only)
+    #[cfg(target_os = "linux")]
+    pub fn timestamp_source(&self) -> TimestampSource {
+        self.timestamp_source
     }
 }
 
@@ -183,22 +164,19 @@ impl ConnectionGroup for UdpConnectionGroup {
         socket.set_nonblocking(true)?;
         self.core.register_readable(&socket, conn_id)?;
 
-        // On Linux, configure timestamping
+        // Configure timestamping before the first send, so the kernel's TX
+        // counter starts at zero like the connection's
         #[cfg(target_os = "linux")]
-        let conn = {
-            let timestamps_enabled = if self.timestamp_config.enable_timestamps {
-                self.timestamp_config.configure_timestamping(socket.as_raw_fd(), "UDP", conn_id)
-            } else {
-                false
-            };
-
-            UdpConn::with_timestamps(socket, *target, timestamps_enabled)
-        };
-
+        let timestamps_enabled = self.timestamp_config.configure_socket(
+            socket.as_raw_fd(),
+            self.timestamp_source,
+            "UDP",
+            conn_id,
+        );
         #[cfg(not(target_os = "linux"))]
-        let conn = UdpConn::new(socket, *target);
+        let timestamps_enabled = false;
 
-        self.core.insert(conn_id, conn);
+        self.core.insert(conn_id, UdpConn::new(socket, *target, timestamps_enabled));
 
         Ok(conn_id)
     }
@@ -217,7 +195,8 @@ impl ConnectionGroup for UdpConnectionGroup {
 
     #[cfg(target_os = "linux")]
     fn poll_tx_timestamps(&mut self, out: &mut Vec<crate::TxTimestampInfo>) -> Result<()> {
-        self.core.poll_tx_timestamps("UDP", out);
+        // One stamp per datagram: exact
+        self.core.poll_tx_timestamps(false, "UDP", out);
         Ok(())
     }
 
@@ -271,6 +250,8 @@ impl TransportFactory for UdpTransportFactory {
 mod tests {
     use super::*;
     use crate::Error;
+    #[cfg(target_os = "linux")]
+    use crate::{KernelClock, TxRange, TxTimestampInfo};
     use std::net::UdpSocket as StdUdpSocket;
     use std::thread;
 
@@ -418,11 +399,9 @@ mod tests {
         assert!(ready.is_empty());
         assert!(matches!(group.recv(conn_id, &mut buf).unwrap(), RecvOutcome::WouldBlock));
 
-        // Each send is one packet id
-        let first = group.send(conn_id, b"one").unwrap();
-        let second = group.send(conn_id, b"two").unwrap();
-        assert_eq!((first.tx_start, first.tx_end), (0, 0));
-        assert_eq!((second.tx_start, second.tx_end), (1, 1));
+        // No TX timestamps by default, so no TX range
+        assert_eq!(group.send(conn_id, b"one").unwrap().tx, None);
+        assert_eq!(group.send(conn_id, b"two").unwrap().tx, None);
 
         // One datagram per recv
         let mut server_buf = [0u8; 16];
@@ -474,6 +453,53 @@ mod tests {
             assert_eq!(&buf[..len], packet.as_bytes());
             assert!(timestamp.cycles() >= receipt.timestamp.cycles());
         }
+    }
+
+    /// Wait until `group` has reported `count` TX timestamps
+    #[cfg(target_os = "linux")]
+    fn wait_tx_stamps(group: &mut UdpConnectionGroup, count: usize) -> Vec<TxTimestampInfo> {
+        let mut all = Vec::new();
+        let mut out = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while all.len() < count && std::time::Instant::now() < deadline {
+            group.poll_tx_timestamps(&mut out).unwrap();
+            all.append(&mut out);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(all.len(), count, "TX timestamps within 5 s");
+        all
+    }
+
+    /// Kernel datagram IDs 0, 1, 2 (pinned in hw_timestamp's tests) reach
+    /// the caller as exact exclusive ends 1, 2, 3, equal to the receipts'
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_udp_group_loopback_tx_stamps_match_receipts() {
+        let server = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        let config = UdpTimestampConfig::with_software_timestamps();
+        let mut group = UdpConnectionGroup::with_timestamp_config(config).unwrap();
+        assert_eq!(group.timestamp_source(), TimestampSource::KernelSoftware);
+        let conn_id = group.add_connection(&addr).unwrap();
+
+        let ends: Vec<_> = (0..3)
+            .map(|i| {
+                let receipt = group.send(conn_id, &[0; 10]).unwrap();
+                assert_eq!(receipt.tx, Some(TxRange { start: i, end: i + 1 }));
+                receipt.tx.unwrap().end
+            })
+            .collect();
+        let stamps = wait_tx_stamps(&mut group, 3);
+        assert_eq!(stamps.iter().map(|s| s.tx_end).collect::<Vec<_>>(), ends);
+        for stamp in &stamps {
+            assert_eq!(stamp.conn_id, conn_id);
+            assert!(!stamp.cumulative);
+            assert_eq!(stamp.timestamp.clock, KernelClock::Realtime);
+        }
+
+        let mut out = Vec::new();
+        group.poll_tx_timestamps(&mut out).unwrap();
+        assert!(out.is_empty());
     }
 
     #[test]
