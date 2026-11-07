@@ -1,131 +1,118 @@
-//! Example demonstrating new Redis commands
+//! Example: Redis connection setup and newer commands
 //!
-//! This example shows how to use:
-//! - AUTH (simple and ACL authentication)
-//! - SELECT (database selection)
-//! - HELLO (protocol negotiation)
+//! This example shows:
+//! - Connection setup from config: AUTH, SELECT and HELLO, sent once per
+//!   connection before the workload, never as part of the command mix
 //! - SETEX (set with expiry)
 //! - SETRANGE/GETRANGE (offset-based operations)
 //! - CLUSTER SLOTS (topology discovery, through a custom command template)
+//! - RESP3 reply framing, including skipped push messages
 
 use xylem_protocols::redis::command_selector::FixedCommandSelector;
 use xylem_protocols::redis::{RedisOp, RedisProtocol};
-use xylem_protocols::{CommandTemplate, Protocol};
+use xylem_protocols::{CommandTemplate, Protocol, RedisAuthConfig, RedisConfig};
 
 fn main() {
-    println!("=== Redis New Commands Examples ===\n");
+    println!("=== Redis Connection Setup ===\n");
 
-    // 1. AUTH - Simple password authentication
-    println!("1. AUTH (Simple Password):");
-    let auth_selector = Box::new(FixedCommandSelector::new(RedisOp::Auth {
-        username: None,
-        password: "mySecretPassword".to_string(),
-    }));
-    let mut auth_protocol = RedisProtocol::new(auth_selector);
-    let auth_request = auth_protocol.generate_request_with_key(0, 1, 64);
-    println!("   Request: {}", String::from_utf8_lossy(&auth_request.data));
+    // The same fields a profile sets in [traffic_groups.protocol_config]:
+    //   auth = { username = "bench", password = "..." }
+    //   db = 3
+    //   resp = 3
+    let config = RedisConfig {
+        auth: Some(RedisAuthConfig {
+            username: Some("bench".to_string()),
+            password: Some("example-password".to_string()),
+            password_env: None,
+        }),
+        db: Some(3),
+        resp: Some(3),
+        ..Default::default()
+    };
+    let setup = config.connection_setup().expect("valid connection setup");
+    println!("Every connection sends, in order: {}", setup.step_names().join(", "));
 
-    // 2. AUTH - ACL with username (Redis 6.0+)
-    println!("2. AUTH (ACL - Redis 6.0+):");
-    let acl_selector = Box::new(FixedCommandSelector::new(RedisOp::Auth {
-        username: Some("admin".to_string()),
-        password: "adminPassword".to_string(),
-    }));
-    let mut acl_protocol = RedisProtocol::new(acl_selector);
-    let acl_request = acl_protocol.generate_request_with_key(0, 1, 64);
-    println!("   Request: {}", String::from_utf8_lossy(&acl_request.data));
+    // Each setup command waits for its reply before the next one goes out.
+    // Setup requests are warmup and never dumped; AUTH carries the password,
+    // so this example prints only its command name.
+    let mut protocol = RedisProtocol::from_config(&config, None).expect("valid config");
+    let replies: [&[u8]; 3] = [b"+OK\r\n", b"+OK\r\n", b"%1\r\n$5\r\nproto\r\n:3\r\n"];
+    for (step, reply) in setup.step_names().into_iter().zip(replies) {
+        let request = protocol.next_request(0);
+        assert!(request.metadata.is_setup && !protocol.can_send(0));
+        if step == "AUTH" {
+            println!("   {step}: <credentials not shown>");
+        } else {
+            println!("   {step}: {}", String::from_utf8_lossy(&request.data).escape_debug());
+        }
+        protocol.parse_response(0, reply).expect("setup reply accepted");
+    }
+    let first = protocol.next_request(0);
+    println!(
+        "   First measured request: {}",
+        String::from_utf8_lossy(&first.data).escape_debug()
+    );
 
-    // 3. SELECT - Database selection
-    println!("3. SELECT (Database 5):");
-    let select_selector = Box::new(FixedCommandSelector::new(RedisOp::SelectDb { db: 5 }));
-    let mut select_protocol = RedisProtocol::new(select_selector);
-    let select_request = select_protocol.generate_request_with_key(0, 1, 64);
-    println!("   Request: {}", String::from_utf8_lossy(&select_request.data));
+    // An error reply during setup fails the run, without the password.
+    let mut rejected = RedisProtocol::from_config(&config, None).expect("valid config");
+    rejected.next_request(0);
+    let error = rejected
+        .parse_response(0, b"-WRONGPASS invalid username-password pair\r\n")
+        .unwrap_err();
+    println!("   Rejected AUTH: {error}\n");
 
-    // 4. HELLO - RESP2 protocol negotiation
-    println!("4. HELLO (RESP2):");
-    let hello2_selector = Box::new(FixedCommandSelector::new(RedisOp::Hello { version: 2 }));
-    let mut hello2_protocol = RedisProtocol::new(hello2_selector);
-    let hello2_request = hello2_protocol.generate_request_with_key(0, 1, 64);
-    println!("   Request: {}", String::from_utf8_lossy(&hello2_request.data));
+    println!("=== Commands ===\n");
 
-    // 5. HELLO - RESP3 protocol negotiation
-    println!("5. HELLO (RESP3):");
-    let hello3_selector = Box::new(FixedCommandSelector::new(RedisOp::Hello { version: 3 }));
-    let mut hello3_protocol = RedisProtocol::new(hello3_selector);
-    let hello3_request = hello3_protocol.generate_request_with_key(0, 1, 64);
-    println!("   Request: {}", String::from_utf8_lossy(&hello3_request.data));
-
-    // 6. SETEX - Set with expiry (session storage)
-    println!("6. SETEX (TTL=300 seconds):");
+    // 1. SETEX - Set with expiry (session storage)
+    println!("1. SETEX (TTL=300 seconds):");
     let setex_selector = Box::new(FixedCommandSelector::new(RedisOp::SetEx { ttl_seconds: 300 }));
     let mut setex_protocol = RedisProtocol::new(setex_selector);
     let setex_request = setex_protocol.generate_request_with_key(0, 42, 20);
     println!("   Request: {}", String::from_utf8_lossy(&setex_request.data));
 
-    // 7. SETRANGE - Offset-based write
-    println!("7. SETRANGE (Offset=10):");
+    // 2. SETRANGE - Offset-based write
+    println!("2. SETRANGE (Offset=10):");
     let setrange_selector = Box::new(FixedCommandSelector::new(RedisOp::SetRange { offset: 10 }));
     let mut setrange_protocol = RedisProtocol::new(setrange_selector);
     let setrange_request = setrange_protocol.generate_request_with_key(0, 100, 8);
     println!("   Request: {}", String::from_utf8_lossy(&setrange_request.data));
 
-    // 8. GETRANGE - Offset-based read
-    println!("8. GETRANGE (Offset=5 to end):");
+    // 3. GETRANGE - Offset-based read
+    println!("3. GETRANGE (Offset=5 to end):");
     let getrange_selector =
         Box::new(FixedCommandSelector::new(RedisOp::GetRange { offset: 5, end: -1 }));
     let mut getrange_protocol = RedisProtocol::new(getrange_selector);
     let getrange_request = getrange_protocol.generate_request_with_key(0, 200, 64);
     println!("   Request: {}", String::from_utf8_lossy(&getrange_request.data));
 
-    // 9. CLUSTER SLOTS - Topology discovery
-    println!("9. CLUSTER SLOTS:");
+    // 4. CLUSTER SLOTS - Topology discovery
+    println!("4. CLUSTER SLOTS:");
     let slots_template = CommandTemplate::parse("CLUSTER SLOTS").unwrap();
     let slots_selector = Box::new(FixedCommandSelector::new(RedisOp::Custom(slots_template)));
     let mut slots_protocol = RedisProtocol::new(slots_selector);
     let slots_request = slots_protocol.generate_request_with_key(0, 1, 64);
     println!("   Request: {}", String::from_utf8_lossy(&slots_request.data));
 
-    println!("\n=== RESP3 Response Parsing ===\n");
+    println!("\n=== RESP3 Reply Framing ===\n");
 
-    // Demonstrate RESP3 response parsing
-    let resp3_selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
-    let mut resp3_protocol = RedisProtocol::new(resp3_selector);
-
-    // RESP3 Null
-    let null_response = b"_\r\n";
-    match resp3_protocol.parse_response(0, null_response) {
-        Ok((consumed, Some(_))) => println!("✓ RESP3 Null parsed ({} bytes)", consumed),
-        _ => println!("✗ Failed to parse RESP3 Null"),
+    let mut resp3_protocol = RedisProtocol::new(Box::new(FixedCommandSelector::new(RedisOp::Get)));
+    let replies: [(&str, &[u8]); 7] = [
+        ("Null", b"_\r\n"),
+        ("Boolean", b"#t\r\n"),
+        ("Double", b",3.14159\r\n"),
+        ("Map", b"%1\r\n+field\r\n:1\r\n"),
+        ("Set", b"~2\r\n+a\r\n+b\r\n"),
+        ("Attribute + reply", b"|1\r\n+ttl\r\n:60\r\n$1\r\nv\r\n"),
+        // A push message answers no request: it is skipped with the reply after it
+        ("Push + reply", b">2\r\n$10\r\ninvalidate\r\n*1\r\n$1\r\nk\r\n+OK\r\n"),
+    ];
+    for (name, reply) in replies {
+        match resp3_protocol.parse_response(0, reply) {
+            Ok((consumed, Some(_))) => println!("✓ RESP3 {name} parsed ({consumed} bytes)"),
+            _ => println!("✗ Failed to parse RESP3 {name}"),
+        }
     }
-
-    // RESP3 Boolean
-    let bool_response = b"#t\r\n";
-    match resp3_protocol.parse_response(0, bool_response) {
-        Ok((consumed, Some(_))) => println!("✓ RESP3 Boolean parsed ({} bytes)", consumed),
-        _ => println!("✗ Failed to parse RESP3 Boolean"),
-    }
-
-    // RESP3 Double
-    let double_response = b",3.14159\r\n";
-    match resp3_protocol.parse_response(0, double_response) {
-        Ok((consumed, Some(_))) => println!("✓ RESP3 Double parsed ({} bytes)", consumed),
-        _ => println!("✗ Failed to parse RESP3 Double"),
-    }
-
-    // RESP3 Map
-    let map_response = b"%2\r\n";
-    match resp3_protocol.parse_response(0, map_response) {
-        Ok((consumed, Some(_))) => println!("✓ RESP3 Map parsed ({} bytes)", consumed),
-        _ => println!("✗ Failed to parse RESP3 Map"),
-    }
-
-    // RESP3 Set
-    let set_response = b"~3\r\n";
-    match resp3_protocol.parse_response(0, set_response) {
-        Ok((consumed, Some(_))) => println!("✓ RESP3 Set parsed ({} bytes)", consumed),
-        _ => println!("✗ Failed to parse RESP3 Set"),
-    }
+    println!("Push messages skipped: {}", resp3_protocol.push_messages());
 
     println!("\n=== All Examples Complete ===");
 }

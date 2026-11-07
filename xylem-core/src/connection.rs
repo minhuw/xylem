@@ -73,6 +73,8 @@ struct PendingRequest {
     /// Time from the intended send time to the send; zero without a schedule
     send_lag: Duration,
     is_warmup: bool,
+    /// Connection setup request; implies `is_warmup`
+    is_setup: bool,
     /// Kernel TX timestamp of the send, once reported
     tx_kernel_ts: Option<KernelTimestamp>,
 }
@@ -269,6 +271,19 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         tx: Option<TxRange>,
         is_warmup: bool,
     ) {
+        self.record_request(req_id, send_ts, send_lag, tx, is_warmup, false);
+    }
+
+    /// Record a sent request, marking connection setup requests
+    fn record_request(
+        &mut self,
+        req_id: ReqId,
+        send_ts: Timestamp,
+        send_lag: Duration,
+        tx: Option<TxRange>,
+        is_warmup: bool,
+        is_setup: bool,
+    ) {
         if let Some(tx) = tx {
             // Queue for TX timestamp correlation (ends increase monotonically)
             let now_ns = crate::timing::time_ns();
@@ -285,10 +300,22 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
             PendingRequest {
                 send_ts,
                 send_lag,
-                is_warmup,
+                is_warmup: is_warmup || is_setup,
+                is_setup,
                 tx_kernel_ts: None,
             },
         );
+    }
+
+    /// Restart the intended schedule once the last pending setup request of
+    /// the connection completed. Setup requests never advance the schedule,
+    /// but the schedule started when the connection was established, so
+    /// without a restart the time spent waiting for setup replies would
+    /// become send lag and a burst of overdue sends.
+    fn finish_setup_request(&mut self) {
+        if !self.pending_map.values().any(|pending| pending.is_setup) {
+            self.policy.reset();
+        }
     }
 
     /// Clean up queue entry for a completed request that didn't receive its TX timestamp
@@ -487,6 +514,9 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
             }
         };
         let latency = pending.send_lag + recv_ts.duration_since(&send_ts);
+        if pending.is_setup {
+            self.finish_setup_request();
+        }
         Ok(Some((latency, pending.is_warmup)))
     }
 
@@ -907,6 +937,28 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         }
 
         Ok(send_lag)
+    }
+
+    /// Send a connection setup request (a handshake, AUTH, ...)
+    ///
+    /// The request is tracked like a warmup request, but has no intended send
+    /// time and does not advance the policy's schedule. When the reply to the
+    /// connection's last pending setup request arrives, the schedule restarts
+    /// from the next time the connection is scheduled.
+    pub fn send_setup(&mut self, connection_id: usize, data: &[u8], req_id: ReqId) -> Result<()> {
+        let state = self
+            .connection_states
+            .get_mut(&connection_id)
+            .ok_or_else(|| crate::Error::Connection("Connection not found".to_string()))?;
+        if !state.can_send() {
+            return Err(crate::Error::Connection(
+                "Connection cannot accept more requests".to_string(),
+            ));
+        }
+        let receipt = self.group.send(connection_id, data)?;
+        let state = self.connection_states.get_mut(&connection_id).unwrap();
+        state.record_request(req_id, receipt.timestamp, Duration::ZERO, receipt.tx, true, true);
+        Ok(())
     }
 
     /// Receive and process responses for a connection

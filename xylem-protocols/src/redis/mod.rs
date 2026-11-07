@@ -8,13 +8,16 @@ pub mod command_selector;
 pub mod command_template;
 mod config;
 mod resp;
+mod setup;
 
 pub use command::RedisOp;
+pub use setup::ConnectionSetup;
 
 use crate::Protocol;
 use anyhow::{anyhow, Result};
 use command_selector::CommandSelector;
 use resp::ReplyKind;
+use setup::{SetupState, SetupTracker};
 
 /// Insert phase state for data population before measurement
 #[derive(Debug)]
@@ -79,6 +82,13 @@ pub struct RedisProtocol {
     rng: Option<rand::rngs::SmallRng>,
     /// Insert phase state (None = no insert phase, go straight to measurement)
     insert_phase: Option<InsertPhaseState>,
+    /// Commands every connection sends before any other request (boxed,
+    /// like the tracker, to keep the protocol enum small)
+    setup: Box<ConnectionSetup>,
+    /// Setup progress of each connection
+    conn_setup: Box<SetupTracker>,
+    /// RESP3 push messages skipped because they answer no request
+    push_messages: u64,
 }
 
 impl RedisProtocol {
@@ -95,6 +105,9 @@ impl RedisProtocol {
             random_data: false,
             rng: None,
             insert_phase: None,
+            setup: Box::default(),
+            conn_setup: Box::default(),
+            push_messages: 0,
         }
     }
 
@@ -129,6 +142,9 @@ impl RedisProtocol {
             random_data,
             rng,
             insert_phase: None,
+            setup: Box::default(),
+            conn_setup: Box::default(),
+            push_messages: 0,
         }
     }
 
@@ -154,6 +170,40 @@ impl RedisProtocol {
         let insert_key_gen = self.key_gen.clone();
         self.insert_phase = Some(InsertPhaseState::new(key_count, value_size, insert_key_gen));
         self
+    }
+
+    /// Send `setup` on every connection before any other request
+    pub fn with_connection_setup(mut self, setup: ConnectionSetup) -> Self {
+        self.setup = Box::new(setup);
+        self
+    }
+
+    /// RESP3 push messages skipped so far: out-of-band messages, such as
+    /// client-side caching invalidations, that answer no request
+    pub fn push_messages(&self) -> u64 {
+        self.push_messages
+    }
+
+    /// The next setup request of a connection, or `None` once its setup is
+    /// done or if there is none
+    fn next_setup_request(&mut self, conn_id: usize) -> Option<crate::Request<(usize, u64)>> {
+        if self.setup.is_empty() {
+            return None;
+        }
+        let step = match self.conn_setup.state(conn_id) {
+            SetupState::Done => return None,
+            SetupState::Next(step) => step,
+            SetupState::Awaiting(step) => panic!(
+                "Redis connection {conn_id} asked for a request while its {} setup reply is \
+                 pending; check can_send first",
+                self.setup.step(step).name()
+            ),
+        };
+        let operation = self.setup.step(step).clone();
+        let data = self.format_command(&operation, 0, 0);
+        let id = (conn_id, self.next_send_seq(conn_id));
+        self.conn_setup.set(conn_id, SetupState::Awaiting(step));
+        Some(crate::Request::setup(data, id))
     }
 
     /// Get next sequence number for a connection (for sending)
@@ -278,6 +328,11 @@ impl Protocol for RedisProtocol {
     type RequestId = (usize, u64); // (conn_id, sequence)
 
     fn next_request(&mut self, conn_id: usize) -> crate::Request<Self::RequestId> {
+        // Phase 0: Connection setup (AUTH, SELECT, HELLO), once per connection
+        if let Some(request) = self.next_setup_request(conn_id) {
+            return request;
+        }
+
         // Phase 1: Insert phase (warmup) - populate data before measurement
         if let Some(ref mut insert_state) = self.insert_phase {
             if let Some(key) = insert_state.next_key() {
@@ -307,10 +362,36 @@ impl Protocol for RedisProtocol {
         let Some(reply) = self.parse_framed_reply(conn_id, data)? else {
             return Ok((0, None));
         };
+        if let SetupState::Awaiting(step) = self.conn_setup.state(conn_id) {
+            // Setup commands go out one at a time, so this reply is the
+            // pending command's.
+            let name = self.setup.step(step).name();
+            if let ReplyKind::Error(error) = &reply.kind {
+                return Err(anyhow!(
+                    "Redis connection setup failed: {name} on connection {conn_id} was \
+                     rejected: {}",
+                    self.setup.redact(error)
+                ));
+            }
+            let next = step + 1;
+            let state = if next == self.setup.len() {
+                SetupState::Done
+            } else {
+                SetupState::Next(next)
+            };
+            self.conn_setup.set(conn_id, state);
+            return Ok((reply.consumed, Some(reply.id)));
+        }
         match reply.kind {
             ReplyKind::Success => Ok((reply.consumed, Some(reply.id))),
             ReplyKind::Error(error) => Err(anyhow!("Redis error: {}", error)),
+            ReplyKind::Push => unreachable!("parse_framed_reply skips push messages"),
         }
+    }
+
+    fn can_send(&self, conn_id: usize) -> bool {
+        // A pending setup command must be answered before anything else
+        !matches!(self.conn_setup.state(conn_id), SetupState::Awaiting(_))
     }
 
     fn name(&self) -> &'static str {
@@ -320,6 +401,8 @@ impl Protocol for RedisProtocol {
     fn reset(&mut self) {
         self.conn_send_seq.clear();
         self.conn_recv_seq.clear();
+        self.conn_setup.clear();
+        self.push_messages = 0;
         self.command_selector.reset();
         if let Some(sizes) = &mut self.value_sizes {
             sizes.reset();
@@ -337,7 +420,8 @@ impl Protocol for RedisProtocol {
     }
 }
 
-/// A complete reply, including attributes. Errors occupy one FIFO response slot too.
+/// A complete reply, including attributes and any push messages before it.
+/// Errors occupy one FIFO response slot too.
 pub(crate) struct FramedReply {
     pub consumed: usize,
     pub id: (usize, u64),
@@ -350,13 +434,30 @@ impl RedisProtocol {
         conn_id: usize,
         data: &[u8],
     ) -> Result<Option<FramedReply>> {
-        let consumed = resp::find_resp_message_end(data)?;
-        if consumed == 0 {
-            return Ok(None);
+        // RESP3 push messages are out of band: skip them, so they are never
+        // matched to a pending request. They are counted only once a reply
+        // after them completes, since until then the caller keeps the
+        // buffer and parses them again.
+        let mut start = 0;
+        let mut pushes = 0;
+        loop {
+            let size = resp::find_resp_message_end(&data[start..])?;
+            if size == 0 {
+                return Ok(None);
+            }
+            let end = start + size;
+            match resp::classify_reply(&data[start..end])? {
+                ReplyKind::Push => {
+                    pushes += 1;
+                    start = end;
+                }
+                kind => {
+                    self.push_messages += pushes;
+                    let id = (conn_id, self.next_recv_seq(conn_id));
+                    return Ok(Some(FramedReply { consumed: end, id, kind }));
+                }
+            }
         }
-        let kind = resp::classify_reply(&data[..consumed])?;
-        let id = (conn_id, self.next_recv_seq(conn_id));
-        Ok(Some(FramedReply { consumed, id, kind }))
     }
 }
 

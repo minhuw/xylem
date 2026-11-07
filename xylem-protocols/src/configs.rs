@@ -229,6 +229,77 @@ pub struct RedisConfig {
     /// that need pre-populated data (e.g., GET workloads).
     #[serde(default)]
     pub insert_phase: Option<InsertPhaseConfig>,
+    /// Authenticate every connection with AUTH when it is established,
+    /// before any other request
+    #[serde(default)]
+    pub auth: Option<RedisAuthConfig>,
+    /// Database every connection selects with SELECT when it is established
+    /// (default: none, so the server's default database 0)
+    #[serde(default)]
+    pub db: Option<u32>,
+    /// RESP version: 2 or 3. 3 sends HELLO 3 when a connection is
+    /// established. Default: no HELLO, so RESP2.
+    #[serde(default)]
+    pub resp: Option<u8>,
+}
+
+/// Credentials a Redis connection sends with AUTH when it is established
+///
+/// Set exactly one of `password` and `password_env`. Debug output never
+/// shows the password.
+#[derive(Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct RedisAuthConfig {
+    /// ACL username (Redis 6+), sent as `AUTH <username> <password>`.
+    /// Without it, `AUTH <password>` authenticates against requirepass.
+    #[serde(default)]
+    pub username: Option<String>,
+    /// Password, written in the profile
+    #[serde(default)]
+    pub password: Option<String>,
+    /// Name of the environment variable that holds the password, read
+    /// when the run starts
+    #[serde(default)]
+    pub password_env: Option<String>,
+}
+
+impl std::fmt::Debug for RedisAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedisAuthConfig")
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("password_env", &self.password_env)
+            .finish()
+    }
+}
+
+impl RedisAuthConfig {
+    /// The password, from the profile or from the environment variable
+    /// `password_env` names. Errors name the variable, never the password.
+    pub fn resolve_password(&self) -> anyhow::Result<String> {
+        match (&self.password, &self.password_env) {
+            (Some(password), None) => Ok(password.clone()),
+            (None, Some(name)) => {
+                anyhow::ensure!(!name.is_empty(), "Redis auth.password_env must not be empty");
+                match std::env::var(name) {
+                    Ok(password) => Ok(password),
+                    Err(std::env::VarError::NotPresent) => anyhow::bail!(
+                        "Redis auth.password_env: environment variable {name} is not set"
+                    ),
+                    Err(std::env::VarError::NotUnicode(_)) => anyhow::bail!(
+                        "Redis auth.password_env: environment variable {name} is not valid UTF-8"
+                    ),
+                }
+            }
+            (Some(_), Some(_)) => {
+                anyhow::bail!("Redis auth sets both password and password_env; set exactly one")
+            }
+            (None, None) => {
+                anyhow::bail!("Redis auth needs a password or password_env; set exactly one")
+            }
+        }
+    }
 }
 
 /// Value size configuration

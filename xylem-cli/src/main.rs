@@ -208,7 +208,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                 "Traffic group {} '{}' protocol_config: {}",
                 i,
                 group.name,
-                protocol_config
+                xylem_cli::config::redacted_protocol_config(protocol_config)
             );
         }
     }

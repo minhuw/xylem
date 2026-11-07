@@ -32,6 +32,8 @@ pub(crate) fn encode_command(args: &[&str]) -> Vec<u8> {
 pub(crate) enum ReplyKind {
     Success,
     Error(String),
+    /// RESP3 out-of-band push message, which answers no request
+    Push,
 }
 
 /// Classify one complete reply, as measured by [`find_resp_message_end`],
@@ -46,6 +48,8 @@ pub(crate) fn classify_reply(frame: &[u8]) -> Result<ReplyKind> {
         ReplyKind::Error(String::from_utf8_lossy(&payload[1..payload.len() - 2]).into_owned())
     } else if payload[0] == b'!' {
         ReplyKind::Error(String::from_utf8_lossy(payload).into_owned())
+    } else if payload[0] == b'>' {
+        ReplyKind::Push
     } else {
         ReplyKind::Success
     };

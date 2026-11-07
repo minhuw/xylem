@@ -26,7 +26,7 @@ RESP speaks in five types, each starting with a special character:
 
 **Arrays** (`*`) let you send or receive multiple values. The format is `*<count>\r\n` followed by that many elements. Each element can be any RESP type—strings, integers, even nested arrays. This is how commands work: `GET key:1234` becomes `*2\r\n$3\r\nGET\r\n$8\r\nkey:1234\r\n`—an array of two bulk strings.
 
-RESP3 adds more types: true nulls (`_\r\n`), booleans (`#t\r\n` or `#f\r\n`), doubles for floating-point numbers (`,3.14\r\n`), maps (`%<count>\r\n`) for key-value pairs, sets (`~<count>\r\n`) for unique collections, and a few others. These semantic types make client libraries simpler because they don't have to guess whether a bulk string is a number or text.
+RESP3 adds more types: true nulls (`_\r\n`), booleans (`#t\r\n` or `#f\r\n`), doubles for floating-point numbers (`,3.14\r\n`), maps (`%<count>\r\n`) for key-value pairs, sets (`~<count>\r\n`) for unique collections, and a few others. A connection speaks RESP2 until it sends `HELLO 3`; see [Connection Setup](#connection-setup-auth-select-and-hello). These semantic types make client libraries simpler because they don't have to guess whether a bulk string is a number or text.
 
 ### Commands on the Wire
 
@@ -83,12 +83,6 @@ Let's talk about what these commands actually do and when you'd use them in benc
 
 **SETRANGE** and **GETRANGE** work on offsets within a value. `SETRANGE key:1000 5 hello` overwrites 5 bytes starting at offset 5. `GETRANGE key:1000 5 -1` reads from offset 5 to the end. These are useful for large-value workloads where you only modify or read part of the data—think partial updates to binary structures or reading substrings from log entries.
 
-**AUTH** authenticates your connection. With simple password auth, it's `AUTH mypassword`. With Redis 6.0+ ACL, it's `AUTH username password`. You'll need this to benchmark production-like setups where Redis isn't publicly accessible.
-
-**SELECT** switches databases. Redis has 16 logical databases by default (numbered 0-15). `SELECT 5` moves to database 5. Keys in different databases are isolated. Use this to test multi-tenant scenarios or benchmark how database switching affects performance.
-
-**HELLO** negotiates the protocol version. `HELLO 2` sticks with RESP2. `HELLO 3` upgrades to RESP3. The response includes server version, supported features, and other metadata. Benchmark this if you care about RESP3 adoption or client compatibility.
-
 **SCAN** iterates over the keyspace: `SCAN 0 COUNT 100 MATCH key:*`. Set `cursor`, `count` and `pattern` with `params = { cursor = 0, count = 100, pattern = "key:*" }`; each request sends the same cursor. Use it to measure the cost of keyspace iteration alongside regular traffic.
 
 **MULTI**, **EXEC** and **DISCARD** start, commit and abort a transaction. Each is sent as a separate weighted command, so commands picked between them are queued and answered with `+QUEUED`.
@@ -117,6 +111,66 @@ Templates for common commands:
 | Cluster | `CLUSTER SLOTS` |
 
 Replies are framed generically, so integers, bulk strings, nils, arrays, nested arrays and RESP3 types all count as one completed request. An error reply, such as `WRONGTYPE` when a template uses a key that already holds another type, counts as a failure. Watch for this when templates and `get`/`set` draw from the same keyspace.
+
+## Connection Setup: AUTH, SELECT and HELLO
+
+AUTH, SELECT and HELLO configure a connection rather than exercise the server, so Xylem never puts them in the command mix. You set them in the traffic group's `protocol_config`, and every connection sends them once, right after it connects and before any insert-phase or measured request:
+
+```toml
+[traffic_groups.protocol_config]
+auth = { password = "secret" }   # AUTH secret (requirepass)
+db = 3                           # SELECT 3
+resp = 3                         # HELLO 3
+```
+
+**`auth`** authenticates the connection. With only a password, Xylem sends `AUTH <password>`, which checks the server's `requirepass`. Add a username for a Redis 6+ ACL user, and Xylem sends `AUTH <username> <password>`. To keep the password out of the profile, name an environment variable instead with `password_env`; Xylem reads it when the run starts and stops with an error naming the variable if it is not set. Set exactly one of `password` and `password_env`:
+
+```toml
+auth = { username = "bench", password = "secret" }
+auth = { username = "bench", password_env = "REDIS_PASSWORD" }
+```
+
+**`db`** selects a logical database with `SELECT <db>`. Without it, connections stay in the server's default database 0. The server decides how many databases exist (16 by default).
+
+**`resp`** picks the protocol version: 2 (the default, so no HELLO) or 3, which sends `HELLO 3`. Xylem frames every RESP3 reply type, including maps, sets, doubles, booleans, big numbers, verbatim strings and attributes. Out-of-band push messages, such as client-tracking invalidations, answer no request: Xylem skips them instead of matching them to a pending request.
+
+The setup commands go out one at a time, in the order AUTH, SELECT, HELLO, each waiting for its reply. Separate commands, rather than a combined `HELLO 3 AUTH user pass`, keep AUTH and SELECT working on servers without HELLO, and tell you which step failed. Setup requests are warmup: they count toward no latency, throughput, byte or request count, never appear in the request dump, and do not use up a rate-limited connection's schedule, which starts once setup completes. An error reply to any of them, such as `WRONGPASS`, `NOAUTH`, `NOPERM`, an out-of-range database or an unknown HELLO, stops the run with an error naming the command and connection. Xylem never writes the password to its output, logs or errors.
+
+A complete profile for a password-protected server:
+
+```toml
+[experiment]
+name = "redis-auth"
+duration = "30s"
+
+[[traffic_groups]]
+name = "bench"
+protocol = "redis"
+target = "127.0.0.1:6379"
+threads = [0]
+connections_per_thread = 8
+max_pending_per_connection = 4
+
+[traffic_groups.protocol_config]
+auth = { username = "bench", password = "secret" }   # or password_env = "REDIS_PASSWORD"
+db = 3
+
+[traffic_groups.protocol_config.keys]
+strategy = "random"
+max = 100000
+value_size = 64
+
+[traffic_groups.protocol_config.operations]
+strategy = "fixed"
+operation = "get"
+
+[traffic_groups.traffic_policy]
+type = "closed-loop"
+
+[output]
+format = "json"
+file = "results/redis-auth.json"
+```
 
 ## Building Realistic Workloads
 

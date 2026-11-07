@@ -65,6 +65,7 @@ fn redis_weighted_config() -> RedisConfig {
         value_size: Some(ValueSizeConfig::Uniform { min: 2, max: 9 }),
         random_data: true,
         insert_phase: Some(InsertPhaseConfig { key_count: Some(2), value_size: Some(4) }),
+        ..Default::default()
     }
 }
 
@@ -118,6 +119,7 @@ fn redis_per_command_keys_config() -> RedisConfig {
         }),
         random_data: false,
         insert_phase: Some(InsertPhaseConfig { key_count: None, value_size: None }),
+        ..Default::default()
     }
 }
 
@@ -133,6 +135,7 @@ fn redis_fixed_config() -> RedisConfig {
         value_size: Some(ValueSizeConfig::Normal { mean: 6.0, std_dev: 2.0, min: 3, max: 9 }),
         random_data: true,
         insert_phase: Some(InsertPhaseConfig { key_count: Some(1), value_size: None }),
+        ..Default::default()
     }
 }
 
@@ -630,8 +633,8 @@ fn masstree_set_with_value_size_random_data_and_insert_phase() {
     assert_eq!(
         masstree_requests(&mut protocol, &CONNECTIONS),
         vec![
-            Request::warmup(HANDSHAKE.to_vec(), (0, 0)),
-            Request::warmup(HANDSHAKE.to_vec(), (1, 0)),
+            Request::setup(HANDSHAKE.to_vec(), (0, 0)),
+            Request::setup(HANDSHAKE.to_vec(), (1, 0)),
             Request::warmup(
                 b"\x94\xce\x00\x00\x00\x00\xcc\x08\xa4mt:0\xa9m>}bkX,Y4".to_vec(),
                 (0, 0)
@@ -706,9 +709,9 @@ fn masstree_operations_from_config() {
         assert_eq!(
             masstree_requests(&mut protocol, &[0, 0, 1, 1]),
             vec![
-                Request::warmup(HANDSHAKE.to_vec(), (0, 0)),
+                Request::setup(HANDSHAKE.to_vec(), (0, 0)),
                 Request::measurement(first.to_vec(), (0, 0)),
-                Request::warmup(HANDSHAKE.to_vec(), (1, 0)),
+                Request::setup(HANDSHAKE.to_vec(), (1, 0)),
                 Request::measurement(second.to_vec(), (1, 0)),
             ],
             "{operation}"
