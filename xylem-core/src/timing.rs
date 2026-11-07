@@ -70,6 +70,29 @@ pub fn busy_wait_ns(duration_ns: u64) {
 mod tests {
     use super::*;
 
+    /// Busy waits each overshoot test times
+    const TRIALS: usize = 20;
+
+    /// Run `wait` `TRIALS` times, check that every run waited at least
+    /// `duration_ns`, and return the smallest overshoot past it
+    ///
+    /// A busy wait overshoots only by the last iteration of its loop, but the
+    /// scheduler can preempt the test thread at any moment, which parallel
+    /// tests on a loaded host make common. The best of several runs tests the
+    /// wait itself rather than the machine's load. `wait` gets the start time.
+    fn best_overshoot(duration_ns: u64, wait: impl Fn(u64)) -> u64 {
+        (0..TRIALS)
+            .map(|_| {
+                let start = time_ns();
+                wait(start);
+                let elapsed = time_ns() - start;
+                assert!(elapsed >= duration_ns, "waited {elapsed} ns, less than {duration_ns} ns");
+                elapsed - duration_ns
+            })
+            .min()
+            .expect("TRIALS is not zero")
+    }
+
     #[test]
     fn test_time_ns_monotonic() {
         let t1 = time_ns();
@@ -83,24 +106,15 @@ mod tests {
     #[test]
     #[cfg(not(tarpaulin))]
     fn test_busy_wait_precision() {
-        let start = time_ns();
-        busy_wait_ns(100_000); // 100 microseconds
-        let elapsed = time_ns() - start;
-
-        // Should be within 10% of target (busy-wait is more accurate than sleep)
-        assert!(elapsed >= 100_000, "Should wait at least 100us");
-        assert!(elapsed < 120_000, "Should not wait much more than 100us");
+        // Within 20% of 100 microseconds (busy-wait is more accurate than sleep)
+        let overshoot = best_overshoot(100_000, |_| busy_wait_ns(100_000));
+        assert!(overshoot < 20_000, "overshot 100us by {overshoot} ns even in the best run");
     }
 
     #[test]
     #[cfg(not(tarpaulin))]
     fn test_busy_wait_until() {
-        let start = time_ns();
-        let target = start + 50_000; // 50 microseconds
-        busy_wait_until(target);
-        let elapsed = time_ns() - start;
-
-        assert!(elapsed >= 50_000, "Should reach target time");
-        assert!(elapsed < 70_000, "Should not overshoot by much");
+        let overshoot = best_overshoot(50_000, |start| busy_wait_until(start + 50_000));
+        assert!(overshoot < 20_000, "overshot 50us by {overshoot} ns even in the best run");
     }
 }

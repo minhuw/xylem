@@ -818,9 +818,11 @@ mod tests {
         // One warmup request and one measured request never get a response
         worker.protocols.get_mut(&0).unwrap().warmup = 1;
         worker.send_requests().unwrap();
-        let start = std::time::Instant::now();
+        // The worker's clock, which sets the deadline; another clock may
+        // differ from it by the calibration error
+        let start_ns = timing::time_ns();
         worker.drain_responses().unwrap();
-        assert!(start.elapsed() >= FAKE_DRAIN_TIMEOUT);
+        assert!(timing::time_ns() - start_ns >= FAKE_DRAIN_TIMEOUT.as_nanos() as u64);
         assert!(worker.has_pending());
         let counts = worker.stats.request_counts_global();
         assert_eq!((counts.sent, counts.completed, counts.timed_out), (1, 0, 1));
