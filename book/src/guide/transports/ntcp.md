@@ -71,7 +71,7 @@ Validation requires the `[ntcp]` section whenever a group uses ntcp, exactly one
 - **User-space timestamps only.** Latencies use the CPU timestamp counter read when the send was accepted by ntcp and when a receive completed. There are no kernel or NIC TX/RX timestamps, and `poll_tx_timestamps` reports nothing. The TUN backend has no packet timestamps.
 - **One TUN device and one address per thread.** Threads never share a stack.
 - **Polling.** A group drives its stack whenever xylem sends or polls, and sleeps on the TUN file descriptor only when the stack has nothing left to do. Each connection's stack work costs CPU time on the worker thread, and that time is part of the measured latency.
-- **Temporary quiet time workaround.** At the ntcp version currently used, ntcp waits for a 2×MSL quiet time (240 s) before it opens TCP connections, unless it is told that the host has been up long enough and that its address is new. xylem tells it both: the host's boot age, and that the address was never used before. ntcp is removing the quiet time; until then, avoid reusing an ntcp address for a new run within 4 minutes of a previous run against the same server and port, as an old run's segments could in principle still be in flight.
+- **No startup wait.** Like Linux after a reboot, ntcp opens connections as soon as a run starts. It does not wait out the 2×MSL (240 s) TIME-WAIT state of a previous run. A run that reuses an ntcp address and port against the same server within 4 minutes of an earlier run could in principle meet that run's old segments; ntcp's per-run secret and TCP timestamps make this very unlikely.
 
 ## See Also
 

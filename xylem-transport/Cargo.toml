@@ -18,13 +18,9 @@ libc = { workspace = true }
 nix = { workspace = true }
 # User-space TCP (the `ntcp` feature). The file:// URL is a temporary local
 # pin, to be replaced by the GitHub rev once ntcp pushes it.
-ntcp-native = { git = "file:///home/minhu/projects/ntcp", rev = "9900dccc5f7940342f928eeb6bd015b8a966e3fe", optional = true }
-ntcp-io = { git = "file:///home/minhu/projects/ntcp", rev = "9900dccc5f7940342f928eeb6bd015b8a966e3fe", optional = true }
-ntcp-io-tun = { git = "file:///home/minhu/projects/ntcp", rev = "9900dccc5f7940342f928eeb6bd015b8a966e3fe", optional = true }
-# Only for the TCP quiet-time workaround (`Lifecycle`, `TransportClock` boot
-# age); both go when ntcp removes the quiet time. Same temporary local pin.
-ntcp = { git = "file:///home/minhu/projects/ntcp", rev = "9900dccc5f7940342f928eeb6bd015b8a966e3fe", optional = true }
-ntcp-clock = { git = "file:///home/minhu/projects/ntcp", rev = "9900dccc5f7940342f928eeb6bd015b8a966e3fe", optional = true }
+ntcp-native = { git = "file:///home/minhu/projects/ntcp", rev = "1df55bc6d5f5cd2363ba752a8af63cd906b6037c", optional = true }
+ntcp-io = { git = "file:///home/minhu/projects/ntcp", rev = "1df55bc6d5f5cd2363ba752a8af63cd906b6037c", optional = true }
+ntcp-io-tun = { git = "file:///home/minhu/projects/ntcp", rev = "1df55bc6d5f5cd2363ba752a8af63cd906b6037c", optional = true }
 
 # Non-Linux: I/O multiplexing via mio (kqueue on macOS/BSD, IOCP on Windows)
 [target.'cfg(not(target_os = "linux"))'.dependencies]
@@ -32,7 +28,7 @@ mio = { workspace = true }
 
 [features]
 # User-space TCP transport over ntcp (Linux only; a no-op elsewhere)
-ntcp = ["dep:ntcp-native", "dep:ntcp-io", "dep:ntcp-io-tun", "dep:ntcp", "dep:ntcp-clock"]
+ntcp = ["dep:ntcp-native", "dep:ntcp-io", "dep:ntcp-io-tun"]
 
 [dependencies.tracing]
 workspace = true

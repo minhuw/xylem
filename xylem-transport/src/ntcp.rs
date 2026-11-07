@@ -70,34 +70,6 @@ fn deadline_after(timeout: Duration) -> u64 {
 }
 
 // =============================================================================
-// Temporary TCP quiet-time workaround
-// =============================================================================
-
-/// TEMPORARY: let ntcp admit TCP connections right away
-///
-/// At the pinned ntcp revision, TCP admission waits for a quiet time of
-/// 2*MSL (240 s) after host boot and after earlier emission from the local
-/// address, unless `NetworkConfig::lifecycle` states otherwise. The boot age
-/// comes from ntcp's `CLOCK_BOOTTIME` provider (microseconds), converted to
-/// the nanosecond ticks of this module; the address is declared as never
-/// used before, as it is dedicated to ntcp.
-///
-/// ntcp is removing the whole mechanism. Once it lands, delete this function
-/// and its call, and the `ntcp` and `ntcp-clock` dependencies.
-fn skip_quiet_time(config: &mut NetworkConfig) -> Result<()> {
-    let clock_error =
-        |e: ntcp_clock::TransportError| Error::Other(format!("ntcp transport clock: {e}"));
-    let mut clock = ntcp_clock::TransportClock::new().map_err(clock_error)?;
-    let ticks = clock.sample().map_err(clock_error)?.ticks;
-    let boot_age_us = clock.boot_age(ticks).map_err(clock_error)?;
-    config.lifecycle = ::ntcp::Lifecycle {
-        boot_age: Some(boot_age_us.saturating_mul(UNITS_PER_SECOND / 1_000_000)),
-        continuity: ::ntcp::SourceContinuity::Never,
-    };
-    Ok(())
-}
-
-// =============================================================================
 // Slot table
 // =============================================================================
 
@@ -284,7 +256,6 @@ impl<P: PacketIo + AsRawFd> NtcpConnectionGroup<P> {
     /// group passes, and generates the TCP secret from `/dev/urandom`.
     pub fn new(mut config: NetworkConfig, io: P) -> Result<Self> {
         config.tcp.connection.timebase.units_per_second = UNITS_PER_SECOND;
-        skip_quiet_time(&mut config)?;
         let network = Network::new(config, io, random_secret()?, now_ticks())
             .map_err(|e| network_error("ntcp network setup", e))?;
         Ok(Self {
@@ -791,7 +762,6 @@ mod tests {
     fn run_echo_server(wire: Wire, listen: bool, close_after: Option<usize>, stop: &AtomicBool) {
         let mut config = network_config(SERVER);
         config.tcp.connection.timebase.units_per_second = UNITS_PER_SECOND;
-        skip_quiet_time(&mut config).unwrap();
         let mut network =
             Network::new(config, wire, random_secret().unwrap(), now_ticks()).unwrap();
         let listener: Option<ListenerId> = listen.then(|| network.listen(PORT, 16).unwrap());
