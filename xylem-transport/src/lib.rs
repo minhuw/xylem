@@ -2,7 +2,8 @@
 //!
 //! This crate provides transport layer implementations for the Xylem latency
 //! measurement tool. Transports handle the low-level network I/O using non-blocking
-//! sockets with runtime-selectable I/O multiplexing (epoll, poll, or select).
+//! sockets and one readiness multiplexer per connection group: epoll on Linux,
+//! mio (kqueue) elsewhere.
 //!
 //! ## Available Transports
 //!
@@ -18,13 +19,6 @@
 //! - Linux kernel >= 4.19.4 for best results
 //! - NIC with hardware timestamping support for HW timestamps (e.g., Mellanox ConnectX, Intel i210)
 //! - Root or CAP_NET_ADMIN capability for NIC-level timestamping
-//!
-//! ## I/O Multiplexer Selection
-//!
-//! The multiplexer backend can be selected at runtime:
-//! - `Epoll`: Linux-only, most efficient for large numbers of connections
-//! - `Poll`: Portable, no fd limit, good performance
-//! - `Select`: Portable, but limited to ~1024 file descriptors
 //!
 //! ## Connection Group API
 //!
@@ -92,6 +86,7 @@ impl fmt::Display for Error {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl From<nix::Error> for Error {
     fn from(err: nix::Error) -> Self {
         Error::Io(std::io::Error::from(err))
@@ -256,7 +251,7 @@ pub trait TransportFactory: Send + Sync {
 
 // Connection-group code shared by the tcp, udp, and unix modules
 mod group;
-pub mod mux;
+mod mux;
 pub mod tcp;
 mod timestamp;
 pub mod udp;
@@ -273,7 +268,6 @@ pub mod hw_timestamp;
 // Re-exports
 // =============================================================================
 
-pub use mux::{Multiplexer, MultiplexerType};
 pub use timestamp::{time_ns, Timestamp};
 
 pub use tcp::{TcpConnectionGroup, TcpTransportFactory};

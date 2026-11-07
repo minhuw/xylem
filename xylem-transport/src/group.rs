@@ -7,7 +7,7 @@
 //! This module also holds the kernel timestamping configuration used by the
 //! TCP and UDP groups (Linux only).
 
-use crate::mux::{Interest, Multiplexer, MultiplexerType};
+use crate::mux::{Interest, Multiplexer};
 use crate::{Error, Result};
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, RawFd};
@@ -38,6 +38,8 @@ pub struct TimestampConfig {
     pub enable_timestamps: bool,
 }
 
+// Not derivable on Linux, where the fields have non-default defaults
+#[allow(clippy::derivable_impls)]
 impl Default for TimestampConfig {
     fn default() -> Self {
         Self {
@@ -139,9 +141,9 @@ pub(crate) struct GroupCore<C> {
 }
 
 impl<C: GroupSocket> GroupCore<C> {
-    pub(crate) fn new(mux_type: MultiplexerType) -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         Ok(Self {
-            mux: Multiplexer::new(mux_type)?,
+            mux: Multiplexer::new()?,
             connections: HashMap::new(),
             next_id: 0,
         })
@@ -160,7 +162,7 @@ impl<C: GroupSocket> GroupCore<C> {
     /// mixing connection events with other connections in the group. Does not
     /// check the socket for a connection error.
     pub(crate) fn wait_for_connect<S: AsRawFd>(&self, socket: &S) -> Result<()> {
-        let mut temp_mux = Multiplexer::new(self.mux.mux_type())?;
+        let mut temp_mux = Multiplexer::new()?;
         temp_mux.register_fd(socket, 0, Interest::BOTH)?;
 
         // Poll for connection complete

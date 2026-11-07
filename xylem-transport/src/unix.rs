@@ -8,7 +8,6 @@
 //! `add_connection()`.
 
 use crate::group::{GroupCore, GroupSocket};
-use crate::mux::MultiplexerType;
 use crate::{
     ConnectionGroup, Error, RecvOutcome, Result, SendReceipt, Timestamp, TransportFactory,
 };
@@ -103,11 +102,7 @@ pub struct UnixConnectionGroup {
 
 impl UnixConnectionGroup {
     pub fn new() -> Result<Self> {
-        Self::with_multiplexer(MultiplexerType::default())
-    }
-
-    pub fn with_multiplexer(mux_type: MultiplexerType) -> Result<Self> {
-        Ok(Self { core: GroupCore::new(mux_type)? })
+        Ok(Self { core: GroupCore::new()? })
     }
 
     /// Add a connection by Unix socket path
@@ -167,22 +162,17 @@ impl ConnectionGroup for UnixConnectionGroup {
 }
 
 /// Factory for creating Unix socket connection groups
+///
+/// Construct it with `UnixTransportFactory::default()`.
 #[derive(Clone, Copy, Default)]
-pub struct UnixTransportFactory {
-    mux_type: MultiplexerType,
-}
-
-impl UnixTransportFactory {
-    pub fn new(mux_type: MultiplexerType) -> Self {
-        Self { mux_type }
-    }
-}
+#[non_exhaustive]
+pub struct UnixTransportFactory;
 
 impl TransportFactory for UnixTransportFactory {
     type Group = UnixConnectionGroup;
 
     fn create_group(&self) -> Result<Self::Group> {
-        UnixConnectionGroup::with_multiplexer(self.mux_type)
+        UnixConnectionGroup::new()
     }
 }
 

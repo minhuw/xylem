@@ -10,7 +10,6 @@
 //! Configure via `UdpTimestampConfig`.
 
 use crate::group::{GroupCore, GroupSocket, TimestampConfig};
-use crate::mux::MultiplexerType;
 use crate::{ConnectionGroup, RecvOutcome, Result, SendReceipt, Timestamp, TransportFactory};
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
@@ -145,12 +144,8 @@ pub struct UdpConnectionGroup {
 
 impl UdpConnectionGroup {
     pub fn new() -> Result<Self> {
-        Self::with_multiplexer(MultiplexerType::default())
-    }
-
-    pub fn with_multiplexer(mux_type: MultiplexerType) -> Result<Self> {
         Ok(Self {
-            core: GroupCore::new(mux_type)?,
+            core: GroupCore::new()?,
             #[cfg(target_os = "linux")]
             timestamp_config: UdpTimestampConfig::default(),
         })
@@ -158,12 +153,9 @@ impl UdpConnectionGroup {
 
     /// Create with timestamp configuration (Linux only)
     #[cfg(target_os = "linux")]
-    pub fn with_timestamp_config(
-        mux_type: MultiplexerType,
-        timestamp_config: UdpTimestampConfig,
-    ) -> Result<Self> {
+    pub fn with_timestamp_config(timestamp_config: UdpTimestampConfig) -> Result<Self> {
         Ok(Self {
-            core: GroupCore::new(mux_type)?,
+            core: GroupCore::new()?,
             timestamp_config,
         })
     }
@@ -243,33 +235,21 @@ impl ConnectionGroup for UdpConnectionGroup {
 /// Factory for creating UDP connection groups
 #[derive(Clone, Default)]
 pub struct UdpTransportFactory {
-    mux_type: MultiplexerType,
     #[cfg(target_os = "linux")]
     timestamp_config: UdpTimestampConfig,
 }
 
 impl UdpTransportFactory {
-    pub fn new(mux_type: MultiplexerType) -> Self {
-        Self {
-            mux_type,
-            #[cfg(target_os = "linux")]
-            timestamp_config: UdpTimestampConfig::default(),
-        }
-    }
-
     /// Create factory with timestamp configuration (Linux only)
     #[cfg(target_os = "linux")]
-    pub fn with_timestamp_config(
-        mux_type: MultiplexerType,
-        timestamp_config: UdpTimestampConfig,
-    ) -> Self {
-        Self { mux_type, timestamp_config }
+    pub fn with_timestamp_config(timestamp_config: UdpTimestampConfig) -> Self {
+        Self { timestamp_config }
     }
 
     /// Create factory with timestamping enabled (uses default interface binding)
     #[cfg(target_os = "linux")]
-    pub fn with_timestamps(mux_type: MultiplexerType) -> Self {
-        Self::with_timestamp_config(mux_type, UdpTimestampConfig::with_timestamps())
+    pub fn with_timestamps() -> Self {
+        Self::with_timestamp_config(UdpTimestampConfig::with_timestamps())
     }
 }
 
@@ -278,13 +258,10 @@ impl TransportFactory for UdpTransportFactory {
 
     fn create_group(&self) -> Result<Self::Group> {
         #[cfg(target_os = "linux")]
-        return UdpConnectionGroup::with_timestamp_config(
-            self.mux_type,
-            self.timestamp_config.clone(),
-        );
+        return UdpConnectionGroup::with_timestamp_config(self.timestamp_config.clone());
 
         #[cfg(not(target_os = "linux"))]
-        UdpConnectionGroup::with_multiplexer(self.mux_type)
+        UdpConnectionGroup::new()
     }
 }
 

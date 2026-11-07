@@ -10,7 +10,6 @@
 //! Configure via `TcpTimestampConfig`.
 
 use crate::group::{GroupCore, GroupSocket, TimestampConfig};
-use crate::mux::MultiplexerType;
 use crate::{
     ConnectionGroup, Error, RecvOutcome, Result, SendReceipt, Timestamp, TransportFactory,
 };
@@ -171,12 +170,8 @@ pub struct TcpConnectionGroup {
 
 impl TcpConnectionGroup {
     pub fn new() -> Result<Self> {
-        Self::with_multiplexer(MultiplexerType::default())
-    }
-
-    pub fn with_multiplexer(mux_type: MultiplexerType) -> Result<Self> {
         Ok(Self {
-            core: GroupCore::new(mux_type)?,
+            core: GroupCore::new()?,
             #[cfg(target_os = "linux")]
             timestamp_config: TcpTimestampConfig::default(),
         })
@@ -184,12 +179,9 @@ impl TcpConnectionGroup {
 
     /// Create with timestamp configuration (Linux only)
     #[cfg(target_os = "linux")]
-    pub fn with_timestamp_config(
-        mux_type: MultiplexerType,
-        timestamp_config: TcpTimestampConfig,
-    ) -> Result<Self> {
+    pub fn with_timestamp_config(timestamp_config: TcpTimestampConfig) -> Result<Self> {
         Ok(Self {
-            core: GroupCore::new(mux_type)?,
+            core: GroupCore::new()?,
             timestamp_config,
         })
     }
@@ -290,33 +282,21 @@ impl ConnectionGroup for TcpConnectionGroup {
 /// Factory for creating TCP connection groups
 #[derive(Clone, Default)]
 pub struct TcpTransportFactory {
-    mux_type: MultiplexerType,
     #[cfg(target_os = "linux")]
     timestamp_config: TcpTimestampConfig,
 }
 
 impl TcpTransportFactory {
-    pub fn new(mux_type: MultiplexerType) -> Self {
-        Self {
-            mux_type,
-            #[cfg(target_os = "linux")]
-            timestamp_config: TcpTimestampConfig::default(),
-        }
-    }
-
     /// Create factory with timestamp configuration (Linux only)
     #[cfg(target_os = "linux")]
-    pub fn with_timestamp_config(
-        mux_type: MultiplexerType,
-        timestamp_config: TcpTimestampConfig,
-    ) -> Self {
-        Self { mux_type, timestamp_config }
+    pub fn with_timestamp_config(timestamp_config: TcpTimestampConfig) -> Self {
+        Self { timestamp_config }
     }
 
     /// Create factory with timestamping enabled (uses default interface binding)
     #[cfg(target_os = "linux")]
-    pub fn with_timestamps(mux_type: MultiplexerType) -> Self {
-        Self::with_timestamp_config(mux_type, TcpTimestampConfig::with_timestamps())
+    pub fn with_timestamps() -> Self {
+        Self::with_timestamp_config(TcpTimestampConfig::with_timestamps())
     }
 }
 
@@ -326,12 +306,12 @@ impl TransportFactory for TcpTransportFactory {
     fn create_group(&self) -> Result<Self::Group> {
         #[cfg(target_os = "linux")]
         {
-            TcpConnectionGroup::with_timestamp_config(self.mux_type, self.timestamp_config.clone())
+            TcpConnectionGroup::with_timestamp_config(self.timestamp_config.clone())
         }
 
         #[cfg(not(target_os = "linux"))]
         {
-            TcpConnectionGroup::with_multiplexer(self.mux_type)
+            TcpConnectionGroup::new()
         }
     }
 }
@@ -616,13 +596,6 @@ mod tests {
     #[test]
     fn test_tcp_transport_factory() {
         let factory = TcpTransportFactory::default();
-        let group = factory.create_group();
-        assert!(group.is_ok());
-    }
-
-    #[test]
-    fn test_tcp_transport_factory_with_poll() {
-        let factory = TcpTransportFactory::new(MultiplexerType::Poll);
         let group = factory.create_group();
         assert!(group.is_ok());
     }
