@@ -55,9 +55,15 @@ requests; warmup requests are excluded:
 - `completed`: requests whose response arrived, in the window or the drain.
   Equal to the latency `sample_count` unless the sampling policy is `none` or
   a `limited` rate drops latencies.
-- `timed_out`: still pending when the drain timeout passed. Their latency is
-  unknown, so they are not in the latency statistics; the console prints a
-  warning when this is nonzero.
+- `timed_out`: no response within the group's `request_timeout` (UDP groups,
+  default 1 s; see [UDP](configuration/transport.md#udp-ipport)), or still pending
+  when the drain timeout passed. Their latency is unknown, so they are not in
+  the latency statistics (it is censored, not recorded as the timeout); the
+  console prints a warning when this is nonzero.
+- `late_responses`: responses that arrived after their request timed out.
+  They are dropped, identified by request ID, and add no latency; their
+  requests stay in `timed_out`. Only UDP groups time out requests, so this is
+  zero for the other transports.
 - `failed`: pending on a connection that closed or failed.
 - `late_sends`: requests whose send lag exceeded 100 µs.
 - `unsent`: sends a rate-driven schedule intended before the end of the

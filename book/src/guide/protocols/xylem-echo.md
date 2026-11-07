@@ -13,7 +13,7 @@ The xylem-echo protocol is used for testing and development purposes. Full docum
 `udp`, `unix` and `ntcp`. Over UDP each request is one datagram and the server
 answers each with one datagram after the request's delay; replies may arrive
 out of order and match their requests by request ID. See the server's
-`README.md` and the [UDP transport](../configuration/transport.md#udp).
+`README.md` and the [UDP transport](../configuration/transport.md#udp-ipport).
 
 ## See Also
 
