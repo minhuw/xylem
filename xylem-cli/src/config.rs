@@ -50,12 +50,6 @@ pub struct ExperimentConfig {
 /// Re-export KeysConfig from xylem-protocols for use in config files
 pub use xylem_protocols::KeysConfig;
 
-// Keep the legacy wire format available to downstream callers during migration.
-#[allow(deprecated)]
-mod legacy;
-#[allow(deprecated)]
-pub use legacy::{CommandParams, CommandWeightConfig, OperationsConfig};
-
 /// Output configuration
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct OutputConfig {

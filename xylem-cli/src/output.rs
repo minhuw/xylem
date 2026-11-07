@@ -12,21 +12,6 @@ use std::path::Path;
 use std::time::Duration;
 use xylem_core::stats::{AggregatedStats, TupleStatsCollector};
 
-/// Legacy flat experiment results. CLI JSON uses [`DetailedExperimentResults`].
-#[deprecated(note = "Use DetailedExperimentResults, the current CLI JSON format.")]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExperimentResults {
-    pub protocol: String,
-    pub target: String,
-    pub duration_secs: f64,
-    pub total_requests: u64,
-    pub total_tx_bytes: u64,
-    pub total_rx_bytes: u64,
-    pub throughput_rps: f64,
-    pub throughput_mbps: f64,
-    pub latency: LatencyStats,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LatencyStats {
     pub min_us: f64,
@@ -56,14 +41,6 @@ pub struct StatsRecord {
     pub latency_p99_us: f64,
     pub latency_p999_us: f64,
     pub latency_mean_us: f64,
-}
-
-#[allow(deprecated)]
-impl ExperimentResults {
-    /// Write results to JSON file
-    pub fn write_json(&self, path: &str) -> Result<()> {
-        write_pretty_json(self, path, "Results written to")
-    }
 }
 
 /// Write `results` to `path` as pretty-printed JSON, then print `message`
