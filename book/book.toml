@@ -1,7 +1,6 @@
 [book]
 authors = ["Xylem Contributors"]
 language = "en"
-multilingual = false
 src = "src"
 title = "Xylem Documentation"
 description = "Documentation for Xylem - A high-performance and modular traffic generator and measurement tool for RPC workloads"
@@ -12,7 +11,7 @@ create-missing = true
 
 [output.html]
 git-repository-url = "https://github.com/minhuw/xylem"
-git-repository-icon = "fa-github"
+git-repository-icon = "fab-github"
 edit-url-template = "https://github.com/minhuw/xylem/edit/main/book/{path}"
 additional-css = ["theme/custom.css"]
 additional-js = []
