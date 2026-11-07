@@ -145,6 +145,17 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         self.pool.connection_targets()
     }
 
+    /// Set the request timeout of traffic group `group_id`; see
+    /// [`ConnectionPool::set_request_timeout`]
+    ///
+    /// A request that times out frees its pipeline slot and counts in
+    /// `timed_out` without a latency; a response that still arrives counts in
+    /// `late_responses` and is dropped. The timeout runs from the send, so it
+    /// excludes an open-loop request's send lag.
+    pub fn set_request_timeout(&mut self, group_id: usize, timeout: Option<Duration>) {
+        self.pool.set_request_timeout(group_id, timeout);
+    }
+
     /// Set the request dumper for recording all requests
     ///
     /// # Arguments
@@ -193,6 +204,7 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
 
             let poll_timeout = self.poll_timeout(now_ns, end_ns);
             self.process_responses(poll_timeout)?;
+            self.expire_requests(timing::time_ns());
         }
 
         // Stop sending and wait for the responses still pending
@@ -273,9 +285,11 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         Ok(())
     }
 
-    /// Bound every receive wait by the experiment deadline. A closed-loop
-    /// entry has no timestamp, so test readiness before interpreting an empty peek.
+    /// Bound every receive wait by the experiment deadline and the next
+    /// request timeout. A closed-loop entry has no timestamp, so test
+    /// readiness before interpreting an empty peek.
     fn poll_timeout(&self, now_ns: u64, end_ns: u64) -> Duration {
+        let end_ns = self.pool.next_request_deadline().map_or(end_ns, |next| next.min(end_ns));
         let remaining_ns = end_ns.saturating_sub(now_ns);
         let wait_ns = if self.pool.has_ready(now_ns) {
             0
@@ -312,8 +326,9 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
                 None => continue,
             };
 
-            // Skip connections with no pending requests
-            if state.pending_count() == 0 {
+            // Skip connections with no pending requests. A datagram connection
+            // is still read, so late or stray datagrams do not keep it ready.
+            if state.pending_count() == 0 && !self.pool.is_datagram() {
                 continue;
             }
 
@@ -341,6 +356,10 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
                     self.stats.record_latency(group_id, connection_id, latency);
                 }
             }
+            let late = self.pool.take_late_responses(connection_id);
+            if late > 0 {
+                self.stats.record_late_responses(group_id, connection_id, late);
+            }
 
             // Reschedule connection if it can send but isn't on heap
             // This handles two cases:
@@ -352,6 +371,25 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         self.ready_ids = ready_ids;
 
         Ok(())
+    }
+
+    /// Time out the requests whose request timeout passed by `now_ns`, count
+    /// the measurement ones, and reschedule the connections they freed
+    fn expire_requests(&mut self, now_ns: u64) {
+        let mut freed = Vec::new();
+        let stats = &mut self.stats;
+        self.pool
+            .expire_requests_at(now_ns, |connection_id, group_id, expired, measured| {
+                if measured > 0 {
+                    stats.record_timed_out(group_id, connection_id, measured);
+                }
+                tracing::debug!(connection_id, group_id, expired, "Requests timed out");
+                freed.push((connection_id, group_id));
+            });
+        for (connection_id, group_id) in freed {
+            let protocol = self.protocols.get(&group_id).expect("Protocol not found for group_id");
+            self.pool.try_schedule_connection(connection_id, protocol);
+        }
     }
 
     fn maintain_tx_queues(&mut self, now_ns: u64) {
@@ -403,7 +441,12 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             }
             // Short waits keep TX timestamp polling and the deadline responsive.
             let wait_ns = (deadline_ns - now_ns).min(10_000_000);
+            let wait_ns = self
+                .pool
+                .next_request_deadline()
+                .map_or(wait_ns, |next| wait_ns.min(next.saturating_sub(now_ns)));
             self.process_responses(Duration::from_nanos(wait_ns))?;
+            self.expire_requests(timing::time_ns());
         }
 
         let mut timed_out = 0;
@@ -904,6 +947,79 @@ mod tests {
         assert_eq!(worker.next_tx_cleanup_ns, 1_000_000_100);
         worker.maintain_tx_queues(1_000_000_100);
         assert_eq!(worker.next_tx_cleanup_ns, 2_000_000_100);
+    }
+
+    #[test]
+    fn timed_out_request_frees_the_pipeline_and_its_late_response_counts() {
+        let factory = FakeFactory::default();
+        factory.0.lock().unwrap().datagram = true;
+        factory.0.lock().unwrap().live_timestamps = true;
+        let mut worker = fake_worker(&factory, 1, Box::new(UniformPolicyScheduler::closed_loop()));
+        worker.set_request_timeout(0, Some(Duration::from_millis(20)));
+        worker.send_requests().unwrap();
+        assert_eq!(factory.0.lock().unwrap().sent.len(), 1);
+        // The full pipeline waits for the request's deadline, not the end
+        let now = timing::time_ns();
+        let wait = worker.poll_timeout(now, now + 10_000_000_000);
+        assert!(wait <= Duration::from_millis(20), "{wait:?}");
+        thread::sleep(Duration::from_millis(25));
+        worker.expire_requests(timing::time_ns());
+        let counts = worker.stats.request_counts_global();
+        assert_eq!((counts.sent, counts.timed_out, counts.completed), (1, 1, 0));
+
+        // The freed slot sends the next request at once
+        worker.send_requests().unwrap();
+        assert_eq!(factory.0.lock().unwrap().sent.len(), 2);
+        // Request 0's late response is dropped and counted; request 1 completes
+        factory.0.lock().unwrap().responses.push_back(Ok(0u64.to_le_bytes().to_vec()));
+        worker.process_responses(Duration::ZERO).unwrap();
+        factory.0.lock().unwrap().responses.push_back(Ok(1u64.to_le_bytes().to_vec()));
+        worker.process_responses(Duration::ZERO).unwrap();
+        let counts = worker.stats.request_counts_global();
+        assert_eq!((counts.completed, counts.timed_out, counts.late_responses), (1, 1, 1));
+        assert_eq!(global(&worker).latency_sample_count, 1, "the late response has no latency");
+        // Every received datagram counts toward the received bytes
+        assert_eq!(worker.stats.entries().values().map(|entry| entry.rx_bytes).sum::<u64>(), 16);
+    }
+
+    #[test]
+    fn open_loop_keeps_sending_through_losses_with_a_request_timeout() {
+        let factory = FakeFactory::default();
+        factory.0.lock().unwrap().datagram = true;
+        factory.0.lock().unwrap().live_timestamps = true;
+        let mut worker =
+            fake_worker(&factory, 1, Box::new(UniformPolicyScheduler::fixed_rate(1000.0)));
+        worker.set_request_timeout(0, Some(Duration::from_millis(5)));
+        // Nothing is ever answered; each timeout frees the single slot
+        let start = std::time::Instant::now();
+        worker.run().unwrap();
+        assert!(start.elapsed() < Duration::from_millis(100) + FAKE_DRAIN_TIMEOUT * 3);
+        let counts = worker.stats.request_counts_global();
+        assert!(counts.sent >= 10 && counts.sent <= 21, "{counts:?}");
+        // Every request timed out, in the window or during the drain
+        assert_eq!((counts.timed_out, counts.completed, counts.failed), (counts.sent, 0, 0));
+        assert!(!worker.has_pending());
+        assert!(counts.unsent >= 70, "{counts:?}");
+        assert!(counts.late_sends > 0, "the blocked schedule shows as send lag");
+        assert_eq!(global(&worker).latency_sample_count, 0);
+    }
+
+    #[test]
+    fn warmup_timeouts_are_not_counted() {
+        let factory = FakeFactory::default();
+        factory.0.lock().unwrap().datagram = true;
+        factory.0.lock().unwrap().live_timestamps = true;
+        let mut worker = fake_worker(&factory, 2, Box::new(UniformPolicyScheduler::closed_loop()));
+        worker.protocols.get_mut(&0).unwrap().warmup = 2;
+        worker.set_request_timeout(0, Some(Duration::from_millis(1)));
+        worker.send_requests().unwrap();
+        thread::sleep(Duration::from_millis(5));
+        worker.expire_requests(timing::time_ns());
+        factory.0.lock().unwrap().responses.push_back(Ok(0u64.to_le_bytes().to_vec()));
+        worker.process_responses(Duration::ZERO).unwrap();
+        let counts = worker.stats.request_counts_global();
+        assert_eq!((counts.sent, counts.timed_out, counts.late_responses), (0, 0, 0));
+        assert_eq!(worker.pool.get_state(0).unwrap().pending_count(), 0);
     }
 
     #[test]

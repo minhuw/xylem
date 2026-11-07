@@ -185,6 +185,10 @@ impl ConnectionGroup for UdpConnectionGroup {
         self.core.conn_mut(conn_id)?.send(data)
     }
 
+    fn is_datagram(&self) -> bool {
+        true
+    }
+
     fn recv(&mut self, conn_id: usize, buf: &mut [u8]) -> Result<RecvOutcome> {
         self.core.conn_mut(conn_id)?.recv(buf)
     }
