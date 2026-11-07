@@ -31,7 +31,9 @@ TX timestamps arrive later than the send that caused them, and are matched to se
 
 ## Supported Transports
 
-- **TCP** - Connection-oriented byte streams using TCP sockets
+- **TCP** - Connection-oriented byte streams using TCP sockets. Every
+  connection sets `TCP_NODELAY`, so Nagle's algorithm never holds back a small
+  or pipelined request and inflates its latency.
 - **UDP** - Connectionless datagram communication
 - **Unix Domain Sockets** - Local inter-process communication
 
