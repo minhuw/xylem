@@ -14,7 +14,8 @@
 use crate::group::{GroupCore, GroupSocket, TimestampConfig};
 use crate::mux::{Interest, Multiplexer, MultiplexerType};
 use crate::{
-    ConnectionGroup, Error, GroupConnection, Result, Timestamp, Transport, TransportFactory,
+    ConnectionGroup, Error, RecvOutcome, Result, SendReceipt, Timestamp, Transport,
+    TransportFactory,
 };
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
@@ -138,10 +139,9 @@ impl Transport for UdpTransport {
 // =============================================================================
 
 /// A single UDP "connection" within a connection group
-pub struct UdpConn {
+pub(crate) struct UdpConn {
     socket: UdpSocket,
     target: SocketAddr,
-    recv_buffer: Vec<u8>,
     /// TX packet counter for correlating TX timestamps (wrapping)
     /// For UDP, each datagram gets its own timestamp, so we use a simple counter
     tx_packet_counter: u32,
@@ -156,7 +156,6 @@ impl UdpConn {
         Self {
             socket,
             target,
-            recv_buffer: vec![0u8; DEFAULT_UDP_BUFFER_SIZE],
             tx_packet_counter: 0,
             #[cfg(target_os = "linux")]
             timestamps_enabled: false,
@@ -168,7 +167,6 @@ impl UdpConn {
         Self {
             socket,
             target,
-            recv_buffer: vec![0u8; DEFAULT_UDP_BUFFER_SIZE],
             tx_packet_counter: 0,
             timestamps_enabled,
         }
@@ -186,8 +184,8 @@ impl GroupSocket for UdpConn {
     }
 }
 
-impl GroupConnection for UdpConn {
-    fn send(&mut self, data: &[u8]) -> Result<(Timestamp, u32, u32)> {
+impl UdpConn {
+    fn send(&mut self, data: &[u8]) -> Result<SendReceipt> {
         // For UDP, kernel's SOF_TIMESTAMPING_OPT_ID returns a packet counter (not byte offset).
         // The kernel reports packet ID N after the Nth sendmsg (0-indexed).
         // Unlike TCP where opt_id = cumulative bytes sent, UDP opt_id = packet sequence number.
@@ -213,36 +211,34 @@ impl GroupConnection for UdpConn {
         self.tx_packet_counter = packet_id.wrapping_add(1);
 
         // Return software timestamp and packet ID for correlation
-        Ok((Timestamp::now(), tx_start, tx_end))
+        Ok(SendReceipt {
+            timestamp: Timestamp::now(),
+            tx_start,
+            tx_end,
+        })
     }
 
-    fn recv(&mut self) -> Result<(Vec<u8>, Timestamp)> {
+    /// Read one datagram into `buf`; the kernel truncates it to `buf`'s length
+    fn recv(&mut self, buf: &mut [u8]) -> Result<RecvOutcome> {
         // On Linux with timestamps enabled, use recvmsg to get kernel timestamp
         #[cfg(target_os = "linux")]
         if self.timestamps_enabled {
             let fd = self.socket.as_raw_fd();
-            match hw_timestamp::recvmsg_with_timestamp(fd, &mut self.recv_buffer, 0) {
-                Ok((n, ts_opt)) => {
-                    let data = self.recv_buffer[..n].to_vec();
+            return match hw_timestamp::recvmsg_with_timestamp(fd, buf, 0) {
+                Ok((len, ts_opt)) => {
                     // Use hardware timestamp if available, otherwise software
                     let timestamp = ts_opt.unwrap_or_else(Timestamp::now);
-                    return Ok((data, timestamp));
+                    Ok(RecvOutcome::Data { len, timestamp })
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    return Ok((Vec::new(), Timestamp::now()));
-                }
-                Err(e) => return Err(e.into()),
-            }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(RecvOutcome::WouldBlock),
+                Err(e) => Err(e.into()),
+            };
         }
 
         // Standard recv path (non-Linux or timestamps disabled)
-        match self.socket.recv_from(&mut self.recv_buffer) {
-            Ok((n, _src_addr)) => {
-                let timestamp = Timestamp::now();
-                let data = self.recv_buffer[..n].to_vec();
-                Ok((data, timestamp))
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok((Vec::new(), Timestamp::now())),
+        match self.socket.recv_from(buf) {
+            Ok((len, _src_addr)) => Ok(RecvOutcome::Data { len, timestamp: Timestamp::now() }),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(RecvOutcome::WouldBlock),
             Err(e) => Err(e.into()),
         }
     }
@@ -289,8 +285,6 @@ impl Default for UdpConnectionGroup {
 }
 
 impl ConnectionGroup for UdpConnectionGroup {
-    type Conn = UdpConn;
-
     fn add_connection(&mut self, target: &SocketAddr) -> Result<usize> {
         let conn_id = self.core.reserve_id();
 
@@ -324,21 +318,22 @@ impl ConnectionGroup for UdpConnectionGroup {
         Ok(conn_id)
     }
 
-    fn get(&self, conn_id: usize) -> Option<&Self::Conn> {
-        self.core.get(conn_id)
+    fn send(&mut self, conn_id: usize, data: &[u8]) -> Result<SendReceipt> {
+        self.core.conn_mut(conn_id)?.send(data)
     }
 
-    fn get_mut(&mut self, conn_id: usize) -> Option<&mut Self::Conn> {
-        self.core.get_mut(conn_id)
+    fn recv(&mut self, conn_id: usize, buf: &mut [u8]) -> Result<RecvOutcome> {
+        self.core.conn_mut(conn_id)?.recv(buf)
     }
 
-    fn poll(&mut self, timeout: Option<Duration>) -> Result<Vec<usize>> {
-        self.core.poll(timeout)
+    fn poll(&mut self, timeout: Duration, ready: &mut Vec<usize>) -> Result<()> {
+        self.core.poll(timeout, ready)
     }
 
     #[cfg(target_os = "linux")]
-    fn poll_tx_timestamps(&mut self) -> Result<Vec<crate::TxTimestampInfo>> {
-        Ok(self.core.poll_tx_timestamps("UDP"))
+    fn poll_tx_timestamps(&mut self, out: &mut Vec<crate::TxTimestampInfo>) -> Result<()> {
+        self.core.poll_tx_timestamps("UDP", out);
+        Ok(())
     }
 
     fn len(&self) -> usize {
@@ -548,9 +543,9 @@ mod tests {
         assert_eq!(conn_id2, 1);
         assert_eq!(group.len(), 2);
 
-        assert!(group.get(0).is_some());
-        assert!(group.get(1).is_some());
-        assert!(group.get(99).is_none());
+        assert!(group.core.get(0).is_some());
+        assert!(group.core.get(1).is_some());
+        assert!(group.core.get(99).is_none());
     }
 
     #[test]
@@ -571,18 +566,22 @@ mod tests {
         let conn_id = group.add_connection(&addr).unwrap();
 
         let test_data = b"Hello, UDP Group!";
-        let (send_ts, _tx_start, _tx_end) =
-            group.get_mut(conn_id).unwrap().send(test_data).unwrap();
+        let receipt = group.send(conn_id, test_data).unwrap();
 
         thread::sleep(Duration::from_millis(10));
 
-        let ready = group.poll(Some(Duration::from_millis(100))).unwrap();
+        let mut ready = vec![usize::MAX];
+        group.poll(Duration::from_millis(100), &mut ready).unwrap();
         assert!(!ready.is_empty());
         assert!(ready.contains(&conn_id));
+        assert!(!ready.contains(&usize::MAX));
 
-        let (recv_data, recv_ts) = group.get_mut(conn_id).unwrap().recv().unwrap();
-        assert_eq!(recv_data, test_data);
-        assert!(recv_ts.cycles() >= send_ts.cycles());
+        let mut buf = vec![0u8; 65536];
+        let RecvOutcome::Data { len, timestamp } = group.recv(conn_id, &mut buf).unwrap() else {
+            panic!("expected data");
+        };
+        assert_eq!(&buf[..len], test_data);
+        assert!(timestamp.cycles() >= receipt.timestamp.cycles());
     }
 
     #[test]
@@ -598,8 +597,8 @@ mod tests {
 
         group.close(conn1).unwrap();
         assert_eq!(group.len(), 1);
-        assert!(group.get(conn1).is_none());
-        assert!(group.get(conn2).is_some());
+        assert!(group.core.get(conn1).is_none());
+        assert!(group.core.get(conn2).is_some());
 
         group.close_all().unwrap();
         assert_eq!(group.len(), 0);
@@ -618,30 +617,73 @@ mod tests {
         // Closing a middle id must not let the next connection reuse it or
         // the current length
         group.close(1).unwrap();
-        assert!(group.get(1).is_none());
-        assert!(group.get_mut(1).is_none());
+        assert!(group.core.get(1).is_none());
+        assert!(group.core.get(1).is_none());
         assert_eq!(group.len(), 2);
 
         assert_eq!(group.add_connection(&addr).unwrap(), 3);
         assert_eq!(group.len(), 3);
-        assert!(group.get(0).is_some());
-        assert!(group.get(1).is_none());
-        assert!(group.get(2).is_some());
-        assert!(group.get(3).is_some());
+        assert!(group.core.get(0).is_some());
+        assert!(group.core.get(1).is_none());
+        assert!(group.core.get(2).is_some());
+        assert!(group.core.get(3).is_some());
 
         // Closing the highest id must not let the next connection reuse it
         group.close(3).unwrap();
-        assert!(group.get(3).is_none());
-        assert!(group.get_mut(3).is_none());
+        assert!(group.core.get(3).is_none());
+        assert!(group.core.get(3).is_none());
         assert_eq!(group.len(), 2);
 
         assert_eq!(group.add_connection(&addr).unwrap(), 4);
         assert_eq!(group.len(), 3);
-        assert!(group.get(0).is_some());
-        assert!(group.get(1).is_none());
-        assert!(group.get(2).is_some());
-        assert!(group.get(3).is_none());
-        assert!(group.get(4).is_some());
+        assert!(group.core.get(0).is_some());
+        assert!(group.core.get(1).is_none());
+        assert!(group.core.get(2).is_some());
+        assert!(group.core.get(3).is_none());
+        assert!(group.core.get(4).is_some());
+    }
+
+    #[test]
+    fn test_udp_group_recv_outcomes() {
+        let server = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+
+        let mut group = UdpConnectionGroup::new().unwrap();
+        let conn_id = group.add_connection(&addr).unwrap();
+        let mut buf = vec![0u8; 65536];
+        let mut ready = Vec::new();
+
+        group.poll(Duration::ZERO, &mut ready).unwrap();
+        assert!(ready.is_empty());
+        assert!(matches!(group.recv(conn_id, &mut buf).unwrap(), RecvOutcome::WouldBlock));
+
+        // Each send is one packet id
+        let first = group.send(conn_id, b"one").unwrap();
+        let second = group.send(conn_id, b"two").unwrap();
+        assert_eq!((first.tx_start, first.tx_end), (0, 0));
+        assert_eq!((second.tx_start, second.tx_end), (1, 1));
+
+        // One datagram per recv
+        let mut server_buf = [0u8; 16];
+        let (_, client) = server.recv_from(&mut server_buf).unwrap();
+        server.send_to(b"first", client).unwrap();
+        server.send_to(b"second", client).unwrap();
+        thread::sleep(Duration::from_millis(10));
+        group.poll(Duration::from_millis(100), &mut ready).unwrap();
+        assert_eq!(ready, vec![conn_id]);
+        assert!(matches!(
+            group.recv(conn_id, &mut buf).unwrap(),
+            RecvOutcome::Data { len: 5, .. }
+        ));
+        assert_eq!(&buf[..5], b"first");
+        assert!(matches!(
+            group.recv(conn_id, &mut buf).unwrap(),
+            RecvOutcome::Data { len: 6, .. }
+        ));
+        assert_eq!(&buf[..6], b"second");
+
+        assert!(matches!(group.recv(99, &mut buf), Err(Error::Connection(_))));
+        assert!(matches!(group.send(99, b"x"), Err(Error::Connection(_))));
     }
 
     #[test]

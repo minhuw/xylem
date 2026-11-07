@@ -14,7 +14,8 @@
 use crate::group::{GroupCore, GroupSocket, TimestampConfig};
 use crate::mux::{Interest, Multiplexer, MultiplexerType};
 use crate::{
-    ConnectionGroup, Error, GroupConnection, Result, Timestamp, Transport, TransportFactory,
+    ConnectionGroup, Error, RecvOutcome, Result, SendReceipt, Timestamp, Transport,
+    TransportFactory,
 };
 use socket2::{Domain, Protocol, Socket, Type};
 use std::io::{self, Read, Write};
@@ -166,9 +167,8 @@ impl Transport for TcpTransport {
 // =============================================================================
 
 /// A single TCP connection within a connection group
-pub struct TcpConn {
+pub(crate) struct TcpConn {
     stream: TcpStream,
-    recv_buffer: Vec<u8>,
     connected: bool,
     /// TX byte counter for correlating TX timestamps (wrapping)
     tx_byte_counter: u32,
@@ -182,7 +182,6 @@ impl TcpConn {
     fn new(stream: TcpStream) -> Self {
         Self {
             stream,
-            recv_buffer: vec![0u8; DEFAULT_RECV_BUFFER_SIZE],
             connected: true,
             tx_byte_counter: 0,
             #[cfg(target_os = "linux")]
@@ -194,7 +193,6 @@ impl TcpConn {
     fn with_timestamps(stream: TcpStream, timestamps_enabled: bool) -> Self {
         Self {
             stream,
-            recv_buffer: vec![0u8; DEFAULT_RECV_BUFFER_SIZE],
             connected: true,
             tx_byte_counter: 0,
             timestamps_enabled,
@@ -213,8 +211,8 @@ impl GroupSocket for TcpConn {
     }
 }
 
-impl GroupConnection for TcpConn {
-    fn send(&mut self, data: &[u8]) -> Result<(Timestamp, u32, u32)> {
+impl TcpConn {
+    fn send(&mut self, data: &[u8]) -> Result<SendReceipt> {
         if !self.connected {
             return Err(Error::Connection("Connection closed".to_string()));
         }
@@ -240,60 +238,58 @@ impl GroupConnection for TcpConn {
 
         // Return software timestamp and TX byte range for correlation
         // The actual HW TX timestamp will arrive via error queue with offset >= tx_end
-        Ok((Timestamp::now(), tx_start, tx_end))
+        Ok(SendReceipt {
+            timestamp: Timestamp::now(),
+            tx_start,
+            tx_end,
+        })
     }
 
-    fn recv(&mut self) -> Result<(Vec<u8>, Timestamp)> {
+    fn recv(&mut self, buf: &mut [u8]) -> Result<RecvOutcome> {
+        // The peer closed the stream earlier; nothing more will arrive
         if !self.connected {
-            return Err(Error::Connection("Connection closed".to_string()));
+            return Ok(RecvOutcome::Eof);
         }
 
         // Use kernel timestamps when available
         #[cfg(target_os = "linux")]
         if self.timestamps_enabled {
-            return self.recv_with_timestamp();
+            return self.recv_with_timestamp(buf);
         }
 
         // Standard recv without kernel timestamps
-        self.recv_standard()
+        self.recv_standard(buf)
     }
-}
 
-impl TcpConn {
     /// Standard receive using read() - no kernel timestamps
-    fn recv_standard(&mut self) -> Result<(Vec<u8>, Timestamp)> {
-        match self.stream.read(&mut self.recv_buffer) {
+    fn recv_standard(&mut self, buf: &mut [u8]) -> Result<RecvOutcome> {
+        match self.stream.read(buf) {
             Ok(0) => {
                 self.connected = false;
-                Err(Error::Connection("Connection closed by peer".to_string()))
+                Ok(RecvOutcome::Eof)
             }
-            Ok(n) => {
-                let timestamp = Timestamp::now();
-                let data = self.recv_buffer[..n].to_vec();
-                Ok((data, timestamp))
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok((Vec::new(), Timestamp::now())),
+            Ok(len) => Ok(RecvOutcome::Data { len, timestamp: Timestamp::now() }),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(RecvOutcome::WouldBlock),
             Err(e) => Err(e.into()),
         }
     }
 
     /// Receive using recvmsg() with kernel timestamps
     #[cfg(target_os = "linux")]
-    fn recv_with_timestamp(&mut self) -> Result<(Vec<u8>, Timestamp)> {
+    fn recv_with_timestamp(&mut self, buf: &mut [u8]) -> Result<RecvOutcome> {
         let fd = self.stream.as_raw_fd();
 
-        match hw_timestamp::recvmsg_with_timestamp(fd, &mut self.recv_buffer, 0) {
+        match hw_timestamp::recvmsg_with_timestamp(fd, buf, 0) {
             Ok((0, _)) => {
                 self.connected = false;
-                Err(Error::Connection("Connection closed by peer".to_string()))
+                Ok(RecvOutcome::Eof)
             }
-            Ok((n, ts_opt)) => {
-                let data = self.recv_buffer[..n].to_vec();
+            Ok((len, ts_opt)) => {
                 // Use hardware timestamp if available, otherwise software
                 let timestamp = ts_opt.unwrap_or_else(Timestamp::now);
-                Ok((data, timestamp))
+                Ok(RecvOutcome::Data { len, timestamp })
             }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok((Vec::new(), Timestamp::now())),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(RecvOutcome::WouldBlock),
             Err(e) => Err(e.into()),
         }
     }
@@ -369,8 +365,6 @@ impl Default for TcpConnectionGroup {
 }
 
 impl ConnectionGroup for TcpConnectionGroup {
-    type Conn = TcpConn;
-
     fn add_connection(&mut self, target: &SocketAddr) -> Result<usize> {
         let conn_id = self.core.reserve_id();
 
@@ -396,21 +390,22 @@ impl ConnectionGroup for TcpConnectionGroup {
         Ok(conn_id)
     }
 
-    fn get(&self, conn_id: usize) -> Option<&Self::Conn> {
-        self.core.get(conn_id)
+    fn send(&mut self, conn_id: usize, data: &[u8]) -> Result<SendReceipt> {
+        self.core.conn_mut(conn_id)?.send(data)
     }
 
-    fn get_mut(&mut self, conn_id: usize) -> Option<&mut Self::Conn> {
-        self.core.get_mut(conn_id)
+    fn recv(&mut self, conn_id: usize, buf: &mut [u8]) -> Result<RecvOutcome> {
+        self.core.conn_mut(conn_id)?.recv(buf)
     }
 
-    fn poll(&mut self, timeout: Option<Duration>) -> Result<Vec<usize>> {
-        self.core.poll(timeout)
+    fn poll(&mut self, timeout: Duration, ready: &mut Vec<usize>) -> Result<()> {
+        self.core.poll(timeout, ready)
     }
 
     #[cfg(target_os = "linux")]
-    fn poll_tx_timestamps(&mut self) -> Result<Vec<crate::TxTimestampInfo>> {
-        Ok(self.core.poll_tx_timestamps("TCP"))
+    fn poll_tx_timestamps(&mut self, out: &mut Vec<crate::TxTimestampInfo>) -> Result<()> {
+        self.core.poll_tx_timestamps("TCP", out);
+        Ok(())
     }
 
     fn len(&self) -> usize {
@@ -645,9 +640,9 @@ mod tests {
         assert_eq!(conn_id2, 1);
         assert_eq!(group.len(), 2);
 
-        assert!(group.get(0).is_some());
-        assert!(group.get(1).is_some());
-        assert!(group.get(99).is_none());
+        assert!(group.core.get(0).is_some());
+        assert!(group.core.get(1).is_some());
+        assert!(group.core.get(99).is_none());
     }
 
     #[test]
@@ -673,18 +668,22 @@ mod tests {
         let conn_id = group.add_connection(&addr).unwrap();
 
         let test_data = b"Hello, Group!";
-        let (send_ts, _tx_start, _tx_end) =
-            group.get_mut(conn_id).unwrap().send(test_data).unwrap();
+        let receipt = group.send(conn_id, test_data).unwrap();
 
         thread::sleep(Duration::from_millis(10));
 
-        let ready = group.poll(Some(Duration::from_millis(100))).unwrap();
+        let mut ready = vec![usize::MAX];
+        group.poll(Duration::from_millis(100), &mut ready).unwrap();
         assert!(!ready.is_empty());
         assert!(ready.contains(&conn_id));
+        assert!(!ready.contains(&usize::MAX));
 
-        let (recv_data, recv_ts) = group.get_mut(conn_id).unwrap().recv().unwrap();
-        assert_eq!(recv_data, test_data);
-        assert!(recv_ts.cycles() >= send_ts.cycles());
+        let mut buf = vec![0u8; 65536];
+        let RecvOutcome::Data { len, timestamp } = group.recv(conn_id, &mut buf).unwrap() else {
+            panic!("expected data");
+        };
+        assert_eq!(&buf[..len], test_data);
+        assert!(timestamp.cycles() >= receipt.timestamp.cycles());
     }
 
     fn echo_handler(mut socket: TcpStream) {
@@ -715,18 +714,20 @@ mod tests {
         let conn2 = group.add_connection(&addr).unwrap();
         let conn3 = group.add_connection(&addr).unwrap();
 
-        group.get_mut(conn1).unwrap().send(b"msg1").unwrap();
-        group.get_mut(conn2).unwrap().send(b"msg2").unwrap();
-        group.get_mut(conn3).unwrap().send(b"msg3").unwrap();
+        group.send(conn1, b"msg1").unwrap();
+        group.send(conn2, b"msg2").unwrap();
+        group.send(conn3, b"msg3").unwrap();
 
         thread::sleep(Duration::from_millis(50));
 
-        let ready = group.poll(Some(Duration::from_millis(100))).unwrap();
+        let mut ready = Vec::new();
+        group.poll(Duration::from_millis(100), &mut ready).unwrap();
         assert!(!ready.is_empty());
 
+        let mut buf = vec![0u8; 65536];
         for id in ready {
-            let (data, _) = group.get_mut(id).unwrap().recv().unwrap();
-            assert!(!data.is_empty());
+            let outcome = group.recv(id, &mut buf).unwrap();
+            assert!(matches!(outcome, RecvOutcome::Data { len, .. } if len > 0));
         }
     }
 
@@ -751,8 +752,8 @@ mod tests {
 
         group.close(conn1).unwrap();
         assert_eq!(group.len(), 1);
-        assert!(group.get(conn1).is_none());
-        assert!(group.get(conn2).is_some());
+        assert!(group.core.get(conn1).is_none());
+        assert!(group.core.get(conn2).is_some());
 
         group.close_all().unwrap();
         assert_eq!(group.len(), 0);
@@ -779,30 +780,96 @@ mod tests {
         // Closing a middle id must not let the next connection reuse it or
         // the current length
         group.close(1).unwrap();
-        assert!(group.get(1).is_none());
-        assert!(group.get_mut(1).is_none());
+        assert!(group.core.get(1).is_none());
+        assert!(group.core.get(1).is_none());
         assert_eq!(group.len(), 2);
 
         assert_eq!(group.add_connection(&addr).unwrap(), 3);
         assert_eq!(group.len(), 3);
-        assert!(group.get(0).is_some());
-        assert!(group.get(1).is_none());
-        assert!(group.get(2).is_some());
-        assert!(group.get(3).is_some());
+        assert!(group.core.get(0).is_some());
+        assert!(group.core.get(1).is_none());
+        assert!(group.core.get(2).is_some());
+        assert!(group.core.get(3).is_some());
 
         // Closing the highest id must not let the next connection reuse it
         group.close(3).unwrap();
-        assert!(group.get(3).is_none());
-        assert!(group.get_mut(3).is_none());
+        assert!(group.core.get(3).is_none());
+        assert!(group.core.get(3).is_none());
         assert_eq!(group.len(), 2);
 
         assert_eq!(group.add_connection(&addr).unwrap(), 4);
         assert_eq!(group.len(), 3);
-        assert!(group.get(0).is_some());
-        assert!(group.get(1).is_none());
-        assert!(group.get(2).is_some());
-        assert!(group.get(3).is_none());
-        assert!(group.get(4).is_some());
+        assert!(group.core.get(0).is_some());
+        assert!(group.core.get(1).is_none());
+        assert!(group.core.get(2).is_some());
+        assert!(group.core.get(3).is_none());
+        assert!(group.core.get(4).is_some());
+    }
+
+    #[test]
+    fn test_tcp_group_recv_outcomes() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (peer_tx, peer_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            peer_tx.send(socket).unwrap();
+        });
+
+        let mut group = TcpConnectionGroup::new().unwrap();
+        let conn_id = group.add_connection(&addr).unwrap();
+        let mut peer = peer_rx.recv().unwrap();
+        let mut buf = vec![0u8; 4];
+        let mut ready = Vec::new();
+
+        // Nothing sent yet: a zero timeout returns at once and recv would block
+        group.poll(Duration::ZERO, &mut ready).unwrap();
+        assert!(ready.is_empty());
+        assert!(matches!(group.recv(conn_id, &mut buf).unwrap(), RecvOutcome::WouldBlock));
+
+        // Level-triggered: still reported while bytes remain unread
+        peer.write_all(b"abcdef").unwrap();
+        group.poll(Duration::from_millis(100), &mut ready).unwrap();
+        assert_eq!(ready, vec![conn_id]);
+        assert!(matches!(
+            group.recv(conn_id, &mut buf).unwrap(),
+            RecvOutcome::Data { len: 4, .. }
+        ));
+        assert_eq!(&buf, b"abcd");
+        group.poll(Duration::ZERO, &mut ready).unwrap();
+        assert_eq!(ready, vec![conn_id]);
+        assert!(matches!(
+            group.recv(conn_id, &mut buf).unwrap(),
+            RecvOutcome::Data { len: 2, .. }
+        ));
+        assert_eq!(&buf[..2], b"ef");
+
+        // Peer close is reported as EOF, also on later calls
+        drop(peer);
+        group.poll(Duration::from_millis(100), &mut ready).unwrap();
+        assert_eq!(ready, vec![conn_id]);
+        assert!(matches!(group.recv(conn_id, &mut buf).unwrap(), RecvOutcome::Eof));
+        assert!(matches!(group.recv(conn_id, &mut buf).unwrap(), RecvOutcome::Eof));
+
+        // Unknown and closed ids are connection errors
+        assert!(matches!(group.recv(99, &mut buf), Err(Error::Connection(_))));
+        assert!(matches!(group.send(99, b"x"), Err(Error::Connection(_))));
+        group.close(conn_id).unwrap();
+        assert!(matches!(group.send(conn_id, b"x"), Err(Error::Connection(_))));
+    }
+
+    #[test]
+    fn test_tcp_group_tx_range_tracks_bytes() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || echo_handler(listener.accept().unwrap().0));
+
+        let mut group = TcpConnectionGroup::new().unwrap();
+        let conn_id = group.add_connection(&addr).unwrap();
+        let first = group.send(conn_id, b"hello").unwrap();
+        let second = group.send(conn_id, b"abc").unwrap();
+        assert_eq!((first.tx_start, first.tx_end), (0, 5));
+        assert_eq!((second.tx_start, second.tx_end), (5, 8));
     }
 
     #[test]

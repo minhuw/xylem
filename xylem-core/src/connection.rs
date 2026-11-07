@@ -13,7 +13,7 @@ use std::hash::Hash;
 use std::net::SocketAddr;
 use std::time::Duration;
 use xylem_common::{ParseResult, Protocol, RetryRequest};
-use xylem_transport::{ConnectionGroup, GroupConnection, Timestamp, TransportFactory};
+use xylem_transport::{ConnectionGroup, RecvOutcome, Timestamp, TransportFactory, TxTimestampInfo};
 
 /// Wrapping less-than-or-equal comparison for u32 counters
 ///
@@ -130,8 +130,11 @@ pub struct ConnectionState<ReqId: Eq + Hash + Clone> {
     /// Queue of (tx_end, ReqId, enqueue_time_ns) for TX timestamp correlation - push back, pop front
     /// The enqueue_time_ns is used for stale entry cleanup (entries older than 1 minute are removed)
     tx_pending_queue: VecDeque<(u32, ReqId, u64)>,
-    /// Receive buffer for partial responses
+    /// Receive buffer: unparsed bytes in `recv_buffer[..recv_len]`, spare
+    /// initialised space after them that the transport reads into
     recv_buffer: Vec<u8>,
+    /// Number of unparsed bytes at the front of `recv_buffer`
+    recv_len: usize,
     /// Whether connection is closed
     closed: bool,
     /// Traffic policy for this connection
@@ -158,7 +161,8 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
             max_pending_requests,
             pending_map: HashMap::with_capacity(max_pending_requests),
             tx_pending_queue: VecDeque::with_capacity(max_pending_requests),
-            recv_buffer: Vec::with_capacity(MAX_PAYLOAD),
+            recv_buffer: Vec::new(),
+            recv_len: 0,
             closed: false,
             policy,
             group_id,
@@ -233,7 +237,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
 
     /// Record a sent request with TX byte range for hardware timestamp correlation
     ///
-    /// `tx_start` is accepted for API symmetry with `GroupConnection::send()` but unused;
+    /// `tx_start` is accepted for symmetry with `SendReceipt` but unused;
     /// only `tx_end` is needed to determine when a TX timestamp covers this request.
     fn record_send(
         &mut self,
@@ -359,28 +363,66 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
             .map(completion_tuples)
     }
 
-    /// Process received data and transfer pending timing into each response outcome.
+    /// Process `data` as if the transport had just read it into the spare tail
+    #[cfg(test)]
     fn process_recv_extended<F>(
         &mut self,
         data: &[u8],
+        recv_ts: Timestamp,
+        process_fn: F,
+    ) -> Result<Vec<ReceivedResponse<ReqId>>>
+    where
+        F: FnMut(&[u8]) -> Result<ParseResult<ReqId>>,
+    {
+        let needed = self.recv_len + data.len();
+        if self.recv_buffer.len() < needed {
+            self.recv_buffer.resize(needed, 0);
+        }
+        self.recv_buffer[self.recv_len..needed].copy_from_slice(data);
+        self.process_received(data.len(), recv_ts, process_fn)
+    }
+
+    /// Unparsed bytes buffered from earlier reads
+    #[cfg(test)]
+    fn buffered(&self) -> &[u8] {
+        &self.recv_buffer[..self.recv_len]
+    }
+
+    /// Spare tail of the receive buffer for the transport to read into
+    ///
+    /// Always offers at least `MAX_PAYLOAD` bytes, so a datagram transport
+    /// never truncates a response. Grows the buffer only when needed.
+    fn recv_spare(&mut self) -> &mut [u8] {
+        let needed = self.recv_len + MAX_PAYLOAD;
+        if self.recv_buffer.len() < needed {
+            self.recv_buffer.resize(needed, 0);
+        }
+        &mut self.recv_buffer[self.recv_len..]
+    }
+
+    /// Process `len` bytes the transport read into `recv_spare()` and transfer
+    /// pending timing into each response outcome.
+    fn process_received<F>(
+        &mut self,
+        len: usize,
         recv_ts: Timestamp,
         mut process_fn: F,
     ) -> Result<Vec<ReceivedResponse<ReqId>>>
     where
         F: FnMut(&[u8]) -> Result<ParseResult<ReqId>>,
     {
-        if data.is_empty() {
+        if len == 0 {
             return Ok(Vec::new());
         }
 
         // A read can finish a near-limit frame and contain subsequent frames.
         // Limit individual frames, not the sum of buffered and newly read bytes.
-        self.recv_buffer.extend_from_slice(data);
+        self.recv_len += len;
         let mut responses = Vec::new();
         let mut cursor = 0;
-        while cursor < self.recv_buffer.len() {
-            let available = self.recv_buffer.len() - cursor;
-            let parsed = process_fn(&self.recv_buffer[cursor..])?;
+        while cursor < self.recv_len {
+            let available = self.recv_len - cursor;
+            let parsed = process_fn(&self.recv_buffer[cursor..self.recv_len])?;
             let (consumed, req_id) = match &parsed {
                 ParseResult::Incomplete => (0, None),
                 ParseResult::Complete { bytes_consumed, request_id } => {
@@ -434,8 +476,8 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
             cursor += consumed;
         }
         // Compact the remaining partial frame once, regardless of response count.
-        self.recv_buffer.copy_within(cursor.., 0);
-        self.recv_buffer.truncate(self.recv_buffer.len() - cursor);
+        self.recv_buffer.copy_within(cursor..self.recv_len, 0);
+        self.recv_len -= cursor;
 
         Ok(responses)
     }
@@ -486,6 +528,8 @@ pub struct ConnectionPool<G: ConnectionGroup, ReqId: Eq + Hash + Clone> {
     connection_ids: Vec<usize>,
     /// Min-heap for O(log N) lookup of next ready connection
     ready_heap: ReadyHeap,
+    /// Reused buffer for TX timestamps drained from the group
+    tx_timestamps: Vec<TxTimestampInfo>,
 }
 
 impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionPool<G, ReqId> {
@@ -598,16 +642,19 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
             connection_states,
             connection_ids,
             ready_heap,
+            tx_timestamps: Vec::new(),
         })
     }
 
     /// Poll all connections for readability (single syscall)
     ///
-    /// Returns connection IDs that have data ready to read.
-    pub fn poll(&mut self, timeout: Option<Duration>) -> Result<Vec<usize>> {
-        let ready = self.group.poll(timeout)?;
+    /// Clears `ready`, waits up to `timeout` (zero means do not wait), and
+    /// fills it with the IDs of tracked connections that are ready to read.
+    pub fn poll(&mut self, timeout: Duration, ready: &mut Vec<usize>) -> Result<()> {
+        self.group.poll(timeout, ready)?;
         // Filter to only include connections we're tracking
-        Ok(ready.into_iter().filter(|id| self.connection_states.contains_key(id)).collect())
+        ready.retain(|id| self.connection_states.contains_key(id));
+        Ok(())
     }
 
     /// Send data on a connection
@@ -656,12 +703,7 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
             ));
         }
 
-        let connection = self
-            .group
-            .get_mut(connection_id)
-            .ok_or_else(|| crate::Error::Connection("Connection not found in group".to_string()))?;
-
-        let (send_ts, tx_start, tx_end) = connection.send(data)?;
+        let receipt = self.group.send(connection_id, data)?;
 
         let state = self.connection_states.get_mut(&connection_id).unwrap();
         if let Some(timing) = original_timing {
@@ -669,7 +711,13 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
             // overwrite the logical request's original measurement start.
             state.pending_map.insert(req_id, PendingRequest { timing, tx_hw_ts: None });
         } else {
-            state.record_send(req_id, send_ts, tx_start, tx_end, is_warmup);
+            state.record_send(
+                req_id,
+                receipt.timestamp,
+                receipt.tx_start,
+                receipt.tx_end,
+                is_warmup,
+            );
         }
 
         Ok(())
@@ -686,12 +734,7 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
             return Err(crate::Error::Connection("Connection is closed".to_string()));
         }
 
-        let connection = self
-            .group
-            .get_mut(connection_id)
-            .ok_or_else(|| crate::Error::Connection("Connection not found in group".to_string()))?;
-
-        let _ = connection.send(data)?;
+        self.group.send(connection_id, data)?;
         Ok(())
     }
 
@@ -720,19 +763,22 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
     where
         F: FnMut(&[u8]) -> Result<ParseResult<ReqId>>,
     {
-        let connection = self
-            .group
-            .get_mut(connection_id)
-            .ok_or_else(|| crate::Error::Connection("Connection not found in group".to_string()))?;
-
-        let (data, recv_ts) = connection.recv()?;
-
         let state = self
             .connection_states
             .get_mut(&connection_id)
             .ok_or_else(|| crate::Error::Connection("Connection state not found".to_string()))?;
 
-        let responses = state.process_recv_extended(&data, recv_ts, process_fn)?;
+        // The transport reads straight into the state's buffer, after any
+        // partial frame left by earlier reads.
+        let responses = match self.group.recv(connection_id, state.recv_spare())? {
+            RecvOutcome::Data { len, timestamp } => {
+                state.process_received(len, timestamp, process_fn)?
+            }
+            RecvOutcome::WouldBlock => return Ok(Vec::new()),
+            RecvOutcome::Eof => {
+                return Err(crate::Error::Connection("Connection closed by peer".to_string()))
+            }
+        };
         for response in &responses {
             let ReceivedResponse::Complete { latency, timing, .. } = response else {
                 continue;
@@ -757,10 +803,10 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
     /// Note: A single TX timestamp may update multiple requests if they were
     /// batched together in a single kernel acknowledgment.
     pub fn poll_tx_timestamps(&mut self) -> Result<usize> {
-        let tx_timestamps = self.group.poll_tx_timestamps()?;
+        self.group.poll_tx_timestamps(&mut self.tx_timestamps)?;
         let mut count = 0;
 
-        for tx_info in tx_timestamps {
+        for tx_info in &self.tx_timestamps {
             if let Some(state) = self.connection_states.get_mut(&tx_info.conn_id) {
                 count += state.set_tx_timestamp(tx_info.tx_offset, tx_info.timestamp);
             }
@@ -1065,7 +1111,7 @@ mod tests {
             responses.iter().map(|r| (r.0, r.3)).collect::<Vec<_>>(),
             vec![(1, MAX_PAYLOAD), (2, 16)]
         );
-        assert!(state.recv_buffer.is_empty());
+        assert!(state.buffered().is_empty());
         assert_eq!(state.pending_count(), 0);
     }
 
@@ -1096,9 +1142,9 @@ mod tests {
         state.record_send(100, ts, 0, 100, false);
         data.extend_from_slice(&tail[..6]);
         assert_eq!(state.process_recv(&data, ts, parse_frame).unwrap().len(), 100);
-        assert_eq!(state.recv_buffer, tail[..6]);
+        assert_eq!(state.buffered(), &tail[..6]);
         assert_eq!(state.process_recv(&tail[6..], ts, parse_frame).unwrap()[0].0, 100);
-        assert!(state.recv_buffer.is_empty());
+        assert!(state.buffered().is_empty());
     }
 
     #[test]
@@ -1157,6 +1203,51 @@ mod tests {
             vec![(7, Duration::ZERO, true, 1)]
         );
         assert_eq!(pool.get_state(0).unwrap().pending_count(), 0);
+    }
+
+    #[test]
+    fn pool_receive_reuses_buffer_and_maps_outcomes() {
+        let factory = test_support::FakeFactory::default();
+        let mut pool = ConnectionPool::new(
+            &factory,
+            "127.0.0.1:1".parse().unwrap(),
+            1,
+            2,
+            Box::new(crate::scheduler::UniformPolicyScheduler::closed_loop()),
+            0,
+        )
+        .unwrap();
+        pool.send(0, &[0], 1u64, false).unwrap();
+        pool.send(0, &[0], 2u64, false).unwrap();
+        let data = [frame(1, 16), frame(2, 12)].concat();
+        let io = factory.0.clone();
+
+        // A frame split across reads stays buffered between them
+        io.lock().unwrap().responses.push_back(Ok(data[..10].to_vec()));
+        let responses = pool.recv_responses(0, parse_frame).unwrap();
+        assert!(responses.is_empty());
+        assert_eq!(pool.get_state(0).unwrap().buffered(), &data[..10]);
+
+        io.lock().unwrap().responses.push_back(Ok(data[10..].to_vec()));
+        let responses = pool.recv_responses(0, parse_frame).unwrap();
+        assert_eq!(responses.iter().map(|r| r.0).collect::<Vec<_>>(), vec![1, 2]);
+        let state = pool.get_state(0).unwrap();
+        assert!(state.buffered().is_empty());
+        assert!(state.recv_buffer.len() >= MAX_PAYLOAD);
+        let buffer = (state.recv_buffer.as_ptr(), state.recv_buffer.len());
+
+        // Once large enough, later reads neither grow nor reallocate it
+        pool.send(0, &[0], 3u64, false).unwrap();
+        io.lock().unwrap().responses.push_back(Ok(frame(3, 8)));
+        assert_eq!(pool.recv_responses(0, parse_frame).unwrap()[0].0, 3);
+        let state = pool.get_state(0).unwrap();
+        assert_eq!((state.recv_buffer.as_ptr(), state.recv_buffer.len()), buffer);
+
+        // Nothing to read is not an error; EOF is a connection error
+        assert!(pool.recv_responses(0, parse_frame).unwrap().is_empty());
+        io.lock().unwrap().eof = true;
+        assert!(matches!(pool.recv_responses(0, parse_frame), Err(crate::Error::Connection(_))));
+        assert!(matches!(pool.send(9, &[0], 4, false), Err(crate::Error::Connection(_))));
     }
 
     #[test]
@@ -1267,12 +1358,14 @@ pub(crate) mod test_support {
         pub responses: VecDeque<xylem_transport::Result<Vec<u8>>>,
         pub sent: Vec<Vec<u8>>,
         pub fail_send: bool,
-        pub timeouts: Vec<Option<Duration>>,
+        pub timeouts: Vec<Duration>,
         pub tx_polls: usize,
         pub closed: bool,
         pub timestamp: Timestamp,
         pub response_connection_id: usize,
         pub tx_timestamps: Vec<xylem_transport::TxTimestampInfo>,
+        /// Report EOF once `responses` is empty
+        pub eof: bool,
     }
 
     impl Default for FakeIo {
@@ -1287,6 +1380,7 @@ pub(crate) mod test_support {
                 timestamp: Timestamp::now(),
                 response_connection_id: 0,
                 tx_timestamps: Vec::new(),
+                eof: false,
             }
         }
     }
@@ -1294,67 +1388,88 @@ pub(crate) mod test_support {
     #[derive(Default)]
     pub struct FakeFactory(pub Arc<Mutex<FakeIo>>);
 
-    pub struct FakeConnection(Arc<Mutex<FakeIo>>);
+    pub struct FakeGroup {
+        io: Arc<Mutex<FakeIo>>,
+        connections: usize,
+    }
 
-    impl GroupConnection for FakeConnection {
-        fn send(&mut self, data: &[u8]) -> xylem_transport::Result<(Timestamp, u32, u32)> {
-            let mut io = self.0.lock().unwrap();
+    impl FakeGroup {
+        fn check(&self, id: usize) -> xylem_transport::Result<()> {
+            if id < self.connections {
+                Ok(())
+            } else {
+                Err(xylem_transport::Error::Connection("Connection not found".into()))
+            }
+        }
+    }
+
+    impl ConnectionGroup for FakeGroup {
+        fn add_connection(&mut self, _: &SocketAddr) -> xylem_transport::Result<usize> {
+            let id = self.connections;
+            self.connections += 1;
+            Ok(id)
+        }
+
+        fn send(
+            &mut self,
+            conn_id: usize,
+            data: &[u8],
+        ) -> xylem_transport::Result<xylem_transport::SendReceipt> {
+            self.check(conn_id)?;
+            let mut io = self.io.lock().unwrap();
             if io.fail_send {
                 return Err(xylem_transport::Error::Io(std::io::Error::other("send failed")));
             }
             io.sent.push(data.to_vec());
-            Ok((io.timestamp, 0, io.sent.len() as u32))
+            Ok(xylem_transport::SendReceipt {
+                timestamp: io.timestamp,
+                tx_start: 0,
+                tx_end: io.sent.len() as u32,
+            })
         }
 
-        fn recv(&mut self) -> xylem_transport::Result<(Vec<u8>, Timestamp)> {
-            let mut io = self.0.lock().unwrap();
+        // An empty queued response stands for "no data right now"
+        fn recv(&mut self, conn_id: usize, buf: &mut [u8]) -> xylem_transport::Result<RecvOutcome> {
+            self.check(conn_id)?;
+            let mut io = self.io.lock().unwrap();
+            if io.eof && io.responses.is_empty() {
+                return Ok(RecvOutcome::Eof);
+            }
             let data = io.responses.pop_front().unwrap_or_else(|| Ok(Vec::new()))?;
-            Ok((data, io.timestamp))
-        }
-    }
-
-    pub struct FakeGroup {
-        io: Arc<Mutex<FakeIo>>,
-        connections: Vec<FakeConnection>,
-    }
-
-    impl ConnectionGroup for FakeGroup {
-        type Conn = FakeConnection;
-
-        fn add_connection(&mut self, _: &SocketAddr) -> xylem_transport::Result<usize> {
-            let id = self.connections.len();
-            self.connections.push(FakeConnection(self.io.clone()));
-            Ok(id)
+            if data.is_empty() {
+                return Ok(RecvOutcome::WouldBlock);
+            }
+            buf[..data.len()].copy_from_slice(&data);
+            Ok(RecvOutcome::Data { len: data.len(), timestamp: io.timestamp })
         }
 
-        fn get(&self, id: usize) -> Option<&Self::Conn> {
-            self.connections.get(id)
-        }
-
-        fn get_mut(&mut self, id: usize) -> Option<&mut Self::Conn> {
-            self.connections.get_mut(id)
-        }
-
-        fn poll(&mut self, timeout: Option<Duration>) -> xylem_transport::Result<Vec<usize>> {
+        fn poll(
+            &mut self,
+            timeout: Duration,
+            ready: &mut Vec<usize>,
+        ) -> xylem_transport::Result<()> {
             let mut io = self.io.lock().unwrap();
             io.timeouts.push(timeout);
-            Ok(if io.responses.is_empty() {
-                vec![]
-            } else {
-                vec![io.response_connection_id]
-            })
+            ready.clear();
+            if !io.responses.is_empty() {
+                ready.push(io.response_connection_id);
+            }
+            Ok(())
         }
 
         fn poll_tx_timestamps(
             &mut self,
-        ) -> xylem_transport::Result<Vec<xylem_transport::TxTimestampInfo>> {
+            out: &mut Vec<xylem_transport::TxTimestampInfo>,
+        ) -> xylem_transport::Result<()> {
             let mut io = self.io.lock().unwrap();
             io.tx_polls += 1;
-            Ok(std::mem::take(&mut io.tx_timestamps))
+            out.clear();
+            out.append(&mut io.tx_timestamps);
+            Ok(())
         }
 
         fn len(&self) -> usize {
-            self.connections.len()
+            self.connections
         }
 
         fn close(&mut self, _: usize) -> xylem_transport::Result<()> {
@@ -1371,10 +1486,7 @@ pub(crate) mod test_support {
         type Group = FakeGroup;
 
         fn create_group(&self) -> xylem_transport::Result<Self::Group> {
-            Ok(FakeGroup {
-                io: self.0.clone(),
-                connections: Vec::new(),
-            })
+            Ok(FakeGroup { io: self.0.clone(), connections: 0 })
         }
     }
 }

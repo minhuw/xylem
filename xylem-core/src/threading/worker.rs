@@ -52,6 +52,8 @@ pub struct Worker<G: ConnectionGroup, P: Protocol, S: StatsRecorder = TupleStats
     next_tx_cleanup_ns: u64,
     /// Redirects waiting for capacity on their target connection.
     retry_queue: Vec<(usize, RetryRequest<P::RequestId>, RequestTiming)>,
+    /// Reused buffer for the connection IDs each poll reports ready.
+    ready_ids: Vec<usize>,
 }
 
 impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
@@ -131,6 +133,7 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             thread_id: 0,
             next_tx_cleanup_ns: timing::time_ns().saturating_add(1_000_000_000),
             retry_queue: Vec::new(),
+            ready_ids: Vec::new(),
         }
     }
 
@@ -201,7 +204,7 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             // Derive sleep duration from the ready heap (when next connection will be ready)
             let now_ns = timing::time_ns();
 
-            let poll_timeout = Some(self.poll_timeout(now_ns, end_ns));
+            let poll_timeout = self.poll_timeout(now_ns, end_ns);
             self.process_responses(poll_timeout)?;
         }
 
@@ -320,9 +323,11 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
     }
 
     /// Process responses from all connections
-    fn process_responses(&mut self, timeout: Option<Duration>) -> Result<()> {
-        // Poll all connections with one syscall
-        let ready_ids = self.pool.poll(timeout)?;
+    fn process_responses(&mut self, timeout: Duration) -> Result<()> {
+        // Poll all connections with one syscall. The ID buffer is taken out of
+        // the worker so the loop below can call `&mut self` pool methods.
+        let mut ready_ids = std::mem::take(&mut self.ready_ids);
+        self.pool.poll(timeout, &mut ready_ids)?;
 
         // Poll for TX timestamps from error queue (non-blocking)
         // Must be called AFTER poll() because TX timestamps arrive asynchronously
@@ -338,7 +343,7 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         // Collect retries to process after response handling
         let mut retries = std::mem::take(&mut self.retry_queue);
 
-        for connection_id in ready_ids {
+        for &connection_id in &ready_ids {
             let state = match self.pool.get_state(connection_id) {
                 Some(s) => s,
                 None => continue,
@@ -399,6 +404,7 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             let protocol = self.protocols.get(&group_id).expect("Protocol not found for group_id");
             self.pool.try_schedule_connection(connection_id, protocol);
         }
+        self.ready_ids = ready_ids;
 
         // Process all retries after response handling.
         for (group_id, retry_req, timing) in retries {
@@ -509,7 +515,7 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         if !self.has_pending() {
             return Ok(false);
         }
-        self.process_responses(Some(Duration::from_millis(10)))?;
+        self.process_responses(Duration::from_millis(10))?;
         Ok(self.has_pending())
     }
 
@@ -666,7 +672,7 @@ mod tests {
         assert_eq!(worker.retry_queue.len(), 1);
         assert_eq!(worker.protocols[&0].next_id, 1);
         factory.0.lock().unwrap().responses.push_back(Ok(0u64.to_le_bytes().to_vec()));
-        worker.process_responses(Some(Duration::ZERO)).unwrap();
+        worker.process_responses(Duration::ZERO).unwrap();
         assert!(worker.retry_queue.is_empty());
         assert_eq!(
             factory.0.lock().unwrap().sent,
@@ -735,7 +741,7 @@ mod tests {
             io.response_connection_id = 2;
             io.responses.push_back(Ok(0u64.to_le_bytes().to_vec()));
         }
-        worker.process_responses(Some(Duration::ZERO)).unwrap();
+        worker.process_responses(Duration::ZERO).unwrap();
         assert_eq!(worker.stats.aggregate_by_group(Duration::from_secs(1))[&1].total_requests, 1);
         assert_eq!(worker.retry_queue.len(), 1);
         worker.send_requests().unwrap();
@@ -746,7 +752,7 @@ mod tests {
             io.response_connection_id = 1;
             io.responses.push_back(Ok(99u64.to_le_bytes().to_vec()));
         }
-        worker.process_responses(Some(Duration::ZERO)).unwrap();
+        worker.process_responses(Duration::ZERO).unwrap();
         assert!(worker.retry_queue.is_empty());
         assert_eq!(worker.pool.get_state(1).unwrap().pending_count(), 1);
         assert_eq!(worker.protocols[&0].next_id, 1);
@@ -806,7 +812,7 @@ mod tests {
                 fake_worker(&factory, 2, Box::new(UniformPolicyScheduler::closed_loop()));
             worker.send_requests().unwrap();
             factory.0.lock().unwrap().responses.push_back(Ok(0u64.to_le_bytes().to_vec()));
-            worker.process_responses(Some(Duration::ZERO)).unwrap();
+            worker.process_responses(Duration::ZERO).unwrap();
             assert_eq!(worker.stats.aggregate_global(Duration::from_secs(1)).total_requests, 1);
             if disconnect {
                 factory
@@ -931,16 +937,16 @@ mod tests {
             .unwrap()
             .responses
             .push_back(Ok(b"-ASK 1 127.0.0.1:1\r\n".to_vec()));
-        worker.process_responses(Some(Duration::ZERO)).unwrap();
+        worker.process_responses(Duration::ZERO).unwrap();
         assert_eq!(factory.0.lock().unwrap().sent[1], b"*1\r\n$6\r\nASKING\r\n");
         assert_eq!(factory.0.lock().unwrap().sent.len(), 3);
         for fragment in [b"+O".as_slice(), b"K\r\n", b"$-1\r"] {
             factory.0.lock().unwrap().responses.push_back(Ok(fragment.to_vec()));
-            worker.process_responses(Some(Duration::ZERO)).unwrap();
+            worker.process_responses(Duration::ZERO).unwrap();
             assert_eq!(worker.pool.get_state(0).unwrap().pending_count(), 1);
         }
         factory.0.lock().unwrap().responses.push_back(Ok(b"\n".to_vec()));
-        worker.process_responses(Some(Duration::ZERO)).unwrap();
+        worker.process_responses(Duration::ZERO).unwrap();
         assert_eq!(worker.pool.get_state(0).unwrap().pending_count(), 0);
         assert_eq!(worker.stats.aggregate_global(Duration::from_secs(1)).total_requests, 1);
         assert_eq!(
@@ -962,8 +968,8 @@ mod tests {
         assert_eq!(worker.pool.peek_next_ready_time(), None);
         let timeout = worker.poll_timeout(100, 100_000_100);
         assert_eq!(timeout, Duration::ZERO);
-        worker.process_responses(Some(timeout)).unwrap();
-        assert_eq!(factory.0.lock().unwrap().timeouts, vec![Some(Duration::ZERO)]);
+        worker.process_responses(timeout).unwrap();
+        assert_eq!(factory.0.lock().unwrap().timeouts, vec![Duration::ZERO]);
     }
 
     #[test]
@@ -976,8 +982,8 @@ mod tests {
         worker.pool.try_schedule_connection(0, &worker.protocols[&0]);
         let timeout = worker.poll_timeout(100, 5_000_100);
         assert_eq!(timeout, Duration::from_millis(5));
-        worker.process_responses(Some(timeout)).unwrap();
-        assert_eq!(factory.0.lock().unwrap().timeouts, vec![Some(Duration::from_millis(5))]);
+        worker.process_responses(timeout).unwrap();
+        assert_eq!(factory.0.lock().unwrap().timeouts, vec![Duration::from_millis(5)]);
         assert_eq!(worker.poll_timeout(5_000_101, 5_000_100), Duration::ZERO);
     }
 
@@ -1062,7 +1068,7 @@ mod tests {
             .unwrap()
             .responses
             .push_back(Err(xylem_transport::Error::Connection("closed".into())));
-        worker.process_responses(Some(Duration::ZERO)).unwrap();
+        worker.process_responses(Duration::ZERO).unwrap();
         assert!(worker.pool.get_state(0).unwrap().is_closed());
         assert!(!worker.pool.get_state(1).unwrap().is_closed());
         {
@@ -1383,7 +1389,7 @@ mod tests {
                 responses.extend(id.to_le_bytes());
             }
             factory.0.lock().unwrap().responses.push_back(Ok(responses));
-            worker.process_responses(Some(Duration::ZERO)).unwrap();
+            worker.process_responses(Duration::ZERO).unwrap();
             // Inspect the actual deadline scheduled by response processing; do not
             // call the adaptive policy directly to apply or simulate feedback.
             let next = worker.pool.peek_next_ready_time().unwrap();

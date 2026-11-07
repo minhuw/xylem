@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 use xylem_transport::unix::UnixConnectionGroup;
-use xylem_transport::{ConnectionGroup, GroupConnection, Timestamp};
+use xylem_transport::{ConnectionGroup, RecvOutcome, Timestamp};
 
 const MESSAGE_SIZE: usize = 16;
 const DEFAULT_DURATION_SECS: u64 = 30;
@@ -125,35 +125,31 @@ fn run_worker(
     for (conn_id, state) in states.iter_mut().enumerate() {
         for _ in 0..max_pending {
             let (data, req_id) = state.generate_request();
-            if let Some(conn) = group.get_mut(conn_id) {
-                if let Ok((send_ts, ..)) = conn.send(&data) {
-                    state.pending.insert(req_id, PendingRequest { send_ts });
-                    total_tx += 1;
-                }
+            if let Ok(receipt) = group.send(conn_id, &data) {
+                state.pending.insert(req_id, PendingRequest { send_ts: receipt.timestamp });
+                total_tx += 1;
             }
         }
     }
 
     // Main loop
+    let mut ready = Vec::new();
+    let mut buf = vec![0u8; 8192];
     while Instant::now() < end_time {
-        let ready = match group.poll(Some(Duration::from_micros(100))) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
+        if group.poll(Duration::from_micros(100), &mut ready).is_err() {
+            continue;
+        }
 
-        for conn_id in ready {
+        for &conn_id in &ready {
             let state = &mut states[conn_id];
-            let conn = match group.get_mut(conn_id) {
-                Some(c) => c,
-                None => continue,
-            };
 
-            let (data, recv_ts) = match conn.recv() {
-                Ok(r) => r,
-                Err(_) => continue,
+            let recv_ts = match group.recv(conn_id, &mut buf) {
+                Ok(RecvOutcome::Data { len, timestamp }) => {
+                    state.append_data(&buf[..len]);
+                    timestamp
+                }
+                Ok(RecvOutcome::WouldBlock | RecvOutcome::Eof) | Err(_) => continue,
             };
-
-            state.append_data(&data);
 
             while let Some(req_id) = state.parse_next_response() {
                 let Some(pending) = state.pending.remove(&req_id) else {
@@ -166,10 +162,10 @@ fn run_worker(
 
                 // Send next request (closed loop)
                 let (data, new_req_id) = state.generate_request();
-                let Ok((send_ts, ..)) = conn.send(&data) else {
+                let Ok(receipt) = group.send(conn_id, &data) else {
                     continue;
                 };
-                state.pending.insert(new_req_id, PendingRequest { send_ts });
+                state.pending.insert(new_req_id, PendingRequest { send_ts: receipt.timestamp });
                 total_tx += 1;
             }
         }

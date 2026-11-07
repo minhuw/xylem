@@ -191,24 +191,30 @@ impl<C: GroupSocket> GroupCore<C> {
         self.connections.insert(conn_id, conn);
     }
 
+    #[cfg(test)]
     pub(crate) fn get(&self, conn_id: usize) -> Option<&C> {
         self.connections.get(&conn_id)
     }
 
-    pub(crate) fn get_mut(&mut self, conn_id: usize) -> Option<&mut C> {
-        self.connections.get_mut(&conn_id)
+    /// Look up a live connection for I/O
+    pub(crate) fn conn_mut(&mut self, conn_id: usize) -> Result<&mut C> {
+        self.connections
+            .get_mut(&conn_id)
+            .ok_or_else(|| Error::Connection("Connection not found".to_string()))
     }
 
-    /// Wait for readable sockets and return the ids of live connections
-    pub(crate) fn poll(&mut self, timeout: Option<Duration>) -> Result<Vec<usize>> {
-        let events = self.mux.wait(timeout)?;
-        let ready: Vec<usize> = events
-            .iter()
-            .filter(|e| e.readable)
-            .map(|e| e.id)
-            .filter(|id| self.connections.contains_key(id))
-            .collect();
-        Ok(ready)
+    /// Wait for readable sockets and collect the ids of live connections into `ready`
+    pub(crate) fn poll(&mut self, timeout: Duration, ready: &mut Vec<usize>) -> Result<()> {
+        ready.clear();
+        let events = self.mux.wait(Some(timeout))?;
+        ready.extend(
+            events
+                .iter()
+                .filter(|e| e.readable)
+                .map(|e| e.id)
+                .filter(|id| self.connections.contains_key(id)),
+        );
+        Ok(())
     }
 
     /// Drain TX timestamps from the error queue of every connection with
@@ -216,8 +222,8 @@ impl<C: GroupSocket> GroupCore<C> {
     ///
     /// `transport` names the transport in log messages (e.g., "TCP").
     #[cfg(target_os = "linux")]
-    pub(crate) fn poll_tx_timestamps(&self, transport: &str) -> Vec<TxTimestampInfo> {
-        let mut results = Vec::new();
+    pub(crate) fn poll_tx_timestamps(&self, transport: &str, out: &mut Vec<TxTimestampInfo>) {
+        out.clear();
 
         for (&conn_id, conn) in &self.connections {
             if !conn.timestamps_enabled() {
@@ -230,7 +236,7 @@ impl<C: GroupSocket> GroupCore<C> {
             loop {
                 match hw_timestamp::recv_tx_timestamp(fd) {
                     Ok(Some((timestamp, opt_id))) => {
-                        results.push(TxTimestampInfo { conn_id, tx_offset: opt_id, timestamp });
+                        out.push(TxTimestampInfo { conn_id, tx_offset: opt_id, timestamp });
                     }
                     Ok(None) => break, // No more timestamps available
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -246,8 +252,6 @@ impl<C: GroupSocket> GroupCore<C> {
                 }
             }
         }
-
-        results
     }
 
     pub(crate) fn len(&self) -> usize {

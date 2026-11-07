@@ -11,7 +11,9 @@
 
 use crate::group::{GroupCore, GroupSocket};
 use crate::mux::{Interest, Multiplexer, MultiplexerType};
-use crate::{ConnectionGroup, Error, GroupConnection, Result, Timestamp, TransportFactory};
+use crate::{
+    ConnectionGroup, Error, RecvOutcome, Result, SendReceipt, Timestamp, TransportFactory,
+};
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -145,9 +147,8 @@ impl Default for UnixTransport {
 // =============================================================================
 
 /// A single Unix socket connection within a connection group
-pub struct UnixConn {
+pub(crate) struct UnixConn {
     stream: UnixStream,
-    recv_buffer: Vec<u8>,
     connected: bool,
     /// TX byte counter for timestamp correlation (monotonically increasing)
     tx_byte_counter: u32,
@@ -157,7 +158,6 @@ impl UnixConn {
     fn new(stream: UnixStream) -> Self {
         Self {
             stream,
-            recv_buffer: vec![0u8; DEFAULT_RECV_BUFFER_SIZE],
             connected: true,
             tx_byte_counter: 0,
         }
@@ -170,8 +170,8 @@ impl GroupSocket for UnixConn {
     }
 }
 
-impl GroupConnection for UnixConn {
-    fn send(&mut self, data: &[u8]) -> Result<(Timestamp, u32, u32)> {
+impl UnixConn {
+    fn send(&mut self, data: &[u8]) -> Result<SendReceipt> {
         if !self.connected {
             return Err(Error::Connection("Connection closed".to_string()));
         }
@@ -194,25 +194,26 @@ impl GroupConnection for UnixConn {
 
         // Update byte counter and capture software timestamp
         self.tx_byte_counter = tx_end;
-        Ok((Timestamp::now(), tx_start, tx_end))
+        Ok(SendReceipt {
+            timestamp: Timestamp::now(),
+            tx_start,
+            tx_end,
+        })
     }
 
-    fn recv(&mut self) -> Result<(Vec<u8>, Timestamp)> {
+    fn recv(&mut self, buf: &mut [u8]) -> Result<RecvOutcome> {
+        // The peer closed the stream earlier; nothing more will arrive
         if !self.connected {
-            return Err(Error::Connection("Connection closed".to_string()));
+            return Ok(RecvOutcome::Eof);
         }
 
-        match self.stream.read(&mut self.recv_buffer) {
+        match self.stream.read(buf) {
             Ok(0) => {
                 self.connected = false;
-                Err(Error::Connection("Connection closed by peer".to_string()))
+                Ok(RecvOutcome::Eof)
             }
-            Ok(n) => {
-                let timestamp = Timestamp::now();
-                let data = self.recv_buffer[..n].to_vec();
-                Ok((data, timestamp))
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok((Vec::new(), Timestamp::now())),
+            Ok(len) => Ok(RecvOutcome::Data { len, timestamp: Timestamp::now() }),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(RecvOutcome::WouldBlock),
             Err(e) => Err(e.into()),
         }
     }
@@ -257,24 +258,22 @@ impl Default for UnixConnectionGroup {
 }
 
 impl ConnectionGroup for UnixConnectionGroup {
-    type Conn = UnixConn;
-
     fn add_connection(&mut self, _target: &SocketAddr) -> Result<usize> {
         Err(Error::Connection(
             "UnixConnectionGroup requires a path. Use add_connection_path() instead.".to_string(),
         ))
     }
 
-    fn get(&self, conn_id: usize) -> Option<&Self::Conn> {
-        self.core.get(conn_id)
+    fn send(&mut self, conn_id: usize, data: &[u8]) -> Result<SendReceipt> {
+        self.core.conn_mut(conn_id)?.send(data)
     }
 
-    fn get_mut(&mut self, conn_id: usize) -> Option<&mut Self::Conn> {
-        self.core.get_mut(conn_id)
+    fn recv(&mut self, conn_id: usize, buf: &mut [u8]) -> Result<RecvOutcome> {
+        self.core.conn_mut(conn_id)?.recv(buf)
     }
 
-    fn poll(&mut self, timeout: Option<Duration>) -> Result<Vec<usize>> {
-        self.core.poll(timeout)
+    fn poll(&mut self, timeout: Duration, ready: &mut Vec<usize>) -> Result<()> {
+        self.core.poll(timeout, ready)
     }
 
     fn len(&self) -> usize {
@@ -506,9 +505,9 @@ mod tests {
         assert_eq!(conn_id2, 1);
         assert_eq!(group.len(), 2);
 
-        assert!(group.get(0).is_some());
-        assert!(group.get(1).is_some());
-        assert!(group.get(99).is_none());
+        assert!(group.core.get(0).is_some());
+        assert!(group.core.get(1).is_some());
+        assert!(group.core.get(99).is_none());
     }
 
     #[test]
@@ -545,18 +544,22 @@ mod tests {
         let conn_id = group.add_connection_path(&socket_path).unwrap();
 
         let test_data = b"Hello, Unix Group!";
-        let (send_ts, _tx_start, _tx_end) =
-            group.get_mut(conn_id).unwrap().send(test_data).unwrap();
+        let receipt = group.send(conn_id, test_data).unwrap();
 
         thread::sleep(Duration::from_millis(10));
 
-        let ready = group.poll(Some(Duration::from_millis(100))).unwrap();
+        let mut ready = vec![usize::MAX];
+        group.poll(Duration::from_millis(100), &mut ready).unwrap();
         assert!(!ready.is_empty());
         assert!(ready.contains(&conn_id));
+        assert!(!ready.contains(&usize::MAX));
 
-        let (recv_data, recv_ts) = group.get_mut(conn_id).unwrap().recv().unwrap();
-        assert_eq!(recv_data, test_data);
-        assert!(recv_ts.cycles() >= send_ts.cycles());
+        let mut buf = vec![0u8; 65536];
+        let RecvOutcome::Data { len, timestamp } = group.recv(conn_id, &mut buf).unwrap() else {
+            panic!("expected data");
+        };
+        assert_eq!(&buf[..len], test_data);
+        assert!(timestamp.cycles() >= receipt.timestamp.cycles());
     }
 
     #[test]
@@ -583,8 +586,8 @@ mod tests {
 
         group.close(conn1).unwrap();
         assert_eq!(group.len(), 1);
-        assert!(group.get(conn1).is_none());
-        assert!(group.get(conn2).is_some());
+        assert!(group.core.get(conn1).is_none());
+        assert!(group.core.get(conn2).is_some());
 
         group.close_all().unwrap();
         assert_eq!(group.len(), 0);
@@ -614,30 +617,65 @@ mod tests {
         // Closing a middle id must not let the next connection reuse it or
         // the current length
         group.close(1).unwrap();
-        assert!(group.get(1).is_none());
-        assert!(group.get_mut(1).is_none());
+        assert!(group.core.get(1).is_none());
+        assert!(group.core.get(1).is_none());
         assert_eq!(group.len(), 2);
 
         assert_eq!(group.add_connection_path(&socket_path).unwrap(), 3);
         assert_eq!(group.len(), 3);
-        assert!(group.get(0).is_some());
-        assert!(group.get(1).is_none());
-        assert!(group.get(2).is_some());
-        assert!(group.get(3).is_some());
+        assert!(group.core.get(0).is_some());
+        assert!(group.core.get(1).is_none());
+        assert!(group.core.get(2).is_some());
+        assert!(group.core.get(3).is_some());
 
         // Closing the highest id must not let the next connection reuse it
         group.close(3).unwrap();
-        assert!(group.get(3).is_none());
-        assert!(group.get_mut(3).is_none());
+        assert!(group.core.get(3).is_none());
+        assert!(group.core.get(3).is_none());
         assert_eq!(group.len(), 2);
 
         assert_eq!(group.add_connection_path(&socket_path).unwrap(), 4);
         assert_eq!(group.len(), 3);
-        assert!(group.get(0).is_some());
-        assert!(group.get(1).is_none());
-        assert!(group.get(2).is_some());
-        assert!(group.get(3).is_none());
-        assert!(group.get(4).is_some());
+        assert!(group.core.get(0).is_some());
+        assert!(group.core.get(1).is_none());
+        assert!(group.core.get(2).is_some());
+        assert!(group.core.get(3).is_none());
+        assert!(group.core.get(4).is_some());
+    }
+
+    #[test]
+    fn test_unix_group_recv_outcomes() {
+        let temp_dir = TempDir::new().unwrap();
+        let socket_path = temp_dir.path().join("outcomes.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let (peer_tx, peer_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            peer_tx.send(socket).unwrap();
+        });
+
+        let mut group = UnixConnectionGroup::new().unwrap();
+        let conn_id = group.add_connection_path(&socket_path).unwrap();
+        let mut peer = peer_rx.recv().unwrap();
+        let mut buf = vec![0u8; 64];
+        let mut ready = Vec::new();
+
+        assert!(matches!(group.recv(conn_id, &mut buf).unwrap(), RecvOutcome::WouldBlock));
+
+        peer.write_all(b"data").unwrap();
+        drop(peer);
+        group.poll(Duration::from_millis(100), &mut ready).unwrap();
+        assert_eq!(ready, vec![conn_id]);
+        assert!(matches!(
+            group.recv(conn_id, &mut buf).unwrap(),
+            RecvOutcome::Data { len: 4, .. }
+        ));
+        assert_eq!(&buf[..4], b"data");
+        assert!(matches!(group.recv(conn_id, &mut buf).unwrap(), RecvOutcome::Eof));
+        assert!(matches!(group.recv(conn_id, &mut buf).unwrap(), RecvOutcome::Eof));
+
+        assert!(matches!(group.recv(99, &mut buf), Err(Error::Connection(_))));
+        assert!(matches!(group.send(99, b"x"), Err(Error::Connection(_))));
     }
 
     #[test]

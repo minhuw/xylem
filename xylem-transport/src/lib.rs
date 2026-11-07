@@ -61,7 +61,7 @@
 //! only 1 syscall.
 //!
 //! ```rust,no_run
-//! use xylem_transport::{TcpTransportFactory, TransportFactory, ConnectionGroup, GroupConnection};
+//! use xylem_transport::{ConnectionGroup, RecvOutcome, TcpTransportFactory, TransportFactory};
 //! use std::net::SocketAddr;
 //! use std::time::Duration;
 //!
@@ -72,13 +72,17 @@
 //! let conn_id = group.add_connection(&addr).unwrap();
 //!
 //! // Send on connection
-//! group.get_mut(conn_id).unwrap().send(b"PING\r\n").unwrap();
+//! let receipt = group.send(conn_id, b"PING\r\n").unwrap();
 //!
 //! // Poll all connections with one syscall
-//! let ready = group.poll(Some(Duration::from_millis(100))).unwrap();
-//! for id in ready {
-//!     let (data, _ts) = group.get_mut(id).unwrap().recv().unwrap();
-//!     println!("Received: {:?}", data);
+//! let mut ready = Vec::new();
+//! let mut buf = vec![0u8; 65536];
+//! group.poll(Duration::from_millis(100), &mut ready).unwrap();
+//! for &id in &ready {
+//!     if let RecvOutcome::Data { len, timestamp } = group.recv(id, &mut buf).unwrap() {
+//!         let latency = timestamp.duration_since(&receipt.timestamp);
+//!         println!("Received {:?} after {:?}", &buf[..len], latency);
+//!     }
 //! }
 //! ```
 
@@ -198,37 +202,38 @@ pub struct TxTimestampInfo {
     pub timestamp: Timestamp,
 }
 
-/// A connection within a group
+/// What a send handed to the transport
 ///
-/// Represents a single connection managed by a `ConnectionGroup`. Provides
-/// send/recv operations with timestamp tracking.
-pub trait GroupConnection: Send {
-    /// Send data and return software timestamp and TX byte/packet range
-    ///
-    /// Sends the provided data and returns a tuple of:
-    /// - `Timestamp`: Software timestamp captured immediately after the send
-    /// - `u32`: TX range start (byte offset for TCP, packet ID for UDP)
-    /// - `u32`: TX range end (byte offset for TCP, packet ID for UDP)
-    ///
-    /// The range semantics differ by transport:
-    /// - **TCP**: Byte offsets where end = start + data.len() (wrapping u32 counter)
-    /// - **UDP**: Packet IDs where start == end (single packet per send)
-    ///
-    /// The actual hardware TX timestamp will arrive later via the error queue
-    /// and can be retrieved using `ConnectionGroup::poll_tx_timestamps()`.
-    /// A TX timestamp with offset >= end indicates the data has been transmitted.
-    ///
-    /// Note: The counters wrap at u32::MAX. Callers should use wrapping comparison
-    /// when correlating TX timestamps with send operations.
-    fn send(&mut self, data: &[u8]) -> Result<(Timestamp, u32, u32)>;
+/// The range semantics differ by transport:
+/// - **TCP** (and Unix): Byte offsets where end = start + data.len() (wrapping u32 counter)
+/// - **UDP**: Packet IDs where start == end (single packet per send)
+///
+/// The actual hardware TX timestamp will arrive later via the error queue
+/// and can be retrieved using `ConnectionGroup::poll_tx_timestamps()`.
+/// A TX timestamp with offset >= end indicates the data has been transmitted.
+///
+/// Note: The counters wrap at u32::MAX. Callers should use wrapping comparison
+/// when correlating TX timestamps with send operations.
+#[derive(Debug, Clone, Copy)]
+pub struct SendReceipt {
+    /// Software timestamp taken once the transport accepted every byte
+    pub timestamp: Timestamp,
+    /// TX range start (byte offset for TCP, packet id for UDP), wrapping
+    pub tx_start: u32,
+    /// TX range end (byte offset for TCP, packet id for UDP), wrapping
+    pub tx_end: u32,
+}
 
-    /// Receive data and return timestamp
-    ///
-    /// Attempts to receive data. Returns the received data and a timestamp
-    /// captured immediately after the receive operation.
-    ///
-    /// Returns empty data if no data is available (non-blocking).
-    fn recv(&mut self) -> Result<(Vec<u8>, Timestamp)>;
+/// Result of one receive attempt
+#[derive(Debug, Clone, Copy)]
+pub enum RecvOutcome {
+    /// `len` bytes were written to the front of the buffer; `timestamp` is the
+    /// receive time (kernel/HW when available, else software)
+    Data { len: usize, timestamp: Timestamp },
+    /// No data available right now
+    WouldBlock,
+    /// The peer closed its sending side; no more data will arrive
+    Eof,
 }
 
 /// A group of connections that can be polled together efficiently
@@ -237,46 +242,58 @@ pub trait GroupConnection: Send {
 /// using a single poll/epoll instance. One `poll()` call checks all connections,
 /// reducing syscall overhead compared to polling connections individually.
 ///
-/// Typical usage pattern: create one `ConnectionGroup` per thread.
-pub trait ConnectionGroup: Send {
-    /// The connection type managed by this group
-    type Conn: GroupConnection;
-
+/// All I/O goes through the group by connection ID, so a group may own its
+/// connections in any form (e.g., a user-space network stack). Groups need
+/// not be `Send`: typical usage creates one `ConnectionGroup` per thread,
+/// from a shared `TransportFactory`.
+pub trait ConnectionGroup {
     /// Create and connect a new connection in this group
     ///
-    /// Returns the connection ID that can be used to access the connection.
+    /// Blocks until the connection is established. Returns the connection ID
+    /// used for all later operations on the connection.
     fn add_connection(&mut self, target: &SocketAddr) -> Result<usize>;
 
-    /// Get a connection by ID (immutable)
-    fn get(&self, conn_id: usize) -> Option<&Self::Conn>;
-
-    /// Get a connection by ID (mutable)
-    fn get_mut(&mut self, conn_id: usize) -> Option<&mut Self::Conn>;
-
-    /// Poll all connections for readability
+    /// Send all of `data` on `conn_id`
     ///
-    /// Returns a vector of connection IDs that have data ready to read.
-    /// This is the key efficiency gain: one syscall checks all connections.
+    /// Either every byte is handed to the transport or an error is returned;
+    /// the transport spins while it would block. Returns the software
+    /// timestamp and TX range used to correlate TX timestamps.
     ///
-    /// # Arguments
-    /// * `timeout` - Maximum time to wait. `None` means return immediately.
-    fn poll(&mut self, timeout: Option<Duration>) -> Result<Vec<usize>>;
+    /// Unknown connection IDs return `Error::Connection`.
+    fn send(&mut self, conn_id: usize, data: &[u8]) -> Result<SendReceipt>;
+
+    /// Read the bytes available on `conn_id` into `buf`
+    ///
+    /// Non-blocking. Datagram transports read at most one datagram, which the
+    /// kernel truncates to `buf`'s length.
+    ///
+    /// Unknown connection IDs return `Error::Connection`.
+    fn recv(&mut self, conn_id: usize, buf: &mut [u8]) -> Result<RecvOutcome>;
+
+    /// Wait for readable connections
+    ///
+    /// Clears `ready`, waits up to `timeout` (zero means do not wait), and
+    /// fills it with the IDs of connections that are readable: data, EOF, or
+    /// an error to report. This is the key efficiency gain: one syscall
+    /// checks all connections.
+    ///
+    /// Level-triggered: a connection keeps being reported until a `recv`
+    /// returns `RecvOutcome::WouldBlock`.
+    fn poll(&mut self, timeout: Duration, ready: &mut Vec<usize>) -> Result<()>;
 
     /// Poll for TX timestamps from all connections (Linux only)
     ///
     /// TX timestamps arrive asynchronously via the socket's error queue after
-    /// the data has been transmitted. This method checks all connections and
-    /// returns any available TX timestamps.
-    ///
-    /// Returns a vector of `TxTimestampInfo` containing:
+    /// the data has been transmitted. This method clears `out` and fills it
+    /// with the TX timestamps available now, each a `TxTimestampInfo` with:
     /// - `conn_id`: The connection that sent the data
     /// - `tx_offset`: Byte offset for correlating with the original send
     /// - `timestamp`: The kernel-provided TX timestamp
     ///
-    /// On non-Linux platforms, this returns an empty vector.
-    fn poll_tx_timestamps(&mut self) -> Result<Vec<TxTimestampInfo>> {
-        // Default implementation returns empty (no TX timestamp support)
-        Ok(Vec::new())
+    /// The default implementation (no TX timestamp support) leaves `out` empty.
+    fn poll_tx_timestamps(&mut self, out: &mut Vec<TxTimestampInfo>) -> Result<()> {
+        out.clear();
+        Ok(())
     }
 
     /// Number of connections in the group
