@@ -7,6 +7,7 @@ Xylem supports multiple transport layers for network communication.
 - **[TCP](./transports/tcp.md)** - Reliable byte stream transport
 - **[UDP](./transports/udp.md)** - Unreliable datagram transport
 - **[Unix Domain Sockets](./transports/unix.md)** - Local inter-process communication
+- **[ntcp](./transports/ntcp.md)** - User-space TCP over a TUN device (Linux, `ntcp` build feature)
 
 ## Transport Selection
 
@@ -30,6 +31,20 @@ name = "main"
 protocol = "redis"
 target = "/var/run/redis.sock"
 # ...
+```
+
+For ntcp, which also needs a top-level `[ntcp]` section with one TUN device and address per thread:
+
+```toml
+[[traffic_groups]]
+transport = "ntcp"
+name = "main"
+protocol = "redis"
+target = "10.73.0.1:6379"
+# ...
+
+[ntcp]
+endpoints = [{ ifname = "ntcp0", local_ip = "10.73.0.2" }]
 ```
 
 ## See Also
