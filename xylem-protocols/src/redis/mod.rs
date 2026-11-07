@@ -6,6 +6,7 @@
 mod command;
 pub mod command_selector;
 pub mod command_template;
+mod config;
 mod resp;
 
 pub use command::RedisOp;

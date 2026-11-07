@@ -6,8 +6,6 @@
 pub use xylem_common::{Protocol, Request, RequestMeta};
 
 pub mod configs;
-pub mod factories;
-pub mod factory;
 pub mod http;
 pub mod masstree;
 pub mod memcached;
@@ -22,10 +20,6 @@ pub use configs::{
     MasstreeScanConfig, MemcachedConfig, RedisCommandParams, RedisCommandWeight, RedisConfig,
     RedisOperationsConfig, ValueSizeConfig, XylemEchoConfig,
 };
-pub use factories::{
-    HttpFactory, MemcachedAsciiFactory, MemcachedBinaryFactory, RedisFactory, XylemEchoFactory,
-};
-pub use factory::ProtocolFactory;
 pub use http::HttpMethod;
 pub use http::HttpProtocol;
 pub use masstree::{MasstreeOp, MasstreeProtocol, ResultCode};

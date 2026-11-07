@@ -17,6 +17,8 @@
 //! - Cmd_Replace = 8 (response: Cmd_Replace + 1 = 9)
 //! - Cmd_Handshake = 14 (response: Cmd_Handshake + 1 = 15)
 
+mod config;
+
 use crate::Protocol;
 use anyhow::{anyhow, Result};
 use rmp::decode;

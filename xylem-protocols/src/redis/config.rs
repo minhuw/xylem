@@ -1,28 +1,8 @@
-//! Config-aware Redis construction shared by factories and CLI callers.
+//! Config-aware Redis construction.
 use crate::configs::{RedisConfig, RedisOperationsConfig};
-use crate::factory::ProtocolFactory;
 use crate::redis::{RedisOp, RedisProtocol};
 use crate::{CommandSelector, FixedCommandSelector, WeightedCommandSelector};
 use anyhow::Result;
-
-pub struct RedisFactory;
-
-impl ProtocolFactory for RedisFactory {
-    type Config = RedisConfig;
-    type Protocol = RedisProtocol;
-    fn name(&self) -> &'static str {
-        "redis"
-    }
-    fn create(&self, config: RedisConfig, seed: Option<u64>) -> Result<RedisProtocol> {
-        RedisProtocol::from_config(&config, seed)
-    }
-    fn default_config(&self) -> RedisConfig {
-        RedisConfig::default()
-    }
-    fn validate(&self, config: &RedisConfig) -> Result<()> {
-        RedisProtocol::from_config(config, Some(0)).map(|_| ())
-    }
-}
 
 impl RedisConfig {
     /// Build a selector, honoring command parameters and per-command key distributions.
@@ -91,7 +71,7 @@ impl RedisProtocol {
     }
 }
 
-pub fn parse_redis_operation(
+fn parse_redis_operation(
     cmd: &str,
     params: Option<&crate::RedisCommandParams>,
 ) -> anyhow::Result<crate::RedisOp> {
@@ -169,26 +149,23 @@ mod tests {
     use crate::Protocol;
 
     #[test]
-    fn test_create_default() {
-        let factory = RedisFactory;
-        let protocol = factory.create(RedisConfig::default(), None).unwrap();
+    fn test_from_config_default() {
+        let protocol = RedisProtocol::from_config(&RedisConfig::default(), None).unwrap();
         assert_eq!(Protocol::name(&protocol), "redis");
     }
 
     #[test]
-    fn test_create_with_set_command() {
-        let factory = RedisFactory;
+    fn test_from_config_with_set_command() {
         let config = RedisConfig {
             operations: Some(RedisOperationsConfig::Fixed { operation: "SET".to_string() }),
             ..Default::default()
         };
-        let protocol = factory.create(config, None).unwrap();
+        let protocol = RedisProtocol::from_config(&config, None).unwrap();
         assert_eq!(Protocol::name(&protocol), "redis");
     }
 
     #[test]
-    fn test_create_with_weighted_commands() {
-        let factory = RedisFactory;
+    fn test_from_config_with_weighted_commands() {
         let config = RedisConfig {
             operations: Some(RedisOperationsConfig::Weighted {
                 commands: vec![
@@ -208,18 +185,17 @@ mod tests {
             }),
             ..Default::default()
         };
-        let protocol = factory.create(config, None).unwrap();
+        let protocol = RedisProtocol::from_config(&config, None).unwrap();
         assert_eq!(Protocol::name(&protocol), "redis");
     }
 
     #[test]
     fn test_invalid_command() {
-        let factory = RedisFactory;
         let config = RedisConfig {
             operations: Some(RedisOperationsConfig::Fixed { operation: "INVALID".to_string() }),
             ..Default::default()
         };
-        assert!(factory.create(config, None).is_err());
+        assert!(RedisProtocol::from_config(&config, None).is_err());
     }
 
     #[test]

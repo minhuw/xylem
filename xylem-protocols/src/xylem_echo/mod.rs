@@ -117,6 +117,11 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_default_name() {
+        assert_eq!(Protocol::name(&XylemEchoProtocol::default()), "xylem-echo");
+    }
+
+    #[test]
     fn test_message_format() {
         let mut protocol = XylemEchoProtocol::new(100);
 

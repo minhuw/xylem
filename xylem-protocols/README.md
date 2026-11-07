@@ -8,11 +8,10 @@ Use the configuration-aware constructors for workloads driven by configuration:
 - `MasstreeProtocol::from_config(&MasstreeConfig, seed)`
 - `HttpProtocol::from_config(&HttpConfig)`
 
-Public factories delegate to these constructors; Masstree has no factory, and
-its constructor sends a configured `value_size` at its representative fixed
-size. Existing low-level constructors remain available. Redis callers assembling their own workloads can share
-`RedisConfig::command_selector(seed)` and
-`factories::parse_redis_operation(command, params)`.
+The Masstree constructor sends a configured `value_size` at its
+representative fixed size. Existing low-level constructors remain available.
+Redis callers assembling their own workloads can share
+`RedisConfig::command_selector(seed)`.
 
 Redis construction retains the configured value size generator, including
 inclusive uniform and per-command sizes, instead of choosing a representative

@@ -1,10 +1,6 @@
 use xylem_protocols::configs::*;
-use xylem_protocols::factories::{
-    HttpFactory, MemcachedAsciiFactory, MemcachedBinaryFactory, RedisFactory,
-};
-use xylem_protocols::factory::ProtocolFactory;
 use xylem_protocols::http::HttpProtocol;
-use xylem_protocols::memcached::MemcachedAsciiProtocol;
+use xylem_protocols::memcached::{MemcachedAsciiProtocol, MemcachedBinaryProtocol};
 use xylem_protocols::{Protocol, RedisProtocol};
 
 fn redis() -> RedisProtocol {
@@ -125,7 +121,7 @@ fn http_rejects_unsupported_and_ambiguous_framing_before_success() {
 }
 
 #[test]
-fn factories_honor_keys_values_insertion_and_http_body() {
+fn constructors_honor_keys_values_insertion_and_http_body() {
     let config = MemcachedConfig {
         keys: KeysConfig::Sequential {
             start: 25,
@@ -135,14 +131,14 @@ fn factories_honor_keys_values_insertion_and_http_body() {
         insert_phase: Some(InsertPhaseConfig { key_count: Some(1), value_size: Some(5) }),
         ..Default::default()
     };
-    let mut ascii = MemcachedAsciiFactory.create(config.clone(), Some(42)).unwrap();
+    let mut ascii = MemcachedAsciiProtocol::from_config(&config, Some(42)).unwrap();
     let warmup = ascii.next_request(0);
     assert!(warmup.metadata.is_warmup);
     assert_eq!(warmup.data, b"set item:25 0 0 5\r\nxxxxx\r\n");
     let get = ascii.next_request(0);
     assert!(!get.metadata.is_warmup);
     assert_eq!(get.data, b"get item:25\r\n");
-    let mut binary = MemcachedBinaryFactory.create(config, Some(42)).unwrap();
+    let mut binary = MemcachedBinaryProtocol::from_config(&config, Some(42)).unwrap();
     let warmup = binary.next_request(0);
     assert!(warmup.metadata.is_warmup);
     assert_eq!(warmup.data[1], 1); // SET
@@ -150,23 +146,19 @@ fn factories_honor_keys_values_insertion_and_http_body() {
     let get = binary.next_request(0);
     assert!(!get.metadata.is_warmup);
     assert_eq!(&get.data[24..], b"item:25");
-    let mut http = HttpFactory
-        .create(
-            HttpConfig {
-                method: "POST".into(),
-                body_size: 7,
-                ..Default::default()
-            },
-            None,
-        )
-        .unwrap();
+    let mut http = HttpProtocol::from_config(&HttpConfig {
+        method: "POST".into(),
+        body_size: 7,
+        ..Default::default()
+    })
+    .unwrap();
     let post = http.next_request(0);
     assert!(post.data.ends_with(b"\r\n\r\nxxxxxxx"));
     assert!(String::from_utf8_lossy(&post.data).contains("Content-Length: 7\r\n"));
 }
 
 #[test]
-fn redis_factory_retains_variable_sizes_random_data_and_per_command_keys() {
+fn redis_constructor_retains_variable_sizes_random_data_and_per_command_keys() {
     let config = RedisConfig {
         keys: KeysConfig::Sequential {
             start: 12,
@@ -194,8 +186,8 @@ fn redis_factory_retains_variable_sizes_random_data_and_per_command_keys() {
         random_data: true,
         insert_phase: Some(InsertPhaseConfig { key_count: Some(1), value_size: Some(9) }),
     };
-    let mut first = RedisFactory.create(config.clone(), Some(42)).unwrap();
-    let mut second = RedisFactory.create(config, Some(42)).unwrap();
+    let mut first = RedisProtocol::from_config(&config, Some(42)).unwrap();
+    let mut second = RedisProtocol::from_config(&config, Some(42)).unwrap();
     let mut lengths = std::collections::HashSet::new();
     for i in 0..50 {
         let request = first.next_request(0);
@@ -221,7 +213,7 @@ fn redis_factory_retains_variable_sizes_random_data_and_per_command_keys() {
 }
 
 #[test]
-fn redis_factory_uses_command_parameters_and_rejects_ignored_settings() {
+fn redis_constructor_uses_command_parameters_and_rejects_invalid_settings() {
     let config = RedisConfig {
         operations: Some(RedisOperationsConfig::Weighted {
             commands: vec![RedisCommandWeight {
@@ -233,7 +225,7 @@ fn redis_factory_uses_command_parameters_and_rejects_ignored_settings() {
         }),
         ..Default::default()
     };
-    let mut protocol = RedisFactory.create(config.clone(), None).unwrap();
+    let mut protocol = RedisProtocol::from_config(&config, None).unwrap();
     assert_eq!(
         protocol.next_request(0).data,
         b"*3\r\n$4\r\nMGET\r\n$5\r\nkey:0\r\n$5\r\nkey:1\r\n"
@@ -246,12 +238,12 @@ fn redis_factory_uses_command_parameters_and_rejects_ignored_settings() {
         },
         ..Default::default()
     };
-    assert!(RedisFactory.create(bad, None).is_err());
+    assert!(RedisProtocol::from_config(&bad, None).is_err());
     let bad = MemcachedConfig {
         insert_phase: Some(InsertPhaseConfig::default()),
         ..Default::default()
     };
-    assert!(MemcachedAsciiFactory.create(bad, None).is_err());
+    assert!(MemcachedAsciiProtocol::from_config(&bad, None).is_err());
 }
 
 #[test]
@@ -265,8 +257,8 @@ fn normal_set_sizes_and_round_robin_keys_reach_both_memcached_formats() {
         operation: "SET".into(),
         insert_phase: None,
     };
-    let mut ascii = MemcachedAsciiFactory.create(config.clone(), None).unwrap();
-    let mut binary = MemcachedBinaryFactory.create(config, None).unwrap();
+    let mut ascii = MemcachedAsciiProtocol::from_config(&config, None).unwrap();
+    let mut binary = MemcachedBinaryProtocol::from_config(&config, None).unwrap();
     for key in [0, 1, 0] {
         assert_eq!(ascii.next_request(0).data, format!("set p:{key} 0 0 3\r\nxxx\r\n").as_bytes());
         let request = binary.next_request(0);

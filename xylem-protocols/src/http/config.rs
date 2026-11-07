@@ -1,33 +1,8 @@
-//! HTTP protocol factory
+//! Config-aware HTTP construction.
 
 use crate::configs::HttpConfig;
-use crate::factory::ProtocolFactory;
 use crate::http::{HttpMethod, HttpProtocol};
 use anyhow::Result;
-
-/// Factory for creating HTTP protocol instances
-pub struct HttpFactory;
-
-impl ProtocolFactory for HttpFactory {
-    type Config = HttpConfig;
-    type Protocol = HttpProtocol;
-
-    fn name(&self) -> &'static str {
-        "http"
-    }
-
-    fn create(&self, config: Self::Config, _seed: Option<u64>) -> Result<Self::Protocol> {
-        HttpProtocol::from_config(&config)
-    }
-
-    fn default_config(&self) -> Self::Config {
-        HttpConfig::default()
-    }
-
-    fn validate(&self, config: &Self::Config) -> Result<()> {
-        HttpProtocol::from_config(config).map(|_| ())
-    }
-}
 
 /// Parse HTTP method from string
 fn parse_http_method(method: &str) -> Result<HttpMethod> {
@@ -60,42 +35,38 @@ mod tests {
     use crate::Protocol;
 
     #[test]
-    fn test_create_default() {
-        let factory = HttpFactory;
-        let protocol = factory.create(HttpConfig::default(), None).unwrap();
+    fn test_from_config_default() {
+        let protocol = HttpProtocol::from_config(&HttpConfig::default()).unwrap();
         assert_eq!(Protocol::name(&protocol), "http");
     }
 
     #[test]
-    fn test_create_with_post() {
-        let factory = HttpFactory;
+    fn test_from_config_with_post() {
         let config = HttpConfig {
             method: "POST".to_string(),
             path: "/api/data".to_string(),
             host: Some("example.com".to_string()),
             body_size: 1024,
         };
-        let protocol = factory.create(config, None).unwrap();
+        let protocol = HttpProtocol::from_config(&config).unwrap();
         assert_eq!(Protocol::name(&protocol), "http");
     }
 
     #[test]
     fn test_invalid_method() {
-        let factory = HttpFactory;
         let config = HttpConfig {
             method: "INVALID".to_string(),
             ..Default::default()
         };
-        assert!(factory.create(config, None).is_err());
+        assert!(HttpProtocol::from_config(&config).is_err());
     }
 
     #[test]
-    fn test_validate_empty_path() {
-        let factory = HttpFactory;
+    fn test_empty_path() {
         let config = HttpConfig {
             path: "".to_string(),
             ..Default::default()
         };
-        assert!(factory.validate(&config).is_err());
+        assert!(HttpProtocol::from_config(&config).is_err());
     }
 }
