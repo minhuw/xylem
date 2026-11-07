@@ -270,6 +270,8 @@ mod tests {
         let group = group.unwrap();
         assert_eq!(group.len(), 0);
         assert!(group.is_empty());
+        assert!(group.is_datagram());
+        assert!(!crate::TcpConnectionGroup::new().unwrap().is_datagram());
     }
 
     #[test]

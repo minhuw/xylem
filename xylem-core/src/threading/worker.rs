@@ -1022,6 +1022,108 @@ mod tests {
         assert_eq!(worker.pool.get_state(0).unwrap().pending_count(), 0);
     }
 
+    fn udp_worker<P: Protocol>(
+        target: SocketAddr,
+        protocol: P,
+        max_pending: usize,
+        duration: Duration,
+    ) -> Worker<xylem_transport::UdpConnectionGroup, P> {
+        let mut stats = TupleStatsCollector::default();
+        stats.register_group_policy(0, SamplingPolicy::Limited { max_samples: 100_000, rate: 1.0 });
+        let config = WorkerConfig {
+            target,
+            duration,
+            conn_count: 2,
+            max_pending_per_conn: max_pending,
+            drain_timeout: Duration::from_millis(200),
+        };
+        let factory = xylem_transport::UdpTransportFactory::default();
+        let mut worker = Worker::with_closed_loop(&factory, protocol, stats, config).unwrap();
+        worker.set_request_timeout(0, Some(Duration::from_millis(20)));
+        worker
+    }
+
+    #[test]
+    fn udp_echo_over_loopback_survives_lost_datagrams() {
+        // Echoes requests, but drops every fifth one
+        let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        server.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            let mut count = 0u64;
+            while let Ok((len, peer)) = server.recv_from(&mut buf) {
+                count += 1;
+                if !count.is_multiple_of(5) {
+                    let _ = server.send_to(&buf[..len], peer);
+                }
+            }
+        });
+
+        let protocol = xylem_protocols::xylem_echo::XylemEchoProtocol::new(0);
+        let mut worker = udp_worker(addr, protocol, 4, Duration::from_millis(300));
+        assert!(worker.pool.is_datagram());
+        worker.run().unwrap();
+        let counts = worker.stats.request_counts_global();
+        // Losses time out instead of stalling the closed loop
+        assert!(counts.completed > 100, "{counts:?}");
+        assert!(counts.timed_out > 0, "{counts:?}");
+        assert_eq!(counts.sent, counts.completed + counts.timed_out, "{counts:?}");
+        assert_eq!(counts.failed, 0);
+        assert_eq!(
+            worker.stats.aggregate_global(Duration::from_secs(1)).latency_sample_count,
+            counts.completed
+        );
+    }
+
+    #[test]
+    fn udp_memcached_over_loopback_reassembles_reordered_duplicated_responses() {
+        use xylem_protocols::memcached::{MemcachedAsciiProtocol, MemcachedOp};
+        use xylem_protocols::workload::KeyGeneration;
+        // Answers each GET with a 4000-byte value in three datagrams, sent
+        // last first, with the middle one duplicated
+        let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        server.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            while let Ok((len, peer)) = server.recv_from(&mut buf) {
+                let request = &buf[..len];
+                assert_eq!(&request[2..8], &[0, 0, 0, 1, 0, 0], "single-datagram request");
+                let key = std::str::from_utf8(&request[12..len - 2]).unwrap();
+                let value = vec![b'v'; 4000];
+                let mut body = format!("VALUE {key} 0 {}\r\n", value.len()).into_bytes();
+                body.extend_from_slice(&value);
+                body.extend_from_slice(b"\r\nEND\r\n");
+                let chunks: Vec<_> = body.chunks(1400).collect();
+                for number in [2usize, 1, 1, 0] {
+                    let mut datagram = request[..2].to_vec();
+                    datagram.extend_from_slice(&(number as u16).to_be_bytes());
+                    datagram.extend_from_slice(&(chunks.len() as u16).to_be_bytes());
+                    datagram.extend_from_slice(&[0, 0]);
+                    datagram.extend_from_slice(chunks[number]);
+                    let _ = server.send_to(&datagram, peer);
+                }
+            }
+        });
+
+        let protocol = MemcachedAsciiProtocol::with_workload(
+            MemcachedOp::Get,
+            KeyGeneration::sequential(0),
+            8,
+        )
+        .with_udp_framing();
+        let mut worker = udp_worker(addr, protocol, 2, Duration::from_millis(200));
+        worker.run().unwrap();
+        let counts = worker.stats.request_counts_global();
+        assert!(counts.completed > 20, "{counts:?}");
+        assert_eq!(counts.sent, counts.completed + counts.timed_out, "{counts:?}");
+        assert_eq!((counts.failed, counts.late_responses), (0, 0), "{counts:?}");
+        // Each response's bytes are its datagrams, duplicates included
+        let rx: u64 = worker.stats.entries().values().map(|entry| entry.rx_bytes).sum();
+        assert!(rx >= counts.completed * 4000, "{rx}");
+    }
+
     #[test]
     fn test_pipelined_worker_basic() {
         // Start echo server
