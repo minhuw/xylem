@@ -70,6 +70,9 @@ pub(crate) fn format_optional(value: Option<f64>) -> String {
 pub struct StatsRecord {
     pub time_secs: f64,
     pub group_id: usize,
+    /// Worker thread that owns the connection; connection IDs restart at 0
+    /// on every thread.
+    pub thread_id: usize,
     pub connection_id: usize,
     pub request_count: u64,
     pub throughput_rps: f64,
@@ -202,6 +205,7 @@ impl DetailedExperimentResults {
                     StatsRecord {
                         time_secs: key.time_bucket as f64 * bucket_duration_secs,
                         group_id: key.group_id,
+                        thread_id: key.thread_id,
                         connection_id: key.connection_id,
                         request_count: entry.request_count,
                         throughput_rps: entry.request_count as f64 / bucket_duration_secs,
@@ -223,6 +227,7 @@ impl DetailedExperimentResults {
                 .partial_cmp(&b.time_secs)
                 .unwrap()
                 .then_with(|| a.group_id.cmp(&b.group_id))
+                .then_with(|| a.thread_id.cmp(&b.thread_id))
                 .then_with(|| a.connection_id.cmp(&b.connection_id))
         });
 
@@ -429,8 +434,11 @@ impl DetailedExperimentResults {
             // Count unique time buckets and connections
             let unique_times: std::collections::HashSet<_> =
                 self.records.iter().map(|r| r.time_secs as u64).collect();
-            let unique_conns: std::collections::HashSet<_> =
-                self.records.iter().map(|r| (r.group_id, r.connection_id)).collect();
+            let unique_conns: std::collections::HashSet<_> = self
+                .records
+                .iter()
+                .map(|r| (r.group_id, r.thread_id, r.connection_id))
+                .collect();
 
             println!("{}", "-".repeat(70));
             println!(
@@ -442,11 +450,16 @@ impl DetailedExperimentResults {
             println!("{}", "-".repeat(70));
 
             // Show first few entries
-            println!("Sample records (time, group, conn, rps, p99):");
+            println!("Sample records (time, group, thread, conn, rps, p99):");
             for r in self.records.iter().take(10) {
                 println!(
-                    "  t={:.1}s g={} c={}: {:.0} rps, p99={:.2}μs",
-                    r.time_secs, r.group_id, r.connection_id, r.throughput_rps, r.latency_p99_us
+                    "  t={:.1}s g={} t{} c={}: {:.0} rps, p99={:.2}μs",
+                    r.time_secs,
+                    r.group_id,
+                    r.thread_id,
+                    r.connection_id,
+                    r.throughput_rps,
+                    r.latency_p99_us
                 );
             }
             if self.records.len() > 10 {

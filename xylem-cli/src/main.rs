@@ -360,6 +360,9 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
             global_sampling_policy.clone(),
             config_for_worker.stats.bucket_duration,
         );
+        // Connection IDs restart at 0 on every thread; the thread ID keeps
+        // per-connection statistics apart when the collectors are merged.
+        stats.set_thread_id(thread_idx);
 
         // Register per-group sampling policies for independent aggregation
         for (group_id, _) in groups_for_thread.iter() {

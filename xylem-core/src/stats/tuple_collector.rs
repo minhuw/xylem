@@ -1,6 +1,6 @@
 //! Tuple-keyed statistics collection with on-demand aggregation
 //!
-//! Stores statistics keyed by `(time_bucket, group_id, connection_id)` tuple,
+//! Stores statistics keyed by `(time_bucket, group_id, thread_id, connection_id)`,
 //! enabling flexible post-hoc aggregation by any dimension.
 
 use super::policy::SamplingPolicy;
@@ -23,7 +23,10 @@ pub struct StatsKey {
     pub time_bucket: u64,
     /// Traffic group ID
     pub group_id: usize,
-    /// Connection ID within the group
+    /// Worker thread that owns the connection. Each thread numbers its
+    /// connections from 0, so this tells apart equal connection IDs.
+    pub thread_id: usize,
+    /// Connection ID within the thread's connection pool
     pub connection_id: usize,
 }
 
@@ -477,7 +480,9 @@ pub struct TimeSeriesPoint {
 /// Per-connection statistics summary
 #[derive(Debug, Clone)]
 pub struct ConnectionStats {
-    /// Connection ID
+    /// Worker thread that owns the connection
+    pub thread_id: usize,
+    /// Connection ID within the thread
     pub connection_id: usize,
     /// Group ID this connection belongs to
     pub group_id: usize,
@@ -493,14 +498,16 @@ pub struct ConnectionStats {
 
 /// Tuple-keyed statistics collector
 ///
-/// Stores statistics keyed by (time_bucket, group_id, connection_id) for flexible
+/// Stores statistics keyed by (time_bucket, group_id, thread_id, connection_id) for flexible
 /// on-demand aggregation by any dimension. Global latency storage is independent
 /// of group storage: each recorded latency is sampled once under each policy.
 /// This requires additional storage per bucket and allows heterogeneous
 /// groups without converting or discarding their sketches.
 pub struct TupleStatsCollector {
-    /// Statistics entries keyed by (time_bucket, group_id, connection_id)
+    /// Statistics entries keyed by (time_bucket, group_id, thread_id, connection_id)
     entries: HashMap<StatsKey, StatsEntry>,
+    /// Thread recorded in the keys of new entries; see [`Self::set_thread_id`].
+    thread_id: usize,
     /// Independent global storage per bucket, recorded with the global policy.
     /// This avoids trying to convert incompatible group sketches during aggregation.
     global_entries: HashMap<u64, StatsEntry>,
@@ -520,6 +527,7 @@ impl TupleStatsCollector {
     pub fn new(sampling_policy: SamplingPolicy, bucket_duration: Duration) -> Self {
         Self {
             entries: HashMap::new(),
+            thread_id: 0,
             global_entries: HashMap::new(),
             sampling_policy,
             group_sampling_policies: HashMap::new(),
@@ -536,12 +544,27 @@ impl TupleStatsCollector {
     ) -> Self {
         Self {
             entries: HashMap::new(),
+            thread_id: 0,
             global_entries: HashMap::new(),
             sampling_policy,
             group_sampling_policies: HashMap::new(),
             bucket_duration_ns: bucket_duration.as_nanos() as u64,
             experiment_start_ns: start_time_ns,
         }
+    }
+
+    /// Set the worker thread recorded with each connection's statistics.
+    ///
+    /// Each worker thread numbers its connections from 0, so collectors from
+    /// different threads must have different thread IDs; otherwise merging
+    /// them combines unrelated connections that share an ID. Defaults to 0.
+    pub fn set_thread_id(&mut self, thread_id: usize) {
+        self.thread_id = thread_id;
+    }
+
+    /// The worker thread recorded with new entries.
+    pub fn thread_id(&self) -> usize {
+        self.thread_id
     }
 
     /// Register a per-group sampling policy before recording that group's data.
@@ -573,7 +596,12 @@ impl TupleStatsCollector {
     ) -> (&mut StatsEntry, &mut StatsEntry) {
         let time_bucket = self.compute_bucket(crate::timing::time_ns());
         let policy = self.group_sampling_policies.get(&group_id).unwrap_or(&self.sampling_policy);
-        let key = StatsKey { time_bucket, group_id, connection_id };
+        let key = StatsKey {
+            time_bucket,
+            group_id,
+            thread_id: self.thread_id,
+            connection_id,
+        };
         let entry = self.entries.entry(key).or_insert_with(|| StatsEntry::new(policy));
         let global = self
             .global_entries
@@ -611,13 +639,13 @@ impl TupleStatsCollector {
         ids
     }
 
-    /// Get all unique connection IDs for a group
-    pub fn connection_ids(&self, group_id: usize) -> Vec<usize> {
-        let mut ids: Vec<usize> = self
+    /// Get the `(thread_id, connection_id)` of every connection in a group, sorted
+    pub fn connection_ids(&self, group_id: usize) -> Vec<(usize, usize)> {
+        let mut ids: Vec<(usize, usize)> = self
             .entries
             .keys()
             .filter(|k| k.group_id == group_id)
-            .map(|k| k.connection_id)
+            .map(|k| (k.thread_id, k.connection_id))
             .collect();
         ids.sort_unstable();
         ids.dedup();
@@ -711,17 +739,20 @@ impl TupleStatsCollector {
         &self,
         group_id: usize,
         duration: Duration,
-    ) -> HashMap<usize, ConnectionStats> {
+    ) -> HashMap<(usize, usize), ConnectionStats> {
         let mut result = HashMap::new();
 
-        for conn_id in self.connection_ids(group_id) {
+        for (thread_id, conn_id) in self.connection_ids(group_id) {
             let mut total_requests = 0u64;
             let mut total_tx_bytes = 0u64;
             let mut total_rx_bytes = 0u64;
             let mut merged_latency = LatencyStorage::from_policy(self.get_group_policy(group_id));
 
             for (key, entry) in &self.entries {
-                if key.group_id == group_id && key.connection_id == conn_id {
+                if key.group_id == group_id
+                    && key.thread_id == thread_id
+                    && key.connection_id == conn_id
+                {
                     total_requests += entry.request_count;
                     total_tx_bytes += entry.tx_bytes;
                     total_rx_bytes += entry.rx_bytes;
@@ -738,8 +769,9 @@ impl TupleStatsCollector {
             );
 
             result.insert(
-                conn_id,
+                (thread_id, conn_id),
                 ConnectionStats {
+                    thread_id,
                     connection_id: conn_id,
                     group_id,
                     request_count: total_requests,
@@ -822,6 +854,7 @@ impl TupleStatsCollector {
     pub fn time_series_by_connection(
         &self,
         group_id: usize,
+        thread_id: usize,
         connection_id: usize,
     ) -> Vec<TimeSeriesPoint> {
         let bucket_duration_secs = self.bucket_duration_ns as f64 / 1_000_000_000.0;
@@ -829,7 +862,11 @@ impl TupleStatsCollector {
         let mut points: Vec<TimeSeriesPoint> = self
             .entries
             .iter()
-            .filter(|(k, _)| k.group_id == group_id && k.connection_id == connection_id)
+            .filter(|(k, _)| {
+                k.group_id == group_id
+                    && k.thread_id == thread_id
+                    && k.connection_id == connection_id
+            })
             .map(|(key, entry)| {
                 let total_bytes = (entry.tx_bytes + entry.rx_bytes) as f64;
                 let latency_percentiles = entry.latency.percentiles(&[0.5, 0.99, 0.999]);
@@ -863,6 +900,7 @@ impl TupleStatsCollector {
         let first = &collectors[0];
         let mut merged = Self {
             entries: HashMap::new(),
+            thread_id: 0,
             global_entries: HashMap::new(),
             sampling_policy: first.sampling_policy.clone(),
             group_sampling_policies: HashMap::new(),
@@ -1052,11 +1090,11 @@ mod tests {
                 assert_eq!(stats.total_requests, 100);
                 assert_eq!(stats.throughput_mbps, 0.0024);
                 close(stats.latency_p99.as_nanos() as u64);
-                let connection = &collector.aggregate_by_connection(group, duration)[&0];
+                let connection = &collector.aggregate_by_connection(group, duration)[&(0, 0)];
                 assert_eq!((connection.tx_bytes, connection.rx_bytes), (100, 200));
                 close(connection.latency.latency_p99.as_nanos() as u64);
                 close(collector.time_series_by_group(group)[0].latency_p99_ns);
-                close(collector.time_series_by_connection(group, 0)[0].latency_p99_ns);
+                close(collector.time_series_by_connection(group, 0, 0)[0].latency_p99_ns);
             }
             assert!(collector.entries.values().all(|entry| entry.latency.count() == 100));
         }
@@ -1137,16 +1175,19 @@ mod tests {
         let k1 = StatsKey {
             time_bucket: 0,
             group_id: 1,
+            thread_id: 0,
             connection_id: 2,
         };
         let k2 = StatsKey {
             time_bucket: 0,
             group_id: 1,
+            thread_id: 0,
             connection_id: 2,
         };
         let k3 = StatsKey {
             time_bucket: 1,
             group_id: 1,
+            thread_id: 0,
             connection_id: 2,
         };
 
@@ -1542,8 +1583,8 @@ mod tests {
         collector.record_rx_bytes(0, 0, 50);
 
         assert_eq!(collector.group_ids(), vec![0, 1]);
-        assert_eq!(collector.connection_ids(0), vec![0, 1]);
-        assert_eq!(collector.connection_ids(1), vec![0]);
+        assert_eq!(collector.connection_ids(0), vec![(0, 0), (0, 1)]);
+        assert_eq!(collector.connection_ids(1), vec![(0, 0)]);
     }
 
     #[test]
@@ -1569,7 +1610,40 @@ mod tests {
 
         let merged = TupleStatsCollector::merge(vec![c1, c2]);
 
-        assert_eq!(merged.connection_ids(0), vec![0, 1]);
+        assert_eq!(merged.connection_ids(0), vec![(0, 0), (0, 1)]);
+    }
+
+    #[test]
+    fn connections_of_different_threads_stay_distinct_after_merge() {
+        let start = crate::timing::time_ns();
+        let collector_for = |thread_id: usize, latency_us: u64, requests: usize| {
+            let mut collector = TupleStatsCollector::with_start_time(
+                SamplingPolicy::default(),
+                Duration::from_secs(3600),
+                start,
+            );
+            collector.set_thread_id(thread_id);
+            for _ in 0..requests {
+                collector.record_tx_bytes(0, 0, 10);
+                collector.record_latency(0, 0, Duration::from_micros(latency_us));
+            }
+            collector
+        };
+        // Both threads' first connection has ID 0.
+        let merged =
+            TupleStatsCollector::merge(vec![collector_for(2, 10, 3), collector_for(5, 90, 7)]);
+        assert_eq!(merged.connection_ids(0), vec![(2, 0), (5, 0)]);
+        let connections = merged.aggregate_by_connection(0, Duration::from_secs(1));
+        let a = &connections[&(2, 0)];
+        let b = &connections[&(5, 0)];
+        assert_eq!((a.thread_id, a.request_count, a.tx_bytes), (2, 3, 30));
+        assert_eq!((b.thread_id, b.request_count, b.tx_bytes), (5, 7, 70));
+        assert_eq!(a.latency.max_latency, Some(Duration::from_micros(10)));
+        assert_eq!(b.latency.min_latency, Some(Duration::from_micros(90)));
+        assert_eq!(merged.time_series_by_connection(0, 5, 0)[0].request_count, 7);
+        // Group and global totals still include both threads.
+        assert_eq!(merged.aggregate_global(Duration::from_secs(1)).total_requests, 10);
+        assert_eq!(merged.aggregate_by_group(Duration::from_secs(1))[&0].total_requests, 10);
     }
 
     #[test]

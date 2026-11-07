@@ -42,6 +42,11 @@ include_records = true
 bucket_duration = "1s"
 ```
 
+Each record names its connection by `group_id`, `thread_id` and
+`connection_id`. Connection IDs restart at 0 on every worker thread, so
+`thread_id` (the thread's entry in `threads`) is needed to tell connections
+apart.
+
 HTML uses Chart.js (loaded from a CDN) and the light theme. Only
 `output.html.library = "chartjs"` and `output.html.theme = "light"` are supported.
 `output.real_time` must remain false; the feature is not implemented by the CLI

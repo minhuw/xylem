@@ -64,7 +64,7 @@ fn test_tuple_stats_single_thread_redis() {
     println!("\nPer-connection stats ({} connections):", conn_stats.len());
     for (conn_id, cs) in &conn_stats {
         println!(
-            "  Connection {}: {} requests, p99={:.2}μs",
+            "  Connection {:?}: {} requests, p99={:.2}μs",
             conn_id,
             cs.request_count,
             cs.latency.latency_p99.as_micros()
@@ -113,7 +113,8 @@ fn test_tuple_stats_multi_thread_redis() {
                 xylem_protocols::FixedCommandSelector::new(xylem_protocols::redis::RedisOp::Get),
             ));
 
-            let stats = create_tuple_stats();
+            let mut stats = create_tuple_stats();
+            stats.set_thread_id(thread_idx);
             let worker_config = WorkerConfig {
                 target: target_addr,
                 duration,
@@ -152,10 +153,15 @@ fn test_tuple_stats_multi_thread_redis() {
     let conn_stats = merged.aggregate_by_connection(0, duration);
     println!("\nMerged per-connection stats ({} connections):", conn_stats.len());
 
-    // Each thread has conn_count connections, all in group 0
-    // Connection IDs are local to each thread, so we might have duplicates
-    // that get merged
-    assert!(!conn_stats.is_empty(), "Should have per-connection stats");
+    // Each thread has conn_count connections, all in group 0. Connection IDs
+    // restart at 0 on each thread; the thread ID keeps them apart.
+    assert_eq!(
+        conn_stats.len(),
+        conn_count * num_threads,
+        "Per-thread connections stay distinct"
+    );
+    let total_from_connections: u64 = conn_stats.values().map(|c| c.request_count).sum();
+    assert_eq!(total_from_connections, global.total_requests);
 
     // Verify time series is merged correctly
     let time_series = merged.time_series_global();
