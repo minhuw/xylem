@@ -13,7 +13,7 @@ description = "Transport layer implementations for Xylem latency measurement too
 socket2 = { workspace = true }
 libc = { workspace = true }
 
-# Linux-only: I/O multiplexing via nix (epoll, poll, select)
+# Linux-only: I/O multiplexing via nix (epoll)
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { workspace = true }
 

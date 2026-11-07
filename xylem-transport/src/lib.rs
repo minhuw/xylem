@@ -2,7 +2,8 @@
 //!
 //! This crate provides transport layer implementations for the Xylem latency
 //! measurement tool. Transports handle the low-level network I/O using non-blocking
-//! sockets with runtime-selectable I/O multiplexing (epoll, poll, or select).
+//! sockets and one readiness multiplexer per connection group: epoll on Linux,
+//! mio (kqueue) elsewhere.
 //!
 //! ## Available Transports
 //!
@@ -10,51 +11,44 @@
 //! - **UDP**: Non-blocking UDP sockets
 //! - **Unix**: Unix domain sockets (Unix only)
 //!
-//! ## Hardware Timestamping (Linux only)
+//! ## Kernel Timestamping (Linux only)
 //!
-//! On Linux, transports can use kernel timestamps (SO_TIMESTAMPING) for more
-//! accurate latency measurement. Hardware timestamps are used when available,
-//! with automatic fallback to software timestamps. This requires:
-//! - Linux kernel >= 4.19.4 for best results
-//! - NIC with hardware timestamping support for HW timestamps (e.g., Mellanox ConnectX, Intel i210)
-//! - Root or CAP_NET_ADMIN capability for NIC-level timestamping
+//! By default every timestamp is a user-space cycle count read when the send
+//! or receive call completed. TCP and UDP groups use kernel timestamps
+//! (SO_TIMESTAMPING) only when asked, through `TimestampConfig`:
+//! - NIC hardware timestamps, when an interface is configured and has
+//!   hardware timestamping switched on (e.g. with `enable_nic_timestamping`,
+//!   which needs root or CAP_NET_ADMIN);
+//! - otherwise kernel software timestamps, if requested explicitly.
 //!
-//! ## I/O Multiplexer Selection
+//! Each group logs the source in effect once, at info level. A kernel
+//! timestamp is used for a latency only when the send and the receive both
+//! have one from the same clock; see [`Timestamp::duration_since`].
 //!
-//! The multiplexer backend can be selected at runtime:
-//! - `Epoll`: Linux-only, most efficient for large numbers of connections
-//! - `Poll`: Portable, no fd limit, good performance
-//! - `Select`: Portable, but limited to ~1024 file descriptors
+//! ## TX Timestamp Correlation
 //!
-//! ## Transport APIs
+//! Each connection counts what it sends in the units of its TX timestamp
+//! counter: bytes for byte streams (TCP), datagrams for datagram transports
+//! (UDP). Counters start at zero before the first send and wrap at
+//! `u32::MAX`; compare them with wrapping arithmetic.
 //!
-//! This crate provides two APIs:
+//! - A send returns [`SendReceipt::tx`] `= Some(TxRange { start, end })`, the
+//!   half-open range of counter values it used. `end` is exclusive: two
+//!   10-byte TCP sends give `[0, 10)` and `[10, 20)`; two UDP sends give
+//!   `[0, 1)` and `[1, 2)`. It is `None` when the connection reports no TX
+//!   timestamps.
+//! - A TX timestamp ([`TxTimestampInfo`]) carries `tx_end`, the exclusive end
+//!   of what it covers, in the same units. Transports normalise the kernel's
+//!   value to this: with `SOF_TIMESTAMPING_OPT_ID`, Linux reports the offset
+//!   of the last byte for TCP (`seq + len - 1`) and the datagram index for
+//!   UDP, both `tx_end - 1`.
+//! - If `cumulative` (TCP), the stamp covers every not yet stamped send with
+//!   `end <= tx_end`: the kernel stamps only the last segment of what it
+//!   transmits together. Otherwise (UDP) it covers only the send with
+//!   `end == tx_end`, so a missing or reordered stamp is never given to
+//!   another send.
 //!
-//! ### Single-Connection API (`Transport` trait)
-//!
-//! Simple API for managing individual connections. Each transport owns its own
-//! multiplexer instance, so polling N connections requires N syscalls.
-//!
-//! ```rust,no_run
-//! use xylem_transport::{TcpTransport, Transport, Timestamp};
-//! use std::net::SocketAddr;
-//!
-//! let mut transport = TcpTransport::new();
-//! let addr: SocketAddr = "127.0.0.1:6379".parse().unwrap();
-//!
-//! transport.connect(&addr).unwrap();
-//! let send_ts = transport.send(b"PING\r\n").unwrap();
-//!
-//! while !transport.poll_readable().unwrap() {
-//!     std::hint::spin_loop();
-//! }
-//!
-//! let (response, recv_ts) = transport.recv().unwrap();
-//! let latency = recv_ts.duration_since(&send_ts);
-//! println!("Latency: {:?}", latency);
-//! ```
-//!
-//! ### Connection Group API (`ConnectionGroup` trait)
+//! ## Connection Group API
 //!
 //! Efficient API for managing multiple connections. A single multiplexer is
 //! shared across all connections in the group, so polling N connections requires
@@ -120,6 +114,7 @@ impl fmt::Display for Error {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl From<nix::Error> for Error {
     fn from(err: nix::Error) -> Self {
         Error::Io(std::io::Error::from(err))
@@ -135,100 +130,58 @@ impl From<std::io::Error> for Error {
 }
 
 // =============================================================================
-// Single-Connection API (Transport trait)
-// =============================================================================
-
-/// Transport protocol trait for single connections
-///
-/// This trait defines the interface for transport layer implementations.
-/// All methods are blocking/synchronous to enable tight control over timing
-/// and busy-waiting in the event loop.
-///
-/// Each `Transport` instance owns its own poll/epoll instance. For managing
-/// multiple connections efficiently, use the `ConnectionGroup` API instead.
-pub trait Transport: Send {
-    /// Connect to a target
-    ///
-    /// Establishes a connection to the specified target address.
-    /// Returns immediately after connection is established.
-    fn connect(&mut self, target: &SocketAddr) -> Result<()>;
-
-    /// Send data and return timestamp
-    ///
-    /// Sends the provided data and captures a nanosecond-precision timestamp
-    /// immediately after the send operation completes.
-    ///
-    /// For non-blocking transports, this may return immediately without
-    /// guaranteeing the data has been written to the network.
-    fn send(&mut self, data: &[u8]) -> Result<Timestamp>;
-
-    /// Receive data and return timestamp
-    ///
-    /// Attempts to receive data from the transport. Returns the received data
-    /// and a timestamp captured immediately after the receive operation.
-    ///
-    /// For non-blocking transports, this returns immediately even if no data
-    /// is available (returning empty buffer or error).
-    fn recv(&mut self) -> Result<(Vec<u8>, Timestamp)>;
-
-    /// Check if there is data ready to read
-    ///
-    /// Non-blocking check for read readiness. Returns true if recv() will
-    /// likely return data without blocking.
-    fn poll_readable(&mut self) -> Result<bool>;
-
-    /// Close the connection
-    ///
-    /// Closes the transport and releases resources.
-    fn close(&mut self) -> Result<()>;
-}
-
-// =============================================================================
 // Connection Group API (ConnectionGroup trait)
 // =============================================================================
+
+/// Half-open range `[start, end)` of TX counter values used by one send
+///
+/// See [TX timestamp correlation](crate#tx-timestamp-correlation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TxRange {
+    /// First counter value of the send (wrapping)
+    pub start: u32,
+    /// Exclusive end: one past the last counter value of the send (wrapping)
+    pub end: u32,
+}
 
 /// Information about a TX timestamp received from the kernel
 ///
 /// TX timestamps arrive asynchronously via the socket's error queue.
-/// This struct contains the timestamp and the byte offset (opt_id) needed
-/// to correlate it back to the original send operation.
+/// `tx_end` and `cumulative` say which sends the stamp belongs to.
 #[derive(Debug, Clone, Copy)]
 pub struct TxTimestampInfo {
     /// Connection ID that sent the data
     pub conn_id: usize,
-    /// Byte offset (opt_id) for correlating with the send operation
-    pub tx_offset: u32,
-    /// The kernel-provided TX timestamp
-    pub timestamp: Timestamp,
+    /// Exclusive end of the TX counter range the stamp covers; equal to the
+    /// `TxRange::end` of the last send it belongs to
+    pub tx_end: u32,
+    /// Whether the stamp also covers earlier sends not yet stamped (byte
+    /// streams), rather than only the send ending at `tx_end` (datagrams)
+    pub cumulative: bool,
+    /// The kernel-provided TX timestamp; attach it to the send's own
+    /// `Timestamp` with [`Timestamp::with_kernel`]
+    pub timestamp: KernelTimestamp,
 }
 
 /// What a send handed to the transport
 ///
-/// The range semantics differ by transport:
-/// - **TCP** (and Unix): Byte offsets where end = start + data.len() (wrapping u32 counter)
-/// - **UDP**: Packet IDs where start == end (single packet per send)
-///
-/// The actual hardware TX timestamp will arrive later via the error queue
-/// and can be retrieved using `ConnectionGroup::poll_tx_timestamps()`.
-/// A TX timestamp with offset >= end indicates the data has been transmitted.
-///
-/// Note: The counters wrap at u32::MAX. Callers should use wrapping comparison
-/// when correlating TX timestamps with send operations.
+/// The kernel TX timestamp, if any, arrives later via
+/// `ConnectionGroup::poll_tx_timestamps()` and is matched with `tx`.
 #[derive(Debug, Clone, Copy)]
 pub struct SendReceipt {
     /// Software timestamp taken once the transport accepted every byte
     pub timestamp: Timestamp,
-    /// TX range start (byte offset for TCP, packet id for UDP), wrapping
-    pub tx_start: u32,
-    /// TX range end (byte offset for TCP, packet id for UDP), wrapping
-    pub tx_end: u32,
+    /// TX counter range of this send, or `None` if the connection reports no
+    /// TX timestamps
+    pub tx: Option<TxRange>,
 }
 
 /// Result of one receive attempt
 #[derive(Debug, Clone, Copy)]
 pub enum RecvOutcome {
-    /// `len` bytes were written to the front of the buffer; `timestamp` is the
-    /// receive time (kernel/HW when available, else software)
+    /// `len` bytes were written to the front of the buffer; `timestamp` holds
+    /// the cycles read when the receive completed, plus the kernel/HW receive
+    /// timestamp when one was reported
     Data { len: usize, timestamp: Timestamp },
     /// No data available right now
     WouldBlock,
@@ -257,7 +210,8 @@ pub trait ConnectionGroup {
     ///
     /// Either every byte is handed to the transport or an error is returned;
     /// the transport spins while it would block. Returns the software
-    /// timestamp and TX range used to correlate TX timestamps.
+    /// timestamp and, when TX timestamps are on, the TX range used to
+    /// correlate them.
     ///
     /// Unknown connection IDs return `Error::Connection`.
     fn send(&mut self, conn_id: usize, data: &[u8]) -> Result<SendReceipt>;
@@ -281,14 +235,13 @@ pub trait ConnectionGroup {
     /// returns `RecvOutcome::WouldBlock`.
     fn poll(&mut self, timeout: Duration, ready: &mut Vec<usize>) -> Result<()>;
 
-    /// Poll for TX timestamps from all connections (Linux only)
+    /// Poll for TX timestamps from all connections
     ///
-    /// TX timestamps arrive asynchronously via the socket's error queue after
-    /// the data has been transmitted. This method clears `out` and fills it
-    /// with the TX timestamps available now, each a `TxTimestampInfo` with:
-    /// - `conn_id`: The connection that sent the data
-    /// - `tx_offset`: Byte offset for correlating with the original send
-    /// - `timestamp`: The kernel-provided TX timestamp
+    /// TX timestamps arrive asynchronously (via the socket's error queue on
+    /// Linux) after the data has been transmitted. This method clears `out`
+    /// and fills it with the TX timestamps available now. Connections whose
+    /// sends are all stamped already, or that report no TX timestamps, cost
+    /// nothing.
     ///
     /// The default implementation (no TX timestamp support) leaves `out` empty.
     fn poll_tx_timestamps(&mut self, out: &mut Vec<TxTimestampInfo>) -> Result<()> {
@@ -333,7 +286,7 @@ pub trait TransportFactory: Send + Sync {
 
 // Connection-group code shared by the tcp, udp, and unix modules
 mod group;
-pub mod mux;
+mod mux;
 pub mod tcp;
 mod timestamp;
 pub mod udp;
@@ -350,13 +303,10 @@ pub mod hw_timestamp;
 // Re-exports
 // =============================================================================
 
-pub use mux::{Multiplexer, MultiplexerType};
-pub use timestamp::{time_ns, Timestamp};
+pub use timestamp::{time_ns, KernelClock, KernelTimestamp, Timestamp};
 
-pub use tcp::TcpTransport;
-pub use udp::UdpTransport;
-#[cfg(unix)]
-pub use unix::UnixTransport;
+#[cfg(target_os = "linux")]
+pub use group::TimestampSource;
 
 pub use tcp::{TcpConnectionGroup, TcpTransportFactory};
 pub use udp::{UdpConnectionGroup, UdpTransportFactory};
@@ -371,4 +321,6 @@ pub use udp::UdpTimestampConfig;
 
 // Hardware timestamping utilities (Linux only)
 #[cfg(target_os = "linux")]
-pub use hw_timestamp::{disable_nic_timestamping, enable_nic_timestamping};
+pub use hw_timestamp::{
+    disable_nic_timestamping, enable_nic_timestamping, nic_timestamping_enabled,
+};

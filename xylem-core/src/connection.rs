@@ -13,7 +13,10 @@ use std::hash::Hash;
 use std::net::SocketAddr;
 use std::time::Duration;
 use xylem_common::Protocol;
-use xylem_transport::{ConnectionGroup, RecvOutcome, Timestamp, TransportFactory, TxTimestampInfo};
+use xylem_transport::{
+    ConnectionGroup, KernelTimestamp, RecvOutcome, Timestamp, TransportFactory, TxRange,
+    TxTimestampInfo,
+};
 
 /// Wrapping less-than-or-equal comparison for u32 counters
 ///
@@ -61,9 +64,11 @@ const TX_QUEUE_STALE_TIMEOUT_NS: u64 = 60_000_000_000;
 /// Pending request tracking
 #[derive(Debug)]
 struct PendingRequest {
+    /// Cycles read when the send call completed
     send_ts: Timestamp,
     is_warmup: bool,
-    tx_hw_ts: Option<Timestamp>,
+    /// Kernel TX timestamp of the send, once reported
+    tx_kernel_ts: Option<KernelTimestamp>,
 }
 
 /// Per-connection application state (no transport - I/O goes through ConnectionGroup)
@@ -76,17 +81,20 @@ struct PendingRequest {
 ///    Used when responses arrive (protocol provides req_id)
 ///
 /// 2. `tx_pending_queue: VecDeque<(u32, ReqId, u64)>` - Queue for TX timestamp correlation
-///    Requests are pushed to back (tx_end is monotonically increasing),
+///    Holds `(TxRange::end, req_id, enqueue_time_ns)` for sends whose transport reports
+///    TX timestamps (`SendReceipt::tx` is `Some`); other sends never enter it.
+///    Requests are pushed to back (ends increase monotonically, wrapping),
 ///    TX timestamps are matched from front (kernel delivers in order).
 ///    The u64 is a monotonic timestamp (nanoseconds) for stale entry cleanup.
 ///
-/// Flow:
-/// - send() -> push_back to tx_pending_queue, insert into pending_map
-/// - poll_tx_timestamps() -> pop from front while tx_end <= offset, set pending_map[req_id].tx_hw_ts
+/// Flow (see `xylem_transport`'s "TX Timestamp Correlation" for the contract):
+/// - send() -> push_back to tx_pending_queue if `tx` is Some, insert into pending_map
+/// - poll_tx_timestamps() -> a cumulative stamp pops from front while end <= tx_end; an
+///   exact stamp removes only the entry with end == tx_end; set pending_map[req_id].tx_kernel_ts
 /// - recv() -> lookup pending_map by req_id, clean up queue if needed, compute latency
 ///
-/// Queue cleanup: When a response arrives before its TX timestamp (or for transports without
-/// HW timestamps like Unix sockets), the queue entry is cleaned up by popping from front.
+/// Queue cleanup: When a response arrives before its TX timestamp, or its stamp was lost,
+/// the queue entry is removed when the response completes the request.
 ///
 /// # Scheduling Invariant
 ///
@@ -213,23 +221,23 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         self.on_heap = on_heap;
     }
 
-    /// Record a sent request with TX byte range for hardware timestamp correlation
+    /// Record a sent request, with its TX range when the transport reports TX timestamps
     ///
-    /// `tx_start` is accepted for symmetry with `SendReceipt` but unused;
-    /// only `tx_end` is needed to determine when a TX timestamp covers this request.
+    /// Only `tx.end` is needed to determine which TX timestamp covers this request.
     fn record_send(
         &mut self,
         req_id: ReqId,
         send_ts: Timestamp,
-        _tx_start: u32,
-        tx_end: u32,
+        tx: Option<TxRange>,
         is_warmup: bool,
     ) {
-        let now_ns = crate::timing::time_ns();
-        // Push to queue for TX timestamp correlation (tx_end increases monotonically)
-        self.tx_pending_queue.push_back((tx_end, req_id.clone(), now_ns));
+        if let Some(tx) = tx {
+            // Queue for TX timestamp correlation (ends increase monotonically)
+            let now_ns = crate::timing::time_ns();
+            self.tx_pending_queue.push_back((tx.end, req_id.clone(), now_ns));
+        }
         self.pending_map
-            .insert(req_id, PendingRequest { send_ts, is_warmup, tx_hw_ts: None });
+            .insert(req_id, PendingRequest { send_ts, is_warmup, tx_kernel_ts: None });
     }
 
     /// Clean up queue entry for a completed request that didn't receive its TX timestamp
@@ -287,26 +295,50 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         removed
     }
 
-    /// Update pending requests with hardware TX timestamp
+    /// Update pending requests with a kernel TX timestamp
     ///
-    /// A TX timestamp with `offset` indicates all bytes/packets up to `offset` have been transmitted.
-    /// We pop from front of queue all requests with `tx_end <= offset` and set their TX timestamp.
+    /// `tx_end` is the exclusive end of the TX counter range the stamp covers.
+    /// - `cumulative` (byte streams): every queued request with `end <= tx_end`
+    ///   was transmitted by then; pop them all from the front and set their
+    ///   TX timestamp. A single TX timestamp may cover multiple small requests.
+    /// - Otherwise (datagrams): only the request with `end == tx_end` gets
+    ///   it. Earlier entries stay queued, so a stamp that is lost or arrives
+    ///   out of order is never given to another request.
     ///
     /// Uses wrapping comparison to handle u32 counter overflow correctly.
     ///
     /// Returns the number of pending requests that were updated with the TX timestamp.
-    /// A single TX timestamp may cover multiple small requests.
-    pub fn set_tx_timestamp(&mut self, offset: u32, tx_ts: Timestamp) -> usize {
+    pub fn set_tx_timestamp(
+        &mut self,
+        tx_end: u32,
+        cumulative: bool,
+        tx_ts: KernelTimestamp,
+    ) -> usize {
+        if !cumulative {
+            let Some(pos) = self.tx_pending_queue.iter().position(|&(end, _, _)| end == tx_end)
+            else {
+                return 0;
+            };
+            let (_, req_id, _) = self.tx_pending_queue.remove(pos).expect("position is in range");
+            return match self.pending_map.get_mut(&req_id) {
+                Some(pending) => {
+                    pending.tx_kernel_ts = Some(tx_ts);
+                    1
+                }
+                None => 0,
+            };
+        }
+
         let mut updated_count = 0;
 
-        // Pop from front while tx_end <= offset (queue is ordered by tx_end)
+        // Pop from front while end <= tx_end (queue is ordered by end)
         // Use wrapping comparison to handle counter overflow after ~4GB (TCP) or ~4B packets (UDP)
-        while let Some(&(tx_end, ref req_id, _)) = self.tx_pending_queue.front() {
-            if wrapping_le(tx_end, offset) {
+        while let Some(&(end, ref req_id, _)) = self.tx_pending_queue.front() {
+            if wrapping_le(end, tx_end) {
                 // Update pending_map if request still exists (might have been completed already
                 // if response arrived before TX timestamp)
                 if let Some(pending) = self.pending_map.get_mut(req_id) {
-                    pending.tx_hw_ts = Some(tx_ts);
+                    pending.tx_kernel_ts = Some(tx_ts);
                     updated_count += 1;
                 }
                 self.tx_pending_queue.pop_front();
@@ -403,10 +435,16 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
                     "Received response for unknown request ID: {req_id:?}"
                 ))
             })?;
-            if pending.tx_hw_ts.is_none() {
-                self.cleanup_tx_queue_entry(&req_id);
-            }
-            let send_ts = pending.tx_hw_ts.unwrap_or(pending.send_ts);
+            // The kernel TX timestamp joins the send's own cycles, so the
+            // latency falls back to cycles unless the receive has a kernel
+            // timestamp from the same clock
+            let send_ts = match pending.tx_kernel_ts {
+                Some(kernel) => pending.send_ts.with_kernel(kernel),
+                None => {
+                    self.cleanup_tx_queue_entry(&req_id);
+                    pending.send_ts
+                }
+            };
             let latency = recv_ts.duration_since(&send_ts);
             responses.push((req_id, latency, pending.is_warmup, consumed));
             cursor += consumed;
@@ -592,7 +630,7 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         let receipt = self.group.send(connection_id, data)?;
 
         let state = self.connection_states.get_mut(&connection_id).unwrap();
-        state.record_send(req_id, receipt.timestamp, receipt.tx_start, receipt.tx_end, is_warmup);
+        state.record_send(req_id, receipt.timestamp, receipt.tx, is_warmup);
 
         Ok(())
     }
@@ -649,7 +687,8 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
 
         for tx_info in &self.tx_timestamps {
             if let Some(state) = self.connection_states.get_mut(&tx_info.conn_id) {
-                count += state.set_tx_timestamp(tx_info.tx_offset, tx_info.timestamp);
+                count +=
+                    state.set_tx_timestamp(tx_info.tx_end, tx_info.cumulative, tx_info.timestamp);
             }
         }
 
@@ -873,6 +912,10 @@ mod tests {
         )
     }
 
+    fn tx(start: u32, end: u32) -> Option<TxRange> {
+        Some(TxRange { start, end })
+    }
+
     // Test frames encode their total size and request ID in an eight-byte header.
     fn frame(id: u32, size: usize) -> Vec<u8> {
         let mut data = vec![0; size];
@@ -898,8 +941,8 @@ mod tests {
     fn fragmented_limit_frame_followed_by_coalesced_frame() {
         let mut state = state();
         let ts = Timestamp::now();
-        state.record_send(1, ts, 0, 1, false);
-        state.record_send(2, ts, 1, 2, false);
+        state.record_send(1, ts, tx(0, 1), false);
+        state.record_send(2, ts, tx(1, 2), false);
         let first = frame(1, MAX_PAYLOAD);
         assert!(state
             .process_recv(&first[..MAX_PAYLOAD - 4], ts, parse_frame)
@@ -920,7 +963,7 @@ mod tests {
         for complete in [false, true] {
             let mut state = state();
             let ts = Timestamp::now();
-            state.record_send(1, ts, 0, 1, false);
+            state.record_send(1, ts, tx(0, 1), false);
             let data = frame(1, MAX_PAYLOAD + 2);
             let len = if complete { data.len() } else { data.len() - 1 };
             let error = state.process_recv(&data[..len], ts, parse_frame).unwrap_err();
@@ -935,11 +978,11 @@ mod tests {
         let ts = Timestamp::now();
         let mut data = Vec::new();
         for id in 0..100 {
-            state.record_send(id, ts, 0, id as u32, false);
+            state.record_send(id, ts, tx(0, id as u32), false);
             data.extend(frame(id as u32, 8));
         }
         let tail = frame(100, 12);
-        state.record_send(100, ts, 0, 100, false);
+        state.record_send(100, ts, tx(0, 100), false);
         data.extend_from_slice(&tail[..6]);
         assert_eq!(state.process_recv(&data, ts, parse_frame).unwrap().len(), 100);
         assert_eq!(state.buffered(), &tail[..6]);
@@ -951,7 +994,7 @@ mod tests {
     fn invalid_parser_consumption_does_not_complete_request() {
         let mut state = state();
         let ts = Timestamp::now();
-        state.record_send(1, ts, 0, 1, false);
+        state.record_send(1, ts, tx(0, 1), false);
         assert!(state.process_recv(&[0], ts, |_| Ok((2, Some(1)))).is_err());
         assert_eq!(state.pending_count(), 1);
     }
@@ -960,7 +1003,7 @@ mod tests {
     fn consumed_bytes_without_request_id_is_an_error() {
         let mut state = state();
         let ts = Timestamp::now();
-        state.record_send(1, ts, 0, 1, false);
+        state.record_send(1, ts, tx(0, 1), false);
         let error = state.process_recv(b"hello", ts, |_| Ok((5, None))).unwrap_err();
         assert_eq!(
             error.to_string(),
@@ -971,7 +1014,7 @@ mod tests {
         // Consuming nothing is an incomplete response, with or without an ID
         for request_id in [None, Some(1)] {
             let mut state = self::state();
-            state.record_send(1, ts, 0, 1, false);
+            state.record_send(1, ts, tx(0, 1), false);
             let responses = state.process_recv(b"hel", ts, |_| Ok((0, request_id))).unwrap();
             assert!(responses.is_empty());
             assert_eq!(state.buffered(), b"hel");
@@ -1043,6 +1086,121 @@ mod tests {
         io.lock().unwrap().eof = true;
         assert!(matches!(pool.recv_responses(0, parse_frame), Err(crate::Error::Connection(_))));
         assert!(matches!(pool.send(9, &[0], 4, false), Err(crate::Error::Connection(_))));
+    }
+
+    #[test]
+    fn kernel_tx_timestamp_keeps_send_cycles() {
+        use xylem_transport::KernelClock;
+        let kernel = |nanos, clock| KernelTimestamp { nanos, clock };
+        // TX has a software kernel stamp: (RX clock, whether the kernel delta is used)
+        for (rx_clock, kernel_used) in [
+            (None, false),
+            (Some(KernelClock::NicHardware), false),
+            (Some(KernelClock::Realtime), true),
+        ] {
+            let mut state = state();
+            let send_ts = Timestamp::now();
+            state.record_send(1, send_ts, Some(TxRange { start: 0, end: 8 }), false);
+            std::thread::sleep(Duration::from_millis(10));
+            // The TX stamp is decoded long after the send; its decode time
+            // must not stand in for the send time
+            assert_eq!(
+                state.set_tx_timestamp(8, true, kernel(1_000_000, KernelClock::Realtime)),
+                1
+            );
+            let recv_ts = Timestamp::now();
+            let recv_ts = match rx_clock {
+                Some(clock) => recv_ts.with_kernel(kernel(1_500_000, clock)),
+                None => recv_ts,
+            };
+            let latency = state.process_recv(&frame(1, 8), recv_ts, parse_frame).unwrap()[0].1;
+            if kernel_used {
+                assert_eq!(latency, Duration::from_micros(500));
+            } else {
+                assert_eq!(latency, recv_ts.duration_since(&send_ts));
+                assert!(latency >= Duration::from_millis(5), "{rx_clock:?}: {latency:?}");
+            }
+        }
+    }
+
+    fn stamped(state: &ConnectionState<u64>, id: u64) -> Option<u64> {
+        state.pending_map[&id].tx_kernel_ts.map(|k| k.nanos)
+    }
+
+    fn sw(nanos: u64) -> KernelTimestamp {
+        KernelTimestamp {
+            nanos,
+            clock: xylem_transport::KernelClock::Realtime,
+        }
+    }
+
+    /// Two 10-byte TCP writes: the kernel reports IDs 9 and 19, which the
+    /// transport normalises to tx_end 10 and 20. Each request gets its own
+    /// stamp; before the fix, request 1 waited for and took request 2's.
+    #[test]
+    fn cumulative_tx_stamp_maps_to_its_own_request() {
+        let mut state = state();
+        let ts = Timestamp::now();
+        state.record_send(1, ts, tx(0, 10), false);
+        state.record_send(2, ts, tx(10, 20), false);
+        assert_eq!(state.set_tx_timestamp(10, true, sw(100)), 1);
+        assert_eq!((stamped(&state, 1), stamped(&state, 2)), (Some(100), None));
+        assert_eq!(state.set_tx_timestamp(20, true, sw(200)), 1);
+        assert_eq!(stamped(&state, 2), Some(200));
+        assert!(state.tx_pending_queue.is_empty());
+
+        // A stamp for coalesced writes covers every request it ends past
+        state.record_send(3, ts, tx(20, 25), false);
+        state.record_send(4, ts, tx(25, 30), false);
+        state.record_send(5, ts, tx(30, 40), false);
+        assert_eq!(state.set_tx_timestamp(30, true, sw(300)), 2);
+        assert_eq!(
+            (stamped(&state, 3), stamped(&state, 4), stamped(&state, 5)),
+            (Some(300), Some(300), None)
+        );
+
+        // Across the u32 wrap
+        let mut state = self::state();
+        state.record_send(1, ts, tx(u32::MAX - 4, 5), false);
+        state.record_send(2, ts, tx(5, 15), false);
+        assert_eq!(state.set_tx_timestamp(5, true, sw(1)), 1);
+        assert_eq!((stamped(&state, 1), stamped(&state, 2)), (Some(1), None));
+    }
+
+    /// UDP datagrams 0, 1, 2 give tx_end 1, 2, 3. A missing or reordered
+    /// stamp goes to its own datagram or nowhere.
+    #[test]
+    fn exact_tx_stamp_never_goes_to_another_datagram() {
+        let mut state = state();
+        let ts = Timestamp::now();
+        for id in 0..4u64 {
+            state.record_send(id, ts, tx(id as u32, id as u32 + 1), false);
+        }
+        // Datagram 0's stamp is lost; 2 arrives before 1
+        assert_eq!(state.set_tx_timestamp(3, false, sw(30)), 1);
+        assert_eq!(state.set_tx_timestamp(2, false, sw(20)), 1);
+        assert_eq!(
+            (0..4).map(|id| stamped(&state, id)).collect::<Vec<_>>(),
+            vec![None, Some(20), Some(30), None]
+        );
+        // A duplicate or unknown stamp matches nothing
+        assert_eq!(state.set_tx_timestamp(3, false, sw(31)), 0);
+        assert_eq!(state.set_tx_timestamp(9, false, sw(90)), 0);
+        assert_eq!(stamped(&state, 2), Some(30));
+
+        // Completing the unstamped request removes its queue entry
+        state.process_recv(&frame(0, 8), ts, parse_frame).unwrap();
+        assert_eq!(state.tx_pending_queue.iter().map(|e| e.1).collect::<Vec<_>>(), vec![3]);
+    }
+
+    #[test]
+    fn sends_without_tx_range_skip_correlation() {
+        let mut state = state();
+        let ts = Timestamp::now();
+        state.record_send(1, ts, None, false);
+        assert!(state.tx_pending_queue.is_empty());
+        assert_eq!(state.set_tx_timestamp(1, true, sw(1)), 0);
+        assert_eq!(state.process_recv(&frame(1, 8), ts, parse_frame).unwrap().len(), 1);
     }
 
     #[test]
@@ -1216,10 +1374,10 @@ pub(crate) mod test_support {
                 return Err(xylem_transport::Error::Io(std::io::Error::other("send failed")));
             }
             io.sent.push(data.to_vec());
+            let end = io.sent.len() as u32;
             Ok(xylem_transport::SendReceipt {
                 timestamp: io.timestamp,
-                tx_start: 0,
-                tx_end: io.sent.len() as u32,
+                tx: Some(TxRange { start: end - 1, end }),
             })
         }
 

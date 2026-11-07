@@ -25,7 +25,7 @@
 //! - Linux kernel timestamping docs: https://docs.kernel.org/networking/timestamping.html
 //! - Lancet implementation: https://github.com/epfl-dcsl/lancet-tool
 
-use crate::{Error, Result, Timestamp};
+use crate::{Error, KernelClock, KernelTimestamp, Result};
 use std::io;
 use std::mem;
 use std::os::unix::io::RawFd;
@@ -112,17 +112,18 @@ impl Default for ScmTimestamping {
 }
 
 impl ScmTimestamping {
-    /// Get the best available timestamp (prefer raw hardware)
-    pub fn best_timestamp(&self) -> Option<(i64, i64)> {
-        // ts[2] = raw hardware timestamp (preferred)
-        // ts[1] = transformed hardware timestamp
-        // ts[0] = software timestamp
-        if self.ts[2].tv_sec != 0 || self.ts[2].tv_nsec != 0 {
-            Some((self.ts[2].tv_sec, self.ts[2].tv_nsec))
-        } else if self.ts[1].tv_sec != 0 || self.ts[1].tv_nsec != 0 {
-            Some((self.ts[1].tv_sec, self.ts[1].tv_nsec))
-        } else if self.ts[0].tv_sec != 0 || self.ts[0].tv_nsec != 0 {
-            Some((self.ts[0].tv_sec, self.ts[0].tv_nsec))
+    /// Get the best available timestamp and its clock (prefer raw hardware)
+    ///
+    /// - `ts[2]`: raw hardware timestamp, the NIC's PHC (preferred)
+    /// - `ts[1]`: legacy transformed hardware timestamp; always zero on
+    ///   current kernels and never requested, so ignored
+    /// - `ts[0]`: software timestamp, CLOCK_REALTIME
+    pub fn best_timestamp(&self) -> Option<(i64, i64, KernelClock)> {
+        let set = |ts: &libc::timespec| ts.tv_sec != 0 || ts.tv_nsec != 0;
+        if set(&self.ts[2]) {
+            Some((self.ts[2].tv_sec, self.ts[2].tv_nsec, KernelClock::NicHardware))
+        } else if set(&self.ts[0]) {
+            Some((self.ts[0].tv_sec, self.ts[0].tv_nsec, KernelClock::Realtime))
         } else {
             None
         }
@@ -274,18 +275,42 @@ pub fn disable_nic_timestamping(interface: &str) -> Result<()> {
     result
 }
 
-fn configure_nic_timestamping(
-    fd: RawFd,
-    interface: &str,
-    rx_filter: i32,
-    tx_type: i32,
-) -> Result<()> {
-    let config = HwtstampConfig { flags: 0, tx_type, rx_filter };
+/// Whether `interface` currently has hardware timestamping switched on
+///
+/// Reads the NIC configuration with `SIOCGHWTSTAMP`, which needs no
+/// privilege, and reports true only when TX timestamping is on and the RX
+/// filter is not `HWTSTAMP_FILTER_NONE`. Socket-level `SO_TIMESTAMPING`
+/// requests succeed whether or not the NIC is configured, so this is the
+/// check that decides whether hardware timestamps will actually arrive.
+///
+/// Returns an error when the interface does not exist or its driver does
+/// not support hardware timestamping.
+pub fn nic_timestamping_enabled(interface: &str) -> Result<bool> {
+    use hwtstamp::*;
 
-    // Create ifreq structure
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_UDP) };
+    if fd < 0 {
+        return Err(Error::Io(io::Error::last_os_error()));
+    }
+
+    let mut config = HwtstampConfig::default();
+    let mut ifr = ifreq_for(interface, &mut config);
+    const SIOCGHWTSTAMP: libc::c_ulong = 0x89b1;
+    let ret = unsafe { libc::ioctl(fd, SIOCGHWTSTAMP, &mut ifr) };
+    let err = io::Error::last_os_error();
+    unsafe { libc::close(fd) };
+
+    if ret < 0 {
+        return Err(Error::Config(format!(
+            "Could not read hardware timestamping configuration of '{interface}': {err}"
+        )));
+    }
+    Ok(config.tx_type != HWTSTAMP_TX_OFF && config.rx_filter != HWTSTAMP_FILTER_NONE)
+}
+
+/// An `ifreq` naming `interface` (truncated to 15 bytes) whose data points at `config`
+fn ifreq_for(interface: &str, config: &mut HwtstampConfig) -> libc::ifreq {
     let mut ifr: libc::ifreq = unsafe { mem::MaybeUninit::zeroed().assume_init() };
-
-    // Copy interface name (max 15 chars + null terminator)
     let if_bytes = interface.as_bytes();
     let copy_len = std::cmp::min(if_bytes.len(), 15);
     unsafe {
@@ -295,9 +320,18 @@ fn configure_nic_timestamping(
             copy_len,
         );
     }
+    ifr.ifr_ifru.ifru_data = config as *mut HwtstampConfig as *mut libc::c_char;
+    ifr
+}
 
-    // Set ifr_data to point to config
-    ifr.ifr_ifru.ifru_data = &config as *const HwtstampConfig as *mut libc::c_char;
+fn configure_nic_timestamping(
+    fd: RawFd,
+    interface: &str,
+    rx_filter: i32,
+    tx_type: i32,
+) -> Result<()> {
+    let mut config = HwtstampConfig { flags: 0, tx_type, rx_filter };
+    let ifr = ifreq_for(interface, &mut config);
 
     // SIOCSHWTSTAMP ioctl
     const SIOCSHWTSTAMP: libc::c_ulong = 0x89b0;
@@ -334,7 +368,7 @@ fn parse_timestamps(
     cmsg_buf: &[u8],
     cmsg_len: usize,
     keep_first_timestamp: bool,
-) -> Option<(Option<Timestamp>, Option<u32>)> {
+) -> Option<(Option<KernelTimestamp>, Option<u32>)> {
     let buf = cmsg_buf.get(..cmsg_len)?;
     let header_len = mem::size_of::<libc::cmsghdr>();
     let data_start = cmsg_align(header_len)?;
@@ -357,13 +391,13 @@ fn parse_timestamps(
             let bytes = payload.get(..mem::size_of::<ScmTimestamping>())?;
             // SAFETY: a complete integer-only timestamp triplet is in this message.
             let scm_ts = unsafe { bytes.as_ptr().cast::<ScmTimestamping>().read_unaligned() };
-            if let Some((sec, nsec)) = scm_ts.best_timestamp() {
+            if let Some((sec, nsec, clock)) = scm_ts.best_timestamp() {
                 if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
                     return None;
                 }
-                (sec as u64).checked_mul(1_000_000_000)?.checked_add(nsec as u64)?;
+                let nanos = (sec as u64).checked_mul(1_000_000_000)?.checked_add(nsec as u64)?;
                 if timestamp.is_none() || !keep_first_timestamp {
-                    timestamp = Some(Timestamp::from_hardware(sec, nsec));
+                    timestamp = Some(KernelTimestamp { nanos, clock });
                 }
             }
         } else if (cmsg.cmsg_level == libc::SOL_IP && cmsg.cmsg_type == libc::IP_RECVERR)
@@ -387,26 +421,26 @@ fn parse_timestamps(
 
 /// Extract a timestamp from recvmsg control messages.
 /// Returns None for missing timestamps or malformed ancillary data.
-pub fn extract_rx_timestamp(cmsg_buf: &[u8], cmsg_len: usize) -> Option<Timestamp> {
+pub fn extract_rx_timestamp(cmsg_buf: &[u8], cmsg_len: usize) -> Option<KernelTimestamp> {
     parse_timestamps(cmsg_buf, cmsg_len, true)?.0
 }
 
 /// Extract a TX timestamp and opt_id from an error queue message.
 /// Returns None for missing timestamps or malformed ancillary data.
 /// When no opt_id is supplied (e.g. UDP), the ID defaults to zero.
-pub fn extract_tx_timestamp(cmsg_buf: &[u8], cmsg_len: usize) -> Option<(Timestamp, u32)> {
+pub fn extract_tx_timestamp(cmsg_buf: &[u8], cmsg_len: usize) -> Option<(KernelTimestamp, u32)> {
     let (timestamp, opt_id) = parse_timestamps(cmsg_buf, cmsg_len, false)?;
     Some((timestamp?, opt_id.unwrap_or(0)))
 }
 
 /// Receive data with timestamps via recvmsg
 ///
-/// Returns (bytes_read, data, optional_timestamp).
+/// Returns (bytes_read, kernel timestamp if one was attached).
 pub fn recvmsg_with_timestamp(
     fd: RawFd,
     buf: &mut [u8],
     flags: i32,
-) -> io::Result<(usize, Option<Timestamp>)> {
+) -> io::Result<(usize, Option<KernelTimestamp>)> {
     let mut cmsg_buf = [0u8; CMSG_BUFFER_SIZE];
     let mut iov = libc::iovec {
         iov_base: buf.as_mut_ptr() as *mut libc::c_void,
@@ -433,7 +467,7 @@ pub fn recvmsg_with_timestamp(
 /// Receive TX timestamp from error queue (non-blocking)
 ///
 /// Returns Some((timestamp, opt_id)) if a TX timestamp is available.
-pub fn recv_tx_timestamp(fd: RawFd) -> io::Result<Option<(Timestamp, u32)>> {
+pub fn recv_tx_timestamp(fd: RawFd) -> io::Result<Option<(KernelTimestamp, u32)>> {
     let mut cmsg_buf = [0u8; CMSG_BUFFER_SIZE];
     let mut dummy_buf = [0u8; 1];
     let mut iov = libc::iovec {
@@ -486,6 +520,10 @@ mod tests {
         message(libc::SOL_SOCKET, cmsg::SCM_TIMESTAMPING, &payload)
     }
 
+    fn sw(nanos: u64) -> KernelTimestamp {
+        KernelTimestamp { nanos, clock: KernelClock::Realtime }
+    }
+
     fn assert_rejected(buf: &[u8], len: usize) {
         assert!(extract_rx_timestamp(buf, len).is_none());
         assert!(extract_tx_timestamp(buf, len).is_none());
@@ -531,12 +569,9 @@ mod tests {
                 buf.extend(timestamp_message());
                 buf.extend(message(level, kind, &error));
                 let buf = &buf[prefix..];
-                assert_eq!(
-                    extract_rx_timestamp(buf, buf.len()).unwrap().hw_nanos(),
-                    Some(1_234_000_000_567)
-                );
+                assert_eq!(extract_rx_timestamp(buf, buf.len()).unwrap(), sw(1_234_000_000_567));
                 let (ts, id) = extract_tx_timestamp(buf, buf.len()).unwrap();
-                assert_eq!(ts.hw_nanos(), Some(1_234_000_000_567));
+                assert_eq!(ts, sw(1_234_000_000_567));
                 assert_eq!(id, 42);
             }
         }
@@ -578,14 +613,8 @@ mod tests {
             + mem::offset_of!(libc::timespec, tv_sec);
         put(&mut second, offset, &2345i64.to_ne_bytes());
         buf.extend(second);
-        assert_eq!(
-            extract_rx_timestamp(&buf, buf.len()).unwrap().hw_nanos(),
-            Some(1_234_000_000_567)
-        );
-        assert_eq!(
-            extract_tx_timestamp(&buf, buf.len()).unwrap().0.hw_nanos(),
-            Some(2_345_000_000_567)
-        );
+        assert_eq!(extract_rx_timestamp(&buf, buf.len()).unwrap(), sw(1_234_000_000_567));
+        assert_eq!(extract_tx_timestamp(&buf, buf.len()).unwrap().0, sw(2_345_000_000_567));
     }
 
     #[test]
@@ -610,6 +639,73 @@ mod tests {
         assert!(extract_rx_timestamp(&buf, buf.len()).is_some());
     }
 
+    /// Wait for the next TX timestamp on `fd`'s error queue
+    pub(crate) fn wait_tx_timestamp(fd: RawFd) -> (KernelTimestamp, u32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if let Some(stamp) = recv_tx_timestamp(fd).unwrap() {
+                return stamp;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("no TX timestamp within 5 s");
+    }
+
+    /// Pins what Linux reports with SOF_TIMESTAMPING_OPT_ID on TCP: the
+    /// counter starts at zero and each stamp's ID is the offset of the LAST
+    /// byte of the write (`seq + len - 1`), not the exclusive end.
+    /// Loopback generates software TX timestamps (loopback_xmit).
+    #[test]
+    fn loopback_tcp_opt_id_is_last_byte_offset() {
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        client.set_nodelay(true).unwrap();
+        let fd = client.as_raw_fd();
+        enable_software_timestamping(fd).unwrap();
+
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            client.write_all(&[0; 10]).unwrap();
+            let (ts, id) = wait_tx_timestamp(fd);
+            assert_eq!(ts.clock, KernelClock::Realtime);
+            ids.push(id);
+            server.read_exact(&mut [0; 10]).unwrap();
+        }
+        assert_eq!(ids, vec![9, 19]);
+        assert_eq!(recv_tx_timestamp(fd).unwrap(), None);
+    }
+
+    /// Pins what Linux reports with SOF_TIMESTAMPING_OPT_ID on UDP: one
+    /// stamp per datagram, IDs counting datagrams from zero.
+    #[test]
+    fn loopback_udp_opt_id_counts_datagrams() {
+        use std::os::fd::AsRawFd;
+        let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let fd = client.as_raw_fd();
+        enable_software_timestamping(fd).unwrap();
+
+        let mut ids = Vec::new();
+        for len in [10, 10, 3] {
+            client.send_to(&vec![0; len], server.local_addr().unwrap()).unwrap();
+            let (ts, id) = wait_tx_timestamp(fd);
+            assert_eq!(ts.clock, KernelClock::Realtime);
+            ids.push(id);
+        }
+        assert_eq!(ids, vec![0, 1, 2]);
+        assert_eq!(recv_tx_timestamp(fd).unwrap(), None);
+    }
+
+    #[test]
+    fn loopback_has_no_hardware_timestamping() {
+        // lo has no PHC: either the driver rejects the query or reports it off
+        assert!(!nic_timestamping_enabled("lo").unwrap_or(false));
+        assert!(nic_timestamping_enabled("xylem-no-such-if").is_err());
+    }
+
     #[test]
     fn test_scm_timestamping_best() {
         let mut scm = ScmTimestamping::default();
@@ -617,14 +713,18 @@ mod tests {
         // No timestamps
         assert!(scm.best_timestamp().is_none());
 
+        // The legacy transformed hardware slot is ignored
+        scm.ts[1].tv_sec = 3000;
+        assert!(scm.best_timestamp().is_none());
+
         // Software timestamp
         scm.ts[0].tv_sec = 1000;
         scm.ts[0].tv_nsec = 500;
-        assert_eq!(scm.best_timestamp(), Some((1000, 500)));
+        assert_eq!(scm.best_timestamp(), Some((1000, 500, KernelClock::Realtime)));
 
         // HW raw takes precedence
         scm.ts[2].tv_sec = 2000;
         scm.ts[2].tv_nsec = 1000;
-        assert_eq!(scm.best_timestamp(), Some((2000, 1000)));
+        assert_eq!(scm.best_timestamp(), Some((2000, 1000, KernelClock::NicHardware)));
     }
 }

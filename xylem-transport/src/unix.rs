@@ -2,15 +2,12 @@
 //!
 //! This transport uses Unix domain sockets for local inter-process communication.
 //!
-//! This module provides two APIs:
-//! - `UnixTransport`: Single-connection API (one multiplexer per connection)
-//! - `UnixConnectionGroup`: Multi-connection API (one multiplexer per group)
-//!
-//! Note: Unix sockets use file paths, not network addresses. The ConnectionGroup API
-//! uses `add_connection_path()` instead of `add_connection()`.
+//! `UnixConnectionGroup` manages many Unix stream connections behind one
+//! multiplexer. Unix sockets use file paths, not network addresses, so
+//! connections are added with `add_connection_path()` instead of
+//! `add_connection()`.
 
 use crate::group::{GroupCore, GroupSocket};
-use crate::mux::{Interest, Multiplexer, MultiplexerType};
 use crate::{
     ConnectionGroup, Error, RecvOutcome, Result, SendReceipt, Timestamp, TransportFactory,
 };
@@ -18,129 +15,8 @@ use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
-
-const DEFAULT_RECV_BUFFER_SIZE: usize = 8192;
-
-/// Unix domain socket transport
-pub struct UnixTransport {
-    stream: Option<UnixStream>,
-    path: Option<PathBuf>,
-    mux: Multiplexer,
-    recv_buffer: Vec<u8>,
-}
-
-impl UnixTransport {
-    pub fn new() -> Self {
-        Self::with_multiplexer(MultiplexerType::default())
-    }
-
-    pub fn with_multiplexer(mux_type: MultiplexerType) -> Self {
-        Self {
-            stream: None,
-            path: None,
-            mux: Multiplexer::new(mux_type).expect("Failed to create multiplexer"),
-            recv_buffer: vec![0u8; DEFAULT_RECV_BUFFER_SIZE],
-        }
-    }
-
-    /// Connect to a Unix domain socket at the given path
-    pub fn connect_path<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
-        let path = path.as_ref();
-
-        let stream = UnixStream::connect(path)?;
-        stream.set_nonblocking(true)?;
-
-        self.mux.register_fd(&stream, 0, Interest::BOTH)?;
-
-        // Wait for connection to be established
-        for _ in 0..50 {
-            let events = self.mux.wait(Some(Duration::from_millis(100)))?;
-
-            let connected = events.iter().any(|e| e.id == 0 && e.writable);
-            if !connected {
-                continue;
-            }
-
-            self.mux.modify_fd(&stream, 0, Interest::READABLE)?;
-            self.stream = Some(stream);
-            self.path = Some(path.to_path_buf());
-            return Ok(());
-        }
-
-        // Timeout - deregister before returning error
-        let _ = self.mux.deregister_fd(&stream);
-        Err(Error::Connection("Connection timeout".to_string()))
-    }
-
-    /// Send data and return timestamp
-    pub fn send(&mut self, data: &[u8]) -> Result<Timestamp> {
-        let stream = self
-            .stream
-            .as_mut()
-            .ok_or_else(|| Error::Connection("Not connected".to_string()))?;
-
-        let mut total_written = 0;
-        while total_written < data.len() {
-            match stream.write(&data[total_written..]) {
-                Ok(n) => total_written += n,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    std::hint::spin_loop();
-                    continue;
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-
-        Ok(Timestamp::now())
-    }
-
-    /// Receive data and return timestamp
-    pub fn recv(&mut self) -> Result<(Vec<u8>, Timestamp)> {
-        let stream = self
-            .stream
-            .as_mut()
-            .ok_or_else(|| Error::Connection("Not connected".to_string()))?;
-
-        match stream.read(&mut self.recv_buffer) {
-            Ok(0) => Err(Error::Connection("Connection closed by peer".to_string())),
-            Ok(n) => {
-                let timestamp = Timestamp::now();
-                let data = self.recv_buffer[..n].to_vec();
-                Ok((data, timestamp))
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok((Vec::new(), Timestamp::now())),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    /// Check if there is data ready to read
-    pub fn poll_readable(&mut self) -> Result<bool> {
-        let events = self.mux.wait(Some(Duration::ZERO))?;
-        Ok(!events.is_empty())
-    }
-
-    /// Close the connection
-    pub fn close(&mut self) -> Result<()> {
-        if let Some(stream) = self.stream.take() {
-            let _ = self.mux.deregister_fd(&stream);
-        }
-        self.path = None;
-        Ok(())
-    }
-
-    /// Get the path this transport is connected to
-    pub fn path(&self) -> Option<&Path> {
-        self.path.as_deref()
-    }
-}
-
-impl Default for UnixTransport {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 // =============================================================================
 // Connection Group API
@@ -150,17 +26,11 @@ impl Default for UnixTransport {
 pub(crate) struct UnixConn {
     stream: UnixStream,
     connected: bool,
-    /// TX byte counter for timestamp correlation (monotonically increasing)
-    tx_byte_counter: u32,
 }
 
 impl UnixConn {
     fn new(stream: UnixStream) -> Self {
-        Self {
-            stream,
-            connected: true,
-            tx_byte_counter: 0,
-        }
+        Self { stream, connected: true }
     }
 }
 
@@ -176,10 +46,6 @@ impl UnixConn {
             return Err(Error::Connection("Connection closed".to_string()));
         }
 
-        // Record TX byte range before send
-        let tx_start = self.tx_byte_counter;
-        let tx_end = tx_start.wrapping_add(data.len() as u32);
-
         let mut total_written = 0;
         while total_written < data.len() {
             match self.stream.write(&data[total_written..]) {
@@ -192,13 +58,8 @@ impl UnixConn {
             }
         }
 
-        // Update byte counter and capture software timestamp
-        self.tx_byte_counter = tx_end;
-        Ok(SendReceipt {
-            timestamp: Timestamp::now(),
-            tx_start,
-            tx_end,
-        })
+        // Unix sockets report no TX timestamps
+        Ok(SendReceipt { timestamp: Timestamp::now(), tx: None })
     }
 
     fn recv(&mut self, buf: &mut [u8]) -> Result<RecvOutcome> {
@@ -226,11 +87,7 @@ pub struct UnixConnectionGroup {
 
 impl UnixConnectionGroup {
     pub fn new() -> Result<Self> {
-        Self::with_multiplexer(MultiplexerType::default())
-    }
-
-    pub fn with_multiplexer(mux_type: MultiplexerType) -> Result<Self> {
-        Ok(Self { core: GroupCore::new(mux_type)? })
+        Ok(Self { core: GroupCore::new()? })
     }
 
     /// Add a connection by Unix socket path
@@ -290,22 +147,17 @@ impl ConnectionGroup for UnixConnectionGroup {
 }
 
 /// Factory for creating Unix socket connection groups
+///
+/// Construct it with `UnixTransportFactory::default()`.
 #[derive(Clone, Copy, Default)]
-pub struct UnixTransportFactory {
-    mux_type: MultiplexerType,
-}
-
-impl UnixTransportFactory {
-    pub fn new(mux_type: MultiplexerType) -> Self {
-        Self { mux_type }
-    }
-}
+#[non_exhaustive]
+pub struct UnixTransportFactory;
 
 impl TransportFactory for UnixTransportFactory {
     type Group = UnixConnectionGroup;
 
     fn create_group(&self) -> Result<Self::Group> {
-        UnixConnectionGroup::with_multiplexer(self.mux_type)
+        UnixConnectionGroup::new()
     }
 }
 
@@ -316,153 +168,6 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::thread;
     use tempfile::TempDir;
-
-    #[test]
-    fn test_unix_connect() {
-        let temp_dir = TempDir::new().unwrap();
-        let socket_path = temp_dir.path().join("test.sock");
-
-        let server_path = socket_path.clone();
-        let listener = UnixListener::bind(&server_path).unwrap();
-
-        thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
-            let mut buf = vec![0u8; 1024];
-            loop {
-                let n = socket.read(&mut buf).unwrap_or(0);
-                if n == 0 {
-                    break;
-                }
-                socket.write_all(&buf[..n]).unwrap();
-            }
-        });
-
-        thread::sleep(Duration::from_millis(10));
-
-        let mut transport = UnixTransport::new();
-        assert!(transport.connect_path(&socket_path).is_ok());
-        assert_eq!(transport.path(), Some(socket_path.as_path()));
-    }
-
-    #[test]
-    fn test_unix_send_recv() {
-        let temp_dir = TempDir::new().unwrap();
-        let socket_path = temp_dir.path().join("echo.sock");
-
-        let server_path = socket_path.clone();
-        let listener = UnixListener::bind(&server_path).unwrap();
-
-        thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
-            let mut buf = vec![0u8; 1024];
-            loop {
-                let n = socket.read(&mut buf).unwrap_or(0);
-                if n == 0 {
-                    break;
-                }
-                socket.write_all(&buf[..n]).unwrap();
-            }
-        });
-
-        thread::sleep(Duration::from_millis(10));
-
-        let mut transport = UnixTransport::new();
-        transport.connect_path(&socket_path).unwrap();
-
-        let test_data = b"Hello, Unix!";
-        let send_ts = transport.send(test_data).unwrap();
-
-        thread::sleep(Duration::from_millis(10));
-
-        for _ in 0..100 {
-            if transport.poll_readable().unwrap() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(1));
-        }
-
-        let (recv_data, recv_ts) = transport.recv().unwrap();
-        assert_eq!(recv_data, test_data);
-        assert!(recv_ts.cycles() >= send_ts.cycles());
-    }
-
-    #[test]
-    fn test_unix_send_without_connect() {
-        let mut transport = UnixTransport::new();
-        let result = transport.send(b"test");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_unix_recv_without_connect() {
-        let mut transport = UnixTransport::new();
-        let result = transport.recv();
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_unix_close() {
-        let temp_dir = TempDir::new().unwrap();
-        let socket_path = temp_dir.path().join("close.sock");
-
-        let server_path = socket_path.clone();
-        let listener = UnixListener::bind(&server_path).unwrap();
-
-        thread::spawn(move || {
-            let _ = listener.accept();
-        });
-
-        thread::sleep(Duration::from_millis(10));
-
-        let mut transport = UnixTransport::new();
-        transport.connect_path(&socket_path).unwrap();
-        assert!(transport.close().is_ok());
-        assert!(transport.stream.is_none());
-        assert!(transport.path.is_none());
-    }
-
-    #[test]
-    fn test_unix_multiple_messages() {
-        let temp_dir = TempDir::new().unwrap();
-        let socket_path = temp_dir.path().join("multi.sock");
-
-        let server_path = socket_path.clone();
-        let listener = UnixListener::bind(&server_path).unwrap();
-
-        thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
-            let mut buf = vec![0u8; 1024];
-            loop {
-                let n = socket.read(&mut buf).unwrap_or(0);
-                if n == 0 {
-                    break;
-                }
-                socket.write_all(&buf[..n]).unwrap();
-            }
-        });
-
-        thread::sleep(Duration::from_millis(10));
-
-        let mut transport = UnixTransport::new();
-        transport.connect_path(&socket_path).unwrap();
-
-        for i in 0..5 {
-            let test_data = format!("Message {}", i);
-            transport.send(test_data.as_bytes()).unwrap();
-
-            thread::sleep(Duration::from_millis(5));
-
-            for _ in 0..100 {
-                if transport.poll_readable().unwrap() {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(1));
-            }
-
-            let (recv_data, _) = transport.recv().unwrap();
-            assert_eq!(recv_data, test_data.as_bytes());
-        }
-    }
 
     // =========================================================================
     // Connection Group Tests
@@ -676,6 +381,39 @@ mod tests {
 
         assert!(matches!(group.recv(99, &mut buf), Err(Error::Connection(_))));
         assert!(matches!(group.send(99, b"x"), Err(Error::Connection(_))));
+    }
+
+    #[test]
+    fn test_unix_group_echoes_messages_in_order() {
+        let temp_dir = TempDir::new().unwrap();
+        let socket_path = temp_dir.path().join("multi_group.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = vec![0u8; 1024];
+            while let Ok(n) = socket.read(&mut buf) {
+                if n == 0 || socket.write_all(&buf[..n]).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let mut group = UnixConnectionGroup::new().unwrap();
+        let conn_id = group.add_connection_path(&socket_path).unwrap();
+        let mut buf = vec![0u8; 1024];
+        let mut ready = Vec::new();
+        for i in 0..5 {
+            let message = format!("Message {i}");
+            let receipt = group.send(conn_id, message.as_bytes()).unwrap();
+            group.poll(Duration::from_secs(1), &mut ready).unwrap();
+            assert_eq!(ready, vec![conn_id]);
+            let RecvOutcome::Data { len, timestamp } = group.recv(conn_id, &mut buf).unwrap()
+            else {
+                panic!("expected data");
+            };
+            assert_eq!(&buf[..len], message.as_bytes());
+            assert!(timestamp.cycles() >= receipt.timestamp.cycles());
+        }
     }
 
     #[test]

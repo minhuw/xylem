@@ -7,8 +7,8 @@
 //! This module also holds the kernel timestamping configuration used by the
 //! TCP and UDP groups (Linux only).
 
-use crate::mux::{Interest, Multiplexer, MultiplexerType};
-use crate::{Error, Result};
+use crate::mux::{Interest, Multiplexer};
+use crate::{Error, Result, TxRange};
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::Duration;
@@ -18,97 +18,204 @@ use crate::{hw_timestamp, TxTimestampInfo};
 #[cfg(target_os = "linux")]
 use std::io;
 
+/// Source of the timestamps a connection group reports (Linux only)
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimestampSource {
+    /// NIC hardware timestamps (`SO_TIMESTAMPING` raw hardware), TX and RX
+    Hardware,
+    /// Kernel software timestamps (`SO_TIMESTAMPING` software), TX and RX
+    KernelSoftware,
+    /// User-space cycle counts only: no `SO_TIMESTAMPING`, no error queue
+    UserSpace,
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for TimestampSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            TimestampSource::Hardware => "hardware",
+            TimestampSource::KernelSoftware => "kernel software",
+            TimestampSource::UserSpace => "user-space",
+        })
+    }
+}
+
 /// Configuration for TCP and UDP timestamping (Linux only)
 ///
-/// On Linux, this configures kernel-level timestamping for more accurate
-/// latency measurement. Falls back to software timestamps if HW not available.
-///
-/// By default, kernel timestamps are enabled on Linux.
+/// A group uses NIC hardware timestamps only when `interface` is set and
+/// that interface has hardware timestamping switched on (checked once per
+/// group with `SIOCGHWTSTAMP`). Otherwise it uses kernel software
+/// timestamps if `software_timestamps` is set, and user-space timestamps by
+/// default. See [`TimestampSource`].
 #[derive(Debug, Clone)]
 pub struct TimestampConfig {
-    /// Network interface to bind to for hardware timestamping (e.g., "eth0")
-    /// If None, no interface binding is performed.
+    /// Network interface to bind to and take hardware timestamps from (e.g., "eth0")
+    /// If None, no interface binding is performed and no hardware timestamps are used.
     #[cfg(target_os = "linux")]
     pub interface: Option<String>,
 
-    /// Whether to enable kernel timestamping on sockets
-    /// When true, uses SO_TIMESTAMPING for RX timestamps
+    /// Whether kernel timestamping may be used at all
     /// Default: true on Linux
     #[cfg(target_os = "linux")]
     pub enable_timestamps: bool,
+
+    /// Use kernel software timestamps when hardware timestamps are not in effect
+    /// Default: false (user-space timestamps)
+    #[cfg(target_os = "linux")]
+    pub software_timestamps: bool,
 }
 
+// Not derivable on Linux, where the fields have non-default defaults
+#[allow(clippy::derivable_impls)]
 impl Default for TimestampConfig {
     fn default() -> Self {
         Self {
             #[cfg(target_os = "linux")]
             interface: None,
             #[cfg(target_os = "linux")]
-            enable_timestamps: true, // Enable by default on Linux
+            enable_timestamps: true,
+            #[cfg(target_os = "linux")]
+            software_timestamps: false,
         }
     }
 }
 
 impl TimestampConfig {
-    /// Create config with timestamping enabled (no interface binding)
+    /// Create the default config: hardware timestamps only with an interface
     #[cfg(target_os = "linux")]
     pub fn with_timestamps() -> Self {
-        Self { interface: None, enable_timestamps: true }
+        Self::default()
     }
 
-    /// Create config with timestamping and interface binding
+    /// Create config with interface binding and its hardware timestamps
     #[cfg(target_os = "linux")]
     pub fn with_interface(interface: impl Into<String>) -> Self {
         Self {
             interface: Some(interface.into()),
-            enable_timestamps: true,
+            ..Self::default()
         }
     }
 
-    /// Configure kernel timestamping on a socket (Linux only)
+    /// Create config that uses kernel software timestamps (no interface binding)
+    #[cfg(target_os = "linux")]
+    pub fn with_software_timestamps() -> Self {
+        Self {
+            software_timestamps: true,
+            ..Self::default()
+        }
+    }
+
+    /// Decide the timestamp source for a new group and log it at info level
     ///
-    /// Tries hardware timestamping first, falls back to software if unavailable.
-    /// Returns true if any form of kernel timestamping was enabled.
     /// `transport` names the transport in log messages (e.g., "TCP").
     #[cfg(target_os = "linux")]
-    pub(crate) fn configure_timestamping(
+    pub(crate) fn resolve_source(&self, transport: &str) -> TimestampSource {
+        let hardware = match (&self.interface, self.enable_timestamps) {
+            (Some(interface), true) => match hw_timestamp::nic_timestamping_enabled(interface) {
+                Ok(true) => true,
+                Ok(false) => {
+                    tracing::warn!(
+                        "Hardware timestamping is not enabled on '{}'; not using it",
+                        interface
+                    );
+                    false
+                }
+                Err(e) => {
+                    tracing::warn!("{}; not using hardware timestamps", e);
+                    false
+                }
+            },
+            _ => false,
+        };
+        let source = if hardware {
+            TimestampSource::Hardware
+        } else if self.enable_timestamps && self.software_timestamps {
+            TimestampSource::KernelSoftware
+        } else {
+            TimestampSource::UserSpace
+        };
+        tracing::info!("{} connection group timestamp source: {}", transport, source);
+        source
+    }
+
+    /// Bind a new socket to the interface and enable `source` on it (Linux only)
+    ///
+    /// Returns true if kernel timestamping is enabled on the socket.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn configure_socket(
         &self,
         fd: RawFd,
+        source: TimestampSource,
         transport: &str,
         conn_id: usize,
     ) -> bool {
-        // Bind to interface if specified
-        if let Some(ref interface) = self.interface {
+        if let (Some(interface), true) = (&self.interface, self.enable_timestamps) {
             if let Err(e) = hw_timestamp::bind_to_device(fd, interface) {
                 tracing::warn!("Could not bind to device '{}': {}", interface, e);
             }
         }
 
-        // Try hardware timestamping first
-        if hw_timestamp::enable_socket_timestamping(fd).is_ok() {
-            tracing::debug!(
-                "Hardware timestamping enabled for {} connection {}",
-                transport,
-                conn_id
-            );
-            return true;
-        }
-
-        // Fallback to software timestamps
-        tracing::debug!("Hardware timestamping not available, trying software");
-        match hw_timestamp::enable_software_timestamping(fd) {
-            Ok(()) => {
-                tracing::debug!(
-                    "Software timestamping enabled for {} connection {}",
-                    transport,
-                    conn_id
-                );
-                true
-            }
+        let result = match source {
+            TimestampSource::Hardware => hw_timestamp::enable_socket_timestamping(fd),
+            TimestampSource::KernelSoftware => hw_timestamp::enable_software_timestamping(fd),
+            TimestampSource::UserSpace => return false,
+        };
+        match result {
+            Ok(()) => true,
             Err(e) => {
-                tracing::warn!("Could not enable kernel timestamping: {}", e);
+                tracing::warn!(
+                    "Could not enable {} timestamps on {} connection {}: {}",
+                    source,
+                    transport,
+                    conn_id,
+                    e
+                );
                 false
             }
+        }
+    }
+}
+
+/// Wrapping less-than for u32 counters (valid while they differ by < 2^31)
+#[cfg(target_os = "linux")]
+fn wrapping_lt(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) < 0
+}
+
+/// Send counter correlating kernel TX timestamps with sends
+///
+/// Counts in the units of the kernel's `SOF_TIMESTAMPING_OPT_ID` counter:
+/// bytes for TCP, datagrams for UDP. Both start at zero when timestamping is
+/// enabled, before the first send.
+#[derive(Debug, Default)]
+pub(crate) struct TxCounter {
+    /// Exclusive end of everything sent so far
+    sent: u32,
+    /// Highest exclusive end that a received TX timestamp covered
+    #[cfg(target_os = "linux")]
+    stamped: u32,
+}
+
+impl TxCounter {
+    /// Count `units` more sent; returns their range
+    pub(crate) fn advance(&mut self, units: u32) -> TxRange {
+        let start = self.sent;
+        self.sent = start.wrapping_add(units);
+        TxRange { start, end: self.sent }
+    }
+
+    /// Whether some send has not been covered by a TX timestamp yet
+    #[cfg(target_os = "linux")]
+    fn pending(&self) -> bool {
+        self.stamped != self.sent
+    }
+
+    /// Note a TX timestamp covering up to `end` (exclusive)
+    #[cfg(target_os = "linux")]
+    fn on_stamp(&mut self, end: u32) {
+        if wrapping_lt(self.stamped, end) {
+            self.stamped = end;
         }
     }
 }
@@ -118,12 +225,12 @@ pub(crate) trait GroupSocket {
     /// The file descriptor registered with the group's multiplexer
     fn socket_fd(&self) -> RawFd;
 
-    /// Whether kernel timestamping is enabled on the socket (Linux only)
+    /// The TX counter, when kernel TX timestamps are enabled on the socket
     ///
     /// Connections without kernel timestamping (Unix sockets) keep the default.
     #[cfg(target_os = "linux")]
-    fn timestamps_enabled(&self) -> bool {
-        false
+    fn tx_counter(&mut self) -> Option<&mut TxCounter> {
+        None
     }
 }
 
@@ -136,14 +243,19 @@ pub(crate) struct GroupCore<C> {
     mux: Multiplexer,
     connections: HashMap<usize, C>,
     next_id: usize,
+    /// Number of connections with kernel TX timestamps enabled
+    #[cfg(target_os = "linux")]
+    tx_stamping: usize,
 }
 
 impl<C: GroupSocket> GroupCore<C> {
-    pub(crate) fn new(mux_type: MultiplexerType) -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         Ok(Self {
-            mux: Multiplexer::new(mux_type)?,
+            mux: Multiplexer::new()?,
             connections: HashMap::new(),
             next_id: 0,
+            #[cfg(target_os = "linux")]
+            tx_stamping: 0,
         })
     }
 
@@ -160,7 +272,7 @@ impl<C: GroupSocket> GroupCore<C> {
     /// mixing connection events with other connections in the group. Does not
     /// check the socket for a connection error.
     pub(crate) fn wait_for_connect<S: AsRawFd>(&self, socket: &S) -> Result<()> {
-        let mut temp_mux = Multiplexer::new(self.mux.mux_type())?;
+        let mut temp_mux = Multiplexer::new()?;
         temp_mux.register_fd(socket, 0, Interest::BOTH)?;
 
         // Poll for connection complete
@@ -187,7 +299,13 @@ impl<C: GroupSocket> GroupCore<C> {
     }
 
     /// Start tracking a connection whose socket is already registered
-    pub(crate) fn insert(&mut self, conn_id: usize, conn: C) {
+    // Only Linux reads the TX counter
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    pub(crate) fn insert(&mut self, conn_id: usize, mut conn: C) {
+        #[cfg(target_os = "linux")]
+        if conn.tx_counter().is_some() {
+            self.tx_stamping += 1;
+        }
         self.connections.insert(conn_id, conn);
     }
 
@@ -218,25 +336,43 @@ impl<C: GroupSocket> GroupCore<C> {
     }
 
     /// Drain TX timestamps from the error queue of every connection with
-    /// kernel timestamping enabled (Linux only, non-blocking)
+    /// sends not yet covered by one (Linux only, non-blocking)
     ///
-    /// `transport` names the transport in log messages (e.g., "TCP").
+    /// Normalises the kernel's `SOF_TIMESTAMPING_OPT_ID` value to the
+    /// exclusive end of what the stamp covers: Linux reports the offset of
+    /// the last byte for TCP and the datagram index for UDP, so both become
+    /// `ee_data + 1`, comparable with `SendReceipt::tx`'s `end`.
+    ///
+    /// `cumulative` is passed through to `TxTimestampInfo`; `transport`
+    /// names the transport in log messages (e.g., "TCP").
     #[cfg(target_os = "linux")]
-    pub(crate) fn poll_tx_timestamps(&self, transport: &str, out: &mut Vec<TxTimestampInfo>) {
+    pub(crate) fn poll_tx_timestamps(
+        &mut self,
+        cumulative: bool,
+        transport: &str,
+        out: &mut Vec<TxTimestampInfo>,
+    ) {
         out.clear();
+        if self.tx_stamping == 0 {
+            return;
+        }
 
-        for (&conn_id, conn) in &self.connections {
-            if !conn.timestamps_enabled() {
+        for (&conn_id, conn) in &mut self.connections {
+            let fd = conn.socket_fd();
+            let Some(counter) = conn.tx_counter() else {
+                continue;
+            };
+            if !counter.pending() {
                 continue;
             }
-
-            let fd = conn.socket_fd();
 
             // Poll error queue for TX timestamps (non-blocking)
             loop {
                 match hw_timestamp::recv_tx_timestamp(fd) {
                     Ok(Some((timestamp, opt_id))) => {
-                        out.push(TxTimestampInfo { conn_id, tx_offset: opt_id, timestamp });
+                        let tx_end = opt_id.wrapping_add(1);
+                        counter.on_stamp(tx_end);
+                        out.push(TxTimestampInfo { conn_id, tx_end, cumulative, timestamp });
                     }
                     Ok(None) => break, // No more timestamps available
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -259,9 +395,14 @@ impl<C: GroupSocket> GroupCore<C> {
     }
 
     /// Close a connection, deregistering its socket before it is dropped
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     pub(crate) fn close(&mut self, conn_id: usize) -> Result<()> {
-        if let Some(conn) = self.connections.remove(&conn_id) {
+        if let Some(mut conn) = self.connections.remove(&conn_id) {
             let _ = self.mux.deregister(conn.socket_fd());
+            #[cfg(target_os = "linux")]
+            if conn.tx_counter().is_some() {
+                self.tx_stamping -= 1;
+            }
         }
         Ok(())
     }
