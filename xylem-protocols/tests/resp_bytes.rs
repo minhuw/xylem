@@ -1,6 +1,7 @@
 //! Exact RESP request bytes and request ids for the Redis encoder: every
-//! `RedisOp` variant, command templates, random data, key prefixes and the
-//! insert phase.
+//! `RedisOp` variant, command templates (including templates for commands
+//! without a variant), random data, key prefixes and the insert phase, and
+//! framing of the replies those commands receive.
 
 use xylem_protocols::workload::KeyGeneration;
 use xylem_protocols::{
@@ -89,6 +90,11 @@ fn first_template_bytes(template: &str) -> Vec<u8> {
     first_op_bytes(RedisOp::Custom(CommandTemplate::parse(template).unwrap()))
 }
 
+/// A custom command from `source`.
+fn template(source: &str) -> RedisOp {
+    RedisOp::Custom(CommandTemplate::parse(source).unwrap())
+}
+
 /// Maps every `RedisOp` variant to the test that pins its request bytes. The
 /// match has no wildcard arm, so adding a variant fails to compile until it is
 /// mapped to a test here. It is only compiled, never called.
@@ -98,9 +104,7 @@ fn bytes_test_for(op: &RedisOp) -> fn() {
         RedisOp::Get => get_request_bytes,
         RedisOp::Set => set_request_bytes,
         RedisOp::Incr => incr_request_bytes,
-        RedisOp::Del => del_request_bytes,
         RedisOp::MGet { .. } => mget_request_bytes,
-        RedisOp::MSet { .. } => mset_request_bytes,
         RedisOp::Wait { .. } => wait_request_bytes,
         RedisOp::Auth { .. } => auth_request_bytes,
         RedisOp::SelectDb { .. } => select_db_request_bytes,
@@ -108,35 +112,10 @@ fn bytes_test_for(op: &RedisOp) -> fn() {
         RedisOp::SetEx { .. } => setex_request_bytes,
         RedisOp::SetRange { .. } => setrange_request_bytes,
         RedisOp::GetRange { .. } => getrange_request_bytes,
-        RedisOp::ClusterSlots => cluster_slots_request_bytes,
         RedisOp::Scan { .. } => scan_request_bytes,
         RedisOp::Multi => multi_request_bytes,
         RedisOp::Exec => exec_request_bytes,
         RedisOp::Discard => discard_request_bytes,
-        RedisOp::LPush => lpush_request_bytes,
-        RedisOp::RPush => rpush_request_bytes,
-        RedisOp::LPop => lpop_request_bytes,
-        RedisOp::RPop => rpop_request_bytes,
-        RedisOp::LRange { .. } => lrange_request_bytes,
-        RedisOp::LLen => llen_request_bytes,
-        RedisOp::SAdd => sadd_request_bytes,
-        RedisOp::SRem => srem_request_bytes,
-        RedisOp::SMembers => smembers_request_bytes,
-        RedisOp::SIsMember => sismember_request_bytes,
-        RedisOp::SPop { .. } => spop_request_bytes,
-        RedisOp::SCard => scard_request_bytes,
-        RedisOp::ZAdd { .. } => zadd_request_bytes,
-        RedisOp::ZRem => zrem_request_bytes,
-        RedisOp::ZRange { .. } => zrange_request_bytes,
-        RedisOp::ZRangeByScore { .. } => zrangebyscore_request_bytes,
-        RedisOp::ZScore => zscore_request_bytes,
-        RedisOp::ZCard => zcard_request_bytes,
-        RedisOp::HSet { .. } => hset_request_bytes,
-        RedisOp::HGet { .. } => hget_request_bytes,
-        RedisOp::HMSet { .. } => hmset_request_bytes,
-        RedisOp::HMGet { .. } => hmget_request_bytes,
-        RedisOp::HGetAll => hgetall_request_bytes,
-        RedisOp::HDel { .. } => hdel_request_bytes,
         RedisOp::Custom(_) => custom_request_bytes,
     }
 }
@@ -180,18 +159,6 @@ fn incr_request_bytes() {
 }
 
 #[test]
-fn del_request_bytes() {
-    assert_op_requests(
-        RedisOp::Del,
-        [
-            b"*2\r\n$3\r\nDEL\r\n$5\r\nkey:7\r\n",
-            b"*2\r\n$3\r\nDEL\r\n$5\r\nkey:8\r\n",
-            b"*2\r\n$3\r\nDEL\r\n$5\r\nkey:9\r\n",
-        ],
-    );
-}
-
-#[test]
 fn mget_request_bytes() {
     // Each request reads `count` consecutive keys starting at the drawn key.
     assert_op_requests(
@@ -220,36 +187,6 @@ fn mget_keys_saturate_at_u64_max() {
               $24\r\nkey:18446744073709551614\r\n\
               $24\r\nkey:18446744073709551615\r\n\
               $24\r\nkey:18446744073709551615\r\n"
-                .to_vec(),
-            (0, 0),
-        ),
-    );
-}
-
-#[test]
-fn mset_request_bytes() {
-    // Each request writes `count` consecutive keys starting at the drawn key.
-    assert_op_requests(
-        RedisOp::MSet { count: 2 },
-        [
-            b"*5\r\n$4\r\nMSET\r\n$5\r\nkey:7\r\n$3\r\nxxx\r\n$5\r\nkey:8\r\n$3\r\nxxx\r\n",
-            b"*5\r\n$4\r\nMSET\r\n$5\r\nkey:8\r\n$3\r\nxxx\r\n$5\r\nkey:9\r\n$3\r\nxxx\r\n",
-            b"*5\r\n$4\r\nMSET\r\n$5\r\nkey:9\r\n$3\r\nxxx\r\n$6\r\nkey:10\r\n$3\r\nxxx\r\n",
-        ],
-    );
-    assert_bytes(&first_op_bytes(RedisOp::MSet { count: 0 }), b"*1\r\n$4\r\nMSET\r\n");
-}
-
-#[test]
-fn mset_keys_saturate_at_u64_max() {
-    let mut protocol = protocol_with_prefix(RedisOp::MSet { count: 2 }, "key:");
-    let request = protocol.generate_request_with_key(0, u64::MAX, 3);
-    assert_request(
-        request,
-        Request::measurement(
-            b"*5\r\n$4\r\nMSET\r\n\
-              $24\r\nkey:18446744073709551615\r\n$3\r\nxxx\r\n\
-              $24\r\nkey:18446744073709551615\r\n$3\r\nxxx\r\n"
                 .to_vec(),
             (0, 0),
         ),
@@ -379,18 +316,6 @@ fn getrange_request_bytes() {
 }
 
 #[test]
-fn cluster_slots_request_bytes() {
-    assert_op_requests(
-        RedisOp::ClusterSlots,
-        [
-            b"*2\r\n$7\r\nCLUSTER\r\n$5\r\nSLOTS\r\n",
-            b"*2\r\n$7\r\nCLUSTER\r\n$5\r\nSLOTS\r\n",
-            b"*2\r\n$7\r\nCLUSTER\r\n$5\r\nSLOTS\r\n",
-        ],
-    );
-}
-
-#[test]
 fn scan_request_bytes() {
     assert_op_requests(
         RedisOp::Scan { cursor: 0, count: None, pattern: None },
@@ -456,334 +381,6 @@ fn discard_request_bytes() {
 }
 
 #[test]
-fn lpush_request_bytes() {
-    assert_op_requests(
-        RedisOp::LPush,
-        [
-            b"*3\r\n$5\r\nLPUSH\r\n$10\r\nkey:list:7\r\n$3\r\nxxx\r\n",
-            b"*3\r\n$5\r\nLPUSH\r\n$10\r\nkey:list:8\r\n$3\r\nxxx\r\n",
-            b"*3\r\n$5\r\nLPUSH\r\n$10\r\nkey:list:9\r\n$3\r\nxxx\r\n",
-        ],
-    );
-}
-
-#[test]
-fn rpush_request_bytes() {
-    assert_op_requests(
-        RedisOp::RPush,
-        [
-            b"*3\r\n$5\r\nRPUSH\r\n$10\r\nkey:list:7\r\n$3\r\nxxx\r\n",
-            b"*3\r\n$5\r\nRPUSH\r\n$10\r\nkey:list:8\r\n$3\r\nxxx\r\n",
-            b"*3\r\n$5\r\nRPUSH\r\n$10\r\nkey:list:9\r\n$3\r\nxxx\r\n",
-        ],
-    );
-}
-
-#[test]
-fn lpop_request_bytes() {
-    assert_op_requests(
-        RedisOp::LPop,
-        [
-            b"*2\r\n$4\r\nLPOP\r\n$10\r\nkey:list:7\r\n",
-            b"*2\r\n$4\r\nLPOP\r\n$10\r\nkey:list:8\r\n",
-            b"*2\r\n$4\r\nLPOP\r\n$10\r\nkey:list:9\r\n",
-        ],
-    );
-}
-
-#[test]
-fn rpop_request_bytes() {
-    assert_op_requests(
-        RedisOp::RPop,
-        [
-            b"*2\r\n$4\r\nRPOP\r\n$10\r\nkey:list:7\r\n",
-            b"*2\r\n$4\r\nRPOP\r\n$10\r\nkey:list:8\r\n",
-            b"*2\r\n$4\r\nRPOP\r\n$10\r\nkey:list:9\r\n",
-        ],
-    );
-}
-
-#[test]
-fn lrange_request_bytes() {
-    assert_op_requests(
-        RedisOp::LRange { start: 0, stop: -1 },
-        [
-            b"*4\r\n$6\r\nLRANGE\r\n$10\r\nkey:list:7\r\n$1\r\n0\r\n$2\r\n-1\r\n",
-            b"*4\r\n$6\r\nLRANGE\r\n$10\r\nkey:list:8\r\n$1\r\n0\r\n$2\r\n-1\r\n",
-            b"*4\r\n$6\r\nLRANGE\r\n$10\r\nkey:list:9\r\n$1\r\n0\r\n$2\r\n-1\r\n",
-        ],
-    );
-    assert_bytes(
-        &first_op_bytes(RedisOp::LRange { start: -10, stop: 25 }),
-        b"*4\r\n$6\r\nLRANGE\r\n$10\r\nkey:list:7\r\n$3\r\n-10\r\n$2\r\n25\r\n",
-    );
-}
-
-#[test]
-fn llen_request_bytes() {
-    assert_op_requests(
-        RedisOp::LLen,
-        [
-            b"*2\r\n$4\r\nLLEN\r\n$10\r\nkey:list:7\r\n",
-            b"*2\r\n$4\r\nLLEN\r\n$10\r\nkey:list:8\r\n",
-            b"*2\r\n$4\r\nLLEN\r\n$10\r\nkey:list:9\r\n",
-        ],
-    );
-}
-
-#[test]
-fn sadd_request_bytes() {
-    assert_op_requests(
-        RedisOp::SAdd,
-        [
-            b"*3\r\n$4\r\nSADD\r\n$9\r\nkey:set:7\r\n$8\r\nmember:7\r\n",
-            b"*3\r\n$4\r\nSADD\r\n$9\r\nkey:set:8\r\n$8\r\nmember:8\r\n",
-            b"*3\r\n$4\r\nSADD\r\n$9\r\nkey:set:9\r\n$8\r\nmember:9\r\n",
-        ],
-    );
-}
-
-#[test]
-fn srem_request_bytes() {
-    assert_op_requests(
-        RedisOp::SRem,
-        [
-            b"*3\r\n$4\r\nSREM\r\n$9\r\nkey:set:7\r\n$8\r\nmember:7\r\n",
-            b"*3\r\n$4\r\nSREM\r\n$9\r\nkey:set:8\r\n$8\r\nmember:8\r\n",
-            b"*3\r\n$4\r\nSREM\r\n$9\r\nkey:set:9\r\n$8\r\nmember:9\r\n",
-        ],
-    );
-}
-
-#[test]
-fn smembers_request_bytes() {
-    assert_op_requests(
-        RedisOp::SMembers,
-        [
-            b"*2\r\n$8\r\nSMEMBERS\r\n$9\r\nkey:set:7\r\n",
-            b"*2\r\n$8\r\nSMEMBERS\r\n$9\r\nkey:set:8\r\n",
-            b"*2\r\n$8\r\nSMEMBERS\r\n$9\r\nkey:set:9\r\n",
-        ],
-    );
-}
-
-#[test]
-fn sismember_request_bytes() {
-    assert_op_requests(
-        RedisOp::SIsMember,
-        [
-            b"*3\r\n$9\r\nSISMEMBER\r\n$9\r\nkey:set:7\r\n$8\r\nmember:7\r\n",
-            b"*3\r\n$9\r\nSISMEMBER\r\n$9\r\nkey:set:8\r\n$8\r\nmember:8\r\n",
-            b"*3\r\n$9\r\nSISMEMBER\r\n$9\r\nkey:set:9\r\n$8\r\nmember:9\r\n",
-        ],
-    );
-}
-
-#[test]
-fn spop_request_bytes() {
-    assert_op_requests(
-        RedisOp::SPop { count: None },
-        [
-            b"*2\r\n$4\r\nSPOP\r\n$9\r\nkey:set:7\r\n",
-            b"*2\r\n$4\r\nSPOP\r\n$9\r\nkey:set:8\r\n",
-            b"*2\r\n$4\r\nSPOP\r\n$9\r\nkey:set:9\r\n",
-        ],
-    );
-    assert_bytes(
-        &first_op_bytes(RedisOp::SPop { count: Some(2) }),
-        b"*3\r\n$4\r\nSPOP\r\n$9\r\nkey:set:7\r\n$1\r\n2\r\n",
-    );
-}
-
-#[test]
-fn scard_request_bytes() {
-    assert_op_requests(
-        RedisOp::SCard,
-        [
-            b"*2\r\n$5\r\nSCARD\r\n$9\r\nkey:set:7\r\n",
-            b"*2\r\n$5\r\nSCARD\r\n$9\r\nkey:set:8\r\n",
-            b"*2\r\n$5\r\nSCARD\r\n$9\r\nkey:set:9\r\n",
-        ],
-    );
-}
-
-#[test]
-fn zadd_request_bytes() {
-    assert_op_requests(
-        RedisOp::ZAdd { score: 1.5 },
-        [
-            b"*4\r\n$4\r\nZADD\r\n$10\r\nkey:zset:7\r\n$3\r\n1.5\r\n$8\r\nmember:7\r\n",
-            b"*4\r\n$4\r\nZADD\r\n$10\r\nkey:zset:8\r\n$3\r\n1.5\r\n$8\r\nmember:8\r\n",
-            b"*4\r\n$4\r\nZADD\r\n$10\r\nkey:zset:9\r\n$3\r\n1.5\r\n$8\r\nmember:9\r\n",
-        ],
-    );
-    // Whole-number scores have no fractional part.
-    assert_bytes(
-        &first_op_bytes(RedisOp::ZAdd { score: 2.0 }),
-        b"*4\r\n$4\r\nZADD\r\n$10\r\nkey:zset:7\r\n$1\r\n2\r\n$8\r\nmember:7\r\n",
-    );
-    assert_bytes(
-        &first_op_bytes(RedisOp::ZAdd { score: -0.25 }),
-        b"*4\r\n$4\r\nZADD\r\n$10\r\nkey:zset:7\r\n$5\r\n-0.25\r\n$8\r\nmember:7\r\n",
-    );
-}
-
-#[test]
-fn zrem_request_bytes() {
-    assert_op_requests(
-        RedisOp::ZRem,
-        [
-            b"*3\r\n$4\r\nZREM\r\n$10\r\nkey:zset:7\r\n$8\r\nmember:7\r\n",
-            b"*3\r\n$4\r\nZREM\r\n$10\r\nkey:zset:8\r\n$8\r\nmember:8\r\n",
-            b"*3\r\n$4\r\nZREM\r\n$10\r\nkey:zset:9\r\n$8\r\nmember:9\r\n",
-        ],
-    );
-}
-
-#[test]
-fn zrange_request_bytes() {
-    assert_op_requests(
-        RedisOp::ZRange { start: 0, stop: -1, with_scores: false },
-        [
-            b"*4\r\n$6\r\nZRANGE\r\n$10\r\nkey:zset:7\r\n$1\r\n0\r\n$2\r\n-1\r\n",
-            b"*4\r\n$6\r\nZRANGE\r\n$10\r\nkey:zset:8\r\n$1\r\n0\r\n$2\r\n-1\r\n",
-            b"*4\r\n$6\r\nZRANGE\r\n$10\r\nkey:zset:9\r\n$1\r\n0\r\n$2\r\n-1\r\n",
-        ],
-    );
-    assert_bytes(
-        &first_op_bytes(RedisOp::ZRange { start: 0, stop: 9, with_scores: true }),
-        b"*5\r\n$6\r\nZRANGE\r\n$10\r\nkey:zset:7\r\n$1\r\n0\r\n$1\r\n9\r\n$10\r\nWITHSCORES\r\n",
-    );
-}
-
-#[test]
-fn zrangebyscore_request_bytes() {
-    assert_op_requests(
-        RedisOp::ZRangeByScore { min: 0.0, max: 100.5, with_scores: false },
-        [
-            b"*4\r\n$13\r\nZRANGEBYSCORE\r\n$10\r\nkey:zset:7\r\n$1\r\n0\r\n$5\r\n100.5\r\n",
-            b"*4\r\n$13\r\nZRANGEBYSCORE\r\n$10\r\nkey:zset:8\r\n$1\r\n0\r\n$5\r\n100.5\r\n",
-            b"*4\r\n$13\r\nZRANGEBYSCORE\r\n$10\r\nkey:zset:9\r\n$1\r\n0\r\n$5\r\n100.5\r\n",
-        ],
-    );
-    assert_bytes(
-        &first_op_bytes(RedisOp::ZRangeByScore {
-            min: f64::NEG_INFINITY,
-            max: f64::INFINITY,
-            with_scores: true,
-        }),
-        b"*5\r\n$13\r\nZRANGEBYSCORE\r\n$10\r\nkey:zset:7\r\n\
-          $4\r\n-inf\r\n$3\r\ninf\r\n$10\r\nWITHSCORES\r\n",
-    );
-}
-
-#[test]
-fn zscore_request_bytes() {
-    assert_op_requests(
-        RedisOp::ZScore,
-        [
-            b"*3\r\n$6\r\nZSCORE\r\n$10\r\nkey:zset:7\r\n$8\r\nmember:7\r\n",
-            b"*3\r\n$6\r\nZSCORE\r\n$10\r\nkey:zset:8\r\n$8\r\nmember:8\r\n",
-            b"*3\r\n$6\r\nZSCORE\r\n$10\r\nkey:zset:9\r\n$8\r\nmember:9\r\n",
-        ],
-    );
-}
-
-#[test]
-fn zcard_request_bytes() {
-    assert_op_requests(
-        RedisOp::ZCard,
-        [
-            b"*2\r\n$5\r\nZCARD\r\n$10\r\nkey:zset:7\r\n",
-            b"*2\r\n$5\r\nZCARD\r\n$10\r\nkey:zset:8\r\n",
-            b"*2\r\n$5\r\nZCARD\r\n$10\r\nkey:zset:9\r\n",
-        ],
-    );
-}
-
-#[test]
-fn hset_request_bytes() {
-    assert_op_requests(
-        RedisOp::HSet { field: "f1".to_string() },
-        [
-            b"*4\r\n$4\r\nHSET\r\n$10\r\nkey:hash:7\r\n$2\r\nf1\r\n$3\r\nxxx\r\n",
-            b"*4\r\n$4\r\nHSET\r\n$10\r\nkey:hash:8\r\n$2\r\nf1\r\n$3\r\nxxx\r\n",
-            b"*4\r\n$4\r\nHSET\r\n$10\r\nkey:hash:9\r\n$2\r\nf1\r\n$3\r\nxxx\r\n",
-        ],
-    );
-}
-
-#[test]
-fn hget_request_bytes() {
-    assert_op_requests(
-        RedisOp::HGet { field: "f1".to_string() },
-        [
-            b"*3\r\n$4\r\nHGET\r\n$10\r\nkey:hash:7\r\n$2\r\nf1\r\n",
-            b"*3\r\n$4\r\nHGET\r\n$10\r\nkey:hash:8\r\n$2\r\nf1\r\n",
-            b"*3\r\n$4\r\nHGET\r\n$10\r\nkey:hash:9\r\n$2\r\nf1\r\n",
-        ],
-    );
-}
-
-#[test]
-fn hmset_request_bytes() {
-    assert_op_requests(
-        RedisOp::HMSet { fields: vec!["a".to_string(), "bb".to_string()] },
-        [
-            b"*6\r\n$5\r\nHMSET\r\n$10\r\nkey:hash:7\r\n$1\r\na\r\n$3\r\nxxx\r\n$2\r\nbb\r\n$3\r\nxxx\r\n",
-            b"*6\r\n$5\r\nHMSET\r\n$10\r\nkey:hash:8\r\n$1\r\na\r\n$3\r\nxxx\r\n$2\r\nbb\r\n$3\r\nxxx\r\n",
-            b"*6\r\n$5\r\nHMSET\r\n$10\r\nkey:hash:9\r\n$1\r\na\r\n$3\r\nxxx\r\n$2\r\nbb\r\n$3\r\nxxx\r\n",
-        ],
-    );
-    assert_bytes(
-        &first_op_bytes(RedisOp::HMSet { fields: Vec::new() }),
-        b"*2\r\n$5\r\nHMSET\r\n$10\r\nkey:hash:7\r\n",
-    );
-}
-
-#[test]
-fn hmget_request_bytes() {
-    assert_op_requests(
-        RedisOp::HMGet {
-            fields: vec!["a".to_string(), "bb".to_string()],
-        },
-        [
-            b"*4\r\n$5\r\nHMGET\r\n$10\r\nkey:hash:7\r\n$1\r\na\r\n$2\r\nbb\r\n",
-            b"*4\r\n$5\r\nHMGET\r\n$10\r\nkey:hash:8\r\n$1\r\na\r\n$2\r\nbb\r\n",
-            b"*4\r\n$5\r\nHMGET\r\n$10\r\nkey:hash:9\r\n$1\r\na\r\n$2\r\nbb\r\n",
-        ],
-    );
-    assert_bytes(
-        &first_op_bytes(RedisOp::HMGet { fields: Vec::new() }),
-        b"*2\r\n$5\r\nHMGET\r\n$10\r\nkey:hash:7\r\n",
-    );
-}
-
-#[test]
-fn hgetall_request_bytes() {
-    assert_op_requests(
-        RedisOp::HGetAll,
-        [
-            b"*2\r\n$7\r\nHGETALL\r\n$10\r\nkey:hash:7\r\n",
-            b"*2\r\n$7\r\nHGETALL\r\n$10\r\nkey:hash:8\r\n",
-            b"*2\r\n$7\r\nHGETALL\r\n$10\r\nkey:hash:9\r\n",
-        ],
-    );
-}
-
-#[test]
-fn hdel_request_bytes() {
-    assert_op_requests(
-        RedisOp::HDel { field: "f1".to_string() },
-        [
-            b"*3\r\n$4\r\nHDEL\r\n$10\r\nkey:hash:7\r\n$2\r\nf1\r\n",
-            b"*3\r\n$4\r\nHDEL\r\n$10\r\nkey:hash:8\r\n$2\r\nf1\r\n",
-            b"*3\r\n$4\r\nHDEL\r\n$10\r\nkey:hash:9\r\n$2\r\nf1\r\n",
-        ],
-    );
-}
-
-#[test]
 fn custom_request_bytes() {
     assert_op_requests(
         RedisOp::Custom(CommandTemplate::parse("HSET myhash __key__ __data__").unwrap()),
@@ -793,6 +390,213 @@ fn custom_request_bytes() {
             b"*4\r\n$4\r\nHSET\r\n$6\r\nmyhash\r\n$5\r\nkey:9\r\n$3\r\nxxx\r\n",
         ],
     );
+}
+
+// Templates for commands without a RedisOp variant
+
+#[test]
+fn del_template_bytes() {
+    assert_op_requests(
+        template("DEL __key__"),
+        [
+            b"*2\r\n$3\r\nDEL\r\n$5\r\nkey:7\r\n",
+            b"*2\r\n$3\r\nDEL\r\n$5\r\nkey:8\r\n",
+            b"*2\r\n$3\r\nDEL\r\n$5\r\nkey:9\r\n",
+        ],
+    );
+}
+
+#[test]
+fn mset_template_bytes() {
+    assert_op_requests(
+        template("MSET __key__ __data__ other __data__"),
+        [
+            b"*5\r\n$4\r\nMSET\r\n$5\r\nkey:7\r\n$3\r\nxxx\r\n$5\r\nother\r\n$3\r\nxxx\r\n",
+            b"*5\r\n$4\r\nMSET\r\n$5\r\nkey:8\r\n$3\r\nxxx\r\n$5\r\nother\r\n$3\r\nxxx\r\n",
+            b"*5\r\n$4\r\nMSET\r\n$5\r\nkey:9\r\n$3\r\nxxx\r\n$5\r\nother\r\n$3\r\nxxx\r\n",
+        ],
+    );
+}
+
+#[test]
+fn cluster_slots_template_bytes() {
+    assert_op_requests(
+        template("CLUSTER SLOTS"),
+        [
+            b"*2\r\n$7\r\nCLUSTER\r\n$5\r\nSLOTS\r\n",
+            b"*2\r\n$7\r\nCLUSTER\r\n$5\r\nSLOTS\r\n",
+            b"*2\r\n$7\r\nCLUSTER\r\n$5\r\nSLOTS\r\n",
+        ],
+    );
+}
+
+#[test]
+fn list_template_bytes() {
+    assert_op_requests(
+        template("LPUSH queue __data__"),
+        [
+            b"*3\r\n$5\r\nLPUSH\r\n$5\r\nqueue\r\n$3\r\nxxx\r\n",
+            b"*3\r\n$5\r\nLPUSH\r\n$5\r\nqueue\r\n$3\r\nxxx\r\n",
+            b"*3\r\n$5\r\nLPUSH\r\n$5\r\nqueue\r\n$3\r\nxxx\r\n",
+        ],
+    );
+    let cases: [(&str, &[u8]); 6] = [
+        ("LPUSH __key__ __data__", b"*3\r\n$5\r\nLPUSH\r\n$5\r\nkey:7\r\n$3\r\nxxx\r\n"),
+        ("RPUSH queue __data__", b"*3\r\n$5\r\nRPUSH\r\n$5\r\nqueue\r\n$3\r\nxxx\r\n"),
+        ("LPOP queue", b"*2\r\n$4\r\nLPOP\r\n$5\r\nqueue\r\n"),
+        ("RPOP queue", b"*2\r\n$4\r\nRPOP\r\n$5\r\nqueue\r\n"),
+        (
+            "LRANGE queue -10 25",
+            b"*4\r\n$6\r\nLRANGE\r\n$5\r\nqueue\r\n$3\r\n-10\r\n$2\r\n25\r\n",
+        ),
+        ("LLEN queue", b"*2\r\n$4\r\nLLEN\r\n$5\r\nqueue\r\n"),
+    ];
+    for (source, want) in cases {
+        assert_bytes(&first_template_bytes(source), want);
+    }
+}
+
+#[test]
+fn set_template_bytes() {
+    assert_op_requests(
+        template("SADD tags __key__"),
+        [
+            b"*3\r\n$4\r\nSADD\r\n$4\r\ntags\r\n$5\r\nkey:7\r\n",
+            b"*3\r\n$4\r\nSADD\r\n$4\r\ntags\r\n$5\r\nkey:8\r\n",
+            b"*3\r\n$4\r\nSADD\r\n$4\r\ntags\r\n$5\r\nkey:9\r\n",
+        ],
+    );
+    let cases: [(&str, &[u8]); 5] = [
+        ("SREM tags __key__", b"*3\r\n$4\r\nSREM\r\n$4\r\ntags\r\n$5\r\nkey:7\r\n"),
+        ("SMEMBERS tags", b"*2\r\n$8\r\nSMEMBERS\r\n$4\r\ntags\r\n"),
+        (
+            "SISMEMBER tags __key__",
+            b"*3\r\n$9\r\nSISMEMBER\r\n$4\r\ntags\r\n$5\r\nkey:7\r\n",
+        ),
+        ("SPOP tags 2", b"*3\r\n$4\r\nSPOP\r\n$4\r\ntags\r\n$1\r\n2\r\n"),
+        ("SCARD tags", b"*2\r\n$5\r\nSCARD\r\n$4\r\ntags\r\n"),
+    ];
+    for (source, want) in cases {
+        assert_bytes(&first_template_bytes(source), want);
+    }
+}
+
+#[test]
+fn sorted_set_template_bytes() {
+    assert_op_requests(
+        template("ZADD leaderboard 1.5 __key__"),
+        [
+            b"*4\r\n$4\r\nZADD\r\n$11\r\nleaderboard\r\n$3\r\n1.5\r\n$5\r\nkey:7\r\n",
+            b"*4\r\n$4\r\nZADD\r\n$11\r\nleaderboard\r\n$3\r\n1.5\r\n$5\r\nkey:8\r\n",
+            b"*4\r\n$4\r\nZADD\r\n$11\r\nleaderboard\r\n$3\r\n1.5\r\n$5\r\nkey:9\r\n",
+        ],
+    );
+    let cases: [(&str, &[u8]); 6] = [
+        // The value size can serve as the score.
+        (
+            "ZADD leaderboard __value_size__ __key__",
+            b"*4\r\n$4\r\nZADD\r\n$11\r\nleaderboard\r\n$1\r\n3\r\n$5\r\nkey:7\r\n",
+        ),
+        (
+            "ZREM leaderboard __key__",
+            b"*3\r\n$4\r\nZREM\r\n$11\r\nleaderboard\r\n$5\r\nkey:7\r\n",
+        ),
+        (
+            "ZRANGE leaderboard 0 9 WITHSCORES",
+            b"*5\r\n$6\r\nZRANGE\r\n$11\r\nleaderboard\r\n$1\r\n0\r\n$1\r\n9\r\n$10\r\nWITHSCORES\r\n",
+        ),
+        (
+            "ZRANGEBYSCORE leaderboard -inf +inf",
+            b"*4\r\n$13\r\nZRANGEBYSCORE\r\n$11\r\nleaderboard\r\n$4\r\n-inf\r\n$4\r\n+inf\r\n",
+        ),
+        (
+            "ZSCORE leaderboard __key__",
+            b"*3\r\n$6\r\nZSCORE\r\n$11\r\nleaderboard\r\n$5\r\nkey:7\r\n",
+        ),
+        ("ZCARD leaderboard", b"*2\r\n$5\r\nZCARD\r\n$11\r\nleaderboard\r\n"),
+    ];
+    for (source, want) in cases {
+        assert_bytes(&first_template_bytes(source), want);
+    }
+}
+
+#[test]
+fn hash_template_bytes() {
+    assert_op_requests(
+        template("HSET __key__ f __data__"),
+        [
+            b"*4\r\n$4\r\nHSET\r\n$5\r\nkey:7\r\n$1\r\nf\r\n$3\r\nxxx\r\n",
+            b"*4\r\n$4\r\nHSET\r\n$5\r\nkey:8\r\n$1\r\nf\r\n$3\r\nxxx\r\n",
+            b"*4\r\n$4\r\nHSET\r\n$5\r\nkey:9\r\n$1\r\nf\r\n$3\r\nxxx\r\n",
+        ],
+    );
+    let cases: [(&str, &[u8]); 6] = [
+        // The key can also be a field of one shared hash.
+        (
+            "HSET users __key__ __data__",
+            b"*4\r\n$4\r\nHSET\r\n$5\r\nusers\r\n$5\r\nkey:7\r\n$3\r\nxxx\r\n",
+        ),
+        (
+            "HSET __key__ a __data__ bb __data__",
+            b"*6\r\n$4\r\nHSET\r\n$5\r\nkey:7\r\n$1\r\na\r\n$3\r\nxxx\r\n$2\r\nbb\r\n$3\r\nxxx\r\n",
+        ),
+        ("HGET __key__ f", b"*3\r\n$4\r\nHGET\r\n$5\r\nkey:7\r\n$1\r\nf\r\n"),
+        (
+            "HMGET __key__ a bb",
+            b"*4\r\n$5\r\nHMGET\r\n$5\r\nkey:7\r\n$1\r\na\r\n$2\r\nbb\r\n",
+        ),
+        ("HGETALL __key__", b"*2\r\n$7\r\nHGETALL\r\n$5\r\nkey:7\r\n"),
+        ("HDEL __key__ f", b"*3\r\n$4\r\nHDEL\r\n$5\r\nkey:7\r\n$1\r\nf\r\n"),
+    ];
+    for (source, want) in cases {
+        assert_bytes(&first_template_bytes(source), want);
+    }
+}
+
+// Replies to template commands
+
+#[test]
+fn template_replies_frame_through_the_generic_parser() {
+    let replies: [(&str, &[u8]); 10] = [
+        ("integer (DEL, LPUSH, SADD, ZADD, HSET)", b":1\r\n"),
+        ("bulk string (HGET, LPOP)", b"$3\r\nxxx\r\n"),
+        ("array (LRANGE, SMEMBERS, HGETALL)", b"*2\r\n$1\r\na\r\n$2\r\nbb\r\n"),
+        (
+            "nested array (CLUSTER SLOTS)",
+            b"*1\r\n*3\r\n:0\r\n:16383\r\n*3\r\n$9\r\n127.0.0.1\r\n:6379\r\n$2\r\nid\r\n",
+        ),
+        (
+            "RESP3 nested pairs (ZRANGE WITHSCORES)",
+            b"*2\r\n*2\r\n$1\r\na\r\n,1.5\r\n*2\r\n$2\r\nbb\r\n,2\r\n",
+        ),
+        ("empty array (SMEMBERS of a missing key)", b"*0\r\n"),
+        ("nil bulk string (HGET of a missing field)", b"$-1\r\n"),
+        ("nil array (LPOP with count on a missing key)", b"*-1\r\n"),
+        ("RESP3 null (ZSCORE of a missing member)", b"_\r\n"),
+        ("RESP3 map (HGETALL)", b"%1\r\n$1\r\nf\r\n$3\r\nxxx\r\n"),
+    ];
+    let mut protocol = protocol_with_prefix(template("DEL __key__"), "key:");
+    // Pipelined replies are consumed one frame at a time, in order.
+    let stream: Vec<u8> = replies.iter().flat_map(|(_, frame)| frame.iter().copied()).collect();
+    let mut offset = 0;
+    for (seq, (what, frame)) in replies.iter().enumerate() {
+        // A truncated frame is not a reply yet.
+        let partial = &stream[offset..offset + frame.len() - 1];
+        assert_eq!(protocol.parse_response(0, partial).unwrap(), (0, None), "partial {what}");
+        let got = protocol.parse_response(0, &stream[offset..]).unwrap();
+        assert_eq!(got, (frame.len(), Some((0, seq as u64))), "{what}");
+        offset += frame.len();
+    }
+    assert_eq!(offset, stream.len());
+
+    // An error reply, such as WRONGTYPE from mixing types on one key, is an error.
+    let err = protocol
+        .parse_response(
+            0,
+            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("WRONGTYPE"), "{err}");
 }
 
 // Value sizes and protocol defaults
@@ -1005,26 +809,27 @@ fn random_data_on_fills_every_value_argument_from_the_first_draw() {
             RedisOp::SetRange { offset: 12 },
             b"*4\r\n$8\r\nSETRANGE\r\n$5\r\nkey:7\r\n$2\r\n12\r\n$8\r\nm>}bkX,Y\r\n",
         ),
-        // One value is drawn and repeated for every key.
-        (
-            RedisOp::MSet { count: 2 },
-            b"*5\r\n$4\r\nMSET\r\n$5\r\nkey:7\r\n$8\r\nm>}bkX,Y\r\n$5\r\nkey:8\r\n$8\r\nm>}bkX,Y\r\n",
-        ),
-        (RedisOp::LPush, b"*3\r\n$5\r\nLPUSH\r\n$10\r\nkey:list:7\r\n$8\r\nm>}bkX,Y\r\n"),
-        (RedisOp::RPush, b"*3\r\n$5\r\nRPUSH\r\n$10\r\nkey:list:7\r\n$8\r\nm>}bkX,Y\r\n"),
-        (
-            RedisOp::HSet { field: "f1".to_string() },
-            b"*4\r\n$4\r\nHSET\r\n$10\r\nkey:hash:7\r\n$2\r\nf1\r\n$8\r\nm>}bkX,Y\r\n",
-        ),
-        // One value is drawn and repeated for every field.
-        (
-            RedisOp::HMSet { fields: vec!["a".to_string(), "bb".to_string()] },
-            b"*6\r\n$5\r\nHMSET\r\n$10\r\nkey:hash:7\r\n\
-              $1\r\na\r\n$8\r\nm>}bkX,Y\r\n$2\r\nbb\r\n$8\r\nm>}bkX,Y\r\n",
-        ),
         (
             RedisOp::Custom(CommandTemplate::parse("APPEND __key__ __data__").unwrap()),
             b"*3\r\n$6\r\nAPPEND\r\n$5\r\nkey:7\r\n$8\r\nm>}bkX,Y\r\n",
+        ),
+        (
+            template("LPUSH queue __data__"),
+            b"*3\r\n$5\r\nLPUSH\r\n$5\r\nqueue\r\n$8\r\nm>}bkX,Y\r\n",
+        ),
+        (
+            template("HSET __key__ f1 __data__"),
+            b"*4\r\n$4\r\nHSET\r\n$5\r\nkey:7\r\n$2\r\nf1\r\n$8\r\nm>}bkX,Y\r\n",
+        ),
+        // One value is drawn and repeated for every __data__.
+        (
+            template("MSET __key__ __data__ other __data__"),
+            b"*5\r\n$4\r\nMSET\r\n$5\r\nkey:7\r\n$8\r\nm>}bkX,Y\r\n$5\r\nother\r\n$8\r\nm>}bkX,Y\r\n",
+        ),
+        (
+            template("HSET __key__ a __data__ bb __data__"),
+            b"*6\r\n$4\r\nHSET\r\n$5\r\nkey:7\r\n\
+              $1\r\na\r\n$8\r\nm>}bkX,Y\r\n$2\r\nbb\r\n$8\r\nm>}bkX,Y\r\n",
         ),
     ];
     for (op, want) in cases {
@@ -1039,7 +844,6 @@ fn random_data_on_value_free_ops_do_not_draw() {
     let value_free_ops = vec![
         RedisOp::Get,
         RedisOp::Incr,
-        RedisOp::Del,
         RedisOp::MGet { count: 2 },
         RedisOp::Wait { num_replicas: 1, timeout_ms: 500 },
         RedisOp::Auth {
@@ -1049,31 +853,10 @@ fn random_data_on_value_free_ops_do_not_draw() {
         RedisOp::SelectDb { db: 0 },
         RedisOp::Hello { version: 3 },
         RedisOp::GetRange { offset: 0, end: -1 },
-        RedisOp::ClusterSlots,
         RedisOp::Scan { cursor: 0, count: None, pattern: None },
         RedisOp::Multi,
         RedisOp::Exec,
         RedisOp::Discard,
-        RedisOp::LPop,
-        RedisOp::RPop,
-        RedisOp::LRange { start: 0, stop: -1 },
-        RedisOp::LLen,
-        RedisOp::SAdd,
-        RedisOp::SRem,
-        RedisOp::SMembers,
-        RedisOp::SIsMember,
-        RedisOp::SPop { count: None },
-        RedisOp::SCard,
-        RedisOp::ZAdd { score: 1.5 },
-        RedisOp::ZRem,
-        RedisOp::ZRange { start: 0, stop: -1, with_scores: false },
-        RedisOp::ZRangeByScore { min: 0.0, max: 100.5, with_scores: false },
-        RedisOp::ZScore,
-        RedisOp::ZCard,
-        RedisOp::HGet { field: "f1".to_string() },
-        RedisOp::HMGet { fields: vec!["a".to_string()] },
-        RedisOp::HGetAll,
-        RedisOp::HDel { field: "f1".to_string() },
     ];
     // A SET after a value-free operation still gets the first value of the stream.
     let set: &[u8] = b"*3\r\n$3\r\nSET\r\n$5\r\nkey:7\r\n$8\r\nm>}bkX,Y\r\n";
@@ -1113,27 +896,25 @@ fn key_prefix_applies_to_every_key_argument() {
             b"*3\r\n$4\r\nMGET\r\n$6\r\nuser:7\r\n$6\r\nuser:8\r\n",
         ),
         (
-            RedisOp::MSet { count: 2 },
-            b"*5\r\n$4\r\nMSET\r\n$6\r\nuser:7\r\n$3\r\nxxx\r\n$6\r\nuser:8\r\n$3\r\nxxx\r\n",
-        ),
-        (
             RedisOp::SetEx { ttl_seconds: 60 },
             b"*4\r\n$5\r\nSETEX\r\n$6\r\nuser:7\r\n$2\r\n60\r\n$3\r\nxxx\r\n",
-        ),
-        (RedisOp::LPush, b"*3\r\n$5\r\nLPUSH\r\n$11\r\nuser:list:7\r\n$3\r\nxxx\r\n"),
-        // Members are not prefixed.
-        (RedisOp::SAdd, b"*3\r\n$4\r\nSADD\r\n$10\r\nuser:set:7\r\n$8\r\nmember:7\r\n"),
-        (
-            RedisOp::ZAdd { score: 1.5 },
-            b"*4\r\n$4\r\nZADD\r\n$11\r\nuser:zset:7\r\n$3\r\n1.5\r\n$8\r\nmember:7\r\n",
-        ),
-        (
-            RedisOp::HSet { field: "f1".to_string() },
-            b"*4\r\n$4\r\nHSET\r\n$11\r\nuser:hash:7\r\n$2\r\nf1\r\n$3\r\nxxx\r\n",
         ),
         (
             RedisOp::Custom(CommandTemplate::parse("GET __key__").unwrap()),
             b"*2\r\n$3\r\nGET\r\n$6\r\nuser:7\r\n",
+        ),
+        // Every __key__ is prefixed; literal collection names and fields are not.
+        (
+            template("MSET __key__ __data__ other __data__"),
+            b"*5\r\n$4\r\nMSET\r\n$6\r\nuser:7\r\n$3\r\nxxx\r\n$5\r\nother\r\n$3\r\nxxx\r\n",
+        ),
+        (
+            template("SADD tags __key__"),
+            b"*3\r\n$4\r\nSADD\r\n$4\r\ntags\r\n$6\r\nuser:7\r\n",
+        ),
+        (
+            template("HSET __key__ f1 __data__"),
+            b"*4\r\n$4\r\nHSET\r\n$6\r\nuser:7\r\n$2\r\nf1\r\n$3\r\nxxx\r\n",
         ),
     ];
     for (op, want) in cases {
@@ -1144,17 +925,18 @@ fn key_prefix_applies_to_every_key_argument() {
 }
 
 #[test]
-fn empty_key_prefix_leaves_bare_keys_and_type_prefixes() {
+fn empty_key_prefix_leaves_bare_keys() {
     let cases: Vec<(RedisOp, &[u8])> = vec![
         (RedisOp::Get, b"*2\r\n$3\r\nGET\r\n$1\r\n7\r\n"),
-        (RedisOp::LPush, b"*3\r\n$5\r\nLPUSH\r\n$6\r\nlist:7\r\n$3\r\nxxx\r\n"),
-        (RedisOp::SCard, b"*2\r\n$5\r\nSCARD\r\n$5\r\nset:7\r\n"),
-        (RedisOp::ZCard, b"*2\r\n$5\r\nZCARD\r\n$6\r\nzset:7\r\n"),
-        (RedisOp::HGetAll, b"*2\r\n$7\r\nHGETALL\r\n$6\r\nhash:7\r\n"),
         (
             RedisOp::Custom(CommandTemplate::parse("GET __key__").unwrap()),
             b"*2\r\n$3\r\nGET\r\n$1\r\n7\r\n",
         ),
+        (
+            template("LPUSH __key__ __data__"),
+            b"*3\r\n$5\r\nLPUSH\r\n$1\r\n7\r\n$3\r\nxxx\r\n",
+        ),
+        (template("HGETALL __key__"), b"*2\r\n$7\r\nHGETALL\r\n$1\r\n7\r\n"),
     ];
     for (op, want) in cases {
         let name = op.name();
@@ -1168,12 +950,12 @@ fn multibyte_key_prefix_lengths_count_bytes() {
     let get = [b"*2\r\n$3\r\nGET\r\n$10\r\n".as_slice(), "ключ:7".as_bytes(), b"\r\n"].concat();
     assert_bytes(&first_prefixed_bytes(RedisOp::Get, "ключ:"), &get);
     let lpush = [
-        b"*3\r\n$5\r\nLPUSH\r\n$15\r\n".as_slice(),
-        "ключ:list:7".as_bytes(),
+        b"*3\r\n$5\r\nLPUSH\r\n$10\r\n".as_slice(),
+        "ключ:7".as_bytes(),
         b"\r\n$3\r\nxxx\r\n",
     ]
     .concat();
-    assert_bytes(&first_prefixed_bytes(RedisOp::LPush, "ключ:"), &lpush);
+    assert_bytes(&first_prefixed_bytes(template("LPUSH __key__ __data__"), "ключ:"), &lpush);
 }
 
 // Other request paths

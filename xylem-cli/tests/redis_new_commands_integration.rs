@@ -10,7 +10,7 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use xylem_protocols::redis::{RedisOp, RedisProtocol};
-use xylem_protocols::{FixedCommandSelector, Protocol};
+use xylem_protocols::{CommandTemplate, FixedCommandSelector, Protocol};
 
 mod common;
 
@@ -339,9 +339,10 @@ fn test_cluster_slots_non_cluster() {
 
     println!("Testing CLUSTER SLOTS on non-cluster Redis...");
 
-    // CLUSTER SLOTS on non-cluster Redis should return error
-    let mut slots_protocol =
-        RedisProtocol::new(Box::new(FixedCommandSelector::new(RedisOp::ClusterSlots)));
+    // CLUSTER SLOTS, sent through a custom command template, should return an
+    // error on non-cluster Redis
+    let slots = RedisOp::Custom(CommandTemplate::parse("CLUSTER SLOTS").unwrap());
+    let mut slots_protocol = RedisProtocol::new(Box::new(FixedCommandSelector::new(slots)));
 
     let response = send_command_and_read_response(&mut slots_protocol, "127.0.0.1:6379", 0, 1, 64)
         .expect("CLUSTER SLOTS command failed to send");
