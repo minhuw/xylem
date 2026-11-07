@@ -185,6 +185,10 @@ impl ConnectionGroup for UdpConnectionGroup {
         self.core.conn_mut(conn_id)?.send(data)
     }
 
+    fn is_datagram(&self) -> bool {
+        true
+    }
+
     fn recv(&mut self, conn_id: usize, buf: &mut [u8]) -> Result<RecvOutcome> {
         self.core.conn_mut(conn_id)?.recv(buf)
     }
@@ -266,6 +270,8 @@ mod tests {
         let group = group.unwrap();
         assert_eq!(group.len(), 0);
         assert!(group.is_empty());
+        assert!(group.is_datagram());
+        assert!(!crate::TcpConnectionGroup::new().unwrap().is_datagram());
     }
 
     #[test]

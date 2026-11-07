@@ -2,7 +2,8 @@
 //!
 //! Implements the Memcached text protocol with GET and SET commands.
 
-use super::{next_conn_seq, InsertPhaseState};
+use super::udp::UdpFraming;
+use super::{frame_udp_request, next_conn_seq, parse_udp_response, InsertPhaseState};
 use crate::Protocol;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -22,6 +23,8 @@ pub struct MemcachedAsciiProtocol {
     key_prefix: String,
     /// Insert phase state
     insert_phase: Option<InsertPhaseState>,
+    /// UDP framing and reassembly; `None` over byte streams
+    udp: Option<UdpFraming>,
 }
 
 impl MemcachedAsciiProtocol {
@@ -34,6 +37,7 @@ impl MemcachedAsciiProtocol {
             value_size: 64,
             key_prefix: "key:".to_string(),
             insert_phase: None,
+            udp: None,
         }
     }
 
@@ -51,12 +55,19 @@ impl MemcachedAsciiProtocol {
             value_size,
             key_prefix: "key:".to_string(),
             insert_phase: None,
+            udp: None,
         }
     }
 
     /// Set the prefix used by all generated keys, including warmup requests.
     pub fn with_key_prefix(mut self, prefix: String) -> Self {
         self.key_prefix = prefix;
+        self
+    }
+
+    /// Frame requests and responses for UDP (memcached's 8-byte frame header)
+    pub fn with_udp_framing(mut self) -> Self {
+        self.udp = Some(UdpFraming::default());
         self
     }
 
@@ -105,6 +116,7 @@ impl Protocol for MemcachedAsciiProtocol {
                 let value_size = insert_state.value_size;
                 let seq = next_conn_seq(&mut self.conn_send_seq, conn_id);
                 let request_data = self.encode_set(key, value_size);
+                let request_data = frame_udp_request(seq, request_data, self.udp.as_ref());
                 return crate::Request::warmup(request_data, (conn_id, seq));
             }
         }
@@ -124,6 +136,7 @@ impl Protocol for MemcachedAsciiProtocol {
             }
             MemcachedOp::Set => self.encode_set(key, self.value_size),
         };
+        let request_data = frame_udp_request(seq, request_data, self.udp.as_ref());
         crate::Request::measurement(request_data, (conn_id, seq))
     }
 
@@ -132,41 +145,14 @@ impl Protocol for MemcachedAsciiProtocol {
         conn_id: usize,
         data: &[u8],
     ) -> Result<(usize, Option<Self::RequestId>)> {
-        let mut pos = 0;
-        loop {
-            let Some(line_end) = data[pos..].windows(2).position(|w| w == b"\r\n") else {
-                return Ok((0, None));
-            };
-            let line = &data[pos..pos + line_end];
-            pos += line_end + 2;
-            if line == b"END" || (pos == line_end + 2 && line == b"STORED") {
-                let seq = next_conn_seq(&mut self.conn_recv_seq, conn_id);
-                return Ok((pos, Some((conn_id, seq))));
-            }
-            if line == b"ERROR"
-                || line.starts_with(b"CLIENT_ERROR ")
-                || line.starts_with(b"SERVER_ERROR ")
-            {
-                anyhow::bail!("Memcached error: {}", String::from_utf8_lossy(line));
-            }
-            let header = std::str::from_utf8(line)?;
-            let fields: Vec<_> = header.split_whitespace().collect();
-            anyhow::ensure!(
-                fields.len() == 4 || fields.len() == 5,
-                "Invalid Memcached VALUE header"
-            );
-            anyhow::ensure!(fields[0] == "VALUE", "Unexpected Memcached response: {header}");
-            let length: usize = fields[3].parse()?;
-            let end = pos
-                .checked_add(length)
-                .and_then(|n| n.checked_add(2))
-                .ok_or_else(|| anyhow::anyhow!("Memcached value length overflow"))?;
-            if data.len() < end {
-                return Ok((0, None));
-            }
-            anyhow::ensure!(&data[end - 2..end] == b"\r\n", "Missing Memcached value terminator");
-            pos = end;
+        if let Some(framing) = &mut self.udp {
+            return parse_udp_response(framing, &self.conn_send_seq, conn_id, data, response_len);
         }
+        let Some(len) = response_len(data)? else {
+            return Ok((0, None));
+        };
+        let seq = next_conn_seq(&mut self.conn_recv_seq, conn_id);
+        Ok((len, Some((conn_id, seq))))
     }
 
     fn name(&self) -> &'static str {
@@ -179,5 +165,44 @@ impl Protocol for MemcachedAsciiProtocol {
         if let Some(ref mut key_gen) = self.key_gen {
             key_gen.reset();
         }
+        if let Some(framing) = &mut self.udp {
+            framing.reset();
+        }
+    }
+}
+
+/// Length of the complete response at the start of `data`, `None` if it is
+/// incomplete
+fn response_len(data: &[u8]) -> Result<Option<usize>> {
+    let mut pos = 0;
+    loop {
+        let Some(line_end) = data[pos..].windows(2).position(|w| w == b"\r\n") else {
+            return Ok(None);
+        };
+        let line = &data[pos..pos + line_end];
+        pos += line_end + 2;
+        if line == b"END" || (pos == line_end + 2 && line == b"STORED") {
+            return Ok(Some(pos));
+        }
+        if line == b"ERROR"
+            || line.starts_with(b"CLIENT_ERROR ")
+            || line.starts_with(b"SERVER_ERROR ")
+        {
+            anyhow::bail!("Memcached error: {}", String::from_utf8_lossy(line));
+        }
+        let header = std::str::from_utf8(line)?;
+        let fields: Vec<_> = header.split_whitespace().collect();
+        anyhow::ensure!(fields.len() == 4 || fields.len() == 5, "Invalid Memcached VALUE header");
+        anyhow::ensure!(fields[0] == "VALUE", "Unexpected Memcached response: {header}");
+        let length: usize = fields[3].parse()?;
+        let end = pos
+            .checked_add(length)
+            .and_then(|n| n.checked_add(2))
+            .ok_or_else(|| anyhow::anyhow!("Memcached value length overflow"))?;
+        if data.len() < end {
+            return Ok(None);
+        }
+        anyhow::ensure!(&data[end - 2..end] == b"\r\n", "Missing Memcached value terminator");
+        pos = end;
     }
 }

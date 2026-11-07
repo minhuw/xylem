@@ -35,6 +35,13 @@ pub struct TrafficGroupConfig {
     /// Maximum pending requests per connection
     #[serde(default = "default_max_pending")]
     pub max_pending_per_connection: usize,
+    /// How long a request may wait for its response before it times out,
+    /// frees its pipeline slot, and counts as timed out without a latency
+    /// (e.g., "500ms"). Only for transport "udp", where it defaults to 1s;
+    /// stream transports retransmit and never time out requests.
+    #[serde(default, with = "humantime_serde", skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
+    pub request_timeout: Option<Duration>,
     /// Traffic policy configuration (rate control)
     pub traffic_policy: PolicyConfig,
     /// Latency sampling policy
@@ -49,6 +56,18 @@ pub struct TrafficGroupConfig {
 
 fn default_transport() -> String {
     "tcp".to_string()
+}
+
+/// Request timeout of a UDP traffic group that sets none
+pub const DEFAULT_UDP_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
+
+impl TrafficGroupConfig {
+    /// The request timeout in effect: the configured one, else
+    /// [`DEFAULT_UDP_REQUEST_TIMEOUT`] for transport "udp", else none
+    pub fn effective_request_timeout(&self) -> Option<Duration> {
+        self.request_timeout
+            .or((self.transport == "udp").then_some(DEFAULT_UDP_REQUEST_TIMEOUT))
+    }
 }
 
 fn default_max_pending() -> usize {
@@ -361,6 +380,7 @@ mod tests {
             threads: vec![0, 1, 2],
             connections_per_thread: 10,
             max_pending_per_connection: 5,
+            request_timeout: None,
             traffic_policy: PolicyConfig::ClosedLoop,
             sampling_policy: SamplingPolicy::default(),
             protocol_config: None,
@@ -385,6 +405,7 @@ mod tests {
                 threads: vec![0, 1],
                 connections_per_thread: 5,
                 max_pending_per_connection: 1,
+                request_timeout: None,
                 traffic_policy: PolicyConfig::Poisson { rate: 1000.0 },
                 sampling_policy: SamplingPolicy::Unlimited,
                 protocol_config: Some(serde_json::json!({
@@ -399,6 +420,7 @@ mod tests {
                 threads: vec![2, 3, 4],
                 connections_per_thread: 20,
                 max_pending_per_connection: 32,
+                request_timeout: None,
                 traffic_policy: PolicyConfig::ClosedLoop,
                 sampling_policy: SamplingPolicy::Limited { max_samples: 10_000, rate: 0.01 },
                 protocol_config: Some(serde_json::json!({
@@ -434,6 +456,7 @@ mod tests {
                 threads: vec![0, 1],
                 connections_per_thread: 5,
                 max_pending_per_connection: 1,
+                request_timeout: None,
                 traffic_policy: PolicyConfig::ClosedLoop,
                 sampling_policy: SamplingPolicy::default(),
                 protocol_config: None,
@@ -446,6 +469,7 @@ mod tests {
                 threads: vec![2],
                 connections_per_thread: 10,
                 max_pending_per_connection: 1,
+                request_timeout: None,
                 traffic_policy: PolicyConfig::ClosedLoop,
                 sampling_policy: SamplingPolicy::default(),
                 protocol_config: None,
@@ -468,6 +492,7 @@ mod tests {
                 threads: vec![2, 3], // Pin to cores 2, 3
                 connections_per_thread: 5,
                 max_pending_per_connection: 1,
+                request_timeout: None,
                 traffic_policy: PolicyConfig::ClosedLoop,
                 sampling_policy: SamplingPolicy::default(),
                 protocol_config: None,
@@ -480,6 +505,7 @@ mod tests {
                 threads: vec![5], // Pin to core 5
                 connections_per_thread: 10,
                 max_pending_per_connection: 1,
+                request_timeout: None,
                 traffic_policy: PolicyConfig::ClosedLoop,
                 sampling_policy: SamplingPolicy::default(),
                 protocol_config: None,

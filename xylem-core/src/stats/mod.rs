@@ -47,8 +47,12 @@ pub trait StatsRecorder: Send {
     /// intended send time (`None` for a closed-loop request)
     fn record_sent(&mut self, _group_id: usize, _connection_id: usize, _lag: Option<Duration>) {}
 
-    /// Record measurement requests still pending when the drain deadline passed
+    /// Record measurement requests that timed out: their request timeout
+    /// expired, or they were still pending when the drain deadline passed
     fn record_timed_out(&mut self, _group_id: usize, _connection_id: usize, _count: u64) {}
+
+    /// Record responses that arrived after their measurement request timed out
+    fn record_late_responses(&mut self, _group_id: usize, _connection_id: usize, _count: u64) {}
 
     /// Record measurement requests pending on a connection that closed or failed
     fn record_failed(&mut self, _group_id: usize, _connection_id: usize, _count: u64) {}
@@ -89,6 +93,10 @@ impl StatsRecorder for TupleStatsCollector {
 
     fn record_timed_out(&mut self, group_id: usize, _connection_id: usize, count: u64) {
         self.request_counts_mut(group_id).timed_out += count;
+    }
+
+    fn record_late_responses(&mut self, group_id: usize, _connection_id: usize, count: u64) {
+        self.request_counts_mut(group_id).late_responses += count;
     }
 
     fn record_failed(&mut self, group_id: usize, _connection_id: usize, count: u64) {

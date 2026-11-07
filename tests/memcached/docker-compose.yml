@@ -2,5 +2,8 @@ services:
   memcached:
     image: memcached:1-alpine
     container_name: xylem-test-memcached
+    # memcached >= 1.5.6 disables UDP by default; -U turns it on at the TCP port
+    command: ["-U", "11211"]
     ports:
       - "127.0.0.1:11211:11211"
+      - "127.0.0.1:11211:11211/udp"

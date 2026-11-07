@@ -306,6 +306,8 @@ impl ProfileConfig {
                 );
             };
 
+            validate_udp(group, protocol, i)?;
+
             if group.threads.is_empty() {
                 bail!("Traffic group {} '{}' must have at least one thread", i, group.name);
             }
@@ -385,12 +387,12 @@ impl ProfileConfig {
             // Parse protocol_config once as the appropriate typed struct.
             // This validates the structure, provides better error messages,
             // and gives workers the config they build protocols from.
-            protocol_configs.push(parse_protocol_config(
-                protocol,
-                group.protocol_config.as_ref(),
-                i,
-                &group.name,
-            )?);
+            let protocol_config =
+                parse_protocol_config(protocol, group.protocol_config.as_ref(), i, &group.name)?;
+            if group.transport == "udp" {
+                validate_udp_request_size(&protocol_config, i, &group.name)?;
+            }
+            protocol_configs.push(protocol_config);
         }
 
         // Validate thread assignment
@@ -405,6 +407,75 @@ impl ProfileConfig {
         self.protocol_configs = protocol_configs;
         Ok(())
     }
+}
+
+/// Protocols that work over transport "udp": each frames its requests and
+/// responses as datagrams and matches responses by a request ID
+const UDP_PROTOCOLS: [ProtocolKind; 3] = [
+    ProtocolKind::MemcachedAscii,
+    ProtocolKind::MemcachedBinary,
+    ProtocolKind::XylemEcho,
+];
+
+/// Check a group's transport "udp" and request_timeout settings
+fn validate_udp(
+    group: &xylem_core::traffic_group::TrafficGroupConfig,
+    protocol: ProtocolKind,
+    index: usize,
+) -> Result<()> {
+    if group.transport == "udp" && !UDP_PROTOCOLS.contains(&protocol) {
+        let names: Vec<&str> = PROTOCOLS
+            .iter()
+            .filter(|(_, kind)| UDP_PROTOCOLS.contains(kind))
+            .map(|(name, _)| *name)
+            .collect();
+        bail!(
+            "Traffic group {} '{}': protocol '{}' does not support transport 'udp'. \
+             Protocols that support UDP: {}",
+            index,
+            group.name,
+            group.protocol,
+            names.join(", ")
+        );
+    }
+    if let Some(timeout) = group.request_timeout {
+        if group.transport != "udp" {
+            bail!(
+                "Traffic group {} '{}' sets request_timeout, which only transport 'udp' \
+                 supports; '{}' retransmits lost data and never times out requests",
+                index,
+                group.name,
+                group.transport
+            );
+        }
+        if timeout.is_zero() {
+            bail!("Traffic group {} '{}' request_timeout must be > 0", index, group.name);
+        }
+    }
+    Ok(())
+}
+
+/// Over UDP a memcached request must fit one datagram, which bounds its value size
+fn validate_udp_request_size(config: &ProtocolConfig, index: usize, name: &str) -> Result<()> {
+    let (ProtocolConfig::MemcachedAscii(config) | ProtocolConfig::MemcachedBinary(config)) = config
+    else {
+        return Ok(());
+    };
+    let max = xylem_protocols::memcached::MAX_UDP_VALUE_SIZE;
+    let insert_size = config.insert_phase.as_ref().and_then(|insert| insert.value_size);
+    for size in [Some(config.keys.value_size()), insert_size].into_iter().flatten() {
+        if size > max {
+            bail!(
+                "Traffic group {} '{}': value size {} does not fit one memcached UDP \
+                 datagram; over UDP the largest value size is {}",
+                index,
+                name,
+                size,
+                max
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Reject a traffic policy rate that is not > 0 (NaN fails too)
@@ -913,6 +984,88 @@ file = "results/test.json"
         .expect("Failed to apply target override");
 
         assert_eq!(config.traffic_groups[0].target, "192.168.1.100:6379");
+    }
+
+    /// A one-group profile with `group` (protocol, transport, extra lines)
+    fn udp_profile(protocol: &str, transport: &str, extra: &str) -> Result<ProfileConfig> {
+        let profile = format!(
+            r#"
+[experiment]
+name = "udp"
+duration = "1s"
+
+[[traffic_groups]]
+name = "main"
+protocol = "{protocol}"
+target = "127.0.0.1:11211"
+transport = "{transport}"
+threads = [0]
+connections_per_thread = 1
+{extra}
+
+[traffic_groups.protocol_config.keys]
+strategy = "sequential"
+start = 0
+value_size = 64
+
+[traffic_groups.traffic_policy]
+type = "closed-loop"
+
+[output]
+format = "json"
+file = "results/test.json"
+"#
+        );
+        let mut config: ProfileConfig = toml::from_str(&profile)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    #[test]
+    fn udp_is_accepted_only_for_protocols_that_support_it() {
+        for protocol in ["memcached-ascii", "memcached-binary", "xylem-echo"] {
+            let config = udp_profile(protocol, "udp", "").unwrap();
+            let group = &config.traffic_groups[0];
+            assert_eq!(group.request_timeout, None);
+            assert_eq!(group.effective_request_timeout(), Some(Duration::from_secs(1)));
+        }
+        for protocol in ["redis", "http", "masstree"] {
+            let error = udp_profile(protocol, "udp", "").unwrap_err().to_string();
+            assert!(
+                error.contains(&format!("protocol '{protocol}' does not support transport 'udp'"))
+            );
+            assert!(error.contains("memcached-binary, memcached-ascii, xylem-echo"), "{error}");
+        }
+        // Stream transports have no request timeout
+        let config = udp_profile("memcached-ascii", "tcp", "").unwrap();
+        assert_eq!(config.traffic_groups[0].effective_request_timeout(), None);
+    }
+
+    #[test]
+    fn request_timeout_is_parsed_and_checked() {
+        let config = udp_profile("xylem-echo", "udp", r#"request_timeout = "250ms""#).unwrap();
+        let group = &config.traffic_groups[0];
+        assert_eq!(group.effective_request_timeout(), Some(Duration::from_millis(250)));
+        let error = udp_profile("xylem-echo", "tcp", r#"request_timeout = "250ms""#).unwrap_err();
+        assert!(error.to_string().contains("only transport 'udp'"), "{error}");
+        let error = udp_profile("xylem-echo", "udp", r#"request_timeout = "0s""#).unwrap_err();
+        assert!(error.to_string().contains("request_timeout must be > 0"), "{error}");
+    }
+
+    #[test]
+    fn memcached_udp_values_must_fit_one_datagram() {
+        let max = xylem_protocols::memcached::MAX_UDP_VALUE_SIZE;
+        let at = |size: usize| {
+            let config = udp_profile("memcached-ascii", "udp", "").unwrap();
+            let mut value = toml::Value::try_from(&config).unwrap();
+            value["traffic_groups"][0]["protocol_config"]["keys"]["value_size"] =
+                toml::Value::Integer(size as i64);
+            let mut config: ProfileConfig = value.try_into().unwrap();
+            config.validate()
+        };
+        at(max).unwrap();
+        let error = at(max + 1).unwrap_err().to_string();
+        assert!(error.contains("does not fit one memcached UDP datagram"), "{error}");
     }
 
     #[test]

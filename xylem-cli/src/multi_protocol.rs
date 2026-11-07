@@ -17,18 +17,39 @@ pub enum MultiProtocol {
 impl MultiProtocol {
     /// Construct a traffic group's protocol from the protocol_config that
     /// `ProfileConfig::validate` parsed. HTTP sends `target` as the Host header
-    /// unless the config sets `host`.
-    pub fn from_config(config: &ProtocolConfig, target: &str, seed: Option<u64>) -> Result<Self> {
+    /// unless the config sets `host`. Memcached frames its datagrams when
+    /// the group's `transport` is "udp".
+    pub fn from_config(
+        config: &ProtocolConfig,
+        target: &str,
+        transport: &str,
+        seed: Option<u64>,
+    ) -> Result<Self> {
+        let udp = transport == "udp";
         let protocol = match config {
             ProtocolConfig::Redis(redis_config) => {
                 Self::Redis(xylem_protocols::RedisProtocol::from_config(redis_config, seed)?)
             }
-            ProtocolConfig::MemcachedBinary(mc_config) => Self::MemcachedBinary(
-                xylem_protocols::memcached::MemcachedBinaryProtocol::from_config(mc_config, seed)?,
-            ),
-            ProtocolConfig::MemcachedAscii(mc_config) => Self::MemcachedAscii(
-                xylem_protocols::memcached::MemcachedAsciiProtocol::from_config(mc_config, seed)?,
-            ),
+            ProtocolConfig::MemcachedBinary(mc_config) => {
+                let protocol = xylem_protocols::memcached::MemcachedBinaryProtocol::from_config(
+                    mc_config, seed,
+                )?;
+                Self::MemcachedBinary(if udp {
+                    protocol.with_udp_framing()
+                } else {
+                    protocol
+                })
+            }
+            ProtocolConfig::MemcachedAscii(mc_config) => {
+                let protocol = xylem_protocols::memcached::MemcachedAsciiProtocol::from_config(
+                    mc_config, seed,
+                )?;
+                Self::MemcachedAscii(if udp {
+                    protocol.with_udp_framing()
+                } else {
+                    protocol
+                })
+            }
             ProtocolConfig::Http(http_config) => {
                 let mut http_config = http_config.clone();
                 http_config.host.get_or_insert_with(|| target.to_string());

@@ -96,7 +96,12 @@ fn bundled_profiles_have_no_target_section() {
 fn check_workloads(config: &ProfileConfig, path: &Path) {
     assert_eq!(config.protocol_configs.len(), config.traffic_groups.len(), "{}", path.display());
     for (group, protocol_config) in config.traffic_groups.iter().zip(&config.protocol_configs) {
-        MultiProtocol::from_config(protocol_config, &group.target, config.experiment.seed)
-            .unwrap_or_else(|e| panic!("{} group {}: {e}", path.display(), group.name));
+        MultiProtocol::from_config(
+            protocol_config,
+            &group.target,
+            &group.transport,
+            config.experiment.seed,
+        )
+        .unwrap_or_else(|e| panic!("{} group {}: {e}", path.display(), group.name));
     }
 }

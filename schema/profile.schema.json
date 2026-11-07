@@ -754,6 +754,13 @@
           "description": "Protocol-specific configuration as a JSON value.\nEach protocol factory interprets this according to its own schema.\nThe core is protocol-agnostic - this value is passed directly to the protocol factory.",
           "default": null
         },
+        "request_timeout": {
+          "description": "How long a request may wait for its response before it times out,\nfrees its pipeline slot, and counts as timed out without a latency\n(e.g., \"500ms\"). Only for transport \"udp\", where it defaults to 1s;\nstream transports retransmit and never time out requests.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "sampling_policy": {
           "description": "Latency sampling policy",
           "$ref": "#/$defs/SamplingPolicy",

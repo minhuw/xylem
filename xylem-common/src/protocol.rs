@@ -35,7 +35,26 @@ pub trait Protocol: Send {
     /// Returns Ok((bytes_consumed, Some(request_id))) if complete response found
     /// Returns Ok((0, None)) if response is incomplete
     ///
-    /// Consuming bytes without returning a request ID is an error.
+    /// # Byte streams
+    ///
+    /// On a stream transport (TCP, Unix, ntcp), `data` holds every byte not
+    /// yet consumed, across reads. Consuming bytes without returning a
+    /// request ID is an error.
+    ///
+    /// # Datagrams
+    ///
+    /// On a datagram transport (`ConnectionGroup::is_datagram`, e.g. UDP),
+    /// `data` is one received datagram, or the part of it earlier calls left
+    /// unconsumed; it never contains bytes of another datagram. Two things
+    /// differ from byte streams:
+    /// - `Ok((n, None))` with `n > 0` absorbs `n` bytes that complete no
+    ///   request yet, such as one fragment of a multi-datagram response, a
+    ///   duplicate, or a reply to an unknown request ID.
+    /// - A datagram is never completed by a later one: bytes left when the
+    ///   parser returns `Ok((0, _))` are an error.
+    ///
+    /// A returned request ID that is no longer pending (its request timed
+    /// out) is dropped by the caller and counted as a late response.
     fn parse_response(
         &mut self,
         conn_id: usize,

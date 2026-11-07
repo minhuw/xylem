@@ -1,16 +1,23 @@
 //! Memcached protocol implementations
 //!
 //! The ASCII and binary codecs share the operation enum, the insert-phase
-//! state, and per-connection sequence numbering defined here.
+//! state, per-connection sequence numbering, and the UDP framing defined here.
+//!
+//! Over TCP, responses arrive in request order and match requests by their
+//! per-connection sequence numbers. Over UDP (`with_udp_framing`), every
+//! datagram carries memcached's frame header (see [`udp`]), and responses
+//! match requests by its request id, so loss and reordering are tolerated.
 
 use std::collections::HashMap;
 
 pub mod ascii;
 pub mod binary;
 mod config;
+pub mod udp;
 
 pub use ascii::MemcachedAsciiProtocol;
 pub use binary::MemcachedBinaryProtocol;
+pub use udp::MAX_UDP_VALUE_SIZE;
 
 /// Operation sent in the measurement phase, shared by the ASCII and binary codecs
 #[derive(Debug, Clone, Copy)]
@@ -74,4 +81,38 @@ fn next_conn_seq(conn_seq: &mut HashMap<usize, u64>, conn_id: usize) -> u64 {
     let result = *seq;
     *seq += 1;
     result
+}
+
+/// Frame a request body for UDP with its sequence number as the request id
+fn frame_udp_request(seq: u64, body: Vec<u8>, framing: Option<&udp::UdpFraming>) -> Vec<u8> {
+    match framing {
+        Some(_) => udp::frame_request(seq as u16, &body),
+        None => body,
+    }
+}
+
+/// Parse one response datagram for a codec whose complete responses are
+/// `response_len` bytes long (`Ok(None)` while incomplete)
+///
+/// Consumes the whole datagram. Returns the request ID once the datagram
+/// completes a response; a reassembled response must be exactly one
+/// complete response of the codec.
+fn parse_udp_response(
+    framing: &mut udp::UdpFraming,
+    conn_send_seq: &HashMap<usize, u64>,
+    conn_id: usize,
+    datagram: &[u8],
+    response_len: impl FnOnce(&[u8]) -> anyhow::Result<Option<usize>>,
+) -> anyhow::Result<(usize, Option<(usize, u64)>)> {
+    let sent = conn_send_seq.get(&conn_id).copied().unwrap_or(0);
+    let Some((seq, response)) = framing.receive(conn_id, sent, datagram)? else {
+        return Ok((datagram.len(), None));
+    };
+    let len = response_len(&response)?;
+    anyhow::ensure!(
+        len == Some(response.len()),
+        "Memcached UDP response of {} bytes is not one complete response",
+        response.len()
+    );
+    Ok((datagram.len(), Some((conn_id, seq))))
 }

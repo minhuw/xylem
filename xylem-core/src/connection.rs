@@ -61,6 +61,10 @@ type GroupConfig<Target> =
 /// Entries older than this are cleaned up to prevent memory leaks from lost packets
 const TX_QUEUE_STALE_TIMEOUT_NS: u64 = 60_000_000_000;
 
+/// Most timed-out request IDs a connection remembers to recognise their late
+/// responses; the oldest are forgotten first
+const TIMED_OUT_MEMORY: usize = 4096;
+
 /// Pending request tracking
 #[derive(Debug)]
 struct PendingRequest {
@@ -132,6 +136,21 @@ pub struct ConnectionState<ReqId: Eq + Hash + Clone> {
     /// Whether this connection is currently in the ready heap
     /// Invariant: on_heap == true ⟺ connection can accept more requests
     on_heap: bool,
+    /// How long a request may stay pending before it times out; `None` waits forever
+    request_timeout: Option<Duration>,
+    /// `(deadline_ns, req_id)` of sends with a request timeout, in send order.
+    /// Entries of completed requests are skipped and pruned lazily.
+    deadlines: VecDeque<(u64, ReqId)>,
+    /// Timed-out requests whose late responses are still recognised, mapped
+    /// to whether each was a warmup request
+    timed_out_ids: HashMap<ReqId, bool>,
+    /// `timed_out_ids` keys in timeout order, for forgetting the oldest
+    timed_out_order: VecDeque<ReqId>,
+    /// Late responses to timed-out measurement requests, not yet taken by the worker
+    late_responses: u64,
+    /// Datagram bytes the protocol absorbed without completing a request;
+    /// they are attributed to the next completed response
+    absorbed_bytes: usize,
 }
 
 impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
@@ -155,6 +174,12 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
             policy,
             group_id,
             on_heap: false,
+            request_timeout: None,
+            deadlines: VecDeque::new(),
+            timed_out_ids: HashMap::new(),
+            timed_out_order: VecDeque::new(),
+            late_responses: 0,
+            absorbed_bytes: 0,
         }
     }
 
@@ -248,6 +273,12 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
             // Queue for TX timestamp correlation (ends increase monotonically)
             let now_ns = crate::timing::time_ns();
             self.tx_pending_queue.push_back((tx.end, req_id.clone(), now_ns));
+        }
+        if let Some(timeout) = self.request_timeout {
+            // One timeout per connection, so deadlines increase in send order
+            let timeout_ns = timeout.as_nanos().min(u64::MAX as u128) as u64;
+            let deadline_ns = send_ts.clock_ns().saturating_add(timeout_ns);
+            self.deadlines.push_back((deadline_ns, req_id.clone()));
         }
         self.pending_map.insert(
             req_id,
@@ -370,6 +401,95 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         updated_count
     }
 
+    /// Deadline of the oldest pending request with a timeout, pruning the
+    /// entries of completed requests in front of it
+    fn next_deadline(&mut self) -> Option<u64> {
+        while let Some((deadline_ns, req_id)) = self.deadlines.front() {
+            if self.pending_map.contains_key(req_id) {
+                return Some(*deadline_ns);
+            }
+            self.deadlines.pop_front();
+        }
+        None
+    }
+
+    /// Time out every pending request whose deadline is at or before `now_ns`
+    ///
+    /// Each one leaves the pipeline, and its ID is remembered so a late
+    /// response is dropped. Returns `(expired, expired measurement requests)`.
+    fn expire_requests_at(&mut self, now_ns: u64) -> (usize, u64) {
+        let mut expired = 0;
+        let mut measured = 0;
+        while let Some(deadline_ns) = self.next_deadline() {
+            if deadline_ns > now_ns {
+                break;
+            }
+            let (_, req_id) = self.deadlines.pop_front().expect("next_deadline found an entry");
+            let pending = self.pending_map.remove(&req_id).expect("next_deadline checked it");
+            if pending.tx_kernel_ts.is_none() {
+                self.cleanup_tx_queue_entry(&req_id);
+            }
+            expired += 1;
+            if !pending.is_warmup {
+                measured += 1;
+            }
+            self.remember_timed_out(req_id, pending.is_warmup);
+        }
+        (expired, measured)
+    }
+
+    fn remember_timed_out(&mut self, req_id: ReqId, is_warmup: bool) {
+        if self.timed_out_order.len() == TIMED_OUT_MEMORY {
+            if let Some(oldest) = self.timed_out_order.pop_front() {
+                self.timed_out_ids.remove(&oldest);
+            }
+        }
+        self.timed_out_order.push_back(req_id.clone());
+        self.timed_out_ids.insert(req_id, is_warmup);
+    }
+
+    /// Complete the pending request `req_id`, returning its latency and
+    /// whether it was a warmup request
+    ///
+    /// A response to a timed-out request is dropped (`Ok(None)`) and, for a
+    /// measurement request, counted as late. Any other unknown ID is an error
+    /// on a byte stream; on a datagram connection it is a duplicate or stray
+    /// datagram and is dropped.
+    fn complete(
+        &mut self,
+        req_id: &ReqId,
+        recv_ts: Timestamp,
+        datagram: bool,
+    ) -> Result<Option<(Duration, bool)>> {
+        let Some(pending) = self.pending_map.remove(req_id) else {
+            if let Some(is_warmup) = self.timed_out_ids.remove(req_id) {
+                if !is_warmup {
+                    self.late_responses += 1;
+                }
+                return Ok(None);
+            }
+            if datagram {
+                tracing::debug!(?req_id, "Dropping a datagram response for no pending request");
+                return Ok(None);
+            }
+            return Err(crate::Error::Protocol(format!(
+                "Received response for unknown request ID: {req_id:?}"
+            )));
+        };
+        // The kernel TX timestamp joins the send's own cycles, so the
+        // latency falls back to cycles unless the receive has a kernel
+        // timestamp from the same clock
+        let send_ts = match pending.tx_kernel_ts {
+            Some(kernel) => pending.send_ts.with_kernel(kernel),
+            None => {
+                self.cleanup_tx_queue_entry(req_id);
+                pending.send_ts
+            }
+        };
+        let latency = pending.send_lag + recv_ts.duration_since(&send_ts);
+        Ok(Some((latency, pending.is_warmup)))
+    }
+
     /// Process `data` as if the transport had just read it into the spare tail
     #[cfg(test)]
     fn process_recv<F>(
@@ -451,29 +571,60 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
                     "Protocol consumed {consumed} bytes but returned no request ID"
                 ))
             })?;
-            let pending = self.pending_map.remove(&req_id).ok_or_else(|| {
-                crate::Error::Protocol(format!(
-                    "Received response for unknown request ID: {req_id:?}"
-                ))
-            })?;
-            // The kernel TX timestamp joins the send's own cycles, so the
-            // latency falls back to cycles unless the receive has a kernel
-            // timestamp from the same clock
-            let send_ts = match pending.tx_kernel_ts {
-                Some(kernel) => pending.send_ts.with_kernel(kernel),
-                None => {
-                    self.cleanup_tx_queue_entry(&req_id);
-                    pending.send_ts
-                }
-            };
-            let latency = pending.send_lag + recv_ts.duration_since(&send_ts);
-            responses.push((req_id, latency, pending.is_warmup, consumed));
+            if let Some((latency, is_warmup)) = self.complete(&req_id, recv_ts, false)? {
+                responses.push((req_id, latency, is_warmup, consumed));
+            }
             cursor += consumed;
         }
         // Compact the remaining partial frame once, regardless of response count.
         self.recv_buffer.copy_within(cursor..self.recv_len, 0);
         self.recv_len -= cursor;
 
+        Ok(responses)
+    }
+
+    /// Process one datagram of `len` bytes the transport read into `recv_spare()`
+    ///
+    /// The datagram is parsed on its own: nothing of it is kept for the next
+    /// one. The parser may absorb bytes without completing a request (a
+    /// fragment, duplicate, or stray), but must consume the whole datagram.
+    /// Returns the completed responses like [`Self::process_received`]; each
+    /// one's byte count includes the absorbed bytes before it.
+    fn process_datagram<F>(
+        &mut self,
+        len: usize,
+        recv_ts: Timestamp,
+        mut process_fn: F,
+    ) -> Result<Vec<(ReqId, Duration, bool, usize)>>
+    where
+        F: FnMut(&[u8]) -> Result<(usize, Option<ReqId>)>,
+    {
+        debug_assert_eq!(self.recv_len, 0, "datagrams leave no unparsed bytes");
+        let mut responses = Vec::new();
+        let mut cursor = 0;
+        while cursor < len {
+            let available = len - cursor;
+            let (consumed, req_id) = process_fn(&self.recv_buffer[cursor..len])?;
+            if consumed > available {
+                return Err(crate::Error::Protocol(
+                    "Response parser consumed more bytes than available".to_string(),
+                ));
+            }
+            if consumed == 0 {
+                return Err(crate::Error::Protocol(format!(
+                    "Protocol left {available} bytes of a {len}-byte datagram unparsed"
+                )));
+            }
+            cursor += consumed;
+            self.absorbed_bytes += consumed;
+            let Some(req_id) = req_id else {
+                continue;
+            };
+            if let Some((latency, is_warmup)) = self.complete(&req_id, recv_ts, true)? {
+                let bytes = std::mem::take(&mut self.absorbed_bytes);
+                responses.push((req_id, latency, is_warmup, bytes));
+            }
+        }
         Ok(responses)
     }
 }
@@ -496,6 +647,11 @@ pub struct ConnectionPool<G: ConnectionGroup, ReqId: Eq + Hash + Clone> {
     ready_heap: ReadyHeap,
     /// Reused buffer for TX timestamps drained from the group
     tx_timestamps: Vec<TxTimestampInfo>,
+    /// Whether the group carries datagrams, which are parsed one at a time
+    datagram: bool,
+    /// No pending request times out before this (a `timing::time_ns` value);
+    /// `None` when none can. May be earlier than the true next deadline.
+    next_deadline_ns: Option<u64>,
 }
 
 impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionPool<G, ReqId> {
@@ -604,12 +760,76 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         }
 
         Ok(Self {
+            datagram: group.is_datagram(),
             group,
             connection_states,
             connection_ids,
             ready_heap,
             tx_timestamps: Vec::new(),
+            next_deadline_ns: None,
         })
+    }
+
+    /// Whether the connections carry datagrams (see [`ConnectionGroup::is_datagram`])
+    pub fn is_datagram(&self) -> bool {
+        self.datagram
+    }
+
+    /// Set how long each request of traffic group `group_id` may stay pending
+    ///
+    /// A request still pending at its deadline times out: it leaves the
+    /// pipeline, gets no latency, and a late response to it is dropped.
+    /// `None` (the default) waits forever. Applies to requests sent from now on.
+    pub fn set_request_timeout(&mut self, group_id: usize, timeout: Option<Duration>) {
+        for state in self.connection_states.values_mut() {
+            if state.group_id == group_id {
+                state.request_timeout = timeout;
+            }
+        }
+    }
+
+    /// Earliest time a pending request may time out (a `timing::time_ns`
+    /// value), or `None` if none can. It may be early, never late.
+    pub fn next_request_deadline(&self) -> Option<u64> {
+        self.next_deadline_ns
+    }
+
+    /// Time out the requests whose deadline passed by `now_ns`
+    ///
+    /// Calls `on_expired(connection_id, group_id, expired, expired_measured)`
+    /// for every connection that lost requests. Cheap until the earliest
+    /// deadline passes.
+    pub fn expire_requests_at(
+        &mut self,
+        now_ns: u64,
+        mut on_expired: impl FnMut(usize, usize, usize, u64),
+    ) {
+        if self.next_deadline_ns.is_none_or(|deadline| deadline > now_ns) {
+            return;
+        }
+        let mut next = None;
+        for &connection_id in &self.connection_ids {
+            let Some(state) = self.connection_states.get_mut(&connection_id) else {
+                continue;
+            };
+            let (expired, measured) = state.expire_requests_at(now_ns);
+            if expired > 0 {
+                on_expired(connection_id, state.group_id, expired, measured);
+            }
+            next = match (next, state.next_deadline()) {
+                (Some(a), Some(b)) => Some(u64::min(a, b)),
+                (a, b) => a.or(b),
+            };
+        }
+        self.next_deadline_ns = next;
+    }
+
+    /// Take the count of late responses to timed-out measurement requests
+    /// received on `connection_id` since the last call
+    pub fn take_late_responses(&mut self, connection_id: usize) -> u64 {
+        self.connection_states
+            .get_mut(&connection_id)
+            .map_or(0, |state| std::mem::take(&mut state.late_responses))
     }
 
     /// Poll all connections for readability (single syscall)
@@ -679,6 +899,12 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
             receipt.tx,
             is_warmup,
         );
+        if state.request_timeout.is_some() {
+            if let Some(&(deadline_ns, _)) = state.deadlines.back() {
+                self.next_deadline_ns =
+                    Some(self.next_deadline_ns.map_or(deadline_ns, |next| next.min(deadline_ns)));
+            }
+        }
 
         Ok(send_lag)
     }
@@ -704,6 +930,9 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         // The transport reads straight into the state's buffer, after any
         // partial frame left by earlier reads.
         let responses = match self.group.recv(connection_id, state.recv_spare())? {
+            RecvOutcome::Data { len, timestamp } if self.datagram => {
+                state.process_datagram(len, timestamp, process_fn)?
+            }
             RecvOutcome::Data { len, timestamp } => {
                 state.process_received(len, timestamp, process_fn)?
             }
@@ -1399,6 +1628,166 @@ mod tests {
         assert_eq!(pool.get_state(0).unwrap().pending_count(), 2);
     }
 
+    fn fake_pool(
+        datagram: bool,
+        max_pending: usize,
+    ) -> (test_support::FakeFactory, ConnectionPool<test_support::FakeGroup, u64>) {
+        let factory = test_support::FakeFactory::default();
+        factory.0.lock().unwrap().datagram = datagram;
+        let pool = ConnectionPool::new(
+            &factory,
+            "127.0.0.1:1".parse().unwrap(),
+            1,
+            max_pending,
+            Box::new(crate::scheduler::UniformPolicyScheduler::closed_loop()),
+            0,
+        )
+        .unwrap();
+        (factory, pool)
+    }
+
+    /// Test datagram parser: an eight-byte frame completes its ID; a datagram
+    /// starting with `F` is a four-byte fragment that completes nothing.
+    fn parse_datagram(data: &[u8]) -> Result<(usize, Option<u64>)> {
+        if data[0] == b'F' {
+            return Ok((4, None));
+        }
+        parse_frame(data)
+    }
+
+    #[test]
+    fn datagrams_are_parsed_one_at_a_time() {
+        let (factory, mut pool) = fake_pool(true, 4);
+        assert!(pool.is_datagram());
+        for id in 1..=3 {
+            pool.send(0, &[0], id, false).unwrap();
+        }
+        let io = factory.0.clone();
+
+        // Fragments are absorbed; their bytes count with the response they precede
+        io.lock()
+            .unwrap()
+            .responses
+            .extend([Ok(b"Fab1".to_vec()), Ok(b"Fab2".to_vec())]);
+        assert!(pool.recv_responses(0, parse_datagram).unwrap().is_empty());
+        assert!(pool.recv_responses(0, parse_datagram).unwrap().is_empty());
+        assert!(pool.get_state(0).unwrap().buffered().is_empty());
+        io.lock().unwrap().responses.push_back(Ok(frame(1, 8)));
+        let responses = pool.recv_responses(0, parse_datagram).unwrap();
+        assert_eq!(responses.iter().map(|r| (r.0, r.3)).collect::<Vec<_>>(), vec![(1, 16)]);
+
+        // One datagram may hold several frames, and a fragment after them
+        let data = [frame(2, 8), frame(3, 12), b"Fxyz".to_vec()].concat();
+        io.lock().unwrap().responses.push_back(Ok(data));
+        let responses = pool.recv_responses(0, parse_datagram).unwrap();
+        assert_eq!(responses.iter().map(|r| (r.0, r.3)).collect::<Vec<_>>(), vec![(2, 8), (3, 12)]);
+        assert_eq!(pool.get_state(0).unwrap().pending_count(), 0);
+
+        // A datagram is never joined with the next: a partial frame is an error
+        pool.send(0, &[0], 4, false).unwrap();
+        io.lock().unwrap().responses.push_back(Ok(frame(4, 16)[..10].to_vec()));
+        let error = pool.recv_responses(0, parse_datagram).unwrap_err();
+        assert!(error.to_string().contains("10 bytes of a 10-byte datagram unparsed"), "{error}");
+        assert!(pool.get_state(0).unwrap().buffered().is_empty());
+        assert_eq!(pool.get_state(0).unwrap().pending_count(), 1);
+
+        // A duplicate datagram for a completed request is dropped, not an error
+        io.lock().unwrap().responses.push_back(Ok(frame(3, 12)));
+        assert!(pool.recv_responses(0, parse_datagram).unwrap().is_empty());
+        assert_eq!(pool.take_late_responses(0), 0);
+    }
+
+    #[test]
+    fn stream_pool_keeps_joining_reads() {
+        let (factory, mut pool) = fake_pool(false, 1);
+        assert!(!pool.is_datagram());
+        pool.send(0, &[0], 1, false).unwrap();
+        let data = frame(1, 16);
+        factory.0.lock().unwrap().responses.push_back(Ok(data[..10].to_vec()));
+        assert!(pool.recv_responses(0, parse_frame).unwrap().is_empty());
+        factory.0.lock().unwrap().responses.push_back(Ok(data[10..].to_vec()));
+        assert_eq!(pool.recv_responses(0, parse_frame).unwrap()[0].0, 1);
+        // Unknown IDs and fragments stay errors on a byte stream
+        factory.0.lock().unwrap().responses.push_back(Ok(frame(9, 8)));
+        assert!(pool.recv_responses(0, parse_frame).is_err());
+    }
+
+    #[test]
+    fn timed_out_request_frees_its_slot_and_its_late_response_is_dropped() {
+        for datagram in [true, false] {
+            let (factory, mut pool) = fake_pool(datagram, 2);
+            let timeout = Duration::from_millis(10);
+            pool.set_request_timeout(0, Some(timeout));
+            let sent_ns = factory.0.lock().unwrap().timestamp.clock_ns();
+            assert_eq!(pool.next_request_deadline(), None);
+            pool.send(0, &[0], 1, false).unwrap();
+            pool.send(0, &[0], 2, true).unwrap();
+            assert!(!pool.get_state(0).unwrap().can_send());
+            let deadline = sent_ns + 10_000_000;
+            assert_eq!(pool.next_request_deadline(), Some(deadline));
+
+            let mut expired = Vec::new();
+            pool.expire_requests_at(deadline - 1, |c, g, n, m| expired.push((c, g, n, m)));
+            assert!(expired.is_empty());
+            pool.expire_requests_at(deadline, |c, g, n, m| expired.push((c, g, n, m)));
+            // Both expired, one of them a measurement request
+            assert_eq!(expired, vec![(0, 0, 2, 1)]);
+            let state = pool.get_state(0).unwrap();
+            assert_eq!(state.pending_count(), 0);
+            assert!(state.can_send());
+            assert!(state.tx_pending_queue.is_empty());
+            assert_eq!(pool.next_request_deadline(), None);
+
+            // Late responses complete nothing; only the measured one counts
+            let io = factory.0.clone();
+            io.lock().unwrap().responses.push_back(Ok([frame(2, 8), frame(1, 8)].concat()));
+            assert!(pool.recv_responses(0, parse_frame).unwrap().is_empty());
+            assert_eq!(pool.take_late_responses(0), 1);
+            assert_eq!(pool.take_late_responses(0), 0);
+            // A second copy is no longer recognised: dropped on datagrams only
+            io.lock().unwrap().responses.push_back(Ok(frame(1, 8)));
+            assert_eq!(pool.recv_responses(0, parse_frame).is_ok(), datagram);
+        }
+    }
+
+    #[test]
+    fn completed_requests_do_not_time_out() {
+        let (factory, mut pool) = fake_pool(true, 4);
+        pool.set_request_timeout(0, Some(Duration::from_millis(10)));
+        let sent_ns = factory.0.lock().unwrap().timestamp.clock_ns();
+        for id in 1..=3 {
+            pool.send(0, &[0], id, false).unwrap();
+        }
+        factory.0.lock().unwrap().responses.push_back(Ok(frame(2, 8)));
+        assert_eq!(pool.recv_responses(0, parse_frame).unwrap().len(), 1);
+        let mut expired = Vec::new();
+        pool.expire_requests_at(sent_ns + 20_000_000, |c, g, n, m| expired.push((c, g, n, m)));
+        assert_eq!(expired, vec![(0, 0, 2, 2)]);
+        // Request 2 completed before its deadline and is not remembered
+        let state = pool.get_state(0).unwrap();
+        assert_eq!(state.timed_out_order, VecDeque::from([1, 3]));
+        assert!(state.deadlines.is_empty());
+
+        // Other groups and connections without a timeout never expire
+        let (_, mut pool) = fake_pool(true, 4);
+        pool.set_request_timeout(1, Some(Duration::from_millis(10)));
+        pool.send(0, &[0], 1, false).unwrap();
+        assert_eq!(pool.next_request_deadline(), None);
+        pool.expire_requests_at(u64::MAX, |_, _, _, _| panic!("no timeout"));
+        assert_eq!(pool.get_state(0).unwrap().pending_count(), 1);
+    }
+
+    #[test]
+    fn timed_out_ids_are_forgotten_oldest_first() {
+        let mut state = state();
+        for id in 0..TIMED_OUT_MEMORY as u64 + 2 {
+            state.remember_timed_out(id, false);
+        }
+        assert_eq!(state.timed_out_ids.len(), TIMED_OUT_MEMORY);
+        assert!(!state.timed_out_ids.contains_key(&1));
+        assert!(state.timed_out_ids.contains_key(&2));
+    }
+
     #[test]
     fn test_wrapping_le() {
         // Normal cases
@@ -1449,6 +1838,8 @@ pub(crate) mod test_support {
         pub eof: bool,
         /// Stamp sends and receives with the current time instead of `timestamp`
         pub live_timestamps: bool,
+        /// Report a datagram group; read when the pool is built
+        pub datagram: bool,
     }
 
     impl Default for FakeIo {
@@ -1465,6 +1856,7 @@ pub(crate) mod test_support {
                 tx_timestamps: Vec::new(),
                 eof: false,
                 live_timestamps: false,
+                datagram: false,
             }
         }
     }
@@ -1535,6 +1927,10 @@ pub(crate) mod test_support {
             }
             buf[..data.len()].copy_from_slice(&data);
             Ok(RecvOutcome::Data { len: data.len(), timestamp: io.now() })
+        }
+
+        fn is_datagram(&self) -> bool {
+            self.io.lock().unwrap().datagram
         }
 
         fn poll(

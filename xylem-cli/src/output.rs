@@ -370,6 +370,7 @@ impl DetailedExperimentResults {
         line("  Sent:", requests.sent.to_string());
         line("  Completed:", requests.completed.to_string());
         line("  Timed out:", requests.timed_out.to_string());
+        line("  Late resp.:", requests.late_responses.to_string());
         line("  Failed:", requests.failed.to_string());
         line("  Late sends:", requests.late_sends.to_string());
         let capped = if requests.unsent_capped {
@@ -380,8 +381,8 @@ impl DetailedExperimentResults {
         line("  Unsent:", format!("{}{capped}", requests.unsent));
         if requests.timed_out > 0 {
             println!(
-                "{indent}  WARNING: {} requests got no response within the drain timeout; \
-                 they have no latency",
+                "{indent}  WARNING: {} requests got no response within the request or \
+                 drain timeout; they have no latency",
                 requests.timed_out
             );
         }

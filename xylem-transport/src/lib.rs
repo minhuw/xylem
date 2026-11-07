@@ -226,6 +226,16 @@ pub trait ConnectionGroup {
     /// Unknown connection IDs return `Error::Connection`.
     fn recv(&mut self, conn_id: usize, buf: &mut [u8]) -> Result<RecvOutcome>;
 
+    /// Whether the group's connections carry datagrams rather than a byte stream
+    ///
+    /// A datagram group's `recv` returns exactly one whole message, so its
+    /// boundaries are meaningful: the connection pool then parses each
+    /// received datagram on its own instead of appending it to earlier
+    /// unparsed bytes. Byte-stream groups (the default) return `false`.
+    fn is_datagram(&self) -> bool {
+        false
+    }
+
     /// Wait for readable connections
     ///
     /// Clears `ready`, waits up to `timeout` (zero means do not wait), and

@@ -95,7 +95,7 @@ fn file_names(dir: &Path) -> Vec<String> {
 }
 
 /// Summary lines that end in a measured value, by their label.
-const MEASURED_LABELS: [&str; 39] = [
+const MEASURED_LABELS: [&str; 41] = [
     "Measured: ",
     "Total Requests:  ",
     "Throughput:      ",
@@ -126,12 +126,14 @@ const MEASURED_LABELS: [&str; 39] = [
     "  Sent:          ",
     "  Completed:     ",
     "  Timed out:     ",
+    "  Late resp.:    ",
     "  Failed:        ",
     "  Late sends:    ",
     "  Unsent:        ",
     "    Sent:        ",
     "    Completed:   ",
     "    Timed out:   ",
+    "    Late resp.:  ",
     "    Failed:      ",
     "    Late sends:  ",
     "    Unsent:      ",
@@ -219,6 +221,7 @@ Requests:
   Sent:          #
   Completed:     #
   Timed out:     #
+  Late resp.:    #
   Failed:        #
   Late sends:    #
   Unsent:        #
@@ -257,6 +260,7 @@ Statistics:
     Sent:        #
     Completed:   #
     Timed out:   #
+    Late resp.:  #
     Failed:      #
     Late sends:  #
     Unsent:      #
@@ -323,7 +327,15 @@ fn summary_values(json_text: &str) -> Vec<String> {
         let ci: f64 = raw_number(section, "confidence_interval_us").parse().unwrap();
         values.push(format!("±{ci:.2}"));
         values.push(raw_number(section, "sample_count").to_string());
-        for key in ["sent", "completed", "timed_out", "failed", "late_sends", "unsent"] {
+        for key in [
+            "sent",
+            "completed",
+            "timed_out",
+            "late_responses",
+            "failed",
+            "late_sends",
+            "unsent",
+        ] {
             values.push(raw_number(accounting, key).to_string());
         }
         // A closed-loop run has no send lags
@@ -422,6 +434,7 @@ const MASKED_JSON: &str = r#"{
       "sent": #,
       "completed": #,
       "timed_out": #,
+      "late_responses": 0,
       "failed": #,
       "late_sends": #,
       "unsent": #,
@@ -468,6 +481,7 @@ const MASKED_JSON: &str = r#"{
           "sent": #,
           "completed": #,
           "timed_out": #,
+          "late_responses": 0,
           "failed": #,
           "late_sends": #,
           "unsent": #,

@@ -508,6 +508,7 @@ mod tests {
         // Should contain array indexing for traffic_groups
         assert!(paths.contains(&"traffic_groups".to_string()));
         assert!(paths.contains(&"traffic_groups.0".to_string()));
+        assert!(paths.contains(&"traffic_groups.0.request_timeout".to_string()));
 
         // Should contain protocol_config paths (manually added for completions)
         assert!(

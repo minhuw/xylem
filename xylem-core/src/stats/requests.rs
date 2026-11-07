@@ -27,8 +27,13 @@ pub struct RequestCounts {
     pub sent: u64,
     /// Requests whose response arrived, in the measurement window or the drain
     pub completed: u64,
-    /// Requests still pending when the drain deadline passed. They have no latency.
+    /// Requests that got no response within their traffic group's
+    /// `request_timeout`, or by the drain deadline. They have no latency.
     pub timed_out: u64,
+    /// Responses that arrived after their request had timed out. They were
+    /// dropped; their requests count in `timed_out`.
+    #[serde(default)]
+    pub late_responses: u64,
     /// Requests pending on a connection that closed or failed
     pub failed: u64,
     /// Sends whose lag behind their intended send time exceeded
@@ -48,6 +53,7 @@ impl RequestCounts {
         self.sent += other.sent;
         self.completed += other.completed;
         self.timed_out += other.timed_out;
+        self.late_responses += other.late_responses;
         self.failed += other.failed;
         self.late_sends += other.late_sends;
         self.unsent += other.unsent;
