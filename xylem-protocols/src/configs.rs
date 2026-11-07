@@ -380,6 +380,9 @@ pub enum RedisCommandParams {
     MGet { count: usize },
     /// WAIT parameters
     Wait { num_replicas: usize, timeout_ms: u64 },
+    /// Custom command template. It precedes SCAN, whose fields are all
+    /// optional and would otherwise match any table, `template` included.
+    Custom { template: String },
     /// SCAN parameters
     Scan {
         #[serde(default)]
@@ -387,8 +390,6 @@ pub enum RedisCommandParams {
         count: Option<usize>,
         pattern: Option<String>,
     },
-    /// Custom command template
-    Custom { template: String },
 }
 
 /// Memcached protocol configuration
