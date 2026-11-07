@@ -353,6 +353,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
             let protocol = xylem_cli::multi_protocol::MultiProtocol::from_config(
                 &config_for_worker.protocol_configs[*group_id],
                 &group_config.target,
+                &group_config.transport,
                 config_for_worker.experiment.seed,
             )?;
 
@@ -444,12 +445,22 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
             drain_timeout: config_for_worker.experiment.drain_timeout,
         };
 
-        // Helper function to wire the request dumper into a created worker, run it,
-        // and return its stats.
+        // Each group's request timeout (UDP groups only)
+        let request_timeouts: Vec<_> = groups_for_thread
+            .iter()
+            .map(|(group_id, _)| {
+                let group_config = &config_for_worker.traffic_groups[*group_id];
+                (*group_id, group_config.effective_request_timeout())
+            })
+            .collect();
+
+        // Helper function to wire the request dumper and request timeouts into a
+        // created worker, run it, and return its stats.
         fn run_worker<G, S>(
             mut worker: Worker<G, xylem_cli::multi_protocol::MultiProtocol, S>,
             request_dumper: Option<&Arc<xylem_core::request_dump::RequestDumper>>,
             thread_idx: usize,
+            request_timeouts: &[(usize, Option<std::time::Duration>)],
         ) -> xylem_core::Result<S>
         where
             G: xylem_transport::ConnectionGroup,
@@ -458,6 +469,9 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
             // Wire request dumper if enabled
             if let Some(dumper) = request_dumper {
                 worker.set_request_dumper(Arc::clone(dumper), thread_idx);
+            }
+            for &(group_id, timeout) in request_timeouts {
+                worker.set_request_timeout(group_id, timeout);
             }
 
             worker.run()?;
@@ -475,7 +489,12 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                     worker_config,
                     groups_config,
                 )?;
-                run_worker(worker, request_dumper_for_worker.as_ref(), thread_idx)
+                run_worker(
+                    worker,
+                    request_dumper_for_worker.as_ref(),
+                    thread_idx,
+                    &request_timeouts,
+                )
             }
             "udp" => {
                 let factory = UdpTransportFactory::default();
@@ -486,7 +505,12 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                     worker_config,
                     groups_config,
                 )?;
-                run_worker(worker, request_dumper_for_worker.as_ref(), thread_idx)
+                run_worker(
+                    worker,
+                    request_dumper_for_worker.as_ref(),
+                    thread_idx,
+                    &request_timeouts,
+                )
             }
             "unix" => {
                 // Unix transport requires special handling - targets are paths, not SocketAddr
@@ -518,7 +542,12 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                     worker_config,
                     unix_groups_config,
                 )?;
-                run_worker(worker, request_dumper_for_worker.as_ref(), thread_idx)
+                run_worker(
+                    worker,
+                    request_dumper_for_worker.as_ref(),
+                    thread_idx,
+                    &request_timeouts,
+                )
             }
             #[cfg(all(target_os = "linux", feature = "ntcp"))]
             "ntcp" => {
@@ -542,7 +571,12 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                     worker_config,
                     groups_config,
                 )?;
-                run_worker(worker, request_dumper_for_worker.as_ref(), thread_idx)
+                run_worker(
+                    worker,
+                    request_dumper_for_worker.as_ref(),
+                    thread_idx,
+                    &request_timeouts,
+                )
             }
             other => Err(xylem_core::Error::Config(format!("Unsupported transport: {}", other)))?,
         }

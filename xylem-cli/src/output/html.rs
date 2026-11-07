@@ -369,6 +369,7 @@ fn request_rows(requests: &xylem_core::stats::RequestCounts, lag: &super::SendLa
         ("Requests Sent", requests.sent.to_string()),
         ("Requests Completed", requests.completed.to_string()),
         ("Requests Timed Out (no latency)", requests.timed_out.to_string()),
+        ("Late Responses (dropped)", requests.late_responses.to_string()),
         ("Requests Failed", requests.failed.to_string()),
         (
             "Late Sends",
