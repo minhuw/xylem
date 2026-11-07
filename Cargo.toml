@@ -53,9 +53,6 @@ rand_distr = "0.5.1"
 # HTTP parsing
 httparse = "1.9"
 
-# CSV parsing
-csv = "1.3"
-
 # Parquet/Arrow for stats streaming
 parquet = { version = "57.1", default-features = false, features = ["arrow", "zstd"] }
 arrow = { version = "57.1", default-features = false, features = ["ipc"] }

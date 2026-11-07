@@ -1,9 +1,6 @@
-//! The CLI and its compatibility adapters must preserve the same bytes as
-//! shared constructors.
+//! The CLI must send the same bytes as the shared constructors.
 use xylem_protocols::configs::*;
-use xylem_protocols::factories::RedisFactory;
-use xylem_protocols::factory::ProtocolFactory;
-use xylem_protocols::Protocol;
+use xylem_protocols::{HttpProtocol, Protocol, RedisProtocol};
 
 /// Capture complete requests from the real executable and reply without an
 /// external service. Both protocols are ordered, so one response releases the
@@ -30,8 +27,7 @@ fn cli_requests(protocol: &str, config: serde_json::Value) -> (String, Vec<Vec<u
             }
         };
         socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let mut parser =
-            xylem_protocols::RedisProtocol::from_config(&RedisConfig::default(), None).unwrap();
+        let mut parser = RedisProtocol::from_config(&RedisConfig::default(), None).unwrap();
         let mut pending = Vec::new();
         let mut requests = Vec::new();
         let mut buf = [0; 4096];
@@ -123,7 +119,7 @@ fn cli_requests(protocol: &str, config: serde_json::Value) -> (String, Vec<Vec<u
 }
 
 #[test]
-fn real_cli_redis_requests_match_factory_variable_sizes() {
+fn real_cli_redis_requests_match_constructor_variable_sizes() {
     let config: RedisConfig = serde_json::from_value(serde_json::json!({
         "keys": { "strategy": "round-robin", "max": 5, "value_size": 13, "prefix": "custom:" },
         "operations": { "strategy": "fixed", "operation": "SET" },
@@ -133,10 +129,10 @@ fn real_cli_redis_requests_match_factory_variable_sizes() {
     }))
     .unwrap();
     let (_, requests) = cli_requests("redis", serde_json::to_value(&config).unwrap());
-    let mut factory = RedisFactory.create(config, Some(42)).unwrap();
+    let mut protocol = RedisProtocol::from_config(&config, Some(42)).unwrap();
     let mut lengths = std::collections::HashSet::new();
     for request in requests {
-        assert_eq!(request, factory.next_request(0).data);
+        assert_eq!(request, protocol.next_request(0).data);
         lengths.insert(request.len());
     }
     assert!(lengths.len() > 2);
@@ -144,7 +140,6 @@ fn real_cli_redis_requests_match_factory_variable_sizes() {
 
 #[test]
 fn real_cli_http_honors_body_size_and_host_fallback() {
-    use xylem_protocols::factories::HttpFactory;
     for host in [None, Some("example.test".to_string())] {
         let mut config = HttpConfig {
             method: "POST".into(),
@@ -154,9 +149,9 @@ fn real_cli_http_honors_body_size_and_host_fallback() {
         };
         let (target, requests) = cli_requests("http", serde_json::to_value(&config).unwrap());
         config.host.get_or_insert(target);
-        let mut factory = HttpFactory.create(config, Some(42)).unwrap();
+        let mut protocol = HttpProtocol::from_config(&config).unwrap();
         for request in requests {
-            assert_eq!(request, factory.next_request(0).data);
+            assert_eq!(request, protocol.next_request(0).data);
         }
     }
 }

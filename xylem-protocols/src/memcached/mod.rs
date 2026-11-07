@@ -7,6 +7,7 @@ use std::collections::HashMap;
 
 pub mod ascii;
 pub mod binary;
+mod config;
 
 pub use ascii::MemcachedAsciiProtocol;
 pub use binary::MemcachedBinaryProtocol;

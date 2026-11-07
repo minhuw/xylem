@@ -8,11 +8,10 @@ Use the configuration-aware constructors for workloads driven by configuration:
 - `MasstreeProtocol::from_config(&MasstreeConfig, seed)`
 - `HttpProtocol::from_config(&HttpConfig)`
 
-Public factories delegate to these constructors; Masstree has no factory, and
-its constructor sends a configured `value_size` at its representative fixed
-size. Existing low-level constructors remain available. Redis callers assembling their own workloads can share
-`RedisConfig::command_selector(seed)` and
-`factories::parse_redis_operation(command, params)`.
+The Masstree constructor sends a configured `value_size` at its
+representative fixed size. Existing low-level constructors remain available.
+Redis callers assembling their own workloads can share
+`RedisConfig::command_selector(seed)`.
 
 Redis construction retains the configured value size generator, including
 inclusive uniform and per-command sizes, instead of choosing a representative
@@ -20,8 +19,7 @@ fixed size. Command names for size lookup are case-insensitive. Insertion uses
 its explicit size or `keys.value_size`; an unbounded sequential keyspace needs
 an explicit insertion count. Per-command key distributions are supported, but
 a different per-command prefix or legacy `keys.value_size` is rejected; use
-`value_size` for per-command sizing. Imported-data workloads require a separate
-driver and are rejected by these constructors.
+`value_size` for per-command sizing.
 
 HTTP supports Content-Length framing and bodyless 204/304 responses.
 Informational responses are retained until the final response arrives, which

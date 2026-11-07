@@ -41,20 +41,6 @@ impl MultiProtocol {
         };
         Ok(protocol)
     }
-
-    /// Generate a SET request with imported data (string key + value bytes)
-    /// Only supported for Redis protocols
-    pub fn generate_set_with_imported_data(
-        &mut self,
-        conn_id: usize,
-        key: &str,
-        value: &[u8],
-    ) -> Request<(usize, u64)> {
-        match self {
-            MultiProtocol::Redis(p) => p.generate_set_with_imported_data(conn_id, key, value),
-            _ => panic!("generate_set_with_imported_data only supported for Redis protocol"),
-        }
-    }
 }
 
 impl Protocol for MultiProtocol {
@@ -151,51 +137,5 @@ mod tests {
             Box::new(xylem_protocols::FixedCommandSelector::new(xylem_protocols::RedisOp::Get));
         let protocol = create_redis_protocol(selector);
         assert_eq!(protocol.name(), "redis");
-    }
-
-    #[test]
-    fn test_multi_protocol_generate_set_with_imported_data_redis() {
-        let selector =
-            Box::new(xylem_protocols::FixedCommandSelector::new(xylem_protocols::RedisOp::Set));
-        let mut protocol = create_redis_protocol(selector);
-
-        let key = "test:key";
-        let value = b"test_value";
-        let request = protocol.generate_set_with_imported_data(0, key, value);
-
-        // Verify request ID
-        assert_eq!(request.request_id, (0, 0));
-
-        // Verify it's a valid RESP SET command
-        let request_str = String::from_utf8_lossy(&request.data);
-        assert!(request_str.contains("SET"));
-        assert!(request_str.contains(key));
-        assert!(request_str.contains("test_value"));
-    }
-
-    #[test]
-    #[should_panic(expected = "only supported for Redis protocol")]
-    fn test_multi_protocol_generate_set_with_imported_data_http_panics() {
-        let mut protocol = MultiProtocol::Http(xylem_protocols::http::HttpProtocol::new(
-            xylem_protocols::HttpMethod::Get,
-            "/".to_string(),
-            "localhost".to_string(),
-        ));
-
-        // This should panic because HTTP doesn't support imported data
-        protocol.generate_set_with_imported_data(0, "key", b"value");
-    }
-
-    #[test]
-    #[should_panic(expected = "only supported for Redis protocol")]
-    fn test_multi_protocol_generate_set_with_imported_data_memcached_panics() {
-        let mut protocol = MultiProtocol::MemcachedBinary(
-            xylem_protocols::memcached::MemcachedBinaryProtocol::new(
-                xylem_protocols::memcached::MemcachedOp::Get,
-            ),
-        );
-
-        // This should panic because Memcached doesn't support imported data
-        protocol.generate_set_with_imported_data(0, "key", b"value");
     }
 }

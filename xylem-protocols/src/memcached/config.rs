@@ -1,57 +1,8 @@
-//! Memcached protocol factories
+//! Config-aware Memcached construction.
 
 use crate::configs::MemcachedConfig;
-use crate::factory::ProtocolFactory;
 use crate::memcached::{MemcachedAsciiProtocol, MemcachedBinaryProtocol, MemcachedOp};
 use anyhow::Result;
-
-/// Factory for creating Memcached Binary protocol instances
-pub struct MemcachedBinaryFactory;
-
-impl ProtocolFactory for MemcachedBinaryFactory {
-    type Config = MemcachedConfig;
-    type Protocol = MemcachedBinaryProtocol;
-
-    fn name(&self) -> &'static str {
-        "memcached-binary"
-    }
-
-    fn create(&self, config: Self::Config, seed: Option<u64>) -> Result<Self::Protocol> {
-        MemcachedBinaryProtocol::from_config(&config, seed)
-    }
-
-    fn default_config(&self) -> Self::Config {
-        MemcachedConfig::default()
-    }
-
-    fn validate(&self, config: &Self::Config) -> Result<()> {
-        MemcachedBinaryProtocol::from_config(config, Some(0)).map(|_| ())
-    }
-}
-
-/// Factory for creating Memcached ASCII protocol instances
-pub struct MemcachedAsciiFactory;
-
-impl ProtocolFactory for MemcachedAsciiFactory {
-    type Config = MemcachedConfig;
-    type Protocol = MemcachedAsciiProtocol;
-
-    fn name(&self) -> &'static str {
-        "memcached-ascii"
-    }
-
-    fn create(&self, config: Self::Config, seed: Option<u64>) -> Result<Self::Protocol> {
-        MemcachedAsciiProtocol::from_config(&config, seed)
-    }
-
-    fn default_config(&self) -> Self::Config {
-        MemcachedConfig::default()
-    }
-
-    fn validate(&self, config: &Self::Config) -> Result<()> {
-        MemcachedAsciiProtocol::from_config(config, Some(0)).map(|_| ())
-    }
-}
 
 /// Parse Memcached operation from string
 fn parse_memcached_op(op: &str) -> Result<MemcachedOp> {
@@ -114,37 +65,35 @@ mod tests {
     use crate::Protocol;
 
     #[test]
-    fn test_binary_create_default() {
-        let factory = MemcachedBinaryFactory;
-        let protocol = factory.create(MemcachedConfig::default(), None).unwrap();
+    fn test_binary_from_config_default() {
+        let protocol =
+            MemcachedBinaryProtocol::from_config(&MemcachedConfig::default(), None).unwrap();
         assert_eq!(Protocol::name(&protocol), "memcached-binary");
     }
 
     #[test]
-    fn test_ascii_create_default() {
-        let factory = MemcachedAsciiFactory;
-        let protocol = factory.create(MemcachedConfig::default(), None).unwrap();
+    fn test_ascii_from_config_default() {
+        let protocol =
+            MemcachedAsciiProtocol::from_config(&MemcachedConfig::default(), None).unwrap();
         assert_eq!(Protocol::name(&protocol), "memcached-ascii");
     }
 
     #[test]
-    fn test_binary_create_with_set() {
-        let factory = MemcachedBinaryFactory;
+    fn test_binary_from_config_with_set() {
         let config = MemcachedConfig {
             operation: "SET".to_string(),
             ..Default::default()
         };
-        let protocol = factory.create(config, None).unwrap();
+        let protocol = MemcachedBinaryProtocol::from_config(&config, None).unwrap();
         assert_eq!(Protocol::name(&protocol), "memcached-binary");
     }
 
     #[test]
     fn test_invalid_operation() {
-        let factory = MemcachedBinaryFactory;
         let config = MemcachedConfig {
             operation: "INVALID".to_string(),
             ..Default::default()
         };
-        assert!(factory.create(config, None).is_err());
+        assert!(MemcachedBinaryProtocol::from_config(&config, None).is_err());
     }
 }

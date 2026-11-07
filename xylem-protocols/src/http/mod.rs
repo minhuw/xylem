@@ -7,6 +7,8 @@
 //!
 //! Request sequence tracking is done per-connection to support pipelining.
 
+mod config;
+
 use crate::Protocol;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;

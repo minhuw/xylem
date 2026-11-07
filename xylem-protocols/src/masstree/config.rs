@@ -1,4 +1,4 @@
-//! Config-aware Masstree construction shared by CLI callers.
+//! Config-aware Masstree construction.
 use crate::configs::MasstreeConfig;
 use crate::masstree::{MasstreeOp, MasstreeProtocol};
 use anyhow::Result;

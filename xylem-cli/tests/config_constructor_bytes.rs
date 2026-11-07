@@ -65,7 +65,6 @@ fn redis_weighted_config() -> RedisConfig {
         value_size: Some(ValueSizeConfig::Uniform { min: 2, max: 9 }),
         random_data: true,
         insert_phase: Some(InsertPhaseConfig { key_count: Some(2), value_size: Some(4) }),
-        ..Default::default()
     }
 }
 
@@ -119,7 +118,6 @@ fn redis_per_command_keys_config() -> RedisConfig {
         }),
         random_data: false,
         insert_phase: Some(InsertPhaseConfig { key_count: None, value_size: None }),
-        ..Default::default()
     }
 }
 
@@ -135,7 +133,6 @@ fn redis_fixed_config() -> RedisConfig {
         value_size: Some(ValueSizeConfig::Normal { mean: 6.0, std_dev: 2.0, min: 3, max: 9 }),
         random_data: true,
         insert_phase: Some(InsertPhaseConfig { key_count: Some(1), value_size: None }),
-        ..Default::default()
     }
 }
 
@@ -154,16 +151,6 @@ fn with_first_command(
 /// Configs that both Redis constructors reject, with the error each one reports.
 fn redis_config_errors() -> Vec<(RedisConfig, &'static str)> {
     vec![
-        (
-            RedisConfig {
-                data_import: Some(DataImportConfig {
-                    file: "data.csv".into(),
-                    verification: None,
-                }),
-                ..Default::default()
-            },
-            "data_import requires an imported-data driver and is unsupported by this constructor",
-        ),
         (
             with_first_command(redis_weighted_config(), |command| {
                 command.keys = Some(KeysConfig::Random {

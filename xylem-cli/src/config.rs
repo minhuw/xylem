@@ -50,12 +50,6 @@ pub struct ExperimentConfig {
 /// Re-export KeysConfig from xylem-protocols for use in config files
 pub use xylem_protocols::KeysConfig;
 
-// Keep the legacy wire format available to downstream callers during migration.
-#[allow(deprecated)]
-mod legacy;
-#[allow(deprecated)]
-pub use legacy::{CommandParams, CommandWeightConfig, OperationsConfig};
-
 /// Output configuration
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct OutputConfig {
@@ -438,11 +432,8 @@ fn parse_protocol_config(
 ) -> Result<ProtocolConfig> {
     match protocol {
         ProtocolKind::Redis => {
-            let config: xylem_protocols::RedisConfig =
-                parse_typed_config(pc, "Redis", group_idx, group_name)?;
-
-            // data_import needs an imported-data driver, which the CLI does not provide
-            if config.data_import.is_some() {
+            // data_import was removed; reject it rather than silently ignore it
+            if pc.is_some_and(|pc| pc.get("data_import").is_some()) {
                 bail!(
                     "Traffic group {} '{}': data_import is not supported for redis protocol. \
                      Remove protocol_config.data_import.",
@@ -450,6 +441,7 @@ fn parse_protocol_config(
                     group_name
                 );
             }
+            let config = parse_typed_config(pc, "Redis", group_idx, group_name)?;
             Ok(ProtocolConfig::Redis(config))
         }
         ProtocolKind::MemcachedBinary => {

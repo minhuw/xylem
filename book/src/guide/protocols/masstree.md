@@ -287,18 +287,7 @@ You should see GET latencies remain stable even as SET rate increases, because r
 
 ### Read-Your-Writes Testing
 
-Testing read-your-writes consistency verifies MVCC correctness. Write a value, then immediately read it back:
-
-```rust
-// Write
-protocol.generate_request(conn_id, key, value_size);  // SET
-// Read
-protocol.generate_request(conn_id, key, 0);  // GET
-
-// Verify response matches written value
-```
-
-With correct MVCC implementation, the GET always sees the SET's value, even if other concurrent transactions are modifying the same key.
+Read-your-writes consistency means a GET always sees the value of an earlier SET to the same key, even while other clients modify that key. xylem frames GET responses but does not compare the returned value with the one it wrote, so it cannot check this property itself. Use it to load the server with a mixed GET/SET workload on hot keys, as above, and check consistency with a separate client.
 
 ## Common Workload Patterns
 
