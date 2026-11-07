@@ -359,7 +359,9 @@ pub enum RedisOperationsConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RedisCommandWeight {
-    /// Command name: "get", "set", "incr", "mget", "wait", or "custom"
+    /// Command name: "get", "set", "incr", "mget", "setex", "setrange",
+    /// "getrange", "scan", "wait", "multi", "exec", "discard", or "custom"
+    /// with `params.template` for any other command
     pub name: String,
     /// Weight (probability) for this command
     pub weight: f64,

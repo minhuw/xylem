@@ -65,6 +65,8 @@ Redis guarantees responses come back in the same order you sent requests, per co
 
 ## The Commands
 
+A profile can select these commands by name: `get`, `set`, `incr`, `mget`, `setex`, `setrange`, `getrange`, `scan`, `wait`, `multi`, `exec`, `discard`, and `custom` for a command template. Names are case-insensitive. Every other Redis command goes through a template; see [Custom Commands via Templates](#custom-commands-via-templates).
+
 Let's talk about what these commands actually do and when you'd use them in benchmarks.
 
 **GET** retrieves a value. It's your bread-and-butter read operation. Benchmark GET to measure read latency, cache hit rates, and how Redis handles concurrent readers. When the key doesn't exist, you get back a null (`$-1\r\n`).
@@ -87,18 +89,34 @@ Let's talk about what these commands actually do and when you'd use them in benc
 
 **HELLO** negotiates the protocol version. `HELLO 2` sticks with RESP2. `HELLO 3` upgrades to RESP3. The response includes server version, supported features, and other metadata. Benchmark this if you care about RESP3 adoption or client compatibility.
 
-**CLUSTER SLOTS** returns the cluster topology: which slots are assigned to which nodes. The response is a nested array with start slot, end slot, and node addresses for each range. Use this to benchmark topology discovery and test how clients handle cluster reconfiguration.
+**SCAN** iterates over the keyspace: `SCAN 0 COUNT 100 MATCH key:*`. Set `cursor`, `count` and `pattern` with `params = { cursor = 0, count = 100, pattern = "key:*" }`; each request sends the same cursor. Use it to measure the cost of keyspace iteration alongside regular traffic.
+
+**MULTI**, **EXEC** and **DISCARD** start, commit and abort a transaction. Each is sent as a separate weighted command, so commands picked between them are queued and answered with `+QUEUED`.
 
 ### Custom Commands via Templates
 
-Xylem's command templates are your escape hatch for anything not built-in. Want to test sorted sets? Write:
+Command templates send any Redis command the profile can't select by name: DEL, MSET, hashes, lists, sets, sorted sets, CLUSTER SLOTS, GEOADD, and so on. A template is a `custom` command with `params.template`:
 ```toml
 [[traffic_groups.protocol_config.operations.commands]]
 name = "custom"
-template = "ZADD leaderboard __value_size__ player:__key__"
+weight = 0.1
+params = { template = "ZADD leaderboard __value_size__ __key__" }
 ```
 
-Xylem replaces `__key__` with the current key, `__value_size__` with the value size, and `__data__` with generated data. The template becomes a proper RESP array. You can benchmark HSET, LPUSH, SADD, GEOADD—anything Redis supports.
+The template is split on whitespace into the arguments of a RESP array. Xylem replaces `__key__` with the current key (including the key prefix, so `key:42`), `__data__` with a generated value, and `__value_size__` with the value size as a number. A variable is always a whole argument: `player:__key__` sends two arguments, `player:` and `key:42`. So a key can't carry a type prefix such as `list:`. Use a fixed collection name and put `__key__` in a member or field position, or give the data structure commands their own keyspace by putting them in a separate traffic group with a different `keys.prefix`.
+
+Templates for common commands:
+
+| Data type | Templates |
+|-----------|-----------|
+| Keys | `DEL __key__`, `MSET __key__ __data__ other __data__`, `EXPIRE __key__ 60` |
+| Hash | `HSET __key__ field __data__` (one hash per key), `HSET users __key__ __data__` (one shared hash), `HGET __key__ field`, `HGETALL __key__`, `HDEL __key__ field` |
+| List | `LPUSH queue __data__`, `RPUSH queue __data__`, `LPOP queue`, `LRANGE queue 0 9`, `LLEN queue` |
+| Set | `SADD tags __key__`, `SREM tags __key__`, `SISMEMBER tags __key__`, `SMEMBERS tags`, `SCARD tags` |
+| Sorted set | `ZADD leaderboard __value_size__ __key__`, `ZSCORE leaderboard __key__`, `ZRANGE leaderboard 0 9 WITHSCORES`, `ZREM leaderboard __key__`, `ZCARD leaderboard` |
+| Cluster | `CLUSTER SLOTS` |
+
+Replies are framed generically, so integers, bulk strings, nils, arrays, nested arrays and RESP3 types all count as one completed request. An error reply, such as `WRONGTYPE` when a template uses a key that already holds another type, counts as a failure. Watch for this when templates and `get`/`set` draw from the same keyspace.
 
 ## Building Realistic Workloads
 
