@@ -17,9 +17,6 @@
 pub mod keys;
 pub mod value_size;
 
-// Re-export distributions from xylem-common
-pub use xylem_common::distributions;
-
 // Re-export main types
 pub use keys::{KeyGeneration, KeyGeneratorTrait};
 pub use value_size::{FixedSize, NormalSize, PerCommandSize, UniformSize, ValueSizeGenerator};

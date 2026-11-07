@@ -190,6 +190,28 @@ mod tests {
     }
 
     #[test]
+    fn test_custom_template_params_from_profile_json() {
+        let config: RedisConfig = serde_json::from_str(
+            r#"{
+                "keys": { "strategy": "sequential", "start": 7, "value_size": 3 },
+                "operations": {
+                    "strategy": "weighted",
+                    "commands": [
+                        { "name": "custom", "weight": 1.0,
+                          "params": { "template": "HSET users __key__ __data__" } }
+                    ]
+                }
+            }"#,
+        )
+        .unwrap();
+        let mut protocol = RedisProtocol::from_config(&config, None).unwrap();
+        assert_eq!(
+            protocol.next_request(0).data,
+            b"*4\r\n$4\r\nHSET\r\n$5\r\nusers\r\n$5\r\nkey:7\r\n$3\r\nxxx\r\n"
+        );
+    }
+
+    #[test]
     fn test_invalid_command() {
         let config = RedisConfig {
             operations: Some(RedisOperationsConfig::Fixed { operation: "INVALID".to_string() }),

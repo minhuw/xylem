@@ -359,7 +359,9 @@ pub enum RedisOperationsConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RedisCommandWeight {
-    /// Command name: "get", "set", "incr", "mget", "wait", or "custom"
+    /// Command name: "get", "set", "incr", "mget", "setex", "setrange",
+    /// "getrange", "scan", "wait", "multi", "exec", "discard", or "custom"
+    /// with `params.template` for any other command
     pub name: String,
     /// Weight (probability) for this command
     pub weight: f64,
@@ -380,6 +382,9 @@ pub enum RedisCommandParams {
     MGet { count: usize },
     /// WAIT parameters
     Wait { num_replicas: usize, timeout_ms: u64 },
+    /// Custom command template. It precedes SCAN, whose fields are all
+    /// optional and would otherwise match any table, `template` included.
+    Custom { template: String },
     /// SCAN parameters
     Scan {
         #[serde(default)]
@@ -387,8 +392,6 @@ pub enum RedisCommandParams {
         count: Option<usize>,
         pattern: Option<String>,
     },
-    /// Custom command template
-    Custom { template: String },
 }
 
 /// Memcached protocol configuration
@@ -545,16 +548,6 @@ impl InsertPhaseConfig {
             anyhow::anyhow!("insert_phase.key_count is required for sequential keys")
         })?;
         Ok((count, self.value_size.unwrap_or_else(|| keys.value_size())))
-    }
-
-    /// Resolve key_count with fallback to provided default
-    pub fn key_count_or(&self, default: u64) -> u64 {
-        self.key_count.unwrap_or(default)
-    }
-
-    /// Resolve value_size with fallback to provided default
-    pub fn value_size_or(&self, default: usize) -> usize {
-        self.value_size.unwrap_or(default)
     }
 }
 

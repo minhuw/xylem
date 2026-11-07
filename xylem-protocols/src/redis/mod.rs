@@ -18,7 +18,7 @@ use resp::ReplyKind;
 
 /// Insert phase state for data population before measurement
 #[derive(Debug)]
-pub struct InsertPhaseState {
+pub(crate) struct InsertPhaseState {
     /// Total number of keys to insert
     key_count: u64,
     /// Number of keys inserted so far
@@ -44,11 +44,6 @@ impl InsertPhaseState {
         }
     }
 
-    /// Check if insert phase is complete
-    pub fn is_complete(&self) -> bool {
-        self.inserted >= self.key_count
-    }
-
     /// Get next key to insert, returns None if insert phase is complete
     pub fn next_key(&mut self) -> Option<u64> {
         if self.inserted >= self.key_count {
@@ -71,10 +66,6 @@ pub struct RedisProtocol {
     conn_send_seq: std::collections::HashMap<usize, u64>,
     /// Per-connection sequence numbers for receive
     conn_recv_seq: std::collections::HashMap<usize, u64>,
-    /// Track connections currently in a transaction
-    conn_in_transaction: std::collections::HashSet<usize>,
-    /// Command execution statistics
-    command_stats: std::collections::HashMap<String, u64>,
     /// Key generator for next_request() - None means use command_selector's per-command keys
     key_gen: Option<crate::workload::KeyGeneration>,
     /// Value size for next_request()
@@ -97,8 +88,6 @@ impl RedisProtocol {
             command_selector,
             conn_send_seq: std::collections::HashMap::new(),
             conn_recv_seq: std::collections::HashMap::new(),
-            conn_in_transaction: std::collections::HashSet::new(),
-            command_stats: std::collections::HashMap::new(),
             key_gen: None,
             value_size: 64,
             value_sizes: None,
@@ -107,22 +96,6 @@ impl RedisProtocol {
             rng: None,
             insert_phase: None,
         }
-    }
-
-    /// Create with embedded workload generator
-    pub fn with_workload(
-        command_selector: Box<dyn CommandSelector<RedisOp>>,
-        key_gen: crate::workload::KeyGeneration,
-        value_size: usize,
-    ) -> Self {
-        Self::with_workload_and_options(
-            command_selector,
-            key_gen,
-            value_size,
-            "key:".to_string(),
-            false,
-            None,
-        )
     }
 
     /// Create with embedded workload generator and custom options
@@ -149,8 +122,6 @@ impl RedisProtocol {
             command_selector,
             conn_send_seq: std::collections::HashMap::new(),
             conn_recv_seq: std::collections::HashMap::new(),
-            conn_in_transaction: std::collections::HashSet::new(),
-            command_stats: std::collections::HashMap::new(),
             key_gen: Some(key_gen),
             value_size,
             value_sizes: None,
@@ -185,22 +156,6 @@ impl RedisProtocol {
         self
     }
 
-    /// Check if currently in insert phase (warmup)
-    pub fn is_in_insert_phase(&self) -> bool {
-        self.insert_phase.as_ref().is_some_and(|p| !p.is_complete())
-    }
-
-    /// Record a command execution
-    fn record_command(&mut self, op: &RedisOp) {
-        let cmd_name = op.name();
-        *self.command_stats.entry(cmd_name.to_string()).or_insert(0) += 1;
-    }
-
-    /// Get command execution statistics
-    pub fn get_command_stats(&self) -> &std::collections::HashMap<String, u64> {
-        &self.command_stats
-    }
-
     /// Get next sequence number for a connection (for sending)
     fn next_send_seq(&mut self, conn_id: usize) -> u64 {
         let seq = self.conn_send_seq.entry(conn_id).or_insert(0);
@@ -222,16 +177,6 @@ impl RedisProtocol {
     /// Get configured value size
     pub fn value_size(&self) -> usize {
         self.value_size
-    }
-
-    /// Get the key prefix
-    pub fn key_prefix(&self) -> &str {
-        &self.key_prefix
-    }
-
-    /// Check if random data is enabled
-    pub fn random_data(&self) -> bool {
-        self.random_data
     }
 
     /// Format a key with the configured prefix
@@ -259,28 +204,6 @@ impl RedisProtocol {
             "x".repeat(size)
         }
     }
-
-    /// Check if a connection is in a transaction
-    pub fn is_in_transaction(&self, conn_id: usize) -> bool {
-        self.conn_in_transaction.contains(&conn_id)
-    }
-
-    /// Mark a connection as being in a transaction
-    fn set_transaction_state(&mut self, conn_id: usize, in_transaction: bool) {
-        if in_transaction {
-            self.conn_in_transaction.insert(conn_id);
-        } else {
-            self.conn_in_transaction.remove(&conn_id);
-        }
-    }
-
-    /// Clean up connection state when connection closes
-    /// This prevents HashMap leak with dead connection IDs
-    pub fn cleanup_connection(&mut self, conn_id: usize) {
-        self.conn_send_seq.remove(&conn_id);
-        self.conn_recv_seq.remove(&conn_id);
-        self.conn_in_transaction.remove(&conn_id);
-    }
 }
 
 impl RedisProtocol {
@@ -302,7 +225,6 @@ impl RedisProtocol {
 
         // Select command first
         let operation = self.command_selector.next_command();
-        self.record_command(&operation);
 
         // Generate key for this specific command
         let key = self
@@ -327,14 +249,6 @@ impl RedisProtocol {
 
         // Select which command to execute
         let operation = self.command_selector.next_command();
-        self.record_command(&operation);
-
-        // Update transaction state based on command
-        match &operation {
-            RedisOp::Multi => self.set_transaction_state(conn_id, true),
-            RedisOp::Exec | RedisOp::Discard => self.set_transaction_state(conn_id, false),
-            _ => {}
-        }
 
         let value_size = self.size_for_operation(&operation, value_size);
         let request_data = self.format_command(&operation, key, value_size);
@@ -355,7 +269,6 @@ impl RedisProtocol {
     ) -> crate::Request<(usize, u64)> {
         let seq = self.next_send_seq(conn_id);
         let id = (conn_id, seq);
-        self.record_command(operation);
         let request_data = self.format_command(operation, key, value_size);
         crate::Request::measurement(request_data, id)
     }
@@ -407,12 +320,10 @@ impl Protocol for RedisProtocol {
     fn reset(&mut self) {
         self.conn_send_seq.clear();
         self.conn_recv_seq.clear();
-        self.conn_in_transaction.clear();
         self.command_selector.reset();
         if let Some(sizes) = &mut self.value_sizes {
             sizes.reset();
         }
-        self.command_stats.clear();
         if let Some(ref mut key_gen) = self.key_gen {
             key_gen.reset();
         }
@@ -945,19 +856,6 @@ mod tests {
         assert!(request_str.contains("-1")); // end
     }
 
-    #[test]
-    fn test_generate_cluster_slots() {
-        let selector = Box::new(FixedCommandSelector::new(RedisOp::ClusterSlots));
-        let mut protocol = RedisProtocol::new(selector);
-
-        let request = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request.data);
-
-        assert!(request_str.starts_with("*2\r\n"));
-        assert!(request_str.contains("CLUSTER"));
-        assert!(request_str.contains("SLOTS"));
-    }
-
     // RESP3 response parsing tests
 
     #[test]
@@ -1275,65 +1173,6 @@ mod tests {
     }
 
     #[test]
-    fn test_transaction_state_tracking() {
-        let selector = Box::new(FixedCommandSelector::new(RedisOp::Multi));
-        let mut protocol = RedisProtocol::new(selector);
-
-        // Initially not in transaction
-        assert!(!protocol.is_in_transaction(0));
-
-        // After MULTI, should be in transaction
-        protocol.generate_request_with_key(0, 42, 64);
-        assert!(protocol.is_in_transaction(0));
-
-        // Switch to EXEC command
-        protocol.command_selector = Box::new(FixedCommandSelector::new(RedisOp::Exec));
-        protocol.generate_request_with_key(0, 42, 64);
-
-        // After EXEC, should not be in transaction
-        assert!(!protocol.is_in_transaction(0));
-    }
-
-    #[test]
-    fn test_transaction_state_with_discard() {
-        let selector = Box::new(FixedCommandSelector::new(RedisOp::Multi));
-        let mut protocol = RedisProtocol::new(selector);
-
-        // Start transaction
-        protocol.generate_request_with_key(0, 42, 64);
-        assert!(protocol.is_in_transaction(0));
-
-        // Switch to DISCARD command
-        protocol.command_selector = Box::new(FixedCommandSelector::new(RedisOp::Discard));
-        protocol.generate_request_with_key(0, 42, 64);
-
-        // After DISCARD, should not be in transaction
-        assert!(!protocol.is_in_transaction(0));
-    }
-
-    #[test]
-    fn test_transaction_state_per_connection() {
-        let selector = Box::new(FixedCommandSelector::new(RedisOp::Multi));
-        let mut protocol = RedisProtocol::new(selector);
-
-        // Start transaction on connection 0
-        protocol.generate_request_with_key(0, 42, 64);
-        assert!(protocol.is_in_transaction(0));
-        assert!(!protocol.is_in_transaction(1)); // Connection 1 not in transaction
-
-        // Start transaction on connection 1
-        protocol.generate_request_with_key(1, 42, 64);
-        assert!(protocol.is_in_transaction(0));
-        assert!(protocol.is_in_transaction(1));
-
-        // End transaction on connection 0
-        protocol.command_selector = Box::new(FixedCommandSelector::new(RedisOp::Exec));
-        protocol.generate_request_with_key(0, 42, 64);
-        assert!(!protocol.is_in_transaction(0));
-        assert!(protocol.is_in_transaction(1)); // Connection 1 still in transaction
-    }
-
-    #[test]
     fn test_parse_multi_response() {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::Multi));
         let mut protocol = RedisProtocol::new(selector);
@@ -1377,501 +1216,6 @@ mod tests {
         let (consumed, id) = result.unwrap();
         assert_eq!(consumed, 13); // *2\r\n (4) + +OK\r\n (5) + :1\r\n (4) = 13
         assert_eq!(id, Some((0, 0)));
-    }
-
-    #[test]
-    fn test_transaction_reset() {
-        let selector = Box::new(FixedCommandSelector::new(RedisOp::Multi));
-        let mut protocol = RedisProtocol::new(selector);
-
-        // Start transactions on multiple connections
-        protocol.generate_request_with_key(0, 42, 64);
-        protocol.generate_request_with_key(1, 42, 64);
-        assert!(protocol.is_in_transaction(0));
-        assert!(protocol.is_in_transaction(1));
-
-        // Reset should clear all transaction state
-        protocol.reset();
-        assert!(!protocol.is_in_transaction(0));
-        assert!(!protocol.is_in_transaction(1));
-    }
-
-    #[test]
-    fn test_command_tracking() {
-        use command_selector::FixedCommandSelector;
-
-        // Test GET command tracking
-        let mut protocol = RedisProtocol::new(Box::new(FixedCommandSelector::new(RedisOp::Get)));
-
-        // Generate some requests
-        for _ in 0..10 {
-            protocol.generate_request_with_key(0, 123, 100);
-        }
-
-        let stats = protocol.get_command_stats();
-        assert_eq!(stats.get("GET"), Some(&10));
-        assert_eq!(stats.len(), 1);
-
-        // Reset and verify
-        protocol.reset();
-        let stats = protocol.get_command_stats();
-        assert_eq!(stats.len(), 0);
-    }
-
-    #[test]
-    fn test_command_tracking_multiple_commands() {
-        use command_selector::WeightedCommandSelector;
-
-        // Create weighted selector with GET and SET
-        let commands = vec![(RedisOp::Get, 0.7), (RedisOp::Set, 0.3)];
-        let selector = WeightedCommandSelector::with_seed(commands, Some(42)).unwrap();
-        let mut protocol = RedisProtocol::new(Box::new(selector));
-
-        // Generate 100 requests
-        for i in 0..100 {
-            protocol.generate_request_with_key(0, i as u64, 100);
-        }
-
-        let stats = protocol.get_command_stats();
-
-        // Should have both GET and SET
-        assert!(stats.contains_key("GET"));
-        assert!(stats.contains_key("SET"));
-
-        // Total should be 100
-        let total: u64 = stats.values().sum();
-        assert_eq!(total, 100);
-
-        // GET should be majority with 70/30 split
-        let get_count = *stats.get("GET").unwrap();
-        let set_count = *stats.get("SET").unwrap();
-        assert!(get_count > set_count);
-    }
-
-    #[test]
-    fn test_command_tracking_special_commands() {
-        use command_selector::FixedCommandSelector;
-
-        // Test MGET
-        let mut protocol =
-            RedisProtocol::new(Box::new(FixedCommandSelector::new(RedisOp::MGet { count: 5 })));
-        protocol.generate_request_with_key(0, 123, 100);
-        assert_eq!(protocol.get_command_stats().get("MGET"), Some(&1));
-
-        // Test INCR
-        let mut protocol = RedisProtocol::new(Box::new(FixedCommandSelector::new(RedisOp::Incr)));
-        protocol.generate_request_with_key(0, 123, 100);
-        assert_eq!(protocol.get_command_stats().get("INCR"), Some(&1));
-    }
-
-    // Tests for new commands
-
-    #[test]
-    fn test_generate_del_request() {
-        let selector = Box::new(FixedCommandSelector::new(RedisOp::Del));
-        let mut protocol = RedisProtocol::new(selector);
-
-        let request = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request.data);
-
-        assert!(request_str.starts_with("*2\r\n"));
-        assert!(request_str.contains("DEL"));
-        assert!(request_str.contains("key:42"));
-    }
-
-    #[test]
-    fn test_generate_mset_request() {
-        let selector = Box::new(FixedCommandSelector::new(RedisOp::MSet { count: 3 }));
-        let mut protocol = RedisProtocol::new(selector);
-
-        let request = protocol.generate_request_with_key(0, 10, 5);
-        let request_str = String::from_utf8_lossy(&request.data);
-
-        assert!(request_str.starts_with("*7\r\n")); // MSET + 3 * (key + value)
-        assert!(request_str.contains("MSET"));
-        assert!(request_str.contains("key:10"));
-        assert!(request_str.contains("key:11"));
-        assert!(request_str.contains("key:12"));
-        assert!(request_str.contains("xxxxx")); // 5 bytes of value
-    }
-
-    #[test]
-    fn test_generate_lpush_request() {
-        let selector = Box::new(FixedCommandSelector::new(RedisOp::LPush));
-        let mut protocol = RedisProtocol::new(selector);
-
-        let request = protocol.generate_request_with_key(0, 42, 10);
-        let request_str = String::from_utf8_lossy(&request.data);
-
-        assert!(request_str.starts_with("*3\r\n"));
-        assert!(request_str.contains("LPUSH"));
-        assert!(request_str.contains("list:42"));
-        assert!(request_str.contains("xxxxxxxxxx")); // 10 bytes of value
-    }
-
-    #[test]
-    fn test_generate_rpush_request() {
-        let selector = Box::new(FixedCommandSelector::new(RedisOp::RPush));
-        let mut protocol = RedisProtocol::new(selector);
-
-        let request = protocol.generate_request_with_key(0, 42, 10);
-        let request_str = String::from_utf8_lossy(&request.data);
-
-        assert!(request_str.starts_with("*3\r\n"));
-        assert!(request_str.contains("RPUSH"));
-        assert!(request_str.contains("list:42"));
-    }
-
-    #[test]
-    fn test_generate_lpop_request() {
-        let selector = Box::new(FixedCommandSelector::new(RedisOp::LPop));
-        let mut protocol = RedisProtocol::new(selector);
-
-        let request = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request.data);
-
-        assert!(request_str.starts_with("*2\r\n"));
-        assert!(request_str.contains("LPOP"));
-        assert!(request_str.contains("list:42"));
-    }
-
-    #[test]
-    fn test_generate_rpop_request() {
-        let selector = Box::new(FixedCommandSelector::new(RedisOp::RPop));
-        let mut protocol = RedisProtocol::new(selector);
-
-        let request = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request.data);
-
-        assert!(request_str.starts_with("*2\r\n"));
-        assert!(request_str.contains("RPOP"));
-        assert!(request_str.contains("list:42"));
-    }
-
-    #[test]
-    fn test_generate_lrange_request() {
-        let selector = Box::new(FixedCommandSelector::new(RedisOp::LRange { start: 0, stop: 10 }));
-        let mut protocol = RedisProtocol::new(selector);
-
-        let request = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request.data);
-
-        assert!(request_str.starts_with("*4\r\n"));
-        assert!(request_str.contains("LRANGE"));
-        assert!(request_str.contains("list:42"));
-        assert!(request_str.contains("0")); // start
-        assert!(request_str.contains("10")); // stop
-    }
-
-    #[test]
-    fn test_generate_llen_request() {
-        let selector = Box::new(FixedCommandSelector::new(RedisOp::LLen));
-        let mut protocol = RedisProtocol::new(selector);
-
-        let request = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request.data);
-
-        assert!(request_str.starts_with("*2\r\n"));
-        assert!(request_str.contains("LLEN"));
-        assert!(request_str.contains("list:42"));
-    }
-
-    #[test]
-    fn test_generate_sadd_request() {
-        let selector = Box::new(FixedCommandSelector::new(RedisOp::SAdd));
-        let mut protocol = RedisProtocol::new(selector);
-
-        let request = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request.data);
-
-        assert!(request_str.starts_with("*3\r\n"));
-        assert!(request_str.contains("SADD"));
-        assert!(request_str.contains("set:42"));
-        assert!(request_str.contains("member:42"));
-    }
-
-    #[test]
-    fn test_generate_srem_request() {
-        let selector = Box::new(FixedCommandSelector::new(RedisOp::SRem));
-        let mut protocol = RedisProtocol::new(selector);
-
-        let request = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request.data);
-
-        assert!(request_str.starts_with("*3\r\n"));
-        assert!(request_str.contains("SREM"));
-        assert!(request_str.contains("set:42"));
-        assert!(request_str.contains("member:42"));
-    }
-
-    #[test]
-    fn test_generate_smembers_request() {
-        let selector = Box::new(FixedCommandSelector::new(RedisOp::SMembers));
-        let mut protocol = RedisProtocol::new(selector);
-
-        let request = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request.data);
-
-        assert!(request_str.starts_with("*2\r\n"));
-        assert!(request_str.contains("SMEMBERS"));
-        assert!(request_str.contains("set:42"));
-    }
-
-    #[test]
-    fn test_generate_sismember_request() {
-        let selector = Box::new(FixedCommandSelector::new(RedisOp::SIsMember));
-        let mut protocol = RedisProtocol::new(selector);
-
-        let request = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request.data);
-
-        assert!(request_str.starts_with("*3\r\n"));
-        assert!(request_str.contains("SISMEMBER"));
-        assert!(request_str.contains("set:42"));
-        assert!(request_str.contains("member:42"));
-    }
-
-    #[test]
-    fn test_generate_spop_request() {
-        let selector = Box::new(FixedCommandSelector::new(RedisOp::SPop { count: None }));
-        let mut protocol = RedisProtocol::new(selector);
-
-        let request = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request.data);
-
-        assert!(request_str.starts_with("*2\r\n"));
-        assert!(request_str.contains("SPOP"));
-        assert!(request_str.contains("set:42"));
-    }
-
-    #[test]
-    fn test_generate_spop_with_count_request() {
-        let selector = Box::new(FixedCommandSelector::new(RedisOp::SPop { count: Some(5) }));
-        let mut protocol = RedisProtocol::new(selector);
-
-        let request = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request.data);
-
-        assert!(request_str.starts_with("*3\r\n"));
-        assert!(request_str.contains("SPOP"));
-        assert!(request_str.contains("set:42"));
-        assert!(request_str.contains("5"));
-    }
-
-    #[test]
-    fn test_generate_scard_request() {
-        let selector = Box::new(FixedCommandSelector::new(RedisOp::SCard));
-        let mut protocol = RedisProtocol::new(selector);
-
-        let request = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request.data);
-
-        assert!(request_str.starts_with("*2\r\n"));
-        assert!(request_str.contains("SCARD"));
-        assert!(request_str.contains("set:42"));
-    }
-
-    #[test]
-    fn test_generate_zadd_request() {
-        let selector = Box::new(FixedCommandSelector::new(RedisOp::ZAdd { score: 1.5 }));
-        let mut protocol = RedisProtocol::new(selector);
-
-        let request = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request.data);
-
-        assert!(request_str.starts_with("*4\r\n"));
-        assert!(request_str.contains("ZADD"));
-        assert!(request_str.contains("zset:42"));
-        assert!(request_str.contains("1.5"));
-        assert!(request_str.contains("member:42"));
-    }
-
-    #[test]
-    fn test_generate_zrem_request() {
-        let selector = Box::new(FixedCommandSelector::new(RedisOp::ZRem));
-        let mut protocol = RedisProtocol::new(selector);
-
-        let request = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request.data);
-
-        assert!(request_str.starts_with("*3\r\n"));
-        assert!(request_str.contains("ZREM"));
-        assert!(request_str.contains("zset:42"));
-        assert!(request_str.contains("member:42"));
-    }
-
-    #[test]
-    fn test_generate_zrange_request() {
-        let selector = Box::new(FixedCommandSelector::new(RedisOp::ZRange {
-            start: 0,
-            stop: 10,
-            with_scores: false,
-        }));
-        let mut protocol = RedisProtocol::new(selector);
-
-        let request = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request.data);
-
-        assert!(request_str.starts_with("*4\r\n"));
-        assert!(request_str.contains("ZRANGE"));
-        assert!(request_str.contains("zset:42"));
-        assert!(!request_str.contains("WITHSCORES"));
-    }
-
-    #[test]
-    fn test_generate_zrange_with_scores_request() {
-        let selector = Box::new(FixedCommandSelector::new(RedisOp::ZRange {
-            start: 0,
-            stop: -1,
-            with_scores: true,
-        }));
-        let mut protocol = RedisProtocol::new(selector);
-
-        let request = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request.data);
-
-        assert!(request_str.starts_with("*5\r\n"));
-        assert!(request_str.contains("ZRANGE"));
-        assert!(request_str.contains("zset:42"));
-        assert!(request_str.contains("WITHSCORES"));
-    }
-
-    #[test]
-    fn test_generate_zrangebyscore_request() {
-        let selector = Box::new(FixedCommandSelector::new(RedisOp::ZRangeByScore {
-            min: 0.0,
-            max: 100.0,
-            with_scores: false,
-        }));
-        let mut protocol = RedisProtocol::new(selector);
-
-        let request = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request.data);
-
-        assert!(request_str.starts_with("*4\r\n"));
-        assert!(request_str.contains("ZRANGEBYSCORE"));
-        assert!(request_str.contains("zset:42"));
-    }
-
-    #[test]
-    fn test_generate_zscore_request() {
-        let selector = Box::new(FixedCommandSelector::new(RedisOp::ZScore));
-        let mut protocol = RedisProtocol::new(selector);
-
-        let request = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request.data);
-
-        assert!(request_str.starts_with("*3\r\n"));
-        assert!(request_str.contains("ZSCORE"));
-        assert!(request_str.contains("zset:42"));
-        assert!(request_str.contains("member:42"));
-    }
-
-    #[test]
-    fn test_generate_zcard_request() {
-        let selector = Box::new(FixedCommandSelector::new(RedisOp::ZCard));
-        let mut protocol = RedisProtocol::new(selector);
-
-        let request = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request.data);
-
-        assert!(request_str.starts_with("*2\r\n"));
-        assert!(request_str.contains("ZCARD"));
-        assert!(request_str.contains("zset:42"));
-    }
-
-    #[test]
-    fn test_generate_hset_request() {
-        let selector =
-            Box::new(FixedCommandSelector::new(RedisOp::HSet { field: "field1".to_string() }));
-        let mut protocol = RedisProtocol::new(selector);
-
-        let request = protocol.generate_request_with_key(0, 42, 10);
-        let request_str = String::from_utf8_lossy(&request.data);
-
-        assert!(request_str.starts_with("*4\r\n"));
-        assert!(request_str.contains("HSET"));
-        assert!(request_str.contains("hash:42"));
-        assert!(request_str.contains("field1"));
-        assert!(request_str.contains("xxxxxxxxxx")); // 10 bytes of value
-    }
-
-    #[test]
-    fn test_generate_hget_request() {
-        let selector =
-            Box::new(FixedCommandSelector::new(RedisOp::HGet { field: "field1".to_string() }));
-        let mut protocol = RedisProtocol::new(selector);
-
-        let request = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request.data);
-
-        assert!(request_str.starts_with("*3\r\n"));
-        assert!(request_str.contains("HGET"));
-        assert!(request_str.contains("hash:42"));
-        assert!(request_str.contains("field1"));
-    }
-
-    #[test]
-    fn test_generate_hmset_request() {
-        let selector = Box::new(FixedCommandSelector::new(RedisOp::HMSet {
-            fields: vec!["f1".to_string(), "f2".to_string(), "f3".to_string()],
-        }));
-        let mut protocol = RedisProtocol::new(selector);
-
-        let request = protocol.generate_request_with_key(0, 42, 5);
-        let request_str = String::from_utf8_lossy(&request.data);
-
-        assert!(request_str.starts_with("*8\r\n")); // HMSET + key + 3 * (field + value)
-        assert!(request_str.contains("HMSET"));
-        assert!(request_str.contains("hash:42"));
-        assert!(request_str.contains("f1"));
-        assert!(request_str.contains("f2"));
-        assert!(request_str.contains("f3"));
-    }
-
-    #[test]
-    fn test_generate_hmget_request() {
-        let selector = Box::new(FixedCommandSelector::new(RedisOp::HMGet {
-            fields: vec!["f1".to_string(), "f2".to_string()],
-        }));
-        let mut protocol = RedisProtocol::new(selector);
-
-        let request = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request.data);
-
-        assert!(request_str.starts_with("*4\r\n")); // HMGET + key + 2 fields
-        assert!(request_str.contains("HMGET"));
-        assert!(request_str.contains("hash:42"));
-        assert!(request_str.contains("f1"));
-        assert!(request_str.contains("f2"));
-    }
-
-    #[test]
-    fn test_generate_hgetall_request() {
-        let selector = Box::new(FixedCommandSelector::new(RedisOp::HGetAll));
-        let mut protocol = RedisProtocol::new(selector);
-
-        let request = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request.data);
-
-        assert!(request_str.starts_with("*2\r\n"));
-        assert!(request_str.contains("HGETALL"));
-        assert!(request_str.contains("hash:42"));
-    }
-
-    #[test]
-    fn test_generate_hdel_request() {
-        let selector =
-            Box::new(FixedCommandSelector::new(RedisOp::HDel { field: "field1".to_string() }));
-        let mut protocol = RedisProtocol::new(selector);
-
-        let request = protocol.generate_request_with_key(0, 42, 64);
-        let request_str = String::from_utf8_lossy(&request.data);
-
-        assert!(request_str.starts_with("*3\r\n"));
-        assert!(request_str.contains("HDEL"));
-        assert!(request_str.contains("hash:42"));
-        assert!(request_str.contains("field1"));
     }
 
     #[test]
@@ -1978,64 +1322,5 @@ mod tests {
         let request2 = protocol2.generate_request_with_key(0, 1, 50);
 
         assert_eq!(request1, request2, "Same seed should produce same random data");
-    }
-
-    #[test]
-    fn test_key_prefix_with_data_structures() {
-        use crate::workload::KeyGeneration;
-
-        // Test that key prefix applies to list operations
-        let selector = Box::new(FixedCommandSelector::new(RedisOp::LPush));
-        let key_gen = KeyGeneration::sequential(0);
-        let mut protocol = RedisProtocol::with_workload_and_options(
-            selector,
-            key_gen,
-            10,
-            "myapp:".to_string(),
-            false,
-            None,
-        );
-
-        let request = protocol.generate_request_with_key(0, 42, 10);
-        let request_str = String::from_utf8_lossy(&request.data);
-
-        assert!(request_str.contains("myapp:list:42"), "List key should have custom prefix");
-    }
-
-    #[test]
-    fn test_key_prefix_accessor() {
-        use crate::workload::KeyGeneration;
-
-        let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
-        let key_gen = KeyGeneration::sequential(0);
-        let protocol = RedisProtocol::with_workload_and_options(
-            selector,
-            key_gen,
-            64,
-            "custom:".to_string(),
-            false,
-            None,
-        );
-
-        assert_eq!(protocol.key_prefix(), "custom:");
-        assert!(!protocol.random_data());
-    }
-
-    #[test]
-    fn test_random_data_accessor() {
-        use crate::workload::KeyGeneration;
-
-        let selector = Box::new(FixedCommandSelector::new(RedisOp::Set));
-        let key_gen = KeyGeneration::sequential(0);
-        let protocol = RedisProtocol::with_workload_and_options(
-            selector,
-            key_gen,
-            64,
-            "key:".to_string(),
-            true,
-            Some(42),
-        );
-
-        assert!(protocol.random_data());
     }
 }

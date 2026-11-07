@@ -66,17 +66,6 @@ pub struct WeightedCommandSelector<T> {
 }
 
 impl<T: Clone> WeightedCommandSelector<T> {
-    /// Create a new weighted command selector with entropy-based seed
-    ///
-    /// # Parameters
-    /// - `commands_weights`: Vector of (command, weight) pairs
-    ///
-    /// # Returns
-    /// Error if weights are invalid (empty, negative, or all zero)
-    pub fn new(commands_weights: Vec<(T, f64)>) -> anyhow::Result<Self> {
-        Self::with_seed(commands_weights, None)
-    }
-
     /// Create a new weighted command selector with explicit seed
     ///
     /// # Parameters
@@ -202,7 +191,7 @@ mod tests {
             vec![(TestCommand::Get, 0.7), (TestCommand::Set, 0.2), (TestCommand::Delete, 0.1)];
 
         let mut selector =
-            WeightedCommandSelector::new(commands).expect("Failed to create selector");
+            WeightedCommandSelector::with_seed(commands, None).expect("Failed to create selector");
 
         // Sample many times and verify all commands appear
         let mut seen_get = false;
@@ -267,21 +256,21 @@ mod tests {
     #[test]
     fn test_weighted_selector_empty_commands() {
         let commands: Vec<(TestCommand, f64)> = vec![];
-        let result = WeightedCommandSelector::new(commands);
+        let result = WeightedCommandSelector::with_seed(commands, None);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_weighted_selector_negative_weight() {
         let commands = vec![(TestCommand::Get, 0.8), (TestCommand::Set, -0.2)];
-        let result = WeightedCommandSelector::new(commands);
+        let result = WeightedCommandSelector::with_seed(commands, None);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_weighted_selector_all_zero_weights() {
         let commands = vec![(TestCommand::Get, 0.0), (TestCommand::Set, 0.0)];
-        let result = WeightedCommandSelector::new(commands);
+        let result = WeightedCommandSelector::with_seed(commands, None);
         assert!(result.is_err());
     }
 
@@ -289,7 +278,7 @@ mod tests {
     fn test_weighted_selector_single_command() {
         let commands = vec![(TestCommand::Get, 1.0)];
         let mut selector =
-            WeightedCommandSelector::new(commands).expect("Failed to create selector");
+            WeightedCommandSelector::with_seed(commands, None).expect("Failed to create selector");
 
         for _ in 0..100 {
             assert_eq!(selector.next_command(), TestCommand::Get);

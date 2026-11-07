@@ -11,8 +11,6 @@ use anyhow::{anyhow, Result};
 /// A parsed command template that can generate RESP requests
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommandTemplate {
-    /// Original template string
-    template: String,
     /// Parsed template parts
     parts: Vec<TemplatePart>,
 }
@@ -82,7 +80,7 @@ impl CommandTemplate {
             return Err(anyhow!("Empty command template"));
         }
 
-        Ok(Self { template: template.to_string(), parts })
+        Ok(Self { parts })
     }
 
     fn save_literal_if_nonempty(parts: &mut Vec<TemplatePart>, current_literal: &mut String) {
@@ -116,11 +114,6 @@ impl CommandTemplate {
         } else {
             None
         }
-    }
-
-    /// Generate a RESP request from this template
-    pub fn generate_request(&self, key: u64, value_size: usize) -> Vec<u8> {
-        self.generate_request_with_options(key, value_size, "key:", &"x".repeat(value_size))
     }
 
     /// Generate a RESP request from this template with custom key prefix and value data
@@ -158,39 +151,21 @@ impl CommandTemplate {
         // Second pass: encode as RESP array
         encode_command(&command_parts)
     }
-
-    /// Get the original template string
-    pub fn template(&self) -> &str {
-        &self.template
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_parse_simple_template() {
-        let template = CommandTemplate::parse("GET __key__").unwrap();
-        assert_eq!(template.template(), "GET __key__");
-    }
-
-    #[test]
-    fn test_parse_hset_template() {
-        let template = CommandTemplate::parse("HSET myhash __key__ __data__").unwrap();
-        assert_eq!(template.template(), "HSET myhash __key__ __data__");
-    }
-
-    #[test]
-    fn test_parse_all_variables() {
-        let template = CommandTemplate::parse("TEST __key__ __data__ __value_size__").unwrap();
-        assert_eq!(template.template(), "TEST __key__ __data__ __value_size__");
+    /// Request bytes with the default "key:" prefix and 'x' values.
+    fn generate(template: &CommandTemplate, key: u64, value_size: usize) -> Vec<u8> {
+        template.generate_request_with_options(key, value_size, "key:", &"x".repeat(value_size))
     }
 
     #[test]
     fn test_generate_get_request() {
         let template = CommandTemplate::parse("GET __key__").unwrap();
-        let request = template.generate_request(42, 64);
+        let request = generate(&template, 42, 64);
         let request_str = String::from_utf8(request).unwrap();
 
         // Should be: *2\r\n$3\r\nGET\r\n$6\r\nkey:42\r\n
@@ -202,7 +177,7 @@ mod tests {
     #[test]
     fn test_generate_hset_request() {
         let template = CommandTemplate::parse("HSET myhash __key__ __data__").unwrap();
-        let request = template.generate_request(100, 5);
+        let request = generate(&template, 100, 5);
         let request_str = String::from_utf8(request).unwrap();
 
         // Should be: *4\r\n$4\r\nHSET\r\n$7\r\nmyhash\r\n$7\r\nkey:100\r\n$5\r\nxxxxx\r\n
@@ -216,7 +191,7 @@ mod tests {
     #[test]
     fn test_generate_with_value_size() {
         let template = CommandTemplate::parse("SETEX __key__ __value_size__ __data__").unwrap();
-        let request = template.generate_request(1, 10);
+        let request = generate(&template, 1, 10);
         let request_str = String::from_utf8(request).unwrap();
 
         assert!(request_str.contains("SETEX"));
@@ -234,7 +209,7 @@ mod tests {
     #[test]
     fn test_no_variables() {
         let template = CommandTemplate::parse("PING").unwrap();
-        let request = template.generate_request(0, 0);
+        let request = generate(&template, 0, 0);
         let request_str = String::from_utf8(request).unwrap();
 
         assert!(request_str.starts_with("*1\r\n"));
@@ -244,7 +219,7 @@ mod tests {
     #[test]
     fn test_complex_template() {
         let template = CommandTemplate::parse("ZADD myset __value_size__ __key__").unwrap();
-        let request = template.generate_request(50, 100);
+        let request = generate(&template, 50, 100);
         let request_str = String::from_utf8(request).unwrap();
 
         // *4\r\n$4\r\nZADD\r\n$5\r\nmyset\r\n$3\r\n100\r\n$6\r\nkey:50\r\n
@@ -259,7 +234,7 @@ mod tests {
     fn test_template_with_underscore_literal() {
         // Test template with underscore that doesn't match any variable
         let template = CommandTemplate::parse("SET _custom_key __key__").unwrap();
-        let request = template.generate_request(42, 100);
+        let request = generate(&template, 42, 100);
         let request_str = String::from_utf8_lossy(&request);
 
         // _custom_key should be treated as a literal (line 73 coverage)
@@ -272,7 +247,7 @@ mod tests {
         // Test that templates with underscores that don't match variables
         // are treated as literals (line 100 coverage)
         let template = CommandTemplate::parse("SET _invalid__ __key__").unwrap();
-        let request = template.generate_request(42, 100);
+        let request = generate(&template, 42, 100);
         let request_str = String::from_utf8_lossy(&request);
 
         // _invalid__ should be treated as a literal

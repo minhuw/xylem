@@ -6,11 +6,11 @@
 //! - HELLO (protocol negotiation)
 //! - SETEX (set with expiry)
 //! - SETRANGE/GETRANGE (offset-based operations)
-//! - CLUSTER SLOTS (topology discovery)
+//! - CLUSTER SLOTS (topology discovery, through a custom command template)
 
 use xylem_protocols::redis::command_selector::FixedCommandSelector;
 use xylem_protocols::redis::{RedisOp, RedisProtocol};
-use xylem_protocols::Protocol;
+use xylem_protocols::{CommandTemplate, Protocol};
 
 fn main() {
     println!("=== Redis New Commands Examples ===\n");
@@ -80,7 +80,8 @@ fn main() {
 
     // 9. CLUSTER SLOTS - Topology discovery
     println!("9. CLUSTER SLOTS:");
-    let slots_selector = Box::new(FixedCommandSelector::new(RedisOp::ClusterSlots));
+    let slots_template = CommandTemplate::parse("CLUSTER SLOTS").unwrap();
+    let slots_selector = Box::new(FixedCommandSelector::new(RedisOp::Custom(slots_template)));
     let mut slots_protocol = RedisProtocol::new(slots_selector);
     let slots_request = slots_protocol.generate_request_with_key(0, 1, 64);
     println!("   Request: {}", String::from_utf8_lossy(&slots_request.data));
