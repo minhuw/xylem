@@ -19,7 +19,8 @@ use crate::{
 use ntcp_io::PacketIo;
 use ntcp_native::{
     BlockReason, CloseReason, ConnId, DriveReport, Event, Network, NetworkConfig, ReadOutcome,
-    State, WorkBudget, WriteOptions,
+    State, TimestampEvent, TxTimestampEvent, TxTimestampOutcome, TxTimestampSource,
+    TxTimestampStage, WorkBudget, WriteOptions,
 };
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -36,8 +37,18 @@ use std::time::Duration;
 /// drives again before it blocks.
 const WORK_BUDGET: WorkBudget = WorkBudget::new(64, 64, 64, 64);
 
+/// Work done by the drive that puts a request on the wire at the end of
+/// `send`: transmit only
+///
+/// Following ntcp's guidance, received packets and timers wait for the next
+/// `poll` instead of costing every request a full drive.
+const FLUSH_BUDGET: WorkBudget = WorkBudget::new(0, WORK_BUDGET.transmit, 0, 0);
+
 /// Number of events taken from the network per `drain_events` call
 const EVENT_BATCH: usize = 64;
+
+/// Number of TX timestamp records taken per `drain_timestamps` call
+const TIMESTAMP_BATCH: usize = 16;
 
 /// How long `add_connection` waits for the handshake, like the kernel TCP
 /// group's effective connect timeout (50 polls of 100 ms)
@@ -65,8 +76,8 @@ fn now_ticks() -> u64 {
     crate::time_ns()
 }
 
-fn deadline_after(timeout: Duration) -> u64 {
-    now_ticks().saturating_add(u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX))
+fn ticks(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 // =============================================================================
@@ -76,6 +87,9 @@ fn deadline_after(timeout: Duration) -> u64 {
 /// What the group knows about one connection between calls
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct SlotState {
+    /// The handshake completed (`Connected` event); only `add_connection`
+    /// reads it
+    connected: bool,
     /// Data may be waiting: set by `Readable` events, cleared by a receive
     /// that found nothing (or that did not fill the caller's buffer)
     readable: bool,
@@ -155,6 +169,12 @@ impl<H: Copy + Eq + Hash> SlotTable<H> {
         self.by_handle.remove(&handle);
         self.live -= 1;
         Some(handle)
+    }
+
+    fn on_connected(&mut self, handle: H) {
+        if let Some(&id) = self.by_handle.get(&handle) {
+            self.slots[id].state.connected = true;
+        }
     }
 
     fn on_readable(&mut self, handle: H) {
@@ -244,6 +264,10 @@ pub struct NtcpConnectionGroup<P: PacketIo + AsRawFd> {
     closing: Vec<ConnId>,
     /// Reused buffer for `drain_events`
     events: Vec<Event>,
+    /// The last tick passed to ntcp, which rejects time going backwards
+    last_tick: u64,
+    /// Source of ticks; tests replace it
+    clock: fn() -> u64,
     connect_timeout: Duration,
     send_timeout: Duration,
     close_linger: Duration,
@@ -256,13 +280,16 @@ impl<P: PacketIo + AsRawFd> NtcpConnectionGroup<P> {
     /// group passes, and generates the TCP secret from `/dev/urandom`.
     pub fn new(mut config: NetworkConfig, io: P) -> Result<Self> {
         config.tcp.connection.timebase.units_per_second = UNITS_PER_SECOND;
-        let network = Network::new(config, io, random_secret()?, now_ticks())
+        let now = now_ticks();
+        let network = Network::new(config, io, random_secret()?, now)
             .map_err(|e| network_error("ntcp network setup", e))?;
         Ok(Self {
             network,
             slots: SlotTable::new(),
             closing: Vec::new(),
             events: vec![Event::NetworkStopped; EVENT_BATCH],
+            last_tick: now,
+            clock: now_ticks,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             send_timeout: DEFAULT_SEND_TIMEOUT,
             close_linger: DEFAULT_CLOSE_LINGER,
@@ -289,11 +316,28 @@ impl<P: PacketIo + AsRawFd> NtcpConnectionGroup<P> {
         &self.network
     }
 
-    /// Drive the network once
+    /// The tick to pass to ntcp: the clock, but never below the last tick
+    /// passed, since ntcp fails a drive whose time went backwards (the TSC
+    /// clock of `time_ns` may step back when the thread changes CPU)
+    fn now(&mut self) -> u64 {
+        self.last_tick = self.last_tick.max((self.clock)());
+        self.last_tick
+    }
+
+    /// The tick `timeout` from now
+    fn deadline_after(&mut self, timeout: Duration) -> u64 {
+        self.now().saturating_add(ticks(timeout))
+    }
+
+    /// Drive the network once with `budget`
+    fn drive_with(&mut self, budget: WorkBudget) -> Result<DriveReport> {
+        let now = self.now();
+        self.network.drive(now, budget).map_err(|e| network_error("ntcp drive", e))
+    }
+
+    /// Drive the network once: receive, transmit, timers and reclaim
     fn drive(&mut self) -> Result<DriveReport> {
-        self.network
-            .drive(now_ticks(), WORK_BUDGET)
-            .map_err(|e| network_error("ntcp drive", e))
+        self.drive_with(WORK_BUDGET)
     }
 
     /// Drain every pending event into the slot table; returns whether the
@@ -305,10 +349,10 @@ impl<P: PacketIo + AsRawFd> NtcpConnectionGroup<P> {
             let report = self.network.drain_events(&mut self.events);
             for event in &self.events[..report.written] {
                 match *event {
+                    Event::Connected(id) => self.slots.on_connected(id),
                     Event::Readable(id) => self.slots.on_readable(id),
                     Event::Closed { connection, .. } => self.slots.on_closed(connection),
                     Event::NetworkStopped => self.slots.on_stopped(),
-                    // Connected: add_connection reads the connection state.
                     // Writable: send drives until its bytes are accepted
                     _ => {}
                 }
@@ -329,8 +373,8 @@ impl<P: PacketIo + AsRawFd> NtcpConnectionGroup<P> {
 
     /// Wait on the backend fd until it is ready, the next ntcp timer, or
     /// `deadline` (ticks), whichever comes first
-    fn wait(&self, report: &DriveReport, deadline: u64) -> Result<()> {
-        let now = now_ticks();
+    fn wait(&mut self, report: &DriveReport, deadline: u64) -> Result<()> {
+        let now = self.now();
         let mut until = deadline;
         if let Some(timer) = report.next_deadline {
             until = until.min(timer);
@@ -348,10 +392,14 @@ impl<P: PacketIo + AsRawFd> NtcpConnectionGroup<P> {
     }
 
     /// Whether every locally closed connection has finished its close
+    ///
+    /// FIN-WAIT-2 counts as finished: our FIN was ACKed, and only the peer's
+    /// FIN is missing, which a server that never closes does not send (Linux
+    /// bounds that state with tcp_fin_timeout rather than wait for it).
     fn closes_done(&mut self) -> bool {
         let network = &self.network;
         self.closing.retain(|&id| match network.connection_info(id) {
-            Ok(info) => !matches!(info.state, State::Closed | State::TimeWait),
+            Ok(info) => !matches!(info.state, State::Closed | State::TimeWait | State::FinWait2),
             Err(_) => false,
         });
         self.closing.is_empty()
@@ -378,28 +426,42 @@ fn wait_fd(fd: RawFd, events: libc::c_short, wait_ns: u64) -> Result<()> {
 
 impl<P: PacketIo + AsRawFd> ConnectionGroup for NtcpConnectionGroup<P> {
     fn add_connection(&mut self, target: &SocketAddr) -> Result<usize> {
-        let id = self.slots.reserve();
+        // Take an id only once ntcp accepted the connection, so that a
+        // refused `connect` leaves nothing behind
         let conn = self.network.connect(*target).map_err(|e| network_error("ntcp connect", e))?;
-        let deadline = deadline_after(self.connect_timeout);
+        let id = self.slots.reserve();
+        // Attach the handle right away: the drains below apply its
+        // `Connected` or `Closed` event to the slot, just like other
+        // connections' events
+        self.slots.open(id, conn);
+        let deadline = self.deadline_after(self.connect_timeout);
 
+        // ntcp latches `Connected` once, when the handshake reaches
+        // ESTABLISHED (or CLOSE-WAIT)
         loop {
-            let (report, more_events) = self.service()?;
-            let info = self
-                .network
-                .connection_info(conn)
-                .map_err(|e| network_error("ntcp connect", e))?;
-            match info.state {
-                State::Established | State::CloseWait => break,
-                State::SynSent | State::SynReceived => {}
-                _ => {
-                    let _ = self.network.close(conn);
-                    return Err(Error::Connection(format!(
-                        "Connection to {target} failed: {}",
-                        reason_text(info.reason)
-                    )));
+            let (report, more_events) = match self.service() {
+                Ok(service) => service,
+                Err(e) => {
+                    self.slots.remove(id);
+                    let _ = self.network.abort(conn);
+                    return Err(e);
                 }
+            };
+            let state = self.slots.state_mut(id);
+            if state.connected {
+                break;
             }
-            if now_ticks() >= deadline {
+            if state.closed {
+                self.slots.remove(id);
+                let reason = self.network.connection_info(conn).ok().and_then(|i| i.reason);
+                let _ = self.network.close(conn);
+                return Err(Error::Connection(format!(
+                    "Connection to {target} failed: {}",
+                    reason_text(reason)
+                )));
+            }
+            if self.now() >= deadline {
+                self.slots.remove(id);
                 let _ = self.network.abort(conn);
                 return Err(Error::Connection("Connection timeout".to_string()));
             }
@@ -409,10 +471,11 @@ impl<P: PacketIo + AsRawFd> ConnectionGroup for NtcpConnectionGroup<P> {
         }
 
         // Requests are small and latency-bound: never hold them back (Nagle)
-        self.network
-            .set_nodelay(conn, true)
-            .map_err(|e| network_error("ntcp set_nodelay", e))?;
-        self.slots.open(id, conn);
+        if let Err(e) = self.network.set_nodelay(conn, true) {
+            self.slots.remove(id);
+            let _ = self.network.abort(conn);
+            return Err(network_error("ntcp set_nodelay", e));
+        }
         Ok(id)
     }
 
@@ -429,20 +492,25 @@ impl<P: PacketIo + AsRawFd> ConnectionGroup for NtcpConnectionGroup<P> {
             if sent < data.len() {
                 // Only a partial write or a full buffer gets here: let the
                 // stack transmit and take ACKs, within the send timeout
-                let deadline = *deadline.get_or_insert_with(|| deadline_after(self.send_timeout));
-                if now_ticks() >= deadline {
+                let deadline = match deadline {
+                    Some(deadline) => deadline,
+                    None => *deadline.insert(self.deadline_after(self.send_timeout)),
+                };
+                if self.now() >= deadline {
                     return Err(Error::Connection(format!(
                         "Send timeout: {} of {} bytes accepted",
                         sent,
                         data.len()
                     )));
                 }
+                // A full drive: send space frees only as received ACKs are
+                // processed
                 self.drive()?;
             }
         }
         let timestamp = Timestamp::now();
         // Put the request on the wire now rather than at the next poll
-        self.drive()?;
+        self.drive_with(FLUSH_BUDGET)?;
         Ok(SendReceipt { timestamp, tx: None })
     }
 
@@ -450,8 +518,11 @@ impl<P: PacketIo + AsRawFd> ConnectionGroup for NtcpConnectionGroup<P> {
         let conn = self.slots.handle(conn_id)?;
         match self.network.try_read(conn, buf) {
             Ok(ReadOutcome::Data { len, .. }) => {
-                // A read that did not fill the buffer took every byte that
-                // was there; the next arrival raises a new Readable event
+                // ntcp's `try_read` copies min(buf.len(), readable bytes) as
+                // of the call (ntcp-native `Network::try_read`, confirmed by
+                // the ntcp maintainer), so a read that did not fill the
+                // buffer took every byte that was there; it also rearms the
+                // Readable event for the next arrival
                 self.slots.state_mut(conn_id).readable = len == buf.len();
                 Ok(RecvOutcome::Data { len, timestamp: Timestamp::now() })
             }
@@ -469,10 +540,10 @@ impl<P: PacketIo + AsRawFd> ConnectionGroup for NtcpConnectionGroup<P> {
     }
 
     fn poll(&mut self, timeout: Duration, ready: &mut Vec<usize>) -> Result<()> {
-        let deadline = deadline_after(timeout);
+        let deadline = self.deadline_after(timeout);
         loop {
             let (report, more_events) = self.service()?;
-            if self.slots.any_ready() || now_ticks() >= deadline {
+            if self.slots.any_ready() || self.now() >= deadline {
                 break;
             }
             if !report.more_work && !more_events {
@@ -504,9 +575,26 @@ impl<P: PacketIo + AsRawFd> ConnectionGroup for NtcpConnectionGroup<P> {
             self.close(id)?;
         }
 
+        // ntcp frees a closed connection's slot once its `Closed` event and
+        // all its TX timestamp records were drained. None are requested yet,
+        // but drain them anyway; the scratch records need a real ConnId
+        let mut stamps = self.closing.first().map(|&connection| {
+            let placeholder = TimestampEvent {
+                connection,
+                observation: TxTimestampEvent {
+                    cookie: 0,
+                    target: 0,
+                    stage: TxTimestampStage::Transmit,
+                    source: TxTimestampSource::Software,
+                    outcome: TxTimestampOutcome::Cancelled,
+                },
+            };
+            vec![placeholder; TIMESTAMP_BATCH]
+        });
+
         // Keep driving so the FINs, their retransmissions and the final
         // ACKs reach the peers; dropping the network sends nothing
-        let deadline = deadline_after(self.close_linger);
+        let deadline = self.deadline_after(self.close_linger);
         loop {
             let (report, more_events) = match self.service() {
                 Ok(service) => service,
@@ -514,8 +602,15 @@ impl<P: PacketIo + AsRawFd> ConnectionGroup for NtcpConnectionGroup<P> {
                 Err(_) if self.network.is_stopped() => return Ok(()),
                 Err(e) => return Err(e),
             };
-            let quiet = !report.more_work && !report.tx_blocked && self.closes_done();
-            if quiet || now_ticks() >= deadline {
+            if let Some(stamps) = &mut stamps {
+                while self.network.drain_timestamps(stamps).more {}
+            }
+            // Quiet once every close finished and the last drive had nothing
+            // left to transmit. Not `more_work`: at the pinned ntcp revision
+            // a closed connection in FIN-WAIT-2 makes every drive report it
+            let done = self.closes_done();
+            let quiet = done && !report.tx_blocked && report.transmitted == 0;
+            if quiet || self.now() >= deadline {
                 if !quiet {
                     tracing::debug!(
                         "ntcp: {} connection(s) still closing after the {:?} linger",
@@ -588,9 +683,12 @@ mod tests {
     use super::*;
     use ntcp_io::{PacketLayer, TxOutcome};
     use ntcp_native::{ListenerId, ReadOutcome};
+    use std::cell::Cell;
+    use std::net::SocketAddrV6;
     use std::os::unix::net::UnixDatagram;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::time::Instant;
 
     // =========================================================================
     // Slot table
@@ -733,19 +831,29 @@ mod tests {
         config
     }
 
-    /// An ntcp echo server on its own thread; `close_after` closes each
-    /// connection after it echoed that many bytes
+    /// When the echo server closes a connection
+    #[derive(Clone, Copy)]
+    enum ServerClose {
+        /// When the client's FIN arrives
+        OnEof,
+        /// After echoing this many bytes
+        After(usize),
+        /// Never: the connection stays half-open after the client's FIN
+        Never,
+    }
+
+    /// An ntcp echo server on its own thread
     struct EchoServer {
         stop: Arc<AtomicBool>,
         handle: Option<std::thread::JoinHandle<()>>,
     }
 
     impl EchoServer {
-        fn start(wire: Wire, listen: bool, close_after: Option<usize>) -> Self {
+        fn start(wire: Wire, listen: bool, close: ServerClose) -> Self {
             let stop = Arc::new(AtomicBool::new(false));
             let stop_flag = stop.clone();
             let handle =
-                std::thread::spawn(move || run_echo_server(wire, listen, close_after, &stop_flag));
+                std::thread::spawn(move || run_echo_server(wire, listen, close, &stop_flag));
             Self { stop, handle: Some(handle) }
         }
     }
@@ -759,7 +867,7 @@ mod tests {
         }
     }
 
-    fn run_echo_server(wire: Wire, listen: bool, close_after: Option<usize>, stop: &AtomicBool) {
+    fn run_echo_server(wire: Wire, listen: bool, close: ServerClose, stop: &AtomicBool) {
         let mut config = network_config(SERVER);
         config.tcp.connection.timebase.units_per_second = UNITS_PER_SECOND;
         let mut network =
@@ -778,11 +886,15 @@ mod tests {
             }
             conns.retain_mut(|(id, echoed)| {
                 let open = echo_once(&mut network, *id, &mut buf, echoed);
-                let done = close_after.is_some_and(|n| *echoed >= n);
-                if !open || done {
+                let close_now = match close {
+                    ServerClose::OnEof => !open,
+                    ServerClose::After(n) => !open || *echoed >= n,
+                    ServerClose::Never => false,
+                };
+                if close_now {
                     let _ = network.close(*id);
                 }
-                open && !done
+                open && !close_now
             });
             std::thread::sleep(Duration::from_micros(50));
         }
@@ -826,9 +938,9 @@ mod tests {
         let mut out = Vec::new();
         let mut ready = Vec::new();
         let mut buf = [0u8; 1024];
-        let deadline = deadline_after(Duration::from_secs(5));
+        let deadline = Instant::now() + Duration::from_secs(5);
         while out.len() < want {
-            assert!(now_ticks() < deadline, "timed out with {} of {want} bytes", out.len());
+            assert!(Instant::now() < deadline, "timed out with {} of {want} bytes", out.len());
             group.poll(Duration::from_millis(100), &mut ready).unwrap();
             if !ready.contains(&id) {
                 continue;
@@ -843,7 +955,7 @@ mod tests {
     #[test]
     fn echo_round_trips_and_readiness() {
         let (a, b) = link();
-        let _server = EchoServer::start(b, true, None);
+        let _server = EchoServer::start(b, true, ServerClose::OnEof);
         let mut group = client(a);
 
         let first = group.add_connection(&server_addr()).unwrap();
@@ -878,7 +990,7 @@ mod tests {
     #[test]
     fn peer_close_reports_eof() {
         let (a, b) = link();
-        let _server = EchoServer::start(b, true, Some(4));
+        let _server = EchoServer::start(b, true, ServerClose::After(4));
         let mut group = client(a);
         let id = group.add_connection(&server_addr()).unwrap();
         group.send(id, b"ping").unwrap();
@@ -886,9 +998,9 @@ mod tests {
 
         let mut ready = Vec::new();
         let mut buf = [0u8; 64];
-        let deadline = deadline_after(Duration::from_secs(5));
+        let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            assert!(now_ticks() < deadline, "no EOF");
+            assert!(Instant::now() < deadline, "no EOF");
             group.poll(Duration::from_millis(100), &mut ready).unwrap();
             if ready.contains(&id) && matches!(group.recv(id, &mut buf).unwrap(), RecvOutcome::Eof)
             {
@@ -907,7 +1019,7 @@ mod tests {
     fn refused_connection_fails_and_burns_its_id() {
         let (a, b) = link();
         // No listener: the server stack answers the SYN with a RST
-        let _server = EchoServer::start(b, false, None);
+        let _server = EchoServer::start(b, false, ServerClose::OnEof);
         let mut group = client(a);
         let err = group.add_connection(&server_addr()).unwrap_err();
         assert!(matches!(err, Error::Connection(_)), "{err}");
@@ -921,7 +1033,7 @@ mod tests {
         let (a, _b) = link();
         let mut group = client(a);
         group.set_connect_timeout(Duration::from_millis(300));
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let err = group.add_connection(&server_addr()).unwrap_err();
         assert!(matches!(&err, Error::Connection(m) if m.contains("timeout")), "{err}");
         assert!(started.elapsed() >= Duration::from_millis(300));
@@ -931,13 +1043,93 @@ mod tests {
     #[test]
     fn poll_waits_for_its_timeout_when_idle() {
         let (a, b) = link();
-        let _server = EchoServer::start(b, true, None);
+        let _server = EchoServer::start(b, true, ServerClose::OnEof);
         let mut group = client(a);
         group.add_connection(&server_addr()).unwrap();
         let mut ready = Vec::new();
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         group.poll(Duration::from_millis(50), &mut ready).unwrap();
         assert!(ready.is_empty());
         assert!(started.elapsed() >= Duration::from_millis(50));
+    }
+
+    #[test]
+    fn rejected_connect_takes_no_id() {
+        let (a, b) = link();
+        let _server = EchoServer::start(b, true, ServerClose::OnEof);
+        let mut group = client(a);
+        // ntcp refuses OS scope ids before opening anything
+        let scoped = SocketAddr::V6(SocketAddrV6::new("fe80::1".parse().unwrap(), PORT, 0, 1));
+        for _ in 0..3 {
+            assert!(group.add_connection(&scoped).is_err());
+        }
+        assert_eq!(group.len(), 0);
+        assert_eq!(group.add_connection(&server_addr()).unwrap(), 0);
+        assert_eq!(group.slots.slots.len(), 1);
+    }
+
+    #[test]
+    fn connect_completes_on_its_event_and_keeps_other_events() {
+        let (a, b) = link();
+        let _server = EchoServer::start(b, true, ServerClose::OnEof);
+        let mut group = client(a);
+        let first = group.add_connection(&server_addr()).unwrap();
+        assert!(group.slots.state_mut(first).connected);
+
+        // The echo arrives while the next connect drives and drains the
+        // network: its Readable event must reach the first slot
+        group.send(first, b"early").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        let second = group.add_connection(&server_addr()).unwrap();
+        assert!(group.slots.state_mut(second).connected);
+        assert!(group.slots.state_mut(first).readable);
+        let mut ready = Vec::new();
+        group.poll(Duration::ZERO, &mut ready).unwrap();
+        assert_eq!(ready, [first]);
+        assert_eq!(recv_exact(&mut group, first, 5), b"early");
+    }
+
+    #[test]
+    fn close_all_does_not_wait_for_a_peer_that_never_closes() {
+        let (a, b) = link();
+        let _server = EchoServer::start(b, true, ServerClose::Never);
+        let mut group = client(a);
+        for _ in 0..3 {
+            group.add_connection(&server_addr()).unwrap();
+        }
+        group.set_close_linger(Duration::from_secs(5));
+        let started = Instant::now();
+        group.close_all().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+        assert!(group.closing.is_empty());
+    }
+
+    thread_local! {
+        /// How far `stepped_clock` runs ahead of the real clock
+        static CLOCK_AHEAD: Cell<u64> = const { Cell::new(0) };
+    }
+
+    fn stepped_clock() -> u64 {
+        now_ticks() + CLOCK_AHEAD.with(Cell::get)
+    }
+
+    #[test]
+    fn ticks_never_go_backwards() {
+        let (a, b) = link();
+        let _server = EchoServer::start(b, true, ServerClose::OnEof);
+        let mut group = client(a);
+        CLOCK_AHEAD.with(|c| c.set(50_000_000));
+        group.clock = stepped_clock;
+        let id = group.add_connection(&server_addr()).unwrap();
+        let before = group.network().now();
+
+        // The clock steps back 50 ms: ntcp keeps getting the last tick
+        CLOCK_AHEAD.with(|c| c.set(0));
+        group.send(id, b"tick").unwrap();
+        let mut ready = Vec::new();
+        group.poll(Duration::ZERO, &mut ready).unwrap();
+        assert!(group.network().now() >= before);
+        assert_eq!(recv_exact(&mut group, id, 4), b"tick");
+        group.close_all().unwrap();
     }
 }
