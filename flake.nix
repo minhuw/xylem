@@ -151,7 +151,7 @@
             lockFile = ./Cargo.lock;
             # One hash covers every crate of a git repository at its pinned rev
             outputHashes = {
-              "ntcp-native-0.0.1" = "sha256-0CoaNJrrODxvSONqa6y5Pd3b/owk0AFvZBVYfOXXpPc=";
+              "ntcp-native-0.0.1" = "sha256-soBHrGGU0x7FoPHEikqyxM80sa5ezOE/M8Asp2SYr7c=";
             };
           };
 
