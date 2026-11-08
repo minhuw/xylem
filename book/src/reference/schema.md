@@ -297,6 +297,35 @@ real_time = false
 - `html.library` (string, default `"chartjs"`): Only `"chartjs"` is supported.
 - `html.theme` (string, default `"light"`): Only `"light"` is supported.
 
+## Thresholds and Validity
+
+`[thresholds]` maps a metric, optionally filtered to a traffic group, to a
+list of expressions; `[validity]` tunes the checks that a run applied its
+configured load:
+
+```toml
+[thresholds]
+"latency" = ["p99 < 250us", "p99.9 < 1ms"]
+"latency{group=latency-agent}" = ["p50 < 80us"]
+"requests.timed_out" = ["rate < 0.001"]
+
+[validity]
+enabled = true
+max_unsent_ratio = 0.001
+max_late_send_ratio = 0.01
+skip = []
+```
+
+- `thresholds` (table of string lists, default empty): see
+  [Thresholds and Validity](../guide/thresholds.md) for metrics, aggregations,
+  units and evaluation.
+- `validity.enabled` (bool, default true): false disables every check.
+- `validity.max_unsent_ratio` (number from 0 to 1, default 0.001)
+- `validity.max_late_send_ratio` (number from 0 to 1, default 0.01)
+- `validity.skip` (list of `"unsent"`, `"late_sends"`, default empty)
+
+Other `[validity]` keys are rejected.
+
 ## Request Dump
 
 Use `[request_dump]` to record outgoing requests as CSV files:
@@ -407,6 +436,7 @@ real_time = false
 ## See Also
 
 - [Configuration Guide](../guide/configuration.md)
+- [Thresholds and Validity](../guide/thresholds.md)
 - [Protocol Configuration](../guide/configuration/workload.md)
 - [CLI Reference](../guide/cli-reference.md)
 - [Example Profiles](https://github.com/minhuw/xylem/tree/main/profiles)

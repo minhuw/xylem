@@ -25,6 +25,7 @@
   - [Unix Domain Sockets](./guide/transports/unix.md)
   - [ntcp (User-Space TCP)](./guide/transports/ntcp.md)
 - [Output Formats](./guide/output-formats.md)
+- [Thresholds and Validity](./guide/thresholds.md)
 
 # Architecture
 

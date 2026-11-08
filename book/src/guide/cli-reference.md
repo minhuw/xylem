@@ -162,6 +162,18 @@ format = "json"
 file = "/tmp/results.json"
 ```
 
+## Exit Status
+
+| Status | Meaning |
+|---|---|
+| 0 | The run passed its validity checks and thresholds, or none applied |
+| 1 | Error, including an invalid profile or unwritable result files |
+| 2 | Thresholds failed: a `[thresholds]` expression did not hold |
+| 3 | Invalid run: a `[validity]` check failed, so the results do not describe the configured load (takes precedence over 2) |
+
+Result files are written before the exit with 2 or 3. See
+[Thresholds and Validity](./thresholds.md).
+
 ## Environment Variables
 
 Xylem respects the following environment variables:
@@ -175,4 +187,5 @@ RUST_LOG=debug xylem -P tests/redis/redis-get-zipfian.toml
 ## See Also
 
 - [Configuration](./configuration.md) - Detailed configuration file format
+- [Thresholds and Validity](./thresholds.md) - Verdicts and exit statuses
 - [Configuration Schema](../reference/schema.md) - Configuration schema reference

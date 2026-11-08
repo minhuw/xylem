@@ -40,6 +40,7 @@ The configuration is divided into several sections:
 - **[Protocol Configuration](./configuration/workload.md)** - Define key distributions and operations per traffic group
 - **[Transport Configuration](./configuration/transport.md)** - Configure network transport options
 - **[Protocol Selection](./configuration/protocol.md)** - Protocol-specific settings
+- **[Thresholds and Validity](./thresholds.md)** - `[thresholds]` and `[validity]`: pass/fail limits on the results, checks that the run applied its load, and the exit status
 
 ## Basic Example
 
@@ -117,4 +118,5 @@ xylem -P tests/redis/redis-get-zipfian.toml
 - [Protocol Configuration](./configuration/workload.md)
 - [Transport Configuration](./configuration/transport.md)
 - [Protocol Selection](./configuration/protocol.md)
+- [Thresholds and Validity](./thresholds.md)
 - [Configuration Schema](../reference/schema.md)
