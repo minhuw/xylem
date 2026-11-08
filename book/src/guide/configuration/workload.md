@@ -209,7 +209,7 @@ weight = 0.3
 
 [traffic_groups.traffic_policy]
 type = "fixed-rate"
-rate = 100.0  # Per-connection rate
+rate = 100.0  # Requests per second of the whole group
 
 [traffic_groups.sampling_policy]
 type = "unlimited"

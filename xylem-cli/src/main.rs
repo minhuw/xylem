@@ -6,7 +6,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use xylem_core::threading::{CpuPinning, ThreadingRuntime, Worker, WorkerConfig};
+use xylem_core::threading::{CpuPinning, StartTicket, ThreadingRuntime, Worker, WorkerConfig};
 use xylem_transport::{TcpTransportFactory, UdpTransportFactory};
 
 use xylem_cli::{completions, config, output};
@@ -329,12 +329,11 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
     };
 
     let runtime = ThreadingRuntime::with_thread_ids(thread_ids.clone(), cpu_pinning.clone());
-    // One epoch for every thread's time buckets, so equal bucket numbers
-    // cover the same interval when the collectors are merged.
-    let stats_epoch_ns = xylem_core::timing::time_ns();
 
-    // Support multiple traffic groups per thread with per-group protocols
-    let results = runtime.run_workers_generic(move |thread_idx| {
+    // Support multiple traffic groups per thread with per-group protocols.
+    // Each thread connects, then waits at the start gate: every thread starts
+    // at the same time, which anchors every schedule and the stats' buckets.
+    let results = runtime.run_workers_with_start(move |thread_idx, start| {
         // Clone the request dumper for this worker thread
         let request_dumper_for_worker = request_dumper.clone();
         // Find which traffic groups this thread belongs to
@@ -348,13 +347,19 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
         for (group_id, _group_meta) in groups_for_thread.iter() {
             let group_config = &config_for_worker.traffic_groups[*group_id];
 
+            // Each thread's protocol gets its own seed, so threads do not
+            // generate the same keys in lockstep.
+            let protocol_seed = config_for_worker
+                .experiment
+                .seed
+                .map(|seed| xylem_core::seed::protocol_seed(seed, *group_id, thread_idx));
             // Validation parsed each group's protocol_config, in group order.
             // The group's target is the HTTP Host header unless the config sets one.
             let protocol = xylem_cli::multi_protocol::MultiProtocol::from_config(
                 &config_for_worker.protocol_configs[*group_id],
                 &group_config.target,
                 &group_config.transport,
-                config_for_worker.experiment.seed,
+                protocol_seed,
             )?;
 
             protocols.insert(*group_id, protocol);
@@ -363,10 +368,9 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
         // Initialize tuple stats collector
         // Global sampling policy: used for global aggregation (can be "none" to skip global latency)
         // Per-group sampling policies: each group aggregates using its own policy
-        let mut stats = xylem_core::stats::TupleStatsCollector::with_start_time(
+        let mut stats = xylem_core::stats::TupleStatsCollector::new(
             global_sampling_policy.clone(),
             config_for_worker.stats.bucket_duration,
-            stats_epoch_ns,
         );
         // Connection IDs restart at 0 on every thread; the thread ID keeps
         // per-connection statistics apart when the collectors are merged.
@@ -396,11 +400,10 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                 continue;
             }
 
-            // Calculate total connections for rate distribution
-            let total_connections =
-                group_config.connections_per_thread * group_config.threads.len();
-            let policy_scheduler: Box<dyn xylem_core::scheduler::PolicyScheduler> =
-                group_config.traffic_policy.create_scheduler(total_connections)?;
+            // The group's connections share its rate across its threads
+            let policy_scheduler: Box<dyn xylem_core::scheduler::PolicyScheduler> = group_config
+                .traffic_policy
+                .create_scheduler(group_meta, config_for_worker.experiment.seed)?;
 
             let group_target: std::net::SocketAddr =
                 group_config.target.parse().with_context(|| {
@@ -455,12 +458,13 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
             .collect();
 
         // Helper function to wire the request dumper and request timeouts into a
-        // created worker, run it, and return its stats.
+        // created worker, run it from the shared start time, and return its stats.
         fn run_worker<G, S>(
             mut worker: Worker<G, xylem_cli::multi_protocol::MultiProtocol, S>,
             request_dumper: Option<&Arc<xylem_core::request_dump::RequestDumper>>,
             thread_idx: usize,
             request_timeouts: &[(usize, Option<std::time::Duration>)],
+            start: StartTicket,
         ) -> xylem_core::Result<S>
         where
             G: xylem_transport::ConnectionGroup,
@@ -474,7 +478,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                 worker.set_request_timeout(group_id, timeout);
             }
 
-            worker.run()?;
+            worker.run_at(start.wait())?;
             Ok(worker.into_stats())
         }
 
@@ -494,6 +498,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                     request_dumper_for_worker.as_ref(),
                     thread_idx,
                     &request_timeouts,
+                    start,
                 )
             }
             "udp" => {
@@ -510,6 +515,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                     request_dumper_for_worker.as_ref(),
                     thread_idx,
                     &request_timeouts,
+                    start,
                 )
             }
             "unix" => {
@@ -520,11 +526,9 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
 
                 for (group_id, group_meta) in groups_for_thread.iter() {
                     let group_config = &config_for_worker.traffic_groups[*group_id];
-                    // Calculate total connections for rate distribution
-                    let total_connections =
-                        group_config.connections_per_thread * group_config.threads.len();
-                    let policy_scheduler =
-                        group_config.traffic_policy.create_scheduler(total_connections)?;
+                    let policy_scheduler = group_config
+                        .traffic_policy
+                        .create_scheduler(group_meta, config_for_worker.experiment.seed)?;
                     unix_groups_config.push((
                         *group_id,
                         group_config.target.clone(),
@@ -547,6 +551,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                     request_dumper_for_worker.as_ref(),
                     thread_idx,
                     &request_timeouts,
+                    start,
                 )
             }
             #[cfg(all(target_os = "linux", feature = "ntcp"))]
@@ -576,6 +581,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                     request_dumper_for_worker.as_ref(),
                     thread_idx,
                     &request_timeouts,
+                    start,
                 )
             }
             other => Err(xylem_core::Error::Config(format!("Unsupported transport: {}", other)))?,

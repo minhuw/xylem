@@ -79,6 +79,22 @@ pub trait Protocol: Send {
         true
     }
 
+    /// Check if the connection is still in connection setup: it has setup
+    /// requests ([`crate::RequestMeta::is_setup`]) left to send, or a setup
+    /// reply to wait for
+    ///
+    /// While this is true, the worker sends the connection's requests as soon
+    /// as `can_send` allows, off its intended schedule, so a rate-driven
+    /// connection does not wait for its intended send times to set up. Its
+    /// schedule starts once setup is done. Return true only while the next
+    /// request will be a setup request or a setup reply is pending.
+    ///
+    /// Default implementation returns false: any setup requests wait for the
+    /// connection's intended send times like other requests.
+    fn setup_pending(&self, _conn_id: usize) -> bool {
+        false
+    }
+
     /// Protocol name
     fn name(&self) -> &'static str;
 

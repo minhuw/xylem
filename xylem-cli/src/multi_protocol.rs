@@ -135,6 +135,17 @@ impl Protocol for MultiProtocol {
             MultiProtocol::Masstree(p) => p.can_send(conn_id),
         }
     }
+
+    fn setup_pending(&self, conn_id: usize) -> bool {
+        match self {
+            MultiProtocol::Redis(p) => p.setup_pending(conn_id),
+            MultiProtocol::MemcachedBinary(p) => p.setup_pending(conn_id),
+            MultiProtocol::MemcachedAscii(p) => p.setup_pending(conn_id),
+            MultiProtocol::Http(p) => p.setup_pending(conn_id),
+            MultiProtocol::XylemEcho(p) => p.setup_pending(conn_id),
+            MultiProtocol::Masstree(p) => p.setup_pending(conn_id),
+        }
+    }
 }
 
 /// Create a Redis protocol that draws commands from `redis_selector`

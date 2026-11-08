@@ -180,9 +180,29 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         }
     }
 
-    /// Run the pipelined measurement loop (Lancet symmetric_tcp_main style)
+    /// Run the pipelined measurement loop from now; see [`Self::run_at`]
     pub fn run(&mut self) -> Result<()> {
-        let start_ns = timing::time_ns();
+        self.run_at(timing::time_ns())
+    }
+
+    /// Run the pipelined measurement loop (Lancet symmetric_tcp_main style)
+    /// from `start_ns` (a `timing::time_ns` value) to `start_ns + duration`
+    ///
+    /// `start_ns` is the start time every thread shares: every connection's
+    /// intended schedule is anchored at it, so the connections of a traffic
+    /// group interleave across threads, and it is the epoch of the stats' time
+    /// buckets. Nothing is sent before it. A connection still setting up
+    /// starts its schedule once setup is done.
+    pub fn run_at(&mut self, start_ns: u64) -> Result<()> {
+        self.stats.start_measurement(start_ns);
+        self.anchor_schedules(start_ns);
+        let now_ns = timing::time_ns();
+        if start_ns.saturating_sub(now_ns) > 2_000_000 {
+            // Sleep until shortly before the start, then spin to it
+            std::thread::sleep(Duration::from_nanos(start_ns - now_ns - 1_000_000));
+        }
+        timing::busy_wait_until(start_ns);
+
         let duration_ns = self.config.duration.as_nanos().min(u64::MAX as u128) as u64;
         let end_ns = start_ns.saturating_add(duration_ns);
 
@@ -214,6 +234,20 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         self.pool.close_all()?;
 
         Ok(())
+    }
+
+    /// Anchor every connection's schedule at `start_ns` and reschedule the
+    /// connections that can send
+    fn anchor_schedules(&mut self, start_ns: u64) {
+        self.pool.anchor_schedules(start_ns);
+        for connection_id in self.pool.connection_ids().to_vec() {
+            let Some(state) = self.pool.get_state(connection_id) else {
+                continue;
+            };
+            let protocol =
+                self.protocols.get(&state.group_id()).expect("Protocol not found for group_id");
+            self.pool.try_schedule_connection(connection_id, protocol);
+        }
     }
 
     fn send_requests(&mut self) -> Result<()> {
@@ -541,6 +575,9 @@ mod tests {
         /// the protocol cannot send while one is pending.
         setup: u64,
         setup_pending: bool,
+        /// Report setup through `Protocol::setup_pending`, so it goes out
+        /// off the schedule
+        report_setup: bool,
     }
 
     impl Protocol for FakeProtocol {
@@ -579,6 +616,10 @@ mod tests {
 
         fn can_send(&self, _: usize) -> bool {
             !self.setup_pending
+        }
+
+        fn setup_pending(&self, _: usize) -> bool {
+            self.report_setup && (self.setup_pending || self.next_id < self.setup)
         }
 
         fn name(&self) -> &'static str {
@@ -901,6 +942,103 @@ mod tests {
         assert_eq!(worker.stats.entries().values().map(|entry| entry.tx_bytes).sum::<u64>(), 8);
         assert_eq!(worker.stats.entries().values().map(|entry| entry.rx_bytes).sum::<u64>(), 8);
         assert_eq!(global(&worker).latency_sample_count, 1);
+    }
+
+    /// A worker whose one connection is connection 1 of 4 sharing 40 req/s:
+    /// its slots are 25 ms, 125 ms, 225 ms, ... after the start
+    fn striped_worker(factory: &FakeFactory) -> Worker<FakeGroup, FakeProtocol> {
+        use crate::scheduler::{FixedRatePolicy, GroupPolicyScheduler};
+        let scheduler =
+            GroupPolicyScheduler::new(1, |c| Box::new(FixedRatePolicy::striped(40.0, c, 4)));
+        fake_worker(factory, 100, Box::new(scheduler))
+    }
+
+    #[test]
+    fn setup_goes_out_at_once_and_the_schedule_starts_at_the_first_slot_after_it() {
+        for setup_done_after_start in [false, true] {
+            let factory = FakeFactory::default();
+            factory.0.lock().unwrap().live_timestamps = true;
+            let mut worker = striped_worker(&factory);
+            let protocol = worker.protocols.get_mut(&0).unwrap();
+            protocol.setup = 2;
+            protocol.report_setup = true;
+            // The start is now, and setup ends 30 ms after it, or 10 s ahead
+            let start = if setup_done_after_start {
+                timing::time_ns()
+            } else {
+                timing::time_ns() + 10_000_000_000
+            };
+            worker.anchor_schedules(start);
+
+            // Each setup request goes out as soon as the connection can send,
+            // not at its slots
+            for id in 0u64..2 {
+                worker.send_requests().unwrap();
+                assert_eq!(factory.0.lock().unwrap().sent.len() as u64, id + 1);
+                if id == 1 && setup_done_after_start {
+                    thread::sleep(Duration::from_millis(30));
+                }
+                factory.0.lock().unwrap().responses.push_back(Ok(id.to_le_bytes().to_vec()));
+                worker.process_responses(Duration::ZERO).unwrap();
+            }
+
+            // The schedule starts at the first slot at or after both the start
+            // and the end of setup, so setup is neither send lag nor unsent
+            let first = if setup_done_after_start {
+                125_000_000
+            } else {
+                25_000_000
+            };
+            let state = worker.pool.get_state(0).unwrap();
+            assert_eq!(state.intended_send_time(), Some(start + first));
+            worker.record_unsent(start + first);
+            assert_eq!(worker.stats.request_counts_global().unsent, 0);
+            worker.record_unsent(start + first + 100_000_001);
+            assert_eq!(worker.stats.request_counts_global().unsent, 2);
+            if !setup_done_after_start {
+                worker.send_requests().unwrap();
+                assert_eq!(factory.0.lock().unwrap().sent.len(), 2, "nothing is due yet");
+            }
+        }
+    }
+
+    #[test]
+    fn a_connection_stuck_in_setup_intends_no_sends() {
+        for report_setup in [false, true] {
+            let factory = FakeFactory::default();
+            let mut worker =
+                fake_worker(&factory, 100, Box::new(UniformPolicyScheduler::fixed_rate(1000.0)));
+            let protocol = worker.protocols.get_mut(&0).unwrap();
+            protocol.setup = 1;
+            protocol.report_setup = report_setup;
+            let start = timing::time_ns();
+            if report_setup {
+                // Setup goes out at once, long before the first slot
+                worker.anchor_schedules(start + 10_000_000_000);
+            }
+            // Otherwise the setup request takes the unanchored schedule's
+            // first slot, due at once
+            worker.send_requests().unwrap();
+            assert_eq!(factory.0.lock().unwrap().sent.len(), 1);
+            // The setup reply never arrives
+            worker.record_unsent(start + 20_000_000_000);
+            let counts = worker.stats.request_counts_global();
+            assert_eq!((counts.sent, counts.unsent), (0, 0), "report_setup {report_setup}");
+        }
+    }
+
+    #[test]
+    fn run_at_starts_at_the_shared_start_and_takes_it_as_the_bucket_epoch() {
+        let factory = FakeFactory::default();
+        let mut worker = fake_worker(&factory, 1, Box::new(UniformPolicyScheduler::closed_loop()));
+        worker.config.duration = Duration::from_millis(10);
+        let start = timing::time_ns() + 30_000_000;
+        worker.run_at(start).unwrap();
+        assert_eq!(worker.stats.experiment_start_ns(), start);
+        let (first_send, end) = worker.stats.measurement_window_ns().unwrap();
+        assert!(first_send >= start, "nothing is sent before the start");
+        assert_eq!(end, start + 10_000_000);
+        assert_eq!(worker.stats.request_counts_global().sent, 1);
     }
 
     #[test]

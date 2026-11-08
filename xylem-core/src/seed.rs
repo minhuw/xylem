@@ -68,6 +68,20 @@ pub fn derive_seed(master_seed: u64, component: &str) -> u64 {
     ])
 }
 
+/// Seed of traffic group `group`'s protocol on worker thread `thread`
+///
+/// Every thread's protocol of a group has its own seed, so the threads do not
+/// generate the same keys in lockstep.
+pub fn protocol_seed(master_seed: u64, group: usize, thread: usize) -> u64 {
+    derive_seed(master_seed, &format!("{}/{group}/{thread}", components::PROTOCOL))
+}
+
+/// Seed of the Poisson arrivals of connection `connection` of traffic group
+/// `group`, numbered across the group's threads
+pub fn poisson_seed(master_seed: u64, group: usize, connection: usize) -> u64 {
+    derive_seed(master_seed, &format!("{}/{group}/{connection}", components::POISSON_POLICY))
+}
+
 /// Standard component names for seed derivation
 ///
 /// Using constants ensures consistent naming across the codebase
@@ -80,6 +94,8 @@ pub mod components {
     /// Seed component for protocol-specific random generation (e.g., key generation)
     pub const RANDOM_KEYS: &str = "random_key_generation";
     pub const POISSON_POLICY: &str = "poisson_policy";
+    /// Seed component for a traffic group's protocol on one thread
+    pub const PROTOCOL: &str = "protocol";
 }
 
 #[cfg(test)]
@@ -144,6 +160,20 @@ mod tests {
                 assert_ne!(seeds[i], seeds[j], "Seeds {} and {} are not unique", i, j);
             }
         }
+    }
+
+    #[test]
+    fn every_thread_and_connection_gets_its_own_seed() {
+        let protocol = [protocol_seed(42, 0, 0), protocol_seed(42, 0, 1), protocol_seed(42, 1, 0)];
+        let poisson = [poisson_seed(42, 0, 0), poisson_seed(42, 0, 1), poisson_seed(42, 1, 0)];
+        let mut all: Vec<u64> = protocol.iter().chain(&poisson).copied().collect();
+        all.push(42);
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), 7, "threads, groups and connections differ from each other");
+        assert_eq!(protocol_seed(42, 0, 1), protocol_seed(42, 0, 1));
+        assert_ne!(protocol_seed(42, 0, 1), protocol_seed(43, 0, 1));
+        assert_eq!(poisson_seed(42, 1, 0), derive_seed(42, "poisson_policy/1/0"));
     }
 
     #[test]

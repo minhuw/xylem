@@ -8,11 +8,16 @@
 //! - Explicit thread affinity
 //! - Per-group protocol configuration (keys, operations, etc.)
 
-use crate::scheduler::PolicyScheduler;
+use crate::scheduler::{
+    AdaptivePolicy, FixedRatePolicy, GroupPolicyScheduler, PatternAwarePolicy, PoissonPolicy,
+    PolicyScheduler, UniformPolicyScheduler,
+};
 use crate::stats::SamplingPolicy;
+use crate::workload::LoadPattern;
 use crate::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Traffic group configuration
@@ -167,28 +172,47 @@ fn default_max_rate() -> f64 {
 }
 
 impl PolicyConfig {
-    /// Create a policy scheduler from this configuration
+    /// Create the policy scheduler of one thread entry's connections of `group`
     ///
-    /// # Arguments
-    /// * `num_connections` - Total number of connections in the group (for rate distribution)
-    ///
-    /// Rate-based policies (FixedRate, Poisson, Adaptive, etc.) distribute the configured
-    /// rate across all connections. For example, if `rate = 5000` and `num_connections = 10`,
-    /// each connection will target 500 requests/second.
-    pub fn create_scheduler(&self, num_connections: usize) -> Result<Box<dyn PolicyScheduler>> {
-        let num_connections = num_connections.max(1) as f64;
+    /// The group's connections are numbered across its threads, this entry's
+    /// from `group.first_connection`, and share the configured rate:
+    /// - Fixed rate: connection `c` of `N` sends its `k`-th request at
+    ///   `start + ⌊(c + k·N)·10⁹/rate⌋` ns, so the group's merged stream is
+    ///   evenly spaced at `rate`.
+    /// - Poisson: each connection is a Poisson process at `rate/N`. With a
+    ///   `seed`, connection `c` of group `g` draws from
+    ///   [`crate::seed::poisson_seed`]`(seed, g, c)`; without one, from OS entropy.
+    /// - Adaptive and the patterns: each connection runs at `1/N` of the
+    ///   configured rates and starts `c/N` of a request into its schedule.
+    pub fn create_scheduler(
+        &self,
+        group: &TrafficGroup,
+        seed: Option<u64>,
+    ) -> Result<Box<dyn PolicyScheduler>> {
+        let connections = group.total_connections().max(1);
+        let num_connections = connections as f64;
+        let first = group.first_connection;
 
         match self {
-            PolicyConfig::ClosedLoop => {
-                Ok(Box::new(crate::scheduler::UniformPolicyScheduler::closed_loop()))
-            }
+            PolicyConfig::ClosedLoop => Ok(Box::new(UniformPolicyScheduler::closed_loop())),
             PolicyConfig::FixedRate { rate } => {
-                let per_conn_rate = *rate / num_connections;
-                Ok(Box::new(crate::scheduler::UniformPolicyScheduler::fixed_rate(per_conn_rate)))
+                let rate = *rate;
+                Ok(Box::new(GroupPolicyScheduler::new(first, move |c| {
+                    Box::new(FixedRatePolicy::striped(rate, c, connections))
+                })))
             }
             PolicyConfig::Poisson { rate } => {
                 let per_conn_rate = *rate / num_connections;
-                Ok(Box::new(crate::scheduler::UniformPolicyScheduler::poisson(per_conn_rate)?))
+                // Validate the rate once, not on every connection
+                PoissonPolicy::with_seed(per_conn_rate, Some(0))?;
+                let group_id = group.id;
+                Ok(Box::new(GroupPolicyScheduler::new(first, move |c| {
+                    let seed = seed.map(|seed| crate::seed::poisson_seed(seed, group_id, c));
+                    Box::new(
+                        PoissonPolicy::with_seed(per_conn_rate, seed)
+                            .expect("rate already validated"),
+                    )
+                })))
             }
             PolicyConfig::Adaptive {
                 initial_rate,
@@ -200,12 +224,17 @@ impl PolicyConfig {
                 let per_conn_initial = *initial_rate / num_connections;
                 let per_conn_min = *min_rate / num_connections;
                 let per_conn_max = *max_rate / num_connections;
-                Ok(Box::new(crate::scheduler::UniformPolicyScheduler::adaptive(
-                    per_conn_initial,
-                    target_latency,
-                    per_conn_min,
-                    per_conn_max,
-                )))
+                Ok(Box::new(GroupPolicyScheduler::new(first, move |c| {
+                    Box::new(
+                        AdaptivePolicy::new(
+                            per_conn_initial,
+                            target_latency,
+                            per_conn_min,
+                            per_conn_max,
+                        )
+                        .with_phase(c, connections),
+                    )
+                })))
             }
             PolicyConfig::Sinusoidal {
                 base_rate,
@@ -225,14 +254,14 @@ impl PolicyConfig {
                 } else {
                     pattern
                 };
-                Ok(Box::new(crate::scheduler::PatternPolicyScheduler::new(Box::new(pattern))))
+                Ok(pattern_scheduler(Arc::new(pattern), first, connections))
             }
             PolicyConfig::Ramp { start_rate, end_rate, duration } => {
                 let per_conn_start = *start_rate / num_connections;
                 let per_conn_end = *end_rate / num_connections;
                 let pattern =
                     crate::workload::RampPattern::new(per_conn_start, per_conn_end, *duration);
-                Ok(Box::new(crate::scheduler::PatternPolicyScheduler::new(Box::new(pattern))))
+                Ok(pattern_scheduler(Arc::new(pattern), first, connections))
             }
             PolicyConfig::Spike {
                 normal_rate,
@@ -248,17 +277,30 @@ impl PolicyConfig {
                     *spike_start,
                     *spike_duration,
                 );
-                Ok(Box::new(crate::scheduler::PatternPolicyScheduler::new(Box::new(pattern))))
+                Ok(pattern_scheduler(Arc::new(pattern), first, connections))
             }
             PolicyConfig::Sawtooth { min_rate, max_rate, period } => {
                 let per_conn_min = *min_rate / num_connections;
                 let per_conn_max = *max_rate / num_connections;
                 let pattern =
                     crate::workload::SawtoothPattern::new(per_conn_min, per_conn_max, *period);
-                Ok(Box::new(crate::scheduler::PatternPolicyScheduler::new(Box::new(pattern))))
+                Ok(pattern_scheduler(Arc::new(pattern), first, connections))
             }
         }
     }
+}
+
+/// Pattern policies for connections `first, first + 1, ...` of `connections`.
+/// The pattern starts when the worker anchors the schedules.
+fn pattern_scheduler(
+    pattern: Arc<dyn LoadPattern>,
+    first: usize,
+    connections: usize,
+) -> Box<dyn PolicyScheduler> {
+    let start_ns = crate::timing::time_ns();
+    Box::new(GroupPolicyScheduler::new(first, move |c| {
+        Box::new(PatternAwarePolicy::new(Arc::clone(&pattern), start_ns).with_phase(c, connections))
+    }))
 }
 
 /// Traffic group metadata
@@ -278,6 +320,10 @@ pub struct TrafficGroup {
     pub threads: Vec<usize>,
     /// Connections per thread
     pub connections_per_thread: usize,
+    /// Group-wide number of this thread entry's first connection: its
+    /// position in `threads` times `connections_per_thread`, so entries never
+    /// overlap, even for a thread listed twice. Zero from [`Self::from_config`].
+    pub first_connection: usize,
     /// Max pending per connection
     pub max_pending_per_connection: usize,
     /// Sampling policy
@@ -297,6 +343,7 @@ impl TrafficGroup {
             transport: config.transport.clone(),
             threads: config.threads.clone(),
             connections_per_thread: config.connections_per_thread,
+            first_connection: 0,
             max_pending_per_connection: config.max_pending_per_connection,
             sampling_policy: config.sampling_policy.clone(),
             protocol_config: config.protocol_config.clone(),
@@ -318,14 +365,19 @@ pub struct ThreadGroupAssignment {
 
 impl ThreadGroupAssignment {
     /// Create assignment from group configs
+    ///
+    /// Each entry's [`TrafficGroup::first_connection`] numbers its connections
+    /// after those of the entries before it in the group's `threads`.
     pub fn from_configs(configs: &[TrafficGroupConfig]) -> Self {
         let mut assignments: HashMap<usize, Vec<(usize, TrafficGroup)>> = HashMap::new();
 
         for (group_id, config) in configs.iter().enumerate() {
             let group = TrafficGroup::from_config(group_id, config);
 
-            for &thread_id in &config.threads {
-                assignments.entry(thread_id).or_default().push((group_id, group.clone()));
+            for (position, &thread_id) in config.threads.iter().enumerate() {
+                let mut entry = group.clone();
+                entry.first_connection = position * config.connections_per_thread;
+                assignments.entry(thread_id).or_default().push((group_id, entry));
             }
         }
 
@@ -516,5 +568,125 @@ mod tests {
         // Should succeed - non-contiguous IDs allowed
         assert!(assignment.validate().is_ok());
         assert_eq!(assignment.thread_ids(), vec![2, 3, 5]);
+    }
+
+    fn group(
+        name: &str,
+        threads: Vec<usize>,
+        connections: usize,
+        policy: PolicyConfig,
+    ) -> TrafficGroupConfig {
+        TrafficGroupConfig {
+            name: name.to_string(),
+            protocol: "xylem-echo".to_string(),
+            target: "127.0.0.1:9999".to_string(),
+            transport: "tcp".to_string(),
+            threads,
+            connections_per_thread: connections,
+            max_pending_per_connection: 1,
+            request_timeout: None,
+            traffic_policy: policy,
+            sampling_policy: SamplingPolicy::default(),
+            protocol_config: None,
+        }
+    }
+
+    /// A policy's first `sends` intended times when it is anchored at `start`
+    /// and each request goes out on time
+    fn intended_times(
+        policy: &mut dyn crate::scheduler::Policy,
+        start: u64,
+        sends: usize,
+    ) -> Vec<u64> {
+        policy.anchor(start);
+        policy.next_send_time(start - 1_000_000);
+        (0..sends)
+            .map(|_| {
+                let intended = policy.intended_send_time().unwrap();
+                policy.on_request_sent(intended);
+                intended
+            })
+            .collect()
+    }
+
+    /// Every connection's first `sends` intended times, per group, built per
+    /// thread entry the way the CLI builds them and anchored at `start`
+    fn group_schedules(
+        configs: &[TrafficGroupConfig],
+        seed: Option<u64>,
+        start: u64,
+        sends: usize,
+    ) -> HashMap<usize, Vec<Vec<u64>>> {
+        let assignment = ThreadGroupAssignment::from_configs(configs);
+        let mut schedules: HashMap<usize, Vec<Vec<u64>>> = HashMap::new();
+        for thread_id in assignment.thread_ids() {
+            for (group_id, entry) in assignment.get_groups_for_thread(thread_id).unwrap() {
+                let mut scheduler =
+                    configs[*group_id].traffic_policy.create_scheduler(entry, seed).unwrap();
+                // A pool numbers each group's connections from zero
+                for index in 0..entry.connections_per_thread {
+                    let times = intended_times(&mut *scheduler.assign_policy(index), start, sends);
+                    schedules.entry(*group_id).or_default().push(times);
+                }
+            }
+        }
+        schedules
+    }
+
+    #[test]
+    fn fixed_rate_connections_of_every_thread_and_group_merge_into_even_streams() {
+        let start = 1_000_000_000;
+        // Thread 1 carries both groups, and group 1 lists it twice
+        let configs = vec![
+            group("a", vec![0, 1, 2], 3, PolicyConfig::FixedRate { rate: 90_000.0 }),
+            group("b", vec![1, 3, 1], 2, PolicyConfig::FixedRate { rate: 12_345.5 }),
+        ];
+        let assignment = ThreadGroupAssignment::from_configs(&configs);
+        let firsts: Vec<_> = assignment
+            .get_groups_for_thread(1)
+            .unwrap()
+            .iter()
+            .map(|(g, e)| (*g, e.first_connection))
+            .collect();
+        assert_eq!(firsts, vec![(0, 3), (1, 0), (1, 4)]);
+
+        // Group a: 9 connections, 111,112 sends each, about 1e6 in all
+        let schedules = group_schedules(&configs, None, start, 111_112);
+        for (group_id, (numerator, denominator)) in [(0, (90_000u128, 1u128)), (1, (24_691, 2))] {
+            let mut merged: Vec<u64> = schedules[&group_id].iter().flatten().copied().collect();
+            merged.sort_unstable();
+            let expected: Vec<u64> = (0..merged.len() as u128)
+                .map(|j| start + (j * 1_000_000_000 * denominator / numerator) as u64)
+                .collect();
+            assert!(
+                merged == expected,
+                "group {group_id}: first difference at send {:?}",
+                merged.iter().zip(&expected).position(|(a, b)| a != b)
+            );
+        }
+        // The last of group a's 1,000,008 sends is exactly where the rate puts it
+        assert_eq!(schedules[&0].iter().flatten().max(), Some(&(start + 11_111_188_888)));
+    }
+
+    #[test]
+    fn seeded_poisson_groups_repeat_and_every_connection_has_its_own_stream() {
+        let start = 1_000_000_000;
+        let configs = vec![
+            group("a", vec![0, 1], 2, PolicyConfig::Poisson { rate: 4_000.0 }),
+            group("b", vec![1], 2, PolicyConfig::Poisson { rate: 4_000.0 }),
+        ];
+        let schedules = group_schedules(&configs, Some(7), start, 100);
+        assert_eq!(schedules, group_schedules(&configs, Some(7), start, 100));
+        assert_ne!(schedules, group_schedules(&configs, Some(8), start, 100));
+        let mut streams: Vec<_> = schedules.values().flatten().collect();
+        assert_eq!(streams.len(), 6);
+        streams.sort();
+        streams.dedup();
+        assert_eq!(streams.len(), 6, "no two connections share a stream");
+        // Without a seed, every run differs
+        assert_ne!(
+            group_schedules(&configs, None, start, 100),
+            group_schedules(&configs, None, start, 100)
+        );
     }
 }

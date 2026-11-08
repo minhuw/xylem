@@ -394,6 +394,10 @@ impl Protocol for RedisProtocol {
         !matches!(self.conn_setup.state(conn_id), SetupState::Awaiting(_))
     }
 
+    fn setup_pending(&self, conn_id: usize) -> bool {
+        !self.setup.is_empty() && self.conn_setup.state(conn_id) != SetupState::Done
+    }
+
     fn name(&self) -> &'static str {
         "redis"
     }
