@@ -229,7 +229,7 @@
           "default": "tun"
         },
         "dpdk": {
-          "description": "Backend \"dpdk\": the port and the threads' addresses",
+          "description": "Backend \"dpdk\": the port and the threads' addresses (ignored by\nbackend \"tun\")",
           "anyOf": [
             {
               "$ref": "#/$defs/NtcpDpdk"
@@ -240,7 +240,7 @@
           ]
         },
         "endpoints": {
-          "description": "Backend \"tun\": one endpoint per worker thread that runs ntcp traffic\ngroups, in ascending thread-id order",
+          "description": "Backend \"tun\": one endpoint per worker thread that runs ntcp traffic\ngroups, in ascending thread-id order (ignored by backend \"dpdk\")",
           "type": "array",
           "items": {
             "$ref": "#/$defs/NtcpEndpoint"
