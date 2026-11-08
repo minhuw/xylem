@@ -163,7 +163,7 @@ impl TcpConnectionGroup {
     pub fn with_timestamp_config(timestamp_config: TcpTimestampConfig) -> Result<Self> {
         Ok(Self {
             core: GroupCore::new()?,
-            timestamp_source: timestamp_config.resolve_source("TCP"),
+            timestamp_source: timestamp_config.resolve_source("TCP")?,
             timestamp_config,
         })
     }
@@ -229,7 +229,7 @@ impl ConnectionGroup for TcpConnectionGroup {
             self.timestamp_source,
             "TCP",
             conn_id,
-        );
+        )?;
         #[cfg(not(target_os = "linux"))]
         let timestamps_enabled = false;
 
@@ -696,6 +696,24 @@ mod tests {
         let config = TcpTimestampConfig::with_interface("lo");
         let group = TcpConnectionGroup::with_timestamp_config(config).unwrap();
         assert_eq!(group.timestamp_source(), TimestampSource::UserSpace);
+    }
+
+    /// Required hardware timestamps fail the group rather than fall back
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_tcp_group_required_hardware_never_falls_back() {
+        // lo has no PHC: its driver rejects the query or reports it off
+        for interface in ["lo", "xylem-no-such-if"] {
+            let config = TcpTimestampConfig::require_hardware(interface);
+            assert!(config.check().is_err());
+            let Err(error) = TcpTransportFactory::with_timestamp_config(config).create_group()
+            else {
+                panic!("{interface}: created a group without hardware timestamps");
+            };
+            assert!(error.to_string().contains(&format!("'{interface}'")), "{error}");
+        }
+        // Without the requirement, an interface without them is not an error
+        assert!(TcpTimestampConfig::with_interface("lo").check().is_ok());
     }
 
     #[test]

@@ -132,7 +132,7 @@ impl UdpConnectionGroup {
     pub fn with_timestamp_config(timestamp_config: UdpTimestampConfig) -> Result<Self> {
         Ok(Self {
             core: GroupCore::new()?,
-            timestamp_source: timestamp_config.resolve_source("UDP"),
+            timestamp_source: timestamp_config.resolve_source("UDP")?,
             timestamp_config,
         })
     }
@@ -172,7 +172,7 @@ impl ConnectionGroup for UdpConnectionGroup {
             self.timestamp_source,
             "UDP",
             conn_id,
-        );
+        )?;
         #[cfg(not(target_os = "linux"))]
         let timestamps_enabled = false;
 
@@ -506,6 +506,22 @@ mod tests {
         let mut out = Vec::new();
         group.poll_tx_timestamps(&mut out).unwrap();
         assert!(out.is_empty());
+    }
+
+    /// Required hardware timestamps fail the group rather than fall back
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_udp_group_required_hardware_never_falls_back() {
+        // lo has no PHC: its driver rejects the query or reports it off
+        for interface in ["lo", "xylem-no-such-if"] {
+            let config = UdpTimestampConfig::require_hardware(interface);
+            assert!(config.check().is_err());
+            let Err(error) = UdpTransportFactory::with_timestamp_config(config).create_group()
+            else {
+                panic!("{interface}: created a group without hardware timestamps");
+            };
+            assert!(error.to_string().contains(&format!("'{interface}'")), "{error}");
+        }
     }
 
     #[test]

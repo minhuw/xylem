@@ -23,9 +23,14 @@
 //!   which needs root or CAP_NET_ADMIN);
 //! - otherwise kernel software timestamps, if requested explicitly.
 //!
+//! `TimestampConfig::require_hardware` never falls back: a group is not
+//! created unless its interface has hardware timestamping switched on.
+//!
 //! Each group logs the source in effect once, at info level. A kernel
 //! timestamp is used for a latency only when the send and the receive both
-//! have one from the same clock; see [`Timestamp::duration_since`].
+//! have one from the same clock; see [`Timestamp::duration_since`]. The
+//! cycles of both stay available through
+//! [`Timestamp::cycles_duration_since`].
 //!
 //! ## TX Timestamp Correlation
 //!
