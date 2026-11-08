@@ -278,6 +278,12 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
         }
     }
 
+    // The DPDK port of the ntcp "dpdk" backend: EAL, the port, its flows and
+    // its shared ARP table exist before any worker thread attaches a queue,
+    // and until every worker finished
+    #[cfg(all(target_os = "linux", feature = "ntcp-dpdk"))]
+    let ntcp_dpdk_port = start_ntcp_dpdk(&config, &thread_assignment)?;
+
     // Initialize evalsync if enabled and environment variables are set
     #[cfg(feature = "evalsync")]
     let evalsync_enabled = {
@@ -503,7 +509,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
 
         // Helper function to wire the request dumper, request timeouts and error
         // handling into a created worker, run it from the shared start time, and
-        // return its stats.
+        // return its stats and its NIC clock calibration, if any.
         fn run_worker<G, S>(
             mut worker: Worker<G, xylem_cli::multi_protocol::MultiProtocol, S>,
             request_dumper: Option<&Arc<xylem_core::request_dump::RequestDumper>>,
@@ -511,7 +517,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
             request_timeouts: &[(usize, Option<std::time::Duration>)],
             on_errors: &[(usize, xylem_core::traffic_group::OnError)],
             start: StartTicket,
-        ) -> xylem_core::Result<S>
+        ) -> xylem_core::Result<(S, Option<output::NicClockCalibration>)>
         where
             G: xylem_transport::ConnectionGroup,
             S: xylem_core::stats::StatsRecorder,
@@ -528,7 +534,10 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
             }
 
             worker.run_at(start.wait())?;
-            Ok(worker.into_stats())
+            let calibration = worker
+                .clock_calibration()
+                .map(|report| output::NicClockCalibration::new(thread_idx, &report));
+            Ok((worker.into_stats(), calibration))
         }
 
         // Select transport factory based on thread's transport
@@ -614,34 +623,69 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
             }
             #[cfg(all(target_os = "linux", feature = "ntcp"))]
             "ntcp" => {
-                // Validation guarantees the section and one endpoint per ntcp thread.
-                // The factory opens the TUN and builds the stack on this thread.
+                use config::ntcp::NtcpBackend;
+                // Validation guarantees the section and this thread's endpoint
+                // or DPDK address. The factory builds the stack on this thread.
                 let ntcp = config_for_worker.ntcp.as_ref().expect("validated [ntcp] section");
-                let endpoint = ntcp
-                    .endpoint_for_thread(&config_for_worker.traffic_groups, thread_idx)
-                    .expect("validated ntcp endpoint for this thread");
-                let factory = xylem_transport::NtcpTunFactory::new(
-                    endpoint.ifname.clone(),
-                    endpoint.local_ip,
-                    ntcp.mtu,
-                )
-                // Each drive costs time per connection slot: size it to this thread
-                .with_max_connections(total_conn_count);
-                let worker = Worker::new_multi_group_with_targets(
-                    &factory,
-                    protocols,
-                    stats,
-                    worker_config,
-                    groups_config,
-                )?;
-                run_worker(
-                    worker,
-                    request_dumper_for_worker.as_ref(),
-                    thread_idx,
-                    &request_timeouts,
-                    &on_errors,
-                    start,
-                )
+                match ntcp.backend {
+                    NtcpBackend::Tun => {
+                        let endpoint = ntcp
+                            .endpoint_for_thread(&config_for_worker.traffic_groups, thread_idx)
+                            .expect("validated ntcp endpoint for this thread");
+                        let factory = xylem_transport::NtcpTunFactory::new(
+                            endpoint.ifname.clone(),
+                            endpoint.local_ip,
+                            ntcp.mtu,
+                        )
+                        // Size the stack to this thread's connections
+                        .with_max_connections(total_conn_count);
+                        let worker = Worker::new_multi_group_with_targets(
+                            &factory,
+                            protocols,
+                            stats,
+                            worker_config,
+                            groups_config,
+                        )?;
+                        run_worker(
+                            worker,
+                            request_dumper_for_worker.as_ref(),
+                            thread_idx,
+                            &request_timeouts,
+                            &on_errors,
+                            start,
+                        )
+                    }
+                    #[cfg(feature = "ntcp-dpdk")]
+                    NtcpBackend::Dpdk => {
+                        // This thread is pinned already: attaching its queue
+                        // registers it with EAL on its CPU
+                        let port = ntcp_dpdk_port.as_ref().expect("the port of the ntcp threads");
+                        let member = config::ntcp::thread_index(
+                            &config_for_worker.traffic_groups,
+                            thread_idx,
+                        )
+                        .expect("an ntcp thread");
+                        let worker = Worker::new_multi_group_with_targets(
+                            &port.factory(member),
+                            protocols,
+                            stats,
+                            worker_config,
+                            groups_config,
+                        )?;
+                        run_worker(
+                            worker,
+                            request_dumper_for_worker.as_ref(),
+                            thread_idx,
+                            &request_timeouts,
+                            &on_errors,
+                            start,
+                        )
+                    }
+                    #[cfg(not(feature = "ntcp-dpdk"))]
+                    NtcpBackend::Dpdk => {
+                        unreachable!("validation rejects ntcp.backend \"dpdk\" in this build")
+                    }
+                }
             }
             other => Err(xylem_core::Error::Config(format!("Unsupported transport: {}", other)))?,
         }
@@ -658,6 +702,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
     }
 
     tracing::info!("Experiment completed successfully");
+    let (results, calibrations): (Vec<_>, Vec<_>) = results.into_iter().unzip();
     let stats = xylem_core::stats::TupleStatsCollector::merge(results);
 
     // Get transport summary from traffic groups
@@ -682,6 +727,8 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
         &config.traffic_groups,
         config.stats.include_records,
     );
+    detailed_results.nic_clock_calibration = calibrations.into_iter().flatten().collect();
+    detailed_results.nic_clock_calibration.sort_by_key(|c| c.thread_id);
     let verdict = thresholds::evaluate(&mut detailed_results, &config);
 
     tracing::debug!(
@@ -693,6 +740,56 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
     // Print the summary and write output files if configured
     output::write_results(&detailed_results, &config.output.format, &config.output.file)?;
     Ok(verdict)
+}
+
+/// Start the DPDK port of the ntcp "dpdk" backend, if a thread uses it: one
+/// member per ntcp thread, in ascending thread order like `local_ips`
+#[cfg(all(target_os = "linux", feature = "ntcp-dpdk"))]
+fn start_ntcp_dpdk(
+    config: &ProfileConfig,
+    assignment: &xylem_core::traffic_group::ThreadGroupAssignment,
+) -> anyhow::Result<Option<Arc<xylem_transport::NtcpDpdkPort>>> {
+    use config::ntcp::{thread_ids, NtcpBackend};
+    use xylem_core::traffic_group::TimestampSourceConfig;
+    use xylem_transport::{NtcpDpdkConfig, NtcpDpdkMember, NtcpDpdkPort};
+
+    let Some(ntcp) = config.ntcp.as_ref().filter(|ntcp| ntcp.backend == NtcpBackend::Dpdk) else {
+        return Ok(None);
+    };
+    let threads = thread_ids(&config.traffic_groups);
+    if threads.is_empty() {
+        return Ok(None);
+    }
+    let dpdk = ntcp.dpdk.as_ref().expect("validated [ntcp.dpdk] section");
+    let members = threads
+        .iter()
+        .zip(&dpdk.local_ips)
+        .map(|(&thread, &local_ip)| {
+            let groups = assignment.get_groups_for_thread(thread).expect("ntcp threads run groups");
+            NtcpDpdkMember {
+                local_ip,
+                max_connections: groups.iter().map(|(_, g)| g.connections_per_thread).sum(),
+                max_pending: groups
+                    .iter()
+                    .map(|(_, g)| g.max_pending_per_connection)
+                    .max()
+                    .unwrap_or(1),
+                nic_timestamps: groups.iter().any(|(id, _)| {
+                    config.traffic_groups[*id].timestamps == TimestampSourceConfig::Nic
+                }),
+            }
+        })
+        .collect();
+    let port = NtcpDpdkPort::start(NtcpDpdkConfig {
+        device: dpdk.device.clone(),
+        eal_args: dpdk.eal_args.clone(),
+        mtu: u16::try_from(ntcp.mtu).expect("validated ntcp.mtu"),
+        prefix_len: dpdk.prefix_len,
+        gateway: dpdk.gateway,
+        members,
+    })
+    .with_context(|| format!("Failed to start the DPDK port {}", dpdk.device))?;
+    Ok(Some(port))
 }
 
 /// The TCP and UDP timestamp configuration for a group's `timestamps`
@@ -711,6 +808,8 @@ fn timestamp_config(
         TimestampSourceConfig::Hardware(interface) => {
             TcpTimestampConfig::require_hardware(interface.clone())
         }
+        // Only ntcp's DPDK backend takes NIC timestamps (validated)
+        TimestampSourceConfig::Nic => TcpTimestampConfig::default(),
     }
 }
 

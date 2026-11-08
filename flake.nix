@@ -8,9 +8,15 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     flake-utils.url = "github:numtide/flake-utils";
+    # The DPDK SDK of the `ntcp-dpdk` feature, from the ntcp commit that
+    # xylem-transport/Cargo.toml pins; built from this flake's nixpkgs
+    ntcp = {
+      url = "github:minhuw/ntcp/5d2b0f0723acf2295cd992c521c7398a1c6197e2";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { self, nixpkgs, rust-overlay, flake-utils }:
+  outputs = { self, nixpkgs, rust-overlay, flake-utils, ntcp }:
     # nixpkgs unstable no longer supports x86_64-darwin
     flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ] (system:
       let
@@ -34,6 +40,24 @@
         nativeBuildInputs = with pkgs; [
           pkg-config
           protobuf # Required for evalsync's prost-build
+        ];
+
+        # ntcp's static DPDK (with the mlx5 PMDs) and the libraries that
+        # `pkg-config --static libdpdk` names, for the `ntcp-dpdk` feature.
+        # ntcp builds it for x86_64-linux only, so `--all-features` builds
+        # need that system.
+        dpdkInputs = pkgs.lib.optionals (system == "x86_64-linux") [
+          ntcp.packages.${system}.dpdk-mlx5
+          pkgs.rdma-core
+          pkgs.elfutils
+          pkgs.intel-ipsec-mb
+          pkgs.jansson
+          pkgs.libnl
+          pkgs.libpcap
+          pkgs.numactl
+          pkgs.openssl
+          pkgs.zlib
+          pkgs.zstd
         ];
 
         # The package is built with upstream Rust, whose prebuilt standard library has line tables
@@ -103,7 +127,7 @@
           ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
             # Profiling, for flamegraph
             pkgs.perf
-          ];
+          ] ++ dpdkInputs;
 
           inherit nativeBuildInputs;
 
@@ -151,7 +175,7 @@
             lockFile = ./Cargo.lock;
             # One hash covers every crate of a git repository at its pinned rev
             outputHashes = {
-              "ntcp-native-0.0.1" = "sha256-Qp9hCtwYDjaS7Fg6uL9LlL7HHyoClbY8j/LUG7wJj6M=";
+              "ntcp-native-0.0.1" = "sha256-++eB7lPbPiv1GhpRrooV9CFKXZ5nqql8QqBcMICXFl8=";
             };
           };
 

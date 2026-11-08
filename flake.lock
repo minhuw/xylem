@@ -34,10 +34,32 @@
         "type": "github"
       }
     },
+    "ntcp": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1794142082,
+        "narHash": "sha256-++eB7lPbPiv1GhpRrooV9CFKXZ5nqql8QqBcMICXFl8=",
+        "owner": "minhuw",
+        "repo": "ntcp",
+        "rev": "5d2b0f0723acf2295cd992c521c7398a1c6197e2",
+        "type": "github"
+      },
+      "original": {
+        "owner": "minhuw",
+        "repo": "ntcp",
+        "rev": "5d2b0f0723acf2295cd992c521c7398a1c6197e2",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
         "flake-utils": "flake-utils",
         "nixpkgs": "nixpkgs",
+        "ntcp": "ntcp",
         "rust-overlay": "rust-overlay"
       }
     },

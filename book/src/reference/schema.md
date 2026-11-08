@@ -51,7 +51,8 @@ seed = 42
 
 ## Transport and Target
 
-Each traffic group specifies its own `transport` (`"tcp"`, `"udp"`, or `"unix"`)
+Each traffic group specifies its own `transport` (`"tcp"`, `"udp"`, `"unix"`, or
+`"ntcp"` in builds with the `ntcp` feature)
 and `target`. Transport defaults to `"tcp"`; there is no global `[target]` section.
 Groups sharing a thread must use the same transport. TCP and UDP targets must be
 numeric socket addresses, such as `"127.0.0.1:6379"` or `"[::1]:6379"`; hostname
@@ -100,10 +101,11 @@ type = "unlimited"
 - `target` (string, required): Target address for this group. Format depends on transport:
   - TCP/UDP: numeric `"ip:port"` or `"[ipv6]:port"`
   - Unix socket: `"/path/to/socket"`
-- `transport` (string, default `"tcp"`): `"tcp"`, `"udp"`, or `"unix"`
-- `timestamps` (default `"user"`): timestamp source, `"user"`, `"kernel"`, or
-  `{ hardware = "<interface>" }`; `tcp` and `udp` on Linux only, the same for
-  groups sharing a thread. See
+- `transport` (string, default `"tcp"`): `"tcp"`, `"udp"`, `"unix"`, or `"ntcp"`
+  (user-space TCP, needs the top-level `[ntcp]` section)
+- `timestamps` (default `"user"`): timestamp source, `"user"`, `"kernel"`,
+  `{ hardware = "<interface>" }` (`tcp` and `udp` on Linux only), or `"nic"`
+  (`ntcp` with the DPDK backend only); the same for groups sharing a thread. See
   [timestamps](../guide/configuration/transport.md#timestamps).
 - `threads` (array of integers, required): Thread IDs to use for this group
 - `connections_per_thread` (integer, required): Number of connections per thread

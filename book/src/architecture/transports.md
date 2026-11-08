@@ -38,6 +38,11 @@ TX timestamps arrive later than the send that caused them, and are matched to se
   or pipelined request and inflates its latency.
 - **UDP** - Connectionless datagram communication
 - **Unix Domain Sockets** - Local inter-process communication
+- **ntcp** - User-space TCP ([ntcp](https://github.com/minhuw/ntcp)), one
+  stack per worker thread, over a TUN device or a DPDK port (Linux, `ntcp` and
+  `ntcp-dpdk` build features). With DPDK, NIC RX timestamps are converted to
+  xylem's clock by a per-thread calibration, and TX timestamps are the time
+  the stack queued a request to the NIC.
 
 Detailed documentation for each transport is available in the [Transports](../guide/transports.md) section of the User Guide.
 

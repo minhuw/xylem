@@ -10,8 +10,8 @@
 //! - **TCP**: Non-blocking TCP sockets
 //! - **UDP**: Non-blocking UDP sockets
 //! - **Unix**: Unix domain sockets (Unix only)
-//! - **ntcp**: User-space TCP over a packet backend, here a Linux TUN device
-//!   (Linux only, `ntcp` feature)
+//! - **ntcp**: User-space TCP over a packet backend: a Linux TUN device
+//!   (Linux only, `ntcp` feature) or a DPDK port (`ntcp-dpdk` feature)
 //!
 //! ## Kernel Timestamping (Linux only)
 //!
@@ -183,6 +183,31 @@ pub struct SendReceipt {
     pub tx: Option<TxRange>,
 }
 
+/// How a group converted NIC timestamps to the [`time_ns`] clock
+///
+/// The group fits the NIC clock to `time_ns` from paired readings of both,
+/// taken about every 100 ms over a sliding window, and converts each RX
+/// hardware timestamp with the fit in effect when it was read.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClockCalibrationReport {
+    /// Nanoseconds of `time_ns` per NIC clock tick, by the last fit
+    pub ns_per_tick: Option<f64>,
+    /// RMS residual of the last fit's inliers, in nanoseconds
+    pub residual_rms_ns: Option<f64>,
+    /// Largest inlier residual of any fit during the run, in nanoseconds
+    pub max_residual_ns: Option<f64>,
+    /// Paired readings in the last fit's window that it used and rejected
+    pub inliers: usize,
+    pub outliers: usize,
+    /// Paired readings refused because a clock did not move forward
+    pub rejected_samples: u64,
+    /// Receives whose hardware timestamp was converted
+    pub converted: u64,
+    /// Receives without a hardware timestamp of the NIC clock, or read
+    /// before the first fit: their latencies have no kernel split
+    pub unconverted: u64,
+}
+
 /// Result of one receive attempt
 #[derive(Debug, Clone, Copy)]
 pub enum RecvOutcome {
@@ -266,6 +291,14 @@ pub trait ConnectionGroup {
         Ok(())
     }
 
+    /// How the group converted NIC timestamps to the [`time_ns`] clock, for
+    /// groups that report [`KernelClock::NicCalibrated`] timestamps
+    ///
+    /// The default implementation (no such timestamps) returns `None`.
+    fn clock_calibration(&self) -> Option<ClockCalibrationReport> {
+        None
+    }
+
     /// Number of connections in the group
     fn len(&self) -> usize;
 
@@ -329,8 +362,10 @@ pub use timestamp::{time_ns, KernelClock, KernelTimestamp, Timestamp};
 #[cfg(target_os = "linux")]
 pub use group::TimestampSource;
 
+#[cfg(all(target_os = "linux", feature = "ntcp-dpdk"))]
+pub use ntcp::dpdk::{NtcpDpdkConfig, NtcpDpdkFactory, NtcpDpdkMember, NtcpDpdkPort};
 #[cfg(all(target_os = "linux", feature = "ntcp"))]
-pub use ntcp::{NtcpConnectionGroup, NtcpTunFactory};
+pub use ntcp::{NtcpBackend, NtcpConnectionGroup, NtcpTunFactory};
 pub use tcp::{TcpConnectionGroup, TcpTransportFactory};
 pub use udp::{UdpConnectionGroup, UdpTransportFactory};
 #[cfg(unix)]

@@ -104,7 +104,8 @@ drain, and warmup requests time out without being counted. Stream transports
 ## Timestamps
 
 `timestamps` chooses where a traffic group's send and receive timestamps come
-from. It applies to `tcp` and `udp` groups on Linux:
+from. It applies to `tcp` and `udp` groups on Linux, and `"nic"` to `ntcp`
+groups with the DPDK backend:
 
 ```toml
 [[traffic_groups]]
@@ -127,6 +128,10 @@ timestamps = "kernel"        # "user" (default), "kernel", or { hardware = "data
   starts, before any worker, xylem reads the interface's setting with
   `SIOCGHWTSTAMP` and fails with an error if it is off or unsupported. It
   never switches NIC timestamping on, and never falls back to another source.
+- `"nic"`: for `ntcp` groups with `ntcp.backend = "dpdk"` only, which own the
+  NIC: the NIC's hardware RX timestamps converted to xylem's clock, and the
+  time ntcp queued each request to the NIC as its TX timestamp. See
+  [ntcp NIC timestamps](../transports/ntcp.md#nic-timestamps-dpdk).
 
 Every timestamp keeps its user-space cycles. A request's latency uses the
 kernel timestamps when its send and its response both have one from the same
@@ -138,8 +143,9 @@ the kernel round trip (`network_server_us`). A
 request whose TX or RX timestamp did not arrive is measured in cycles and
 counted in `service_us` alone; `kernel_split_count` says how many were split.
 
-- `unix` and `ntcp` groups reject anything but `"user"`: neither has kernel
-  packet timestamps.
+- `unix` groups reject anything but `"user"`, and `ntcp` groups anything but
+  `"user"` and (with the DPDK backend) `"nic"`: neither has kernel packet
+  timestamps.
 - Traffic groups that share a thread share its connection group, whose
   sockets are configured alike, so they must use the same `timestamps`.
 - Kernel timestamps cost an error-queue read per poll for each connection

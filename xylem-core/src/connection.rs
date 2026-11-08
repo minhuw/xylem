@@ -915,6 +915,11 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         self.datagram
     }
 
+    /// See [`ConnectionGroup::clock_calibration`]
+    pub fn clock_calibration(&self) -> Option<xylem_transport::ClockCalibrationReport> {
+        self.group.clock_calibration()
+    }
+
     /// Set how long each request of traffic group `group_id` may stay pending
     ///
     /// A request still pending at its deadline times out: it leaves the

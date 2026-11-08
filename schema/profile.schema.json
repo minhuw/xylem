@@ -211,6 +211,11 @@
           "description": "An existing Linux TUN device (IFF_TUN | IFF_NO_PI)",
           "type": "string",
           "const": "tun"
+        },
+        {
+          "description": "A DPDK port (needs a build with the `ntcp-dpdk` feature)",
+          "type": "string",
+          "const": "dpdk"
         }
       ]
     },
@@ -219,12 +224,23 @@
       "type": "object",
       "properties": {
         "backend": {
-          "description": "Packet backend; only \"tun\" (an existing Linux TUN device) for now",
+          "description": "Packet backend: \"tun\" (an existing Linux TUN device per thread, in\n`endpoints`) or \"dpdk\" (one DPDK port shared by the threads, in\n`[ntcp.dpdk]`)",
           "$ref": "#/$defs/NtcpBackend",
           "default": "tun"
         },
+        "dpdk": {
+          "description": "Backend \"dpdk\": the port and the threads' addresses",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NtcpDpdk"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "endpoints": {
-          "description": "One endpoint per worker thread that runs ntcp traffic groups, in\nascending thread-id order",
+          "description": "Backend \"tun\": one endpoint per worker thread that runs ntcp traffic\ngroups, in ascending thread-id order",
           "type": "array",
           "items": {
             "$ref": "#/$defs/NtcpEndpoint"
@@ -238,9 +254,52 @@
           "minimum": 0
         }
       },
+      "additionalProperties": false
+    },
+    "NtcpDpdk": {
+      "description": "The DPDK port of backend \"dpdk\"\n\nEach worker thread that runs ntcp traffic groups gets one queue pair of\nthe port and its own IPv4 address, steered to its queue by a flow rule.\nThe threads share one ARP table. The port is not isolated: it receives\nall of the device's traffic, so the kernel no longer sees the device's\ntraffic for other addresses while xylem runs (mlx5 VFs: bifurcated).",
+      "type": "object",
+      "properties": {
+        "device": {
+          "description": "EAL devargs of the port: a PCI address, optionally with PMD arguments\n(e.g. \"0000:05:00.0,dv_flow_en=1\"), or a virtual device",
+          "type": "string"
+        },
+        "eal_args": {
+          "description": "More EAL arguments (e.g. [\"--in-memory\", \"--file-prefix=xylem\"]);\nunless they name lcores, EAL's main lcore is the first CPU xylem may\nrun on",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "gateway": {
+          "description": "Router for destinations outside that network",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "ipv4"
+        },
+        "local_ips": {
+          "description": "ntcp's own IPv4 address for each worker thread that runs ntcp traffic\ngroups, in ascending thread-id order",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "ipv4"
+          }
+        },
+        "prefix_len": {
+          "description": "Prefix length of the on-link network of `local_ips`",
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        }
+      },
       "additionalProperties": false,
       "required": [
-        "endpoints"
+        "device",
+        "local_ips",
+        "prefix_len"
       ]
     },
     "NtcpEndpoint": {
@@ -803,6 +862,11 @@
           "required": [
             "hardware"
           ]
+        },
+        {
+          "description": "The NIC timestamps of a user-space stack that owns the NIC (transport\n\"ntcp\" with backend \"dpdk\"): RX hardware timestamps converted to the\nuser-space clock, and the time the stack queued each request to the\nNIC",
+          "type": "string",
+          "const": "nic"
         }
       ]
     },

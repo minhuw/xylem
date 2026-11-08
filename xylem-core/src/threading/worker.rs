@@ -561,6 +561,12 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
     pub fn into_stats(self) -> S {
         self.stats
     }
+
+    /// How the worker's connection group converted NIC timestamps, if it
+    /// did (see [`ConnectionGroup::clock_calibration`])
+    pub fn clock_calibration(&self) -> Option<xylem_transport::ClockCalibrationReport> {
+        self.pool.clock_calibration()
+    }
 }
 
 /// Specialized implementation for Unix domain sockets

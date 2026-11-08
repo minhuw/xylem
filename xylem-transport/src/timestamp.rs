@@ -16,6 +16,11 @@ pub enum KernelClock {
     Realtime,
     /// Raw NIC hardware timestamp (`SOF_TIMESTAMPING_RAW_HARDWARE`), the NIC's PHC
     NicHardware,
+    /// The [`time_ns`] clock, for a user-space stack that owns the NIC: RX
+    /// timestamps are the NIC's hardware timestamps converted with a clock
+    /// calibration fitted while the group runs, and TX timestamps are the
+    /// time the stack handed the request's last byte to the NIC's queue
+    NicCalibrated,
 }
 
 /// A timestamp reported by the kernel or the NIC for one send or receive

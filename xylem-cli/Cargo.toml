@@ -51,6 +51,8 @@ evalsync = { version = "0.2", optional = true }
 evalsync = ["dep:evalsync"]
 # User-space TCP transport "ntcp" (Linux only)
 ntcp = ["xylem-transport/ntcp"]
+# ntcp over DPDK ports (Linux only; needs the DPDK SDK of the nix dev shell)
+ntcp-dpdk = ["ntcp", "xylem-transport/ntcp-dpdk"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

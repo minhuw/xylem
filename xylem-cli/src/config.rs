@@ -628,7 +628,8 @@ const TIMESTAMPING_TRANSPORTS: [&str; 2] = ["tcp", "udp"];
 /// Longest interface name the kernel accepts (IFNAMSIZ less the NUL)
 const MAX_INTERFACE_NAME: usize = 15;
 
-/// Check a group's timestamps setting: anything but "user" needs Linux and
+/// Check a group's timestamps setting: "nic" needs transport "ntcp" (whose
+/// backend `ntcp::validate` checks), anything else but "user" needs Linux and
 /// transport "tcp" or "udp". Whether a hardware interface has timestamping
 /// switched on is checked when the run starts, not here.
 fn validate_timestamps(
@@ -639,14 +640,34 @@ fn validate_timestamps(
     if group.timestamps.is_user() {
         return;
     }
+    if group.timestamps == TimestampSourceConfig::Nic {
+        if group.transport != ntcp::TRANSPORT {
+            errors.push(anyhow!(
+                "Traffic group {} '{}' sets timestamps = \"nic\", which only transport 'ntcp' \
+                 with backend \"dpdk\" supports; transport '{}' takes {{ hardware = \
+                 \"INTERFACE\" }} for NIC timestamps",
+                index,
+                group.name,
+                group.transport
+            ));
+        }
+        return;
+    }
     if !TIMESTAMPING_TRANSPORTS.contains(&group.transport.as_str()) {
+        let ntcp_hint = if group.transport == ntcp::TRANSPORT {
+            " (or \"nic\" with ntcp.backend = \"dpdk\")"
+        } else {
+            ""
+        };
         errors.push(anyhow!(
             "Traffic group {} '{}' sets timestamps = {}, which only transports 'tcp' and 'udp' \
-             support; '{}' has no kernel timestamps. Remove timestamps or set it to \"user\".",
+             support; '{}' has no kernel timestamps. Remove timestamps or set it to \
+             \"user\"{}.",
             index,
             group.name,
             group.timestamps,
-            group.transport
+            group.transport,
+            ntcp_hint
         ));
         return;
     }
@@ -1401,9 +1422,20 @@ file = "results/test.json"
             let error = udp_profile("xylem-echo", "ntcp", line).unwrap_err().to_string();
             if ntcp::SUPPORTED {
                 assert!(error.contains("'ntcp' has no kernel timestamps"), "{error}");
+                assert!(error.contains("\"nic\" with ntcp.backend = \"dpdk\""), "{error}");
             }
         }
         udp_profile("xylem-echo", "unix", r#"timestamps = "user""#).unwrap();
+    }
+
+    #[test]
+    fn nic_timestamps_are_only_for_ntcp() {
+        for transport in ["tcp", "udp", "unix"] {
+            let error = udp_profile("xylem-echo", transport, r#"timestamps = "nic""#)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("only transport 'ntcp' with backend \"dpdk\""), "{error}");
+        }
     }
 
     #[test]
@@ -2147,6 +2179,13 @@ rotation = { size = 1024 }
 
 [ntcp]
 endpoints = [{ ifname = "ntcp0", local_ip = "10.0.0.2" }]
+
+[ntcp.dpdk]
+device = "0000:05:00.0"
+eal_args = ["--in-memory"]
+local_ips = ["10.0.0.3"]
+prefix_len = 24
+gateway = "10.0.0.1"
 
 [thresholds]
 latency = ["p99 < 1s"]

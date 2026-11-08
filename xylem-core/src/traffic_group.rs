@@ -106,6 +106,11 @@ pub enum TimestampSourceConfig {
     /// hardware timestamping switched on: the run fails otherwise, and never
     /// switches it on or falls back to another source
     Hardware(String),
+    /// The NIC timestamps of a user-space stack that owns the NIC (transport
+    /// "ntcp" with backend "dpdk"): RX hardware timestamps converted to the
+    /// user-space clock, and the time the stack queued each request to the
+    /// NIC
+    Nic,
 }
 
 impl TimestampSourceConfig {
@@ -121,6 +126,7 @@ impl std::fmt::Display for TimestampSourceConfig {
         match self {
             TimestampSourceConfig::User => f.write_str("\"user\""),
             TimestampSourceConfig::Kernel => f.write_str("\"kernel\""),
+            TimestampSourceConfig::Nic => f.write_str("\"nic\""),
             TimestampSourceConfig::Hardware(interface) => {
                 write!(f, "{{ hardware = {interface:?} }}")
             }

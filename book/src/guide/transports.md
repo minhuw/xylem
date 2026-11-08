@@ -7,7 +7,7 @@ Xylem supports multiple transport layers for network communication.
 - **[TCP](./transports/tcp.md)** - Reliable byte stream transport
 - **[UDP](./transports/udp.md)** - Unreliable datagram transport
 - **[Unix Domain Sockets](./transports/unix.md)** - Local inter-process communication
-- **[ntcp](./transports/ntcp.md)** - User-space TCP over a TUN device (Linux, `ntcp` build feature)
+- **[ntcp](./transports/ntcp.md)** - User-space TCP over a TUN device or a DPDK port (Linux, `ntcp` and `ntcp-dpdk` build features)
 
 ## Transport Selection
 

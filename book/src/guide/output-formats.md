@@ -216,8 +216,13 @@ timestamp did not arrive, or came from different clocks, count in
 `service_us` alone.
 
 - `clock`: the clock of the service latencies: `user_space` (no kernel split),
-  `kernel_software`, `nic_hardware`, or `mixed` when the scope's requests
-  used different ones. `null` when no request completed.
+  `kernel_software`, `nic_hardware`, `nic_calibrated`, or `mixed` when the
+  scope's requests used different ones. `null` when no request completed.
+  `nic_calibrated` comes from `ntcp` groups with `timestamps = "nic"`: the RX
+  timestamp is the NIC's, converted to xylem's clock, and the TX timestamp is
+  the time ntcp queued the request's last byte to the NIC, before the NIC
+  sends it. `network_server_us` then includes the NIC's transmit delay, and
+  `host_stack_us` is the user-space stack's own time.
 - `kernel_split_count`: requests with a kernel split. Below
   `service_us.sample_count`, some requests lacked a usable kernel timestamp.
 
@@ -233,6 +238,37 @@ requests, unless some `host_stack_us` saturated at zero.
 
 The console prints the same parts in one row each, and the HTML report in a
 table per scope.
+
+### NIC clock calibration
+
+Runs with `timestamps = "nic"` add a top-level `nic_clock_calibration` list,
+one entry per worker thread with such groups, saying how well the thread's
+NIC clock was converted to xylem's clock:
+
+```json
+"nic_clock_calibration": [
+  {
+    "thread_id": 2,
+    "ns_per_tick": 12.800118,
+    "residual_rms_ns": 131.2,
+    "max_residual_ns": 402.7,
+    "inliers": 31,
+    "outliers": 1,
+    "rejected_samples": 0,
+    "converted_rx_stamps": 351204,
+    "unconverted_rx_stamps": 0
+  }
+]
+```
+
+- `ns_per_tick`, `residual_rms_ns`, `inliers`, `outliers`: the last fit, over
+  the last 32 paired clock readings (about 3 s). `residual_rms_ns` is the
+  typical error of a converted RX timestamp; null fields mean no fit existed.
+- `max_residual_ns`: the largest residual of any fit during the run.
+- `rejected_samples`: readings refused because a clock did not move forward.
+- `converted_rx_stamps`, `unconverted_rx_stamps`: receives whose RX hardware
+  timestamp was converted, and receives without one (or before the first
+  fit), whose requests have no kernel split.
 
 ## Latency fields
 

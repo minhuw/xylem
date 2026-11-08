@@ -3,24 +3,32 @@
 //! `NtcpConnectionGroup` runs every connection of a group on one
 //! caller-driven ntcp [`Network`], generic over its packet backend (`P`). The
 //! group drives the network from its own calls: `add_connection`, `send`,
-//! `poll` and `close_all` advance the stack, and `poll` blocks on the
-//! backend's file descriptor when the stack has nothing left to do.
+//! `poll` and `close_all` advance the stack. When the stack has nothing left
+//! to do, `poll` blocks on the backend's file descriptor, or keeps driving a
+//! backend that has none (DPDK).
 //!
-//! `NtcpTunFactory` builds groups over an existing Linux TUN device. The
-//! `Network` is not `Send`: it is built by `create_group` on the calling
-//! (worker) thread and stays there.
+//! `NtcpTunFactory` builds groups over an existing Linux TUN device, and
+//! [`dpdk::NtcpDpdkFactory`] (`ntcp-dpdk` feature) over one queue pair of a
+//! DPDK port. The `Network` is not `Send`: it is built by `create_group` on
+//! the calling (worker) thread and stays there.
 //!
-//! Limits of this first version: TCP only, user-space timestamps only (no
-//! TX timestamps, no backend RX timestamps).
+//! TCP only. Timestamps are user-space ones unless the group enables NIC
+//! timestamps ([`NtcpConnectionGroup::enable_nic_timestamps`]), which needs
+//! a backend with a device clock: then receives carry the NIC's RX hardware
+//! timestamps and sends get ntcp's Scheduled TX timestamps, both on the
+//! [`crate::time_ns`] clock ([`KernelClock::NicCalibrated`]).
 
 use crate::{
-    ConnectionGroup, Error, RecvOutcome, Result, SendReceipt, Timestamp, TransportFactory,
+    ClockCalibrationReport, ConnectionGroup, Error, KernelClock, KernelTimestamp, RecvOutcome,
+    Result, SendReceipt, Timestamp, TransportFactory, TxRange, TxTimestampInfo,
 };
-use ntcp_io::PacketIo;
+use ntcp_io::{ClockDescriptor, PacketIo};
+use ntcp_io_dpdk::ClockCalibration;
 use ntcp_native::{
     BlockReason, CloseReason, ConnId, DriveReport, Event, Network, NetworkConfig, ReadOutcome,
-    State, TimestampEvent, TxTimestampEvent, TxTimestampOutcome, TxTimestampSource,
-    TxTimestampStage, WorkBudget, WriteOptions,
+    RxReadTimestamps, SharedNeighbors, State, TimestampClock, TimestampEvent, TxTimestampEvent,
+    TxTimestampOutcome, TxTimestampRequest, TxTimestampSource, TxTimestampStage, WorkBudget,
+    WriteOptions,
 };
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -28,6 +36,9 @@ use std::io::{self, Read};
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::Duration;
+
+#[cfg(feature = "ntcp-dpdk")]
+pub mod dpdk;
 
 /// Work done per category (received packets, transmitted packets, timers,
 /// reclaimed buffers) in one `Network::drive` call
@@ -72,12 +83,72 @@ pub const DEFAULT_MAX_CONNECTIONS: usize = 64;
 /// Timebase of the ticks passed to ntcp: nanoseconds from [`crate::time_ns`]
 const UNITS_PER_SECOND: u64 = 1_000_000_000;
 
+/// RX timestamp ranges kept per connection with NIC timestamps: a read's
+/// timestamps describe its last byte, and a few ranges cover the segments
+/// that one read takes together
+pub const NIC_RX_TIMESTAMP_RANGES: usize = 4;
+
+/// TX timestamp records per connection with NIC timestamps beyond one per
+/// request in flight: a send split over several writes requests one per
+/// write, and records free only when the group drains them
+pub const NIC_TX_TIMESTAMP_SPARE: usize = 4;
+
+/// Paired clock readings in a NIC clock calibration's sliding window
+const CALIBRATION_WINDOW: usize = 32;
+
+/// Time between paired clock readings while the group runs (ticks)
+const CALIBRATION_PERIOD: u64 = UNITS_PER_SECOND / 10;
+
+/// Device clock reads per paired reading, of which the one bracketed most
+/// tightly by the group's clock is kept
+const CALIBRATION_READS: usize = 3;
+
+/// Paired clock readings taken when NIC timestamps are enabled, and the
+/// time between them, so that the first receives already have a fit
+///
+/// ntcp's robust fit drops readings beyond three robust deviations; with
+/// only three readings one of them always looks like an outlier, which
+/// leaves too few for a fit.
+const CALIBRATION_SEED_SAMPLES: usize = 8;
+const CALIBRATION_SEED_SPACING: Duration = Duration::from_millis(15);
+
 fn now_ticks() -> u64 {
     crate::time_ns()
 }
 
 fn ticks(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+// =============================================================================
+// Packet backends
+// =============================================================================
+
+/// A packet backend an ntcp group can run on
+pub trait NtcpBackend: PacketIo {
+    /// A file descriptor that becomes readable when packets arrive (and
+    /// writable when a blocked transmit can proceed), for `poll` to sleep
+    /// on; `None` makes `poll` busy-poll the backend instead
+    fn wait_fd(&self) -> Option<RawFd>;
+
+    /// The clock of the backend's RX hardware timestamps, if it reports any
+    fn device_clock(&self) -> Option<ClockDescriptor> {
+        None
+    }
+
+    /// The current time of [`device_clock`](Self::device_clock), in its units
+    fn read_device_clock(&self) -> io::Result<u64> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "the packet backend has no device clock",
+        ))
+    }
+}
+
+impl NtcpBackend for ntcp_io_tun::Tun {
+    fn wait_fd(&self) -> Option<RawFd> {
+        Some(self.as_raw_fd())
+    }
 }
 
 // =============================================================================
@@ -159,6 +230,11 @@ impl<H: Copy + Eq + Hash> SlotTable<H> {
         }
     }
 
+    /// The id of a live connection's handle
+    fn id(&self, handle: &H) -> Option<usize> {
+        self.by_handle.get(handle).copied()
+    }
+
     fn state_mut(&mut self, id: usize) -> &mut SlotState {
         &mut self.slots[id].state
     }
@@ -226,6 +302,77 @@ impl<H: Copy + Eq + Hash> SlotTable<H> {
 }
 
 // =============================================================================
+// NIC timestamps
+// =============================================================================
+
+/// The NIC clock of a group with NIC timestamps, fitted to the group's ticks
+struct NicClock {
+    /// Clock of the backend's RX hardware timestamps
+    clock: ClockDescriptor,
+    calibration: ClockCalibration,
+    /// Tick of the next paired reading
+    next_sample: u64,
+    /// Largest inlier residual of any fit so far, in ticks (nanoseconds)
+    max_residual: Option<f64>,
+    rejected_samples: u64,
+    converted: u64,
+    unconverted: u64,
+}
+
+impl NicClock {
+    /// Add one paired reading: the device clock read between two group
+    /// clock reads `before` and `after`
+    fn push(&mut self, before: u64, device: u64, after: u64) {
+        let caller = before + after.saturating_sub(before) / 2;
+        if self.calibration.push(caller, device).is_err() {
+            self.rejected_samples += 1;
+            return;
+        }
+        if let Some(fit) = self.calibration.fit() {
+            let residual = fit.max_residual();
+            self.max_residual = Some(self.max_residual.map_or(residual, |max| max.max(residual)));
+        }
+    }
+
+    /// A read's hardware timestamp on the group's clock, if it has one of
+    /// this NIC's clock and a fit exists
+    fn convert<P: PacketIo>(
+        &mut self,
+        network: &Network<P>,
+        stamps: Option<RxReadTimestamps>,
+    ) -> Option<KernelTimestamp> {
+        let nanos = stamps
+            .and_then(|stamps| stamps.timestamps.hardware)
+            .filter(|stamp| network.backend_clock(stamp.clock) == Some(self.clock))
+            .and_then(|stamp| self.calibration.to_caller(stamp.value));
+        match nanos {
+            Some(nanos) => {
+                self.converted += 1;
+                Some(KernelTimestamp { nanos, clock: KernelClock::NicCalibrated })
+            }
+            None => {
+                self.unconverted += 1;
+                None
+            }
+        }
+    }
+
+    fn report(&self) -> ClockCalibrationReport {
+        let fit = self.calibration.fit();
+        ClockCalibrationReport {
+            ns_per_tick: fit.map(|fit| fit.rate()),
+            residual_rms_ns: fit.map(|fit| fit.residual_rms()),
+            max_residual_ns: self.max_residual,
+            inliers: fit.map_or(0, |fit| fit.inliers()),
+            outliers: fit.map_or(0, |fit| fit.outliers()),
+            rejected_samples: self.rejected_samples,
+            converted: self.converted,
+            unconverted: self.unconverted,
+        }
+    }
+}
+
+// =============================================================================
 // Connection group
 // =============================================================================
 
@@ -254,16 +401,23 @@ fn random_secret() -> Result<[u8; 32]> {
 
 /// A group of connections on one ntcp network
 ///
-/// Generic over the packet backend; the backend's file descriptor must
-/// become readable when packets arrive (and writable when a blocked
-/// transmit can proceed), so that `poll` can sleep on it.
-pub struct NtcpConnectionGroup<P: PacketIo + AsRawFd> {
+/// Generic over the packet backend: `poll` sleeps on the backend's file
+/// descriptor, or busy-polls a backend that has none.
+pub struct NtcpConnectionGroup<P: NtcpBackend> {
     network: Network<P>,
     slots: SlotTable<ConnId>,
     /// Connections closed locally that may still have FINs to (re)transmit
     closing: Vec<ConnId>,
     /// Reused buffer for `drain_events`
     events: Vec<Event>,
+    /// Reused buffer for `drain_timestamps`, created with the first
+    /// connection (its placeholder records need a real `ConnId`)
+    stamp_records: Vec<TimestampEvent>,
+    /// TX timestamps drained from the network until `poll_tx_timestamps`
+    /// takes them
+    tx_stamps: Vec<TxTimestampInfo>,
+    /// Present once NIC timestamps are enabled
+    nic: Option<NicClock>,
     /// The last tick passed to ntcp, which rejects time going backwards
     last_tick: u64,
     /// Source of ticks; tests replace it
@@ -273,27 +427,103 @@ pub struct NtcpConnectionGroup<P: PacketIo + AsRawFd> {
     close_linger: Duration,
 }
 
-impl<P: PacketIo + AsRawFd> NtcpConnectionGroup<P> {
+impl<P: NtcpBackend> NtcpConnectionGroup<P> {
     /// Build the network on the calling thread
     ///
     /// Sets the config's timebase to nanoseconds, the unit of the ticks this
     /// group passes, and generates the TCP secret from `/dev/urandom`.
-    pub fn new(mut config: NetworkConfig, io: P) -> Result<Self> {
+    pub fn new(config: NetworkConfig, io: P) -> Result<Self> {
+        Self::build(config, io, None)
+    }
+
+    /// Build the network on the calling thread as a member of the shared
+    /// neighbour table of an Ethernet port, like [`new`](Self::new)
+    ///
+    /// Every member's ticks come from [`crate::time_ns`], so `neighbors`
+    /// must count nanoseconds.
+    pub fn with_shared_neighbors(
+        config: NetworkConfig,
+        io: P,
+        neighbors: &SharedNeighbors,
+    ) -> Result<Self> {
+        Self::build(config, io, Some(neighbors))
+    }
+
+    fn build(
+        mut config: NetworkConfig,
+        io: P,
+        neighbors: Option<&SharedNeighbors>,
+    ) -> Result<Self> {
         config.tcp.connection.timebase.units_per_second = UNITS_PER_SECOND;
         let now = now_ticks();
-        let network = Network::new(config, io, random_secret()?, now)
-            .map_err(|e| network_error("ntcp network setup", e))?;
+        let secret = random_secret()?;
+        let network = match neighbors {
+            Some(neighbors) => Network::with_shared_neighbors(config, io, secret, now, neighbors),
+            None => Network::new(config, io, secret, now),
+        }
+        .map_err(|e| network_error("ntcp network setup", e))?;
         Ok(Self {
             network,
             slots: SlotTable::new(),
             closing: Vec::new(),
             events: vec![Event::NetworkStopped; EVENT_BATCH],
+            stamp_records: Vec::new(),
+            tx_stamps: Vec::new(),
+            nic: None,
             last_tick: now,
             clock: now_ticks,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             send_timeout: DEFAULT_SEND_TIMEOUT,
             close_linger: DEFAULT_CLOSE_LINGER,
         })
+    }
+
+    /// Timestamp sends and receives with the NIC's clock
+    ///
+    /// Needs a backend with a device clock that reports RX hardware
+    /// timestamps, and a network config with `rx_timestamp_ranges` (e.g.
+    /// [`NIC_RX_TIMESTAMP_RANGES`]) and `tx_timestamp_phases` (a connection's
+    /// most requests in flight plus [`NIC_TX_TIMESTAMP_SPARE`]). From then
+    /// on each send requests ntcp's Scheduled TX timestamp, reported by
+    /// `poll_tx_timestamps`, and each receive converts the RX hardware
+    /// timestamp of its last byte to the group's clock with a calibration
+    /// fitted from paired clock readings. Takes the first readings before
+    /// it returns (about 100 ms), so that receives right after it have a fit.
+    pub fn enable_nic_timestamps(&mut self) -> Result<()> {
+        let config = self.network.config();
+        if config.rx_timestamp_ranges == 0 || config.tx_timestamp_phases == 0 {
+            return Err(Error::Config(
+                "NIC timestamps need rx_timestamp_ranges and tx_timestamp_phases in the ntcp \
+                 network config"
+                    .to_string(),
+            ));
+        }
+        let clock = self.network.backend().device_clock().ok_or_else(|| {
+            Error::Config(
+                "NIC timestamps need a packet backend with RX hardware timestamps".to_string(),
+            )
+        })?;
+        let calibration =
+            ClockCalibration::new(CALIBRATION_WINDOW).expect("the window is within ntcp's bounds");
+        let mut nic = NicClock {
+            clock,
+            calibration,
+            next_sample: 0,
+            max_residual: None,
+            rejected_samples: 0,
+            converted: 0,
+            unconverted: 0,
+        };
+        for sample in 0..CALIBRATION_SEED_SAMPLES {
+            if sample > 0 {
+                std::thread::sleep(CALIBRATION_SEED_SPACING);
+            }
+            let (before, device, after) = self.read_clocks()?;
+            nic.push(before, device, after);
+        }
+        nic.next_sample = self.now().saturating_add(CALIBRATION_PERIOD);
+        self.nic = Some(nic);
+        Ok(())
     }
 
     /// Set how long `add_connection` waits for the handshake
@@ -327,6 +557,39 @@ impl<P: PacketIo + AsRawFd> NtcpConnectionGroup<P> {
     /// The tick `timeout` from now
     fn deadline_after(&mut self, timeout: Duration) -> u64 {
         self.now().saturating_add(ticks(timeout))
+    }
+
+    /// Read the device clock between two reads of the group's clock, a few
+    /// times, and keep the narrowest bracket: an interrupt or preemption
+    /// between the reads widens one and moves its midpoint
+    fn read_clocks(&self) -> Result<(u64, u64, u64)> {
+        let mut best: Option<(u64, u64, u64)> = None;
+        for _ in 0..CALIBRATION_READS {
+            let before = (self.clock)();
+            let device = self.network.backend().read_device_clock().map_err(|e| {
+                Error::Io(io::Error::new(e.kind(), format!("read the NIC clock: {e}")))
+            })?;
+            let after = (self.clock)();
+            let width = after.saturating_sub(before);
+            if best.is_none_or(|(b, _, a)| width < a.saturating_sub(b)) {
+                best = Some((before, device, after));
+            }
+        }
+        Ok(best.expect("CALIBRATION_READS is not zero"))
+    }
+
+    /// Take a paired clock reading for the NIC clock calibration when one
+    /// is due
+    fn sample_clock(&mut self, now: u64) -> Result<()> {
+        match &self.nic {
+            Some(nic) if now >= nic.next_sample => {}
+            _ => return Ok(()),
+        }
+        let (before, device, after) = self.read_clocks()?;
+        let nic = self.nic.as_mut().expect("checked above");
+        nic.next_sample = now.saturating_add(CALIBRATION_PERIOD);
+        nic.push(before, device, after);
+        Ok(())
     }
 
     /// Drive the network once with `budget`
@@ -364,16 +627,69 @@ impl<P: PacketIo + AsRawFd> NtcpConnectionGroup<P> {
         true
     }
 
+    /// Drain every recorded TX timestamp; Scheduled ones of live
+    /// connections are kept for `poll_tx_timestamps`
+    ///
+    /// ntcp frees a record only when it is drained: a connection's TX
+    /// timestamp capacity, and a closed connection's slot, depend on it.
+    fn drain_stamps(&mut self) {
+        if self.stamp_records.is_empty() {
+            // No connection yet, so no records
+            return;
+        }
+        loop {
+            let report = self.network.drain_timestamps(&mut self.stamp_records);
+            for record in &self.stamp_records[..report.written] {
+                let observation = record.observation;
+                let TxTimestampOutcome::Recorded { value, clock } = observation.outcome else {
+                    continue;
+                };
+                if observation.stage != TxTimestampStage::Scheduled
+                    || !matches!(clock, TimestampClock::CallerTicks(_))
+                {
+                    continue;
+                }
+                let Some(conn_id) = self.slots.id(&record.connection) else {
+                    continue;
+                };
+                // The target is the stream position of the write's last
+                // byte; ntcp stamps a write's octets once all are scheduled
+                self.tx_stamps.push(TxTimestampInfo {
+                    conn_id,
+                    tx_end: (observation.target as u32).wrapping_add(1),
+                    cumulative: true,
+                    timestamp: KernelTimestamp {
+                        nanos: value,
+                        clock: KernelClock::NicCalibrated,
+                    },
+                });
+            }
+            if !report.more || report.written == 0 {
+                return;
+            }
+        }
+    }
+
     /// Drive and drain once; returns the drive report and whether events remain
     fn service(&mut self) -> Result<(DriveReport, bool)> {
         let report = self.drive()?;
         let more_events = self.drain();
+        if self.nic.is_some() {
+            self.drain_stamps();
+            let now = self.now();
+            self.sample_clock(now)?;
+        }
         Ok((report, more_events))
     }
 
     /// Wait on the backend fd until it is ready, the next ntcp timer, or
-    /// `deadline` (ticks), whichever comes first
+    /// `deadline` (ticks), whichever comes first; return at once for a
+    /// backend without an fd, which the caller then drives again
     fn wait(&mut self, report: &DriveReport, deadline: u64) -> Result<()> {
+        let Some(fd) = self.network.backend().wait_fd() else {
+            std::hint::spin_loop();
+            return Ok(());
+        };
         let now = self.now();
         let mut until = deadline;
         if let Some(timer) = report.next_deadline {
@@ -388,7 +704,7 @@ impl<P: PacketIo + AsRawFd> NtcpConnectionGroup<P> {
         } else {
             libc::POLLIN
         };
-        wait_fd(self.network.backend().as_raw_fd(), events, wait_ns)
+        wait_fd(fd, events, wait_ns)
     }
 
     /// Whether every locally closed connection has finished its close
@@ -424,11 +740,29 @@ fn wait_fd(fd: RawFd, events: libc::c_short, wait_ns: u64) -> Result<()> {
     Ok(())
 }
 
-impl<P: PacketIo + AsRawFd> ConnectionGroup for NtcpConnectionGroup<P> {
+/// Scratch records for `drain_timestamps`, all naming `connection`
+fn stamp_records(connection: ConnId) -> Vec<TimestampEvent> {
+    let placeholder = TimestampEvent {
+        connection,
+        observation: TxTimestampEvent {
+            cookie: 0,
+            target: 0,
+            stage: TxTimestampStage::Scheduled,
+            source: TxTimestampSource::Software,
+            outcome: TxTimestampOutcome::Cancelled,
+        },
+    };
+    vec![placeholder; TIMESTAMP_BATCH]
+}
+
+impl<P: NtcpBackend> ConnectionGroup for NtcpConnectionGroup<P> {
     fn add_connection(&mut self, target: &SocketAddr) -> Result<usize> {
         // Take an id only once ntcp accepted the connection, so that a
         // refused `connect` leaves nothing behind
         let conn = self.network.connect(*target).map_err(|e| network_error("ntcp connect", e))?;
+        if self.stamp_records.is_empty() {
+            self.stamp_records = stamp_records(conn);
+        }
         let id = self.slots.reserve();
         // Attach the handle right away: the drains below apply its
         // `Connected` or `Closed` event to the slot, just like other
@@ -481,17 +815,31 @@ impl<P: PacketIo + AsRawFd> ConnectionGroup for NtcpConnectionGroup<P> {
 
     fn send(&mut self, conn_id: usize, data: &[u8]) -> Result<SendReceipt> {
         let conn = self.slots.handle(conn_id)?;
+        let stamped = self.nic.is_some();
+        let options = WriteOptions {
+            timestamps: TxTimestampRequest {
+                scheduled: stamped,
+                ..TxTimestampRequest::default()
+            },
+        };
         let mut sent = 0;
+        // Stream positions of the first and past the last byte written
+        let mut range: Option<(u64, u64)> = None;
         let mut deadline = None;
         while sent < data.len() {
-            match self.network.try_write(conn, &data[sent..], WriteOptions::default()) {
-                Ok(receipt) => sent += receipt.accepted,
+            match self.network.try_write(conn, &data[sent..], options) {
+                Ok(receipt) => {
+                    sent += receipt.accepted;
+                    let start = range.map_or(receipt.range.start, |(start, _)| start);
+                    range = Some((start, receipt.range.end));
+                }
                 Err(e) if e.is_would_block() => {}
                 Err(e) => return Err(network_error("ntcp send", e)),
             }
             if sent < data.len() {
-                // Only a partial write or a full buffer gets here: let the
-                // stack transmit and take ACKs, within the send timeout
+                // Only a partial write, a full buffer or used-up TX
+                // timestamp records get here: let the stack transmit and
+                // take ACKs, within the send timeout
                 let deadline = match deadline {
                     Some(deadline) => deadline,
                     None => *deadline.insert(self.deadline_after(self.send_timeout)),
@@ -504,27 +852,45 @@ impl<P: PacketIo + AsRawFd> ConnectionGroup for NtcpConnectionGroup<P> {
                     )));
                 }
                 // A full drive: send space frees only as received ACKs are
-                // processed
+                // processed, TX timestamp records as they are drained
                 self.drive()?;
+                if stamped {
+                    self.drain_stamps();
+                }
             }
         }
         let timestamp = Timestamp::now();
         // Put the request on the wire now rather than at the next poll
         self.drive_with(FLUSH_BUDGET)?;
-        Ok(SendReceipt { timestamp, tx: None })
+        let tx = match range {
+            Some((start, end)) if stamped => {
+                // The flush scheduled the request's bytes unless the peer's
+                // window held them back: its stamp is then ready
+                self.drain_stamps();
+                Some(TxRange { start: start as u32, end: end as u32 })
+            }
+            _ => None,
+        };
+        Ok(SendReceipt { timestamp, tx })
     }
 
     fn recv(&mut self, conn_id: usize, buf: &mut [u8]) -> Result<RecvOutcome> {
         let conn = self.slots.handle(conn_id)?;
         match self.network.try_read(conn, buf) {
-            Ok(ReadOutcome::Data { len, .. }) => {
+            Ok(ReadOutcome::Data { len, last_byte_timestamps, .. }) => {
+                let mut timestamp = Timestamp::now();
                 // ntcp's `try_read` copies min(buf.len(), readable bytes) as
                 // of the call (ntcp-native `Network::try_read`, confirmed by
                 // the ntcp maintainer), so a read that did not fill the
                 // buffer took every byte that was there; it also rearms the
                 // Readable event for the next arrival
                 self.slots.state_mut(conn_id).readable = len == buf.len();
-                Ok(RecvOutcome::Data { len, timestamp: Timestamp::now() })
+                if let Some(nic) = &mut self.nic {
+                    if let Some(stamp) = nic.convert(&self.network, last_byte_timestamps) {
+                        timestamp = timestamp.with_kernel(stamp);
+                    }
+                }
+                Ok(RecvOutcome::Data { len, timestamp })
             }
             Ok(ReadOutcome::Eof) => {
                 self.slots.state_mut(conn_id).eof = true;
@@ -554,6 +920,16 @@ impl<P: PacketIo + AsRawFd> ConnectionGroup for NtcpConnectionGroup<P> {
         Ok(())
     }
 
+    fn poll_tx_timestamps(&mut self, out: &mut Vec<TxTimestampInfo>) -> Result<()> {
+        out.clear();
+        std::mem::swap(out, &mut self.tx_stamps);
+        Ok(())
+    }
+
+    fn clock_calibration(&self) -> Option<ClockCalibrationReport> {
+        self.nic.as_ref().map(NicClock::report)
+    }
+
     fn len(&self) -> usize {
         self.slots.len()
     }
@@ -575,23 +951,6 @@ impl<P: PacketIo + AsRawFd> ConnectionGroup for NtcpConnectionGroup<P> {
             self.close(id)?;
         }
 
-        // ntcp frees a closed connection's slot once its `Closed` event and
-        // all its TX timestamp records were drained. None are requested yet,
-        // but drain them anyway; the scratch records need a real ConnId
-        let mut stamps = self.closing.first().map(|&connection| {
-            let placeholder = TimestampEvent {
-                connection,
-                observation: TxTimestampEvent {
-                    cookie: 0,
-                    target: 0,
-                    stage: TxTimestampStage::Transmit,
-                    source: TxTimestampSource::Software,
-                    outcome: TxTimestampOutcome::Cancelled,
-                },
-            };
-            vec![placeholder; TIMESTAMP_BATCH]
-        });
-
         // Keep driving so the FINs, their retransmissions and the final
         // ACKs reach the peers; dropping the network sends nothing
         let deadline = self.deadline_after(self.close_linger);
@@ -602,9 +961,9 @@ impl<P: PacketIo + AsRawFd> ConnectionGroup for NtcpConnectionGroup<P> {
                 Err(_) if self.network.is_stopped() => return Ok(()),
                 Err(e) => return Err(e),
             };
-            if let Some(stamps) = &mut stamps {
-                while self.network.drain_timestamps(stamps).more {}
-            }
+            // ntcp frees a closed connection's slot once its `Closed` event
+            // and all its TX timestamp records were drained
+            self.drain_stamps();
             // Quiet once every close finished and the last drive had nothing
             // left to transmit. Not `more_work`: at the pinned ntcp revision
             // a closed connection in FIN-WAIT-2 makes every drive report it
@@ -815,9 +1174,68 @@ mod tests {
         }
     }
 
-    impl AsRawFd for Wire {
-        fn as_raw_fd(&self) -> RawFd {
-            self.0.as_raw_fd()
+    impl NtcpBackend for Wire {
+        fn wait_fd(&self) -> Option<RawFd> {
+            Some(self.0.as_raw_fd())
+        }
+    }
+
+    /// A link end like a DPDK queue: no file descriptor to sleep on, and a
+    /// simulated NIC that stamps every received packet with its own clock
+    /// (80 MHz, from an arbitrary origin)
+    struct NicWire(Wire);
+
+    const NIC_CLOCK: ClockDescriptor = ClockDescriptor {
+        domain: ntcp_io::ClockDomain::Device(7),
+        unit: ntcp_io::TimestampUnit::RawTicks { identity: 42 },
+    };
+
+    fn nic_ticks() -> u64 {
+        (u128::from(now_ticks()) * 2 / 25) as u64 + 1_000_000_007
+    }
+
+    impl PacketIo for NicWire {
+        fn layer(&self) -> PacketLayer {
+            PacketLayer::Ip
+        }
+        fn receive(&mut self, out: &mut [u8]) -> io::Result<Option<usize>> {
+            self.0.receive(out)
+        }
+        fn transmit(&mut self, packet: &[u8]) -> io::Result<TxOutcome> {
+            self.0.transmit(packet)
+        }
+        fn timestamp_capabilities(&self) -> ntcp_io::TimestampCapabilities {
+            ntcp_io::TimestampCapabilities { rx_hardware: true, ..Default::default() }
+        }
+        fn receive_with_metadata(
+            &mut self,
+            out: &mut [u8],
+        ) -> io::Result<Option<ntcp_io::ReceivedPacket>> {
+            Ok(self.0.receive(out)?.map(|len| ntcp_io::ReceivedPacket {
+                len,
+                timestamps: ntcp_io::PacketTimestamps {
+                    software: None,
+                    hardware: Some(ntcp_io::PacketTimestamp {
+                        value: nic_ticks(),
+                        source: ntcp_io::TimestampSource::Hardware,
+                        point: ntcp_io::TimestampPoint::DeviceReceive,
+                        clock: NIC_CLOCK,
+                    }),
+                },
+                tcp_segment_size: None,
+            }))
+        }
+    }
+
+    impl NtcpBackend for NicWire {
+        fn wait_fd(&self) -> Option<RawFd> {
+            None
+        }
+        fn device_clock(&self) -> Option<ClockDescriptor> {
+            Some(NIC_CLOCK)
+        }
+        fn read_device_clock(&self) -> io::Result<u64> {
+            Ok(nic_ticks())
         }
     }
 
@@ -934,7 +1352,21 @@ mod tests {
     }
 
     /// Poll until `id` is ready, then receive until `want` bytes arrived
-    fn recv_exact(group: &mut NtcpConnectionGroup<Wire>, id: usize, want: usize) -> Vec<u8> {
+    fn recv_exact<P: NtcpBackend>(
+        group: &mut NtcpConnectionGroup<P>,
+        id: usize,
+        want: usize,
+    ) -> Vec<u8> {
+        recv_stamped(group, id, want).0
+    }
+
+    /// `recv_exact`, with the timestamp of the last receive
+    fn recv_stamped<P: NtcpBackend>(
+        group: &mut NtcpConnectionGroup<P>,
+        id: usize,
+        want: usize,
+    ) -> (Vec<u8>, Option<Timestamp>) {
+        let mut last = None;
         let mut out = Vec::new();
         let mut ready = Vec::new();
         let mut buf = [0u8; 1024];
@@ -945,11 +1377,12 @@ mod tests {
             if !ready.contains(&id) {
                 continue;
             }
-            if let RecvOutcome::Data { len, .. } = group.recv(id, &mut buf).unwrap() {
+            if let RecvOutcome::Data { len, timestamp } = group.recv(id, &mut buf).unwrap() {
                 out.extend_from_slice(&buf[..len]);
+                last = Some(timestamp);
             }
         }
-        out
+        (out, last)
     }
 
     #[test]
@@ -1130,6 +1563,91 @@ mod tests {
         group.poll(Duration::ZERO, &mut ready).unwrap();
         assert!(group.network().now() >= before);
         assert_eq!(recv_exact(&mut group, id, 4), b"tick");
+        group.close_all().unwrap();
+    }
+
+    // =========================================================================
+    // NIC timestamps
+    // =========================================================================
+
+    fn nic_config() -> NetworkConfig {
+        let mut config = network_config(CLIENT);
+        config.rx_timestamp_ranges = NIC_RX_TIMESTAMP_RANGES;
+        config.tx_timestamp_phases = 1 + NIC_TX_TIMESTAMP_SPARE;
+        config
+    }
+
+    #[test]
+    fn nic_timestamps_split_the_round_trip() {
+        let (a, b) = link();
+        let _server = EchoServer::start(b, true, ServerClose::OnEof);
+        let mut group = NtcpConnectionGroup::new(nic_config(), NicWire(a)).unwrap();
+        group.enable_nic_timestamps().unwrap();
+        let id = group.add_connection(&server_addr()).unwrap();
+
+        // More requests than TX timestamp records: drained records free
+        let mut stamps = Vec::new();
+        for round in 0..20u32 {
+            let receipt = group.send(id, &round.to_le_bytes()).unwrap();
+            let tx = receipt.tx.expect("a TX range with NIC timestamps");
+            assert_eq!(tx, TxRange { start: round * 4, end: round * 4 + 4 });
+            let (echo, rx) = recv_stamped(&mut group, id, 4);
+            assert_eq!(echo, round.to_le_bytes());
+
+            group.poll_tx_timestamps(&mut stamps).unwrap();
+            let sent = stamps.iter().find(|s| s.tx_end == tx.end).expect("the Scheduled stamp");
+            assert_eq!(sent.conn_id, id);
+            assert!(sent.cumulative);
+            assert_eq!(sent.timestamp.clock, KernelClock::NicCalibrated);
+            let received = rx.unwrap().kernel().expect("a converted RX stamp");
+            assert_eq!(received.clock, KernelClock::NicCalibrated);
+            // Both on the time_ns clock: the echo reached the simulated NIC
+            // after the request was scheduled and before recv returned
+            // (with a tick of rounding)
+            assert!(received.nanos + 100 >= sent.timestamp.nanos, "{received:?} {sent:?}");
+            assert!(received.nanos <= now_ticks() + 100, "{received:?}");
+        }
+
+        let report = group.clock_calibration().unwrap();
+        assert!(report.converted >= 20, "{report:?}");
+        assert_eq!(report.rejected_samples, 0, "{report:?}");
+        let rate = report.ns_per_tick.unwrap();
+        assert!((rate - 12.5).abs() < 0.01, "{report:?}");
+        // Loose: preemption between a pair's reads moves it (busy hosts)
+        assert!(report.max_residual_ns.unwrap() < 1_000.0, "{report:?}");
+        group.close_all().unwrap();
+    }
+
+    #[test]
+    fn nic_timestamps_need_records_and_a_device_clock() {
+        let (a, _b) = link();
+        let mut group = NtcpConnectionGroup::new(network_config(CLIENT), NicWire(a)).unwrap();
+        let err = group.enable_nic_timestamps().unwrap_err();
+        assert!(matches!(&err, Error::Config(m) if m.contains("rx_timestamp_ranges")), "{err}");
+
+        let (a, _b) = link();
+        let mut group = NtcpConnectionGroup::new(nic_config(), a).unwrap();
+        let err = group.enable_nic_timestamps().unwrap_err();
+        assert!(matches!(&err, Error::Config(m) if m.contains("RX hardware")), "{err}");
+        assert!(group.clock_calibration().is_none());
+    }
+
+    #[test]
+    fn busy_polled_backend_waits_for_its_timeout() {
+        let (a, b) = link();
+        let _server = EchoServer::start(b, true, ServerClose::OnEof);
+        let mut group = NtcpConnectionGroup::new(network_config(CLIENT), NicWire(a)).unwrap();
+        let id = group.add_connection(&server_addr()).unwrap();
+        let mut ready = Vec::new();
+        let started = Instant::now();
+        group.poll(Duration::from_millis(50), &mut ready).unwrap();
+        assert!(ready.is_empty());
+        assert!(started.elapsed() >= Duration::from_millis(50));
+
+        // Without NIC timestamps, sends report no TX range
+        let receipt = group.send(id, b"busy").unwrap();
+        assert!(receipt.tx.is_none());
+        assert_eq!(recv_exact(&mut group, id, 4), b"busy");
         group.close_all().unwrap();
     }
 }

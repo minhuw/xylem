@@ -78,8 +78,8 @@ impl SendLagStats {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LatencyBreakdownStats {
     /// Clock of the service latencies: `user_space`, `kernel_software`,
-    /// `nic_hardware`, or `mixed` when requests differ. Null when no request
-    /// completed.
+    /// `nic_hardware`, `nic_calibrated`, or `mixed` when requests differ.
+    /// Null when no request completed.
     pub clock: Option<BreakdownClock>,
     /// Requests whose send and receive had kernel timestamps from the same
     /// clock, which split their round trip into `host_stack_us` and
@@ -123,6 +123,7 @@ impl LatencyBreakdownStats {
             Some(BreakdownClock::UserSpace) => "user_space",
             Some(BreakdownClock::KernelSoftware) => "kernel_software",
             Some(BreakdownClock::NicHardware) => "nic_hardware",
+            Some(BreakdownClock::NicCalibrated) => "nic_calibrated",
             Some(BreakdownClock::Mixed) => "mixed",
         }
     }
@@ -238,6 +239,56 @@ pub struct DetailedExperimentResults {
     /// Only included when `stats.include_records = true` in config.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub records: Vec<StatsRecord>,
+    /// How each worker thread with `timestamps = "nic"` converted its NIC's
+    /// timestamps to the user-space clock, by thread id; absent without such
+    /// threads
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub nic_clock_calibration: Vec<NicClockCalibration>,
+}
+
+/// How one worker thread converted its NIC's timestamps to the user-space
+/// clock (`nic_calibrated` latency breakdowns)
+///
+/// The thread fits the NIC clock to the user-space clock from paired
+/// readings taken about every 100 ms over a sliding window of 32. The fit
+/// fields are null if no fit existed at the end of the run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NicClockCalibration {
+    pub thread_id: usize,
+    /// Nanoseconds of the user-space clock per NIC clock tick, by the last fit
+    pub ns_per_tick: Option<f64>,
+    /// RMS residual of the last fit, in nanoseconds: the typical error of a
+    /// converted RX timestamp
+    pub residual_rms_ns: Option<f64>,
+    /// Largest residual of any fit during the run, in nanoseconds
+    pub max_residual_ns: Option<f64>,
+    /// Readings of the last fit's window that it used and dropped as outliers
+    pub inliers: usize,
+    pub outliers: usize,
+    /// Readings refused because a clock did not move forward
+    pub rejected_samples: u64,
+    /// Receives whose RX hardware timestamp was converted
+    pub converted_rx_stamps: u64,
+    /// Receives without a convertible RX hardware timestamp; their requests
+    /// have no kernel split
+    pub unconverted_rx_stamps: u64,
+}
+
+impl NicClockCalibration {
+    /// Worker thread `thread_id`'s report
+    pub fn new(thread_id: usize, report: &xylem_transport::ClockCalibrationReport) -> Self {
+        Self {
+            thread_id,
+            ns_per_tick: report.ns_per_tick,
+            residual_rms_ns: report.residual_rms_ns,
+            max_residual_ns: report.max_residual_ns,
+            inliers: report.inliers,
+            outliers: report.outliers,
+            rejected_samples: report.rejected_samples,
+            converted_rx_stamps: report.converted,
+            unconverted_rx_stamps: report.unconverted,
+        }
+    }
 }
 
 /// Experiment metadata
@@ -463,6 +514,8 @@ impl DetailedExperimentResults {
             global,
             traffic_groups,
             records,
+            // `run_experiment` adds the worker threads' reports
+            nic_clock_calibration: Vec::new(),
         }
     }
 
@@ -584,6 +637,26 @@ impl DetailedExperimentResults {
         println!("{indent}  {BREAKDOWN_NOTE}");
     }
 
+    /// Print one line per worker thread's NIC clock calibration
+    fn print_nic_clock_calibration(calibrations: &[NicClockCalibration]) {
+        println!("NIC clock calibration:");
+        let ns =
+            |value: Option<f64>| value.map_or_else(|| "n/a".to_string(), |v| format!("{v:.0}"));
+        for c in calibrations {
+            let rate = c.ns_per_tick.map_or_else(|| "no fit".to_string(), |r| format!("{r:.6}"));
+            println!(
+                "  Thread {}: {} ns/tick, residual rms {} ns, max {} ns; RX stamps \
+                 converted {}, unconverted {}",
+                c.thread_id,
+                rate,
+                ns(c.residual_rms_ns),
+                ns(c.max_residual_ns),
+                c.converted_rx_stamps,
+                c.unconverted_rx_stamps
+            );
+        }
+    }
+
     /// Format a policy config as a human-readable string
     fn format_policy_config(policy: &xylem_core::traffic_group::PolicyConfig) -> String {
         match policy {
@@ -669,6 +742,10 @@ impl DetailedExperimentResults {
         println!();
         Self::print_breakdown(&self.global.latency_breakdown, "");
         println!();
+        if !self.nic_clock_calibration.is_empty() {
+            Self::print_nic_clock_calibration(&self.nic_clock_calibration);
+            println!();
+        }
 
         for (i, group) in self.traffic_groups.iter().enumerate() {
             println!("{}", "-".repeat(70));

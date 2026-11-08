@@ -1,18 +1,26 @@
 # ntcp (User-Space TCP)
 
-The `ntcp` transport runs TCP in user space with [ntcp](https://github.com/minhuw/ntcp), a caller-driven TCP/IP stack, instead of the kernel's TCP. Each worker thread runs its own ntcp stack, which sends and receives raw IP packets through a packet backend. The first backend is a Linux TUN device; DPDK and AF_XDP backends are planned.
+The `ntcp` transport runs TCP in user space with [ntcp](https://github.com/minhuw/ntcp), a caller-driven TCP/IP stack, instead of the kernel's TCP. Each worker thread runs its own ntcp stack, which sends and receives packets through a packet backend: a Linux TUN device (raw IP packets) or a DPDK port (Ethernet frames, with ARP). An AF_XDP backend is planned.
 
 The target server sees an ordinary TCP client. Only the client side changes, so you can compare the kernel stack with a user-space stack against the same server.
 
 ## Building
 
-ntcp is opt-in and Linux-only. Build xylem with the `ntcp` feature:
+ntcp is opt-in and Linux-only. Build xylem with the `ntcp` feature for the TUN backend:
 
 ```bash
 cargo build --release --features ntcp
 ```
 
-A build without the feature rejects `transport = "ntcp"` with an error saying that xylem was built without ntcp support.
+The DPDK backend needs the `ntcp-dpdk` feature, which links DPDK statically. Build it inside the nix dev shell, which provides the DPDK SDK (`pkg-config libdpdk`, with the mlx5 drivers) from ntcp's flake, on x86_64 Linux:
+
+```bash
+nix develop --command cargo build --release --features xylem-cli/ntcp-dpdk
+```
+
+Build and run DPDK binaries with nix's toolchain only: a binary linked against the host's glibc fails to load nix's rdma-core when EAL starts.
+
+A build without the feature rejects `transport = "ntcp"` (or `backend = "dpdk"`) with an error saying that xylem was built without that support.
 
 ## TUN setup
 
@@ -28,9 +36,20 @@ sudo ip link set ntcp0 mtu 1500 up
 
 The device must exist before xylem starts; xylem attaches to it and never creates, configures or removes it. The kernel side sees ntcp's packets arrive on `ntcp0`. To reach a server elsewhere, the kernel has to forward them (IP forwarding plus NAT, or routes back to `10.73.0.0/24` on the server's side). A server running on the same host can listen on `10.73.0.1` directly.
 
+## DPDK setup
+
+The DPDK backend drives one Ethernet port. Each worker thread that runs ntcp traffic gets one queue pair of the port and its own IPv4 address on the port's network; a flow rule steers that address to the thread's queue. The threads share one ARP table: ntcp resolves its next hops and answers ARP requests for its addresses itself.
+
+- **The device.** EAL probes only the device you name (`-a`). With NVIDIA/Mellanox mlx5 NICs the port stays bound to `mlx5_core` (bifurcated driver) and needs `ib_uverbs` and `mlx5_ib` loaded; other NICs must be bound to `vfio-pci`. Name PMD arguments in the device string: `0000:05:00.0,dv_flow_en=1`.
+- **Hugepages.** EAL needs hugepages, e.g. 1 GiB pages reserved at boot. `--in-memory` keeps EAL's files out of `/dev/hugepages` and `/var/run`.
+- **Privileges.** Run xylem as root (or with the capabilities DPDK needs for the device).
+- **Addresses.** ntcp's addresses must be unused on the network, and must not be the kernel's address on that device.
+- **The port takes the device's traffic.** The port is not isolated (on mlx5, an isolated port cannot read the NIC's clock, which NIC timestamps need), so while xylem runs, the kernel no longer receives the device's traffic. Keep management traffic on another interface.
+- **CPUs.** xylem pins worker thread N to CPU N, and attaches the thread's queue after pinning it. Unless `eal_args` name lcores, EAL's main lcore is the first CPU xylem may run on, and EAL starts no threads of its own. Busy-polling keeps each ntcp thread's CPU at 100%.
+
 ## Configuration
 
-Set `transport = "ntcp"` in the traffic groups and add a top-level `[ntcp]` section:
+Set `transport = "ntcp"` in the traffic groups and add a top-level `[ntcp]` section. With the TUN backend:
 
 ```toml
 [[traffic_groups]]
@@ -43,7 +62,7 @@ connections_per_thread = 4
 traffic_policy = { type = "closed-loop" }
 
 [ntcp]
-backend = "tun"                # the only backend for now (default)
+backend = "tun"                # the default
 mtu = 1500                     # IP MTU of the links (default 1500)
 endpoints = [
     { ifname = "ntcp0", local_ip = "10.73.0.2" },   # thread 0
@@ -51,26 +70,65 @@ endpoints = [
 ]
 ```
 
+With the DPDK backend:
+
+```toml
+[[traffic_groups]]
+name = "echo"
+protocol = "xylem-echo"
+target = "10.80.0.1:9999"
+transport = "ntcp"
+threads = [2, 3]
+connections_per_thread = 1
+traffic_policy = { type = "closed-loop" }
+timestamps = "nic"             # optional: NIC timestamps, see below
+
+[ntcp]
+backend = "dpdk"
+mtu = 1500
+
+[ntcp.dpdk]
+device = "0000:05:00.0,dv_flow_en=1"
+eal_args = ["--in-memory", "--file-prefix=xylem"]
+local_ips = ["10.80.0.12", "10.80.0.13"]   # thread 2, thread 3
+prefix_len = 24
+# gateway = "10.80.0.254"      # for targets outside 10.80.0.0/24
+```
+
 | Field | Description |
 |-------|-------------|
-| `backend` | Packet backend. Only `"tun"`: an existing Linux TUN device without packet information headers. |
-| `mtu` | IP MTU that ntcp uses on every endpoint's link, 68 to 65535. Match the device's MTU. |
-| `endpoints` | One `{ ifname, local_ip }` per worker thread that runs ntcp traffic groups. They map to those threads in ascending thread-ID order: with `threads = [4, 2]`, the first endpoint goes to thread 2 and the second to thread 4. |
+| `backend` | Packet backend: `"tun"` (default), an existing Linux TUN device without packet information headers per thread; or `"dpdk"`, one DPDK port shared by the threads. |
+| `mtu` | IP MTU that ntcp uses on every link, 68 to 65535. Match the device's MTU. |
+| `endpoints` | TUN: one `{ ifname, local_ip }` per worker thread that runs ntcp traffic groups. They map to those threads in ascending thread-ID order: with `threads = [4, 2]`, the first endpoint goes to thread 2 and the second to thread 4. |
 | `endpoints[].ifname` | Name of that thread's TUN device. |
 | `endpoints[].local_ip` | ntcp's own address on that device: unicast, not one of the kernel's addresses. |
+| `dpdk.device` | DPDK: EAL devargs of the port, a PCI address (optionally with PMD arguments) or a virtual device. |
+| `dpdk.eal_args` | More EAL arguments, after `-a DEVICE`. |
+| `dpdk.local_ips` | ntcp's IPv4 address for each worker thread that runs ntcp traffic groups, in ascending thread-ID order like `endpoints`. |
+| `dpdk.prefix_len` | Prefix length of the on-link network of `local_ips`, 1 to 32. |
+| `dpdk.gateway` | Router for targets outside that network (optional): another address on it. |
 
-Validation requires the `[ntcp]` section whenever a group uses ntcp, exactly one endpoint per ntcp thread, and a different address and device for every endpoint. Groups sharing a thread share its endpoint. Groups on a thread must all use the same transport, as with every transport.
+Validation requires the `[ntcp]` section whenever a group uses ntcp, and checks the selected backend's settings: exactly one endpoint (TUN) or address (DPDK) per ntcp thread, each address used once, and for TUN a different device per endpoint. The other backend's settings are ignored, so a profile can keep both and switch with `--set ntcp.backend=dpdk`. Groups sharing a thread share its endpoint or address. Groups on a thread must all use the same transport, as with every transport.
+
+## NIC timestamps (DPDK)
+
+With the DPDK backend, `timestamps = "nic"` on a traffic group timestamps its requests with the NIC's clock:
+
+- **RX**: the NIC's hardware timestamp of the packet that carried a response's last byte.
+- **TX**: the time ntcp handed the request's last byte to the NIC's transmit queue (ntcp's *Scheduled* stage). The NIC sends it soon after; this backend has no hardware TX timestamps.
+
+Each worker thread converts the NIC's clock to xylem's clock with a calibration fitted from paired readings of both clocks, taken about every 100 ms over a sliding window of 32 (and 8 readings when the thread starts). The latency breakdown then splits each round trip as with kernel timestamps, with the clock `nic_calibrated`: `network_server_us` is the time from the request being queued to the NIC to the response reaching the NIC, and `host_stack_us` the rest of the user-space round trip. The JSON results list each thread's calibration under `nic_clock_calibration`, with its residuals (the typical conversion error, about 0.1–0.2 µs on a ConnectX-5 VF) and the number of receives without a usable timestamp. See [Output Formats](../output-formats.md).
 
 ## Testing without root
 
-`just test-ntcp` runs an end-to-end test in an unprivileged user and network namespace (`unshare -rn`), with TUN devices that exist only inside it. It runs `xylem-echo-server` on the kernel side and compares ntcp with kernel TCP over the same devices, for one thread and for two. See `tests/ntcp/tun_netns.sh`.
+`just test-ntcp` runs an end-to-end test in an unprivileged user and network namespace (`unshare -rn`), with TUN devices that exist only inside it. It runs `xylem-echo-server` on the kernel side and compares ntcp with kernel TCP over the same devices, for one thread and for two. See `tests/ntcp/tun_netns.sh`. The DPDK backend needs a real NIC (or a virtual device) and root; its unit tests run the same code over a simulated NIC.
 
 ## Current limitations
 
 - **TCP only.** There is no user-space UDP.
-- **User-space timestamps only.** Latencies use the CPU timestamp counter read when the send was accepted by ntcp and when a receive completed. There are no kernel or NIC TX/RX timestamps, and `poll_tx_timestamps` reports nothing. The TUN backend has no packet timestamps.
-- **One TUN device and one address per thread.** Threads never share a stack.
-- **Polling.** A group drives its stack whenever xylem sends or polls, and sleeps on the TUN file descriptor only when the stack has nothing left to do. Each connection's stack work costs CPU time on the worker thread, and that time is part of the measured latency.
+- **Timestamps.** With TUN, user-space timestamps only: latencies use the CPU timestamp counter read when the send was accepted by ntcp and when a receive completed, and `poll_tx_timestamps` reports nothing. With DPDK, `timestamps = "nic"` adds the NIC timestamps above; there are no kernel timestamps.
+- **One endpoint per thread.** Threads never share a stack.
+- **Polling.** A group drives its stack whenever xylem sends or polls. With TUN it sleeps on the device's file descriptor when the stack has nothing left to do; with DPDK it busy-polls its queue. Each connection's stack work costs CPU time on the worker thread, and that time is part of the measured latency.
 - **No startup wait.** Like Linux after a reboot, ntcp opens connections as soon as a run starts. It does not wait out the 2×MSL (240 s) TIME-WAIT state of a previous run. A run that reuses an ntcp address and port against the same server within 4 minutes of an earlier run could in principle meet that run's old segments; ntcp's per-run secret and TCP timestamps make this very unlikely.
 
 ## See Also

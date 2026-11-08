@@ -33,6 +33,10 @@ pub enum BreakdownClock {
     KernelSoftware,
     /// NIC hardware timestamps (the NIC's PHC)
     NicHardware,
+    /// A user-space stack's NIC timestamps on the user-space clock: NIC RX
+    /// hardware timestamps converted by a fitted calibration, and the time
+    /// the stack queued the request to the NIC
+    NicCalibrated,
     /// Different requests of the scope used different clocks
     Mixed,
 }
@@ -43,7 +47,8 @@ impl BreakdownClock {
             BreakdownClock::UserSpace => 1,
             BreakdownClock::KernelSoftware => 2,
             BreakdownClock::NicHardware => 4,
-            BreakdownClock::Mixed => 7,
+            BreakdownClock::NicCalibrated => 8,
+            BreakdownClock::Mixed => 15,
         }
     }
 
@@ -54,6 +59,7 @@ impl BreakdownClock {
             1 => Some(BreakdownClock::UserSpace),
             2 => Some(BreakdownClock::KernelSoftware),
             4 => Some(BreakdownClock::NicHardware),
+            8 => Some(BreakdownClock::NicCalibrated),
             _ => Some(BreakdownClock::Mixed),
         }
     }
@@ -114,6 +120,7 @@ impl LatencyBreakdown {
             None => BreakdownClock::UserSpace,
             Some(KernelClock::Realtime) => BreakdownClock::KernelSoftware,
             Some(KernelClock::NicHardware) => BreakdownClock::NicHardware,
+            Some(KernelClock::NicCalibrated) => BreakdownClock::NicCalibrated,
         }
     }
 }
@@ -272,6 +279,7 @@ mod tests {
         for (clock, expected) in [
             (KernelClock::Realtime, BreakdownClock::KernelSoftware),
             (KernelClock::NicHardware, BreakdownClock::NicHardware),
+            (KernelClock::NicCalibrated, BreakdownClock::NicCalibrated),
         ] {
             // A 5 ms kernel round trip inside the 20 ms user-space one
             let send = send.with_kernel(kernel(1_000_000_000, clock));

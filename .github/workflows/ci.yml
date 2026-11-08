@@ -112,8 +112,12 @@ jobs:
       - name: Install protoc for evalsync's prost-build
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
+      # Every feature but ntcp-dpdk, which needs the nix dev shell's DPDK SDK
+      # (the Clippy and coverage jobs build it with --all-features)
       - name: Check build with the MSRV toolchain
-        run: cargo +1.99.0 check --locked --workspace --all-targets --all-features
+        run: >-
+          cargo +1.99.0 check --locked --workspace --all-targets
+          --features xylem-cli/evalsync,xylem-cli/ntcp,xylem-core/schema,xylem-protocols/schema
 
   audit:
     name: Security Audit
