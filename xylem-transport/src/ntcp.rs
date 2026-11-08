@@ -484,7 +484,9 @@ impl<P: NtcpBackend> NtcpConnectionGroup<P> {
     /// Build the network on the calling thread
     ///
     /// Sets the config's timebase to nanoseconds, the unit of the ticks this
-    /// group passes, and generates the TCP secret from `/dev/urandom`.
+    /// group passes, raises its buffer budget to hold `tcp.max_connections`
+    /// connections (see [`buffer_budget`]), and generates the TCP secret
+    /// from `/dev/urandom`.
     pub fn new(config: NetworkConfig, io: P) -> Result<Self> {
         Self::build(config, io, None)
     }
@@ -508,6 +510,7 @@ impl<P: NtcpBackend> NtcpConnectionGroup<P> {
         neighbors: Option<&SharedNeighbors>,
     ) -> Result<Self> {
         config.tcp.connection.timebase.units_per_second = UNITS_PER_SECOND;
+        config.tcp.max_buffer_bytes = buffer_budget(&config)?;
         let now = now_ticks();
         let secret = random_secret()?;
         let network = match neighbors {
@@ -769,6 +772,22 @@ impl<P: NtcpBackend> NtcpConnectionGroup<P> {
         });
         self.closing.is_empty()
     }
+}
+
+/// The `tcp.max_buffer_bytes` a network with `config` needs to hold
+/// `tcp.max_connections` connections, never below the configured budget
+///
+/// ntcp charges each connection what its buffers and timestamp records can
+/// grow to (about 4.7 MB with its default 64 KiB buffers, reserved but not
+/// resident), so its default budget of 256 MiB admits only about 55.
+fn buffer_budget(config: &NetworkConfig) -> Result<usize> {
+    let needed = config.buffer_budget(config.tcp.max_connections).ok_or_else(|| {
+        Error::Config(format!(
+            "the ntcp buffer budget of {} connections overflows",
+            config.tcp.max_connections
+        ))
+    })?;
+    Ok(needed.max(config.tcp.max_buffer_bytes))
 }
 
 /// `ppoll` one fd for `events`, up to `wait_ns` nanoseconds
@@ -1377,9 +1396,14 @@ mod tests {
         }
     }
 
+    /// Connections an echo server holds at once
+    const SERVER_CONNECTIONS: usize = 72;
+
     fn run_echo_server(wire: Wire, listen: bool, close: ServerClose, stop: &AtomicBool) {
         let mut config = network_config(SERVER);
         config.tcp.connection.timebase.units_per_second = UNITS_PER_SECOND;
+        config.tcp.max_connections = SERVER_CONNECTIONS;
+        config.tcp.max_buffer_bytes = config.buffer_budget(SERVER_CONNECTIONS).unwrap();
         let mut network =
             Network::new(config, wire, random_secret().unwrap(), now_ticks()).unwrap();
         let listener: Option<ListenerId> = listen.then(|| network.listen(PORT, 16).unwrap());
@@ -1576,6 +1600,29 @@ mod tests {
         group.poll(Duration::from_millis(50), &mut ready).unwrap();
         assert!(ready.is_empty());
         assert!(started.elapsed() >= Duration::from_millis(50));
+    }
+
+    #[test]
+    fn more_connections_than_ntcps_default_buffer_budget_admits() {
+        // ntcp's default budget admits about 55 connections
+        const CONNECTIONS: usize = 64;
+        let (a, b) = link();
+        let _server = EchoServer::start(b, true, ServerClose::OnEof);
+        let mut config = network_config(CLIENT);
+        config.tcp.max_connections = CONNECTIONS;
+        let mut group = NtcpConnectionGroup::new(config, a).unwrap();
+        let ids: Vec<usize> = (0..CONNECTIONS)
+            .map(|_| group.add_connection(&server_addr()).unwrap())
+            .collect();
+        assert_eq!(group.len(), CONNECTIONS);
+        for &id in &ids {
+            group.send(id, &(id as u32).to_le_bytes()).unwrap();
+        }
+        group.flush().unwrap();
+        for &id in &ids {
+            assert_eq!(recv_exact(&mut group, id, 4), (id as u32).to_le_bytes());
+        }
+        group.close_all().unwrap();
     }
 
     #[test]
