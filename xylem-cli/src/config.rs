@@ -4,7 +4,7 @@
 //! Configuration files are the primary interface for Xylem, with CLI arguments available
 //! for quick overrides.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -251,23 +251,32 @@ impl ProfileConfig {
     }
 
     /// Validate configuration and parse each group's protocol_config into `protocol_configs`
+    ///
+    /// Every independent problem is reported at once, one per line. Checks
+    /// that a problem makes meaningless are skipped: an invalid transport
+    /// skips the group's mixed-transport check, an unknown protocol skips
+    /// the group's UDP and protocol_config checks, unknown keys in a
+    /// protocol_config skip parsing it, a protocol_config that fails to parse
+    /// skips its UDP size check, and the thread assignment is only checked
+    /// when nothing else failed, since it can only repeat the group errors.
     pub fn validate(&mut self) -> Result<()> {
+        let mut errors = Vec::new();
         if self.output.real_time {
-            bail!("output.real_time is not supported by the CLI; use false");
+            errors.push(anyhow!("output.real_time is not supported by the CLI; use false"));
         }
         if self.output.html.library != "chartjs" {
-            bail!("output.html.library only supports 'chartjs'");
+            errors.push(anyhow!("output.html.library only supports 'chartjs'"));
         }
         if self.output.html.theme != "light" {
-            bail!("output.html.theme only supports 'light'");
+            errors.push(anyhow!("output.html.theme only supports 'light'"));
         }
 
         // Experiment validation
         if self.experiment.name.is_empty() {
-            bail!("Experiment name cannot be empty");
+            errors.push(anyhow!("Experiment name cannot be empty"));
         }
         if self.experiment.duration.as_secs() == 0 {
-            bail!("Experiment duration must be > 0");
+            errors.push(anyhow!("Experiment duration must be > 0"));
         }
 
         let valid_transports: &[&str] = if ntcp::SUPPORTED {
@@ -278,7 +287,7 @@ impl ProfileConfig {
 
         // Traffic groups validation
         if self.traffic_groups.is_empty() {
-            bail!("At least one traffic group must be defined");
+            errors.push(anyhow!("At least one traffic group must be defined"));
         }
 
         // Track transport per thread for validation
@@ -290,24 +299,31 @@ impl ProfileConfig {
         for (i, group) in self.traffic_groups.iter().enumerate() {
             // Validate target address
             if group.target.is_empty() {
-                bail!("Traffic group {} '{}' must have a target address", i, group.name);
+                errors.push(anyhow!(
+                    "Traffic group {} '{}' must have a target address",
+                    i,
+                    group.name
+                ));
             }
 
             // Validate transport
-            ntcp::check_supported(group, i)?;
-            if !valid_transports.contains(&group.transport.as_str()) {
-                bail!(
+            if let Err(error) = ntcp::check_supported(group, i) {
+                errors.push(error);
+            }
+            let valid_transport = valid_transports.contains(&group.transport.as_str());
+            if !valid_transport {
+                errors.push(anyhow!(
                     "Invalid transport '{}' for traffic group {} '{}'. Valid options: {}",
                     group.transport,
                     i,
                     group.name,
                     valid_transports.join(", ")
-                );
+                ));
             }
 
             // Validate protocol
-            let Some(&(_, protocol)) = PROTOCOLS.iter().find(|(name, _)| *name == group.protocol)
-            else {
+            let protocol = PROTOCOLS.iter().find(|(name, _)| *name == group.protocol);
+            if protocol.is_none() {
                 let names: Vec<&str> = PROTOCOLS.iter().map(|(name, _)| *name).collect();
                 let mut error = format!(
                     "Invalid protocol '{}' for traffic group {} '{}'. Valid options: {}",
@@ -319,50 +335,66 @@ impl ProfileConfig {
                 if let Some(message) = keys::removed_protocol(&group.protocol) {
                     error = format!("{error}. {message}");
                 }
-                bail!(error);
-            };
-
-            validate_udp(group, protocol, i)?;
+                errors.push(anyhow!(error));
+            }
 
             if group.threads.is_empty() {
-                bail!("Traffic group {} '{}' must have at least one thread", i, group.name);
+                errors.push(anyhow!(
+                    "Traffic group {} '{}' must have at least one thread",
+                    i,
+                    group.name
+                ));
             }
             if group.connections_per_thread == 0 {
-                bail!("Traffic group {} '{}' connections_per_thread must be > 0", i, group.name);
+                errors.push(anyhow!(
+                    "Traffic group {} '{}' connections_per_thread must be > 0",
+                    i,
+                    group.name
+                ));
             }
             if group.max_pending_per_connection == 0 {
-                bail!(
+                errors.push(anyhow!(
                     "Traffic group {} '{}' max_pending_per_connection must be > 0",
                     i,
                     group.name
-                );
+                ));
             }
 
             // Rate-based policies need a positive rate. Pattern policies accept
             // zero, which pauses sending by design.
-            match &group.traffic_policy {
+            let rates: &[(f64, &str)] = match &group.traffic_policy {
                 PolicyConfig::FixedRate { rate } | PolicyConfig::Poisson { rate } => {
-                    validate_positive_rate(*rate, "rate", i, &group.name)?;
+                    &[(*rate, "rate")]
                 }
-                PolicyConfig::Adaptive { initial_rate, min_rate, max_rate, .. } => {
-                    validate_positive_rate(*initial_rate, "initial_rate", i, &group.name)?;
-                    validate_positive_rate(*min_rate, "min_rate", i, &group.name)?;
-                    validate_positive_rate(*max_rate, "max_rate", i, &group.name)?;
-                }
+                PolicyConfig::Adaptive { initial_rate, min_rate, max_rate, .. } => &[
+                    (*initial_rate, "initial_rate"),
+                    (*min_rate, "min_rate"),
+                    (*max_rate, "max_rate"),
+                ],
                 PolicyConfig::ClosedLoop
                 | PolicyConfig::Sinusoidal { .. }
                 | PolicyConfig::Ramp { .. }
                 | PolicyConfig::Spike { .. }
-                | PolicyConfig::Sawtooth { .. } => {}
+                | PolicyConfig::Sawtooth { .. } => &[],
+            };
+            for &(rate, field) in rates {
+                if let Err(error) = validate_positive_rate(rate, field, i, &group.name) {
+                    errors.push(error);
+                }
             }
 
             // Validate all groups on the same thread use the same transport
-            for &thread_id in &group.threads {
+            let threads = if valid_transport {
+                &group.threads[..]
+            } else {
+                &[]
+            };
+            for &thread_id in threads {
                 match thread_transports.get(&thread_id) {
                     Some((existing_transport, existing_group_idx, existing_group_name))
                         if *existing_transport != group.transport.as_str() =>
                     {
-                        bail!(
+                        errors.push(anyhow!(
                             "Thread {} has mixed transports: group {} '{}' uses '{}' but group {} '{}' uses '{}'. \
                              All traffic groups on the same thread must use the same transport.",
                             thread_id,
@@ -372,7 +404,7 @@ impl ProfileConfig {
                             i,
                             group.name,
                             group.transport
-                        );
+                        ));
                     }
                     None => {
                         thread_transports
@@ -382,6 +414,12 @@ impl ProfileConfig {
                 }
             }
 
+            // The remaining checks need the group's protocol
+            let Some(&(_, protocol)) = protocol else {
+                continue;
+            };
+            validate_udp(group, protocol, i, &mut errors);
+
             // Key-value protocols (Redis, Memcached) require protocol_config with keys
             // HTTP and XylemEcho have sensible defaults and don't require protocol_config
             let requires_protocol_config = matches!(
@@ -390,42 +428,66 @@ impl ProfileConfig {
             );
 
             if requires_protocol_config && group.protocol_config.is_none() {
-                bail!(
+                errors.push(anyhow!(
                     "Traffic group {} '{}' has no protocol_config. \
                      For {} protocol, set traffic_groups[{}].protocol_config with keys configuration.",
                     i,
                     group.name,
                     group.protocol,
                     i
-                );
+                ));
+                continue;
             }
 
             // Reject unknown and removed keys, every one of them, before parsing
             if let Some(pc) = &group.protocol_config {
                 let problems = keys::check_protocol_config(protocol, pc, i, &group.name);
-                combine(problems.into_iter().map(anyhow::Error::msg).collect())?;
+                if !problems.is_empty() {
+                    errors.extend(problems.into_iter().map(anyhow::Error::msg));
+                    continue;
+                }
             }
 
             // Parse protocol_config once as the appropriate typed struct.
             // This validates the structure, provides better error messages,
             // and gives workers the config they build protocols from.
-            let protocol_config =
-                parse_protocol_config(protocol, group.protocol_config.as_ref(), i, &group.name)?;
+            let protocol_config = match parse_protocol_config(
+                protocol,
+                group.protocol_config.as_ref(),
+                i,
+                &group.name,
+            ) {
+                Ok(protocol_config) => protocol_config,
+                Err(error) => {
+                    errors.push(error);
+                    continue;
+                }
+            };
             if group.transport == "udp" {
-                validate_udp_request_size(&protocol_config, i, &group.name)?;
+                if let Err(error) = validate_udp_request_size(&protocol_config, i, &group.name) {
+                    errors.push(error);
+                }
             }
             protocol_configs.push(protocol_config);
         }
 
         // Validate thread assignment
-        let assignment =
-            xylem_core::traffic_group::ThreadGroupAssignment::from_configs(&self.traffic_groups);
-        assignment.validate()?;
+        if errors.is_empty() {
+            let assignment = xylem_core::traffic_group::ThreadGroupAssignment::from_configs(
+                &self.traffic_groups,
+            );
+            if let Err(error) = assignment.validate() {
+                errors.push(error.into());
+            }
+        }
 
-        ntcp::validate(self.ntcp.as_ref(), &self.traffic_groups)?;
+        if let Err(error) = ntcp::validate(self.ntcp.as_ref(), &self.traffic_groups) {
+            errors.push(error);
+        }
 
         // Output validation - format is now an enum, so always valid
 
+        combine(errors)?;
         self.protocol_configs = protocol_configs;
         Ok(())
     }
@@ -463,37 +525,40 @@ fn validate_udp(
     group: &xylem_core::traffic_group::TrafficGroupConfig,
     protocol: ProtocolKind,
     index: usize,
-) -> Result<()> {
+    errors: &mut Vec<anyhow::Error>,
+) {
     if group.transport == "udp" && !UDP_PROTOCOLS.contains(&protocol) {
         let names: Vec<&str> = PROTOCOLS
             .iter()
             .filter(|(_, kind)| UDP_PROTOCOLS.contains(kind))
             .map(|(name, _)| *name)
             .collect();
-        bail!(
+        errors.push(anyhow!(
             "Traffic group {} '{}': protocol '{}' does not support transport 'udp'. \
              Protocols that support UDP: {}",
             index,
             group.name,
             group.protocol,
             names.join(", ")
-        );
+        ));
     }
     if let Some(timeout) = group.request_timeout {
         if group.transport != "udp" {
-            bail!(
+            errors.push(anyhow!(
                 "Traffic group {} '{}' sets request_timeout, which only transport 'udp' \
                  supports; '{}' retransmits lost data and never times out requests",
                 index,
                 group.name,
                 group.transport
-            );
-        }
-        if timeout.is_zero() {
-            bail!("Traffic group {} '{}' request_timeout must be > 0", index, group.name);
+            ));
+        } else if timeout.is_zero() {
+            errors.push(anyhow!(
+                "Traffic group {} '{}' request_timeout must be > 0",
+                index,
+                group.name
+            ));
         }
     }
-    Ok(())
 }
 
 /// Over UDP a memcached request must fit one datagram, which bounds its value size
@@ -1967,6 +2032,62 @@ protocol_config = {}
             let error = format!("{:#}", check_keys(&profile).unwrap_err());
             assert!(error.starts_with(expected), "{path}.{key}: {error}");
         }
+    }
+
+    #[test]
+    fn validation_reports_every_independent_error() {
+        let mut profile = every_table_with("experiment", "name", toml::Value::String("".into()));
+        profile["experiment"]["duration"] = toml::Value::String("0s".into());
+        insert(&mut profile, "output.html", "theme", toml::Value::String("dark".into()));
+        profile["traffic_groups"][0]["target"] = toml::Value::String("".into());
+        profile["traffic_groups"][0]["traffic_policy"]["rate"] = toml::Value::Float(0.0);
+        insert(
+            &mut profile,
+            "traffic_groups.2",
+            "transport",
+            toml::Value::String("pigeon".into()),
+        );
+        insert(
+            &mut profile,
+            "traffic_groups.3.protocol_config",
+            "scna",
+            toml::Value::Integer(1),
+        );
+        let mut config: ProfileConfig = profile.try_into().unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        let expected = [
+            "The profile has 7 errors:",
+            "  - output.html.theme only supports 'light'",
+            "  - Experiment name cannot be empty",
+            "  - Experiment duration must be > 0",
+            "  - Traffic group 0 'redis' must have a target address",
+            "  - Traffic group 0 'redis' traffic_policy.rate must be > 0",
+            "  - Invalid transport 'pigeon' for traffic group 2 'http'. Valid options: tcp, udp, unix",
+            "  - unknown field `scna` in traffic_groups[3].protocol_config (did you mean `scan`?)",
+        ];
+        let lines: Vec<&str> = error.lines().collect();
+        assert_eq!(lines.len(), expected.len(), "{error}");
+        for (line, expected) in lines.iter().zip(expected) {
+            assert!(line.starts_with(expected), "{line} does not start with {expected}");
+        }
+
+        // An unknown protocol skips the checks that need the protocol
+        let mut profile: toml::Value = toml::from_str(EVERY_TABLE).unwrap();
+        profile["traffic_groups"][0]["protocol"] = toml::Value::String("redis-cluster".into());
+        insert(
+            &mut profile,
+            "traffic_groups.0.protocol_config",
+            "bogus",
+            toml::Value::Integer(1),
+        );
+        let mut config: ProfileConfig = profile.try_into().unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.starts_with("Invalid protocol 'redis-cluster' for traffic group 0"),
+            "{error}"
+        );
+        assert!(error.contains("Redis Cluster support was removed"), "{error}");
+        assert_eq!(error.lines().count(), 1, "{error}");
     }
 
     #[test]
