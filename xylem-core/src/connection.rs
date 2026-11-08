@@ -7,6 +7,7 @@
 //! poll syscall checks all connections in the pool.
 
 use crate::scheduler::{Policy, ReadyHeap};
+use crate::stats::LatencyBreakdown;
 use crate::Result;
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
@@ -56,6 +57,9 @@ pub type UnixTrafficGroupConfig =
 /// (group_id, target, conn_count, max_pending_per_conn, policy_scheduler)
 type GroupConfig<Target> =
     (usize, Target, usize, usize, Box<dyn crate::scheduler::PolicyScheduler>);
+
+/// A completed response: (request_id, latency, is_warmup, bytes_consumed, breakdown)
+pub type Completion<ReqId> = (ReqId, Duration, bool, usize, LatencyBreakdown);
 
 /// Timeout for stale TX queue entries (1 minute in nanoseconds)
 /// Entries older than this are cleaned up to prevent memory leaks from lost packets
@@ -475,8 +479,8 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         self.timed_out_ids.insert(req_id, is_warmup);
     }
 
-    /// Complete the pending request `req_id`, returning its latency and
-    /// whether it was a warmup request
+    /// Complete the pending request `req_id`, returning its latency, whether
+    /// it was a warmup request, and where its latency went
     ///
     /// A response to a timed-out request is dropped (`Ok(None)`) and, for a
     /// measurement request, counted as late. Any other unknown ID is an error
@@ -487,7 +491,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         req_id: &ReqId,
         recv_ts: Timestamp,
         datagram: bool,
-    ) -> Result<Option<(Duration, bool)>> {
+    ) -> Result<Option<(Duration, bool, LatencyBreakdown)>> {
         let Some(pending) = self.pending_map.remove(req_id) else {
             if let Some(is_warmup) = self.timed_out_ids.remove(req_id) {
                 if !is_warmup {
@@ -513,11 +517,12 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
                 pending.send_ts
             }
         };
-        let latency = pending.send_lag + recv_ts.duration_since(&send_ts);
+        let breakdown = LatencyBreakdown::between(&send_ts, &recv_ts);
+        let latency = pending.send_lag + breakdown.service;
         if pending.is_setup {
             self.finish_setup_request();
         }
-        Ok(Some((latency, pending.is_warmup)))
+        Ok(Some((latency, pending.is_warmup, breakdown)))
     }
 
     /// Process `data` as if the transport had just read it into the spare tail
@@ -527,7 +532,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         data: &[u8],
         recv_ts: Timestamp,
         process_fn: F,
-    ) -> Result<Vec<(ReqId, Duration, bool, usize)>>
+    ) -> Result<Vec<Completion<ReqId>>>
     where
         F: FnMut(&[u8]) -> Result<(usize, Option<ReqId>)>,
     {
@@ -559,15 +564,15 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
 
     /// Process `len` bytes the transport read into `recv_spare()`
     ///
-    /// Returns (request_id, latency, is_warmup, bytes_consumed) for each
-    /// completed response. The latency is the request's send lag plus its
-    /// service latency, from the send to the receive timestamp.
+    /// Returns (request_id, latency, is_warmup, bytes_consumed, breakdown)
+    /// for each completed response. The latency is the request's send lag
+    /// plus its service latency, from the send to the receive timestamp.
     fn process_received<F>(
         &mut self,
         len: usize,
         recv_ts: Timestamp,
         mut process_fn: F,
-    ) -> Result<Vec<(ReqId, Duration, bool, usize)>>
+    ) -> Result<Vec<Completion<ReqId>>>
     where
         F: FnMut(&[u8]) -> Result<(usize, Option<ReqId>)>,
     {
@@ -601,8 +606,8 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
                     "Protocol consumed {consumed} bytes but returned no request ID"
                 ))
             })?;
-            if let Some((latency, is_warmup)) = self.complete(&req_id, recv_ts, false)? {
-                responses.push((req_id, latency, is_warmup, consumed));
+            if let Some((latency, is_warmup, breakdown)) = self.complete(&req_id, recv_ts, false)? {
+                responses.push((req_id, latency, is_warmup, consumed, breakdown));
             }
             cursor += consumed;
         }
@@ -625,7 +630,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         len: usize,
         recv_ts: Timestamp,
         mut process_fn: F,
-    ) -> Result<Vec<(ReqId, Duration, bool, usize)>>
+    ) -> Result<Vec<Completion<ReqId>>>
     where
         F: FnMut(&[u8]) -> Result<(usize, Option<ReqId>)>,
     {
@@ -650,9 +655,9 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
             let Some(req_id) = req_id else {
                 continue;
             };
-            if let Some((latency, is_warmup)) = self.complete(&req_id, recv_ts, true)? {
+            if let Some((latency, is_warmup, breakdown)) = self.complete(&req_id, recv_ts, true)? {
                 let bytes = std::mem::take(&mut self.absorbed_bytes);
-                responses.push((req_id, latency, is_warmup, bytes));
+                responses.push((req_id, latency, is_warmup, bytes, breakdown));
             }
         }
         Ok(responses)
@@ -963,14 +968,14 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
 
     /// Receive and process responses for a connection
     ///
-    /// Returns a vector of (request_id, latency, is_warmup, bytes_consumed) tuples for each completed response.
+    /// Returns a vector of [`Completion`] tuples for each completed response.
     /// The `is_warmup` flag indicates whether the original request was a warmup request
     /// and stats should not be collected.
     pub fn recv_responses<F>(
         &mut self,
         connection_id: usize,
         process_fn: F,
-    ) -> Result<Vec<(ReqId, Duration, bool, usize)>>
+    ) -> Result<Vec<Completion<ReqId>>>
     where
         F: FnMut(&[u8]) -> Result<(usize, Option<ReqId>)>,
     {
@@ -993,7 +998,7 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
                 return Err(crate::Error::Connection("Connection closed by peer".to_string()))
             }
         };
-        for &(_, latency, is_warmup, _) in &responses {
+        for &(_, latency, is_warmup, _, _) in &responses {
             if !is_warmup {
                 state.policy.on_response(latency);
             }
@@ -1384,9 +1389,10 @@ mod tests {
         .unwrap();
         pool.send(0, &[0], 7u64, true).unwrap();
         factory.0.lock().unwrap().responses.push_back(Ok(vec![0]));
+        let breakdown = LatencyBreakdown { service: Duration::ZERO, kernel: None };
         assert_eq!(
             pool.recv_responses(0, |_| Ok((1, Some(7)))).unwrap(),
-            vec![(7, Duration::ZERO, true, 1)]
+            vec![(7, Duration::ZERO, true, 1, breakdown)]
         );
         assert_eq!(pool.get_state(0).unwrap().pending_count(), 0);
     }
@@ -1656,6 +1662,18 @@ mod tests {
         assert_eq!(responses[0].1, lag + Duration::from_micros(500));
         // Without one, the service part is measured in cycles
         assert_eq!(responses[1].1, lag + recv_ts.duration_since(&send_ts));
+        // The breakdown's service part is the latency without the send lag;
+        // only the stamped request splits it, against the send's own cycles
+        let (stamped, unstamped) = (responses[0].4, responses[1].4);
+        assert_eq!(stamped.service, Duration::from_micros(500));
+        let split = stamped.kernel.unwrap();
+        assert_eq!(split.network_server, Duration::from_micros(500));
+        assert_eq!(
+            split.host_stack,
+            recv_ts.cycles_duration_since(&send_ts).saturating_sub(split.network_server)
+        );
+        assert_eq!(unstamped.service, recv_ts.duration_since(&send_ts));
+        assert_eq!(unstamped.kernel, None);
     }
 
     #[test]

@@ -3,11 +3,15 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+pub mod breakdown;
 pub mod policy;
 pub mod requests;
 pub mod tuple_collector;
 
 // Re-export main types
+pub use breakdown::{
+    BreakdownClock, BreakdownStats, BreakdownSummary, KernelSplit, LatencyBreakdown, PartSummary,
+};
 pub use policy::SamplingPolicy;
 pub use requests::{
     RequestCounts, SendLagStats, SendLagSummary, LATE_SEND_THRESHOLD, UNSENT_WALK_CAP,
@@ -32,6 +36,16 @@ pub trait StatsRecorder: Send {
     /// * `connection_id` - Connection ID within the group
     /// * `latency` - Measured latency
     fn record_latency(&mut self, group_id: usize, connection_id: usize, latency: Duration);
+
+    /// Record where the latency of a completed request went (see
+    /// [`LatencyBreakdown`]); called with each [`Self::record_latency`]
+    fn record_breakdown(
+        &mut self,
+        _group_id: usize,
+        _connection_id: usize,
+        _breakdown: &LatencyBreakdown,
+    ) {
+    }
 
     /// Record transmitted bytes
     fn record_tx_bytes(&mut self, group_id: usize, connection_id: usize, bytes: usize);
@@ -73,6 +87,15 @@ pub trait StatsRecorder: Send {
 impl StatsRecorder for TupleStatsCollector {
     fn record_latency(&mut self, group_id: usize, connection_id: usize, latency: Duration) {
         TupleStatsCollector::record_latency(self, group_id, connection_id, latency);
+    }
+
+    fn record_breakdown(
+        &mut self,
+        group_id: usize,
+        _connection_id: usize,
+        breakdown: &LatencyBreakdown,
+    ) {
+        TupleStatsCollector::record_breakdown(self, group_id, breakdown);
     }
 
     fn record_tx_bytes(&mut self, group_id: usize, connection_id: usize, bytes: usize) {

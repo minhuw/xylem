@@ -3,6 +3,7 @@
 //! Stores statistics keyed by `(time_bucket, group_id, thread_id, connection_id)`,
 //! enabling flexible post-hoc aggregation by any dimension.
 
+use super::breakdown::{BreakdownStats, BreakdownSummary, LatencyBreakdown};
 use super::policy::SamplingPolicy;
 use super::requests::{RequestCounts, SendLagStats, SendLagSummary, LATE_SEND_THRESHOLD};
 use super::AggregatedStats;
@@ -538,6 +539,8 @@ pub struct TupleStatsCollector {
     request_counts: HashMap<usize, RequestCounts>,
     /// Send lags of open-loop requests per group
     send_lags: HashMap<usize, SendLagStats>,
+    /// Latency breakdowns of completed measurement requests per group
+    breakdowns: HashMap<usize, BreakdownStats>,
 }
 
 impl TupleStatsCollector {
@@ -555,6 +558,7 @@ impl TupleStatsCollector {
             measurement_end_ns: None,
             request_counts: HashMap::new(),
             send_lags: HashMap::new(),
+            breakdowns: HashMap::new(),
         }
     }
 
@@ -576,6 +580,7 @@ impl TupleStatsCollector {
             measurement_end_ns: None,
             request_counts: HashMap::new(),
             send_lags: HashMap::new(),
+            breakdowns: HashMap::new(),
         }
     }
 
@@ -673,6 +678,13 @@ impl TupleStatsCollector {
         }
     }
 
+    /// Record where a completed measurement request's latency went. Like
+    /// its latency, a request completed during the drain is included.
+    #[inline]
+    pub fn record_breakdown(&mut self, group_id: usize, breakdown: &LatencyBreakdown) {
+        self.breakdowns.entry(group_id).or_default().record(breakdown);
+    }
+
     /// Request counts of a group, to add to
     pub fn request_counts_mut(&mut self, group_id: usize) -> &mut RequestCounts {
         self.request_counts.entry(group_id).or_default()
@@ -702,6 +714,20 @@ impl TupleStatsCollector {
         let mut total = SendLagStats::default();
         for lags in self.send_lags.values() {
             total.merge(lags);
+        }
+        total.summary()
+    }
+
+    /// Latency breakdown of a group's completed measurement requests
+    pub fn latency_breakdown(&self, group_id: usize) -> BreakdownSummary {
+        self.breakdowns.get(&group_id).map(BreakdownStats::summary).unwrap_or_default()
+    }
+
+    /// Latency breakdown of every group's completed measurement requests
+    pub fn latency_breakdown_global(&self) -> BreakdownSummary {
+        let mut total = BreakdownStats::default();
+        for breakdowns in self.breakdowns.values() {
+            total.merge(breakdowns);
         }
         total.summary()
     }
@@ -1002,6 +1028,7 @@ impl TupleStatsCollector {
             measurement_end_ns: collectors.iter().filter_map(|c| c.measurement_end_ns).max(),
             request_counts: HashMap::new(),
             send_lags: HashMap::new(),
+            breakdowns: HashMap::new(),
         };
 
         // Validate policies before merging any entries.
@@ -1033,6 +1060,9 @@ impl TupleStatsCollector {
             }
             for (group_id, lags) in &collector.send_lags {
                 merged.send_lags.entry(*group_id).or_default().merge(lags);
+            }
+            for (group_id, breakdowns) in &collector.breakdowns {
+                merged.breakdowns.entry(*group_id).or_default().merge(breakdowns);
             }
             for (key, entry) in collector.entries {
                 merged.entries.entry(key).and_modify(|e| e.merge_from(&entry)).or_insert(entry);
@@ -1872,6 +1902,50 @@ mod tests {
         let lag = merged.send_lag_global();
         assert_eq!((lag.sample_count, lag.max), (4, Some(Duration::from_millis(7))));
         assert_eq!(merged.send_lag(9), SendLagSummary::default());
+    }
+
+    #[test]
+    fn latency_breakdowns_are_kept_per_group_and_merged_across_threads() {
+        use crate::stats::{BreakdownClock, KernelSplit};
+        use xylem_transport::KernelClock;
+        let split = |host_us, network_us| LatencyBreakdown {
+            service: Duration::from_micros(network_us),
+            kernel: Some(KernelSplit {
+                clock: KernelClock::Realtime,
+                network_server: Duration::from_micros(network_us),
+                host_stack: Duration::from_micros(host_us),
+            }),
+        };
+        let user = |us| LatencyBreakdown {
+            service: Duration::from_micros(us),
+            kernel: None,
+        };
+        let mut first = TupleStatsCollector::default();
+        first.record_breakdown(0, &split(5, 20));
+        first.record_breakdown(1, &user(40));
+        let mut second = TupleStatsCollector::default();
+        second.set_thread_id(1);
+        second.record_breakdown(0, &split(7, 30));
+        second.end_measurement(crate::timing::time_ns());
+        // Requests completed during the drain count, like their latencies
+        second.record_breakdown(0, &split(9, 50));
+
+        let merged = TupleStatsCollector::merge(vec![first, second]);
+        let group0 = merged.latency_breakdown(0);
+        assert_eq!(group0.clock, Some(BreakdownClock::KernelSoftware));
+        assert_eq!((group0.kernel_split_count, group0.service.sample_count), (3, 3));
+        assert_eq!(group0.service.mean, Some(Duration::from_micros(100) / 3));
+        assert_eq!(group0.host_stack.unwrap().max, Some(Duration::from_micros(9)));
+        assert_eq!(group0.network_server.unwrap().max, Some(Duration::from_micros(50)));
+        let group1 = merged.latency_breakdown(1);
+        assert_eq!(group1.clock, Some(BreakdownClock::UserSpace));
+        assert_eq!((group1.kernel_split_count, group1.host_stack), (0, None));
+
+        let global = merged.latency_breakdown_global();
+        assert_eq!(global.clock, Some(BreakdownClock::Mixed));
+        assert_eq!((global.kernel_split_count, global.service.sample_count), (3, 4));
+        assert_eq!(global.service.max, Some(Duration::from_micros(50)));
+        assert_eq!(merged.latency_breakdown(9), BreakdownSummary::default());
     }
 
     #[test]
