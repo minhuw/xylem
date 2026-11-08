@@ -24,6 +24,10 @@ pub trait Protocol: Send {
         true
     }
 
+    fn setup_pending(&self, _conn_id: usize) -> bool {
+        false
+    }
+
     fn name(&self) -> &'static str;
 
     fn reset(&mut self);
@@ -39,6 +43,10 @@ pub trait Protocol: Send {
   bytes without returning an ID is an error.
 - `can_send` lets a protocol hold back requests on a connection, for example
   until the Masstree handshake completes.
+- `setup_pending` reports a connection that is still in connection setup
+  (Redis AUTH, SELECT and HELLO, the Masstree handshake). Its requests go out
+  as soon as `can_send` allows, off the connection's intended send schedule,
+  which starts once setup is done.
 - `name` returns the protocol name, and `reset` clears per-connection state.
 
 The core engine decides when to send; the protocol decides what to send. The

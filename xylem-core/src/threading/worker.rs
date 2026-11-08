@@ -575,6 +575,9 @@ mod tests {
         /// the protocol cannot send while one is pending.
         setup: u64,
         setup_pending: bool,
+        /// Report setup through `Protocol::setup_pending`, so it goes out
+        /// off the schedule
+        report_setup: bool,
     }
 
     impl Protocol for FakeProtocol {
@@ -613,6 +616,10 @@ mod tests {
 
         fn can_send(&self, _: usize) -> bool {
             !self.setup_pending
+        }
+
+        fn setup_pending(&self, _: usize) -> bool {
+            self.report_setup && (self.setup_pending || self.next_id < self.setup)
         }
 
         fn name(&self) -> &'static str {
@@ -935,6 +942,89 @@ mod tests {
         assert_eq!(worker.stats.entries().values().map(|entry| entry.tx_bytes).sum::<u64>(), 8);
         assert_eq!(worker.stats.entries().values().map(|entry| entry.rx_bytes).sum::<u64>(), 8);
         assert_eq!(global(&worker).latency_sample_count, 1);
+    }
+
+    /// A worker whose one connection is connection 1 of 4 sharing 40 req/s:
+    /// its slots are 25 ms, 125 ms, 225 ms, ... after the start
+    fn striped_worker(factory: &FakeFactory) -> Worker<FakeGroup, FakeProtocol> {
+        use crate::scheduler::{FixedRatePolicy, GroupPolicyScheduler};
+        let scheduler =
+            GroupPolicyScheduler::new(1, |c| Box::new(FixedRatePolicy::striped(40.0, c, 4)));
+        fake_worker(factory, 100, Box::new(scheduler))
+    }
+
+    #[test]
+    fn setup_goes_out_at_once_and_the_schedule_starts_at_the_first_slot_after_it() {
+        for setup_done_after_start in [false, true] {
+            let factory = FakeFactory::default();
+            factory.0.lock().unwrap().live_timestamps = true;
+            let mut worker = striped_worker(&factory);
+            let protocol = worker.protocols.get_mut(&0).unwrap();
+            protocol.setup = 2;
+            protocol.report_setup = true;
+            // The start is now, and setup ends 30 ms after it, or 10 s ahead
+            let start = if setup_done_after_start {
+                timing::time_ns()
+            } else {
+                timing::time_ns() + 10_000_000_000
+            };
+            worker.anchor_schedules(start);
+
+            // Each setup request goes out as soon as the connection can send,
+            // not at its slots
+            for id in 0u64..2 {
+                worker.send_requests().unwrap();
+                assert_eq!(factory.0.lock().unwrap().sent.len() as u64, id + 1);
+                if id == 1 && setup_done_after_start {
+                    thread::sleep(Duration::from_millis(30));
+                }
+                factory.0.lock().unwrap().responses.push_back(Ok(id.to_le_bytes().to_vec()));
+                worker.process_responses(Duration::ZERO).unwrap();
+            }
+
+            // The schedule starts at the first slot at or after both the start
+            // and the end of setup, so setup is neither send lag nor unsent
+            let first = if setup_done_after_start {
+                125_000_000
+            } else {
+                25_000_000
+            };
+            let state = worker.pool.get_state(0).unwrap();
+            assert_eq!(state.intended_send_time(), Some(start + first));
+            worker.record_unsent(start + first);
+            assert_eq!(worker.stats.request_counts_global().unsent, 0);
+            worker.record_unsent(start + first + 100_000_001);
+            assert_eq!(worker.stats.request_counts_global().unsent, 2);
+            if !setup_done_after_start {
+                worker.send_requests().unwrap();
+                assert_eq!(factory.0.lock().unwrap().sent.len(), 2, "nothing is due yet");
+            }
+        }
+    }
+
+    #[test]
+    fn a_connection_stuck_in_setup_intends_no_sends() {
+        for report_setup in [false, true] {
+            let factory = FakeFactory::default();
+            let mut worker =
+                fake_worker(&factory, 100, Box::new(UniformPolicyScheduler::fixed_rate(1000.0)));
+            let protocol = worker.protocols.get_mut(&0).unwrap();
+            protocol.setup = 1;
+            protocol.report_setup = report_setup;
+            let start = timing::time_ns();
+            if report_setup {
+                // Setup goes out at once, long before the first slot
+                worker.anchor_schedules(start + 10_000_000_000);
+            }
+            // Otherwise the setup request takes the unanchored schedule's
+            // first slot, due at once
+            worker.send_requests().unwrap();
+            assert_eq!(factory.0.lock().unwrap().sent.len(), 1);
+            // The setup reply never arrives
+            worker.record_unsent(start + 20_000_000_000);
+            let counts = worker.stats.request_counts_global();
+            assert_eq!((counts.sent, counts.unsent), (0, 0), "report_setup {report_setup}");
+        }
     }
 
     #[test]

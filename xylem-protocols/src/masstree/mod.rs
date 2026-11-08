@@ -638,6 +638,11 @@ impl Protocol for MasstreeProtocol {
         let state = self.get_handshake_state(conn_id);
         state != HandshakeState::Pending
     }
+
+    fn setup_pending(&self, conn_id: usize) -> bool {
+        // The handshake is the connection's setup
+        !self.is_handshake_done(conn_id)
+    }
 }
 
 // Helper methods for parsing different response types

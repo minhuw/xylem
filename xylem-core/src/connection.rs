@@ -138,6 +138,9 @@ pub struct ConnectionState<ReqId: Eq + Hash + Clone> {
     /// Whether this connection is currently in the ready heap
     /// Invariant: on_heap == true ⟺ connection can accept more requests
     on_heap: bool,
+    /// Whether the connection was last scheduled for connection setup: it is
+    /// on the heap as ready now and sends without consulting its policy
+    in_setup: bool,
     /// How long a request may stay pending before it times out; `None` waits forever
     request_timeout: Option<Duration>,
     /// `(deadline_ns, req_id)` of sends with a request timeout, in send order.
@@ -176,6 +179,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
             policy,
             group_id,
             on_heap: false,
+            in_setup: false,
             request_timeout: None,
             deadlines: VecDeque::new(),
             timed_out_ids: HashMap::new(),
@@ -941,9 +945,11 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
     /// Send a connection setup request (a handshake, AUTH, ...)
     ///
     /// The request is tracked like a warmup request, but has no intended send
-    /// time and does not advance the policy's schedule. When the reply to the
-    /// connection's last pending setup request arrives, the schedule restarts
-    /// from the next time the connection is scheduled.
+    /// time and does not advance the policy's schedule, which restarts: while
+    /// setup is pending it is not running, so it intends no sends and counts
+    /// none as unsent. When the reply to the connection's last pending setup
+    /// request arrives, the schedule starts afresh the next time the
+    /// connection is scheduled.
     pub fn send_setup(&mut self, connection_id: usize, data: &[u8], req_id: ReqId) -> Result<()> {
         let state = self
             .connection_states
@@ -957,6 +963,7 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         let receipt = self.group.send(connection_id, data)?;
         let state = self.connection_states.get_mut(&connection_id).unwrap();
         state.record_request(req_id, receipt.timestamp, Duration::ZERO, receipt.tx, true, true);
+        state.policy.reset();
         Ok(())
     }
 
@@ -1061,7 +1068,7 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
             if !state.can_send() {
                 continue;
             }
-            if state.policy.ready_to_send(current_time_ns) {
+            if state.in_setup || state.policy.ready_to_send(current_time_ns) {
                 return Some(connection_id);
             }
             // Dynamic policies wake at their refresh cadence even when paused or
@@ -1076,6 +1083,11 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
     /// Add a connection to the ready heap if not already on it
     ///
     /// Maintains the invariant: on_heap == true ⟺ connection can send (pipeline not full AND protocol ready).
+    ///
+    /// A connection whose protocol reports [`Protocol::setup_pending`] is
+    /// ready at once, off its schedule, so its setup requests go out as soon
+    /// as it can send. Any other connection waits for its policy's next
+    /// wakeup, which starts its schedule if setup restarted it.
     ///
     /// The heap stores ALL connections that can send, including rate-limited connections
     /// with future send times. This allows us to peek at the earliest ready time for
@@ -1115,9 +1127,14 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
             }
 
             // Add to heap regardless of next_send_time
-            // - Closed-loop (None): ready immediately
+            // - Connection setup or closed-loop (None): ready immediately
             // - Rate-limited (Some(future)): will be popped when time arrives
-            let next_send_time = state.next_send_time(current_time_ns);
+            state.in_setup = protocol.setup_pending(connection_id);
+            let next_send_time = if state.in_setup {
+                None
+            } else {
+                state.next_send_time(current_time_ns)
+            };
             state.set_on_heap(true);
             self.ready_heap.push(connection_id, next_send_time);
             return true;
@@ -1149,6 +1166,7 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         for state in self.connection_states.values_mut() {
             state.policy.anchor(start_ns);
             state.set_on_heap(false);
+            state.in_setup = false;
         }
     }
 

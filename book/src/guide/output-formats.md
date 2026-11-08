@@ -77,7 +77,8 @@ requests; warmup requests are excluded:
   the end of the window, at most 10,000,000 requests per connection; Poisson
   schedules are sampled forward with the policy's own generator. Connections
   that failed keep counting their schedule. A connection's schedule starts
-  once it can first send, so the slots before then are not unsent.
+  once it can send after setup, so a connection still setting up at the end
+  counts none, and the slots before a connection's start are not unsent.
 - `unsent_capped`: whether that walk stopped at its cap on some connection, so
   `unsent` is a lower bound.
 
