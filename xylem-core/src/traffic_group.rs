@@ -23,6 +23,7 @@ use std::time::Duration;
 /// Traffic group configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
 pub struct TrafficGroupConfig {
     /// Group name for identification
     pub name: String,
@@ -146,9 +147,10 @@ fn default_max_pending() -> usize {
 /// Policy configuration for traffic groups
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(tag = "type", rename_all = "kebab-case")]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum PolicyConfig {
     /// Closed-loop policy (max throughput)
+    #[serde(deserialize_with = "crate::strict::unit_variant")]
     ClosedLoop,
     /// Fixed-rate policy
     FixedRate {
@@ -768,5 +770,47 @@ mod tests {
             group_schedules(&configs, None, start, 100),
             group_schedules(&configs, None, start, 100)
         );
+    }
+
+    #[test]
+    fn every_policy_variant_rejects_unknown_keys() {
+        for policy in [
+            serde_json::json!({ "type": "closed-loop" }),
+            serde_json::json!({ "type": "fixed-rate", "rate": 1.0 }),
+            serde_json::json!({ "type": "poisson", "rate": 1.0 }),
+            serde_json::json!({ "type": "adaptive", "initial_rate": 1.0, "target_latency_us": 10 }),
+            serde_json::json!({
+                "type": "sinusoidal", "base_rate": 1.0, "amplitude": 1.0, "period": "1s"
+            }),
+            serde_json::json!({
+                "type": "ramp", "start_rate": 1.0, "end_rate": 2.0, "duration": "1s"
+            }),
+            serde_json::json!({
+                "type": "spike", "normal_rate": 1.0, "spike_rate": 2.0,
+                "spike_start": "1s", "spike_duration": "1s"
+            }),
+            serde_json::json!({
+                "type": "sawtooth", "min_rate": 1.0, "max_rate": 2.0, "period": "1s"
+            }),
+        ] {
+            serde_json::from_value::<PolicyConfig>(policy.clone()).unwrap();
+            let mut with_unknown = policy.clone();
+            with_unknown["bogus"] = 1.into();
+            let error = serde_json::from_value::<PolicyConfig>(with_unknown).unwrap_err();
+            assert!(error.to_string().contains("unknown field `bogus`"), "{policy}: {error}");
+        }
+    }
+
+    #[test]
+    fn traffic_groups_reject_unknown_keys() {
+        let group = serde_json::json!({
+            "name": "main", "protocol": "redis", "target": "127.0.0.1:6379", "threads": [0],
+            "connections_per_thread": 1, "traffic_policy": { "type": "closed-loop" }
+        });
+        serde_json::from_value::<TrafficGroupConfig>(group.clone()).unwrap();
+        let mut with_unknown = group;
+        with_unknown["sampling_rate"] = 0.5.into();
+        let error = serde_json::from_value::<TrafficGroupConfig>(with_unknown).unwrap_err();
+        assert!(error.to_string().contains("unknown field `sampling_rate`"), "{error}");
     }
 }

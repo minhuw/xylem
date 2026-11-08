@@ -4,7 +4,7 @@ Protocol configuration in Xylem is defined per-traffic-group using the `protocol
 
 ## Configuration Structure
 
-All protocol-specific configuration lives under `[[traffic_groups]]` in the `protocol_config` section:
+All protocol-specific configuration lives under `[[traffic_groups]]` in the `protocol_config` section. Its keys depend on the group's protocol, and a key the protocol does not take is an error rather than ignored:
 
 ```toml
 [[traffic_groups]]

@@ -38,7 +38,7 @@ xylem -P tests/redis/redis-bench.toml
 
 ### `--set <KEY=VALUE>`
 
-Override any configuration value using dot notation. Can be specified multiple times.
+Override any configuration value using dot notation. Can be specified multiple times. The path must name a key of the profile format, and an index an existing array entry; otherwise Xylem stops with an error that quotes the override and suggests the closest valid key.
 
 ```bash
 xylem -P tests/redis/redis-get-zipfian.toml --set traffic_groups.0.target=192.168.1.100:6379

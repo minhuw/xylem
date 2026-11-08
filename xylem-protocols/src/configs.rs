@@ -14,7 +14,7 @@ fn default_key_prefix() -> String {
 /// Key generation strategy configuration for key-value protocols (Redis, Memcached)
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(tag = "strategy", rename_all = "lowercase")]
+#[serde(tag = "strategy", rename_all = "lowercase", deny_unknown_fields)]
 pub enum KeysConfig {
     /// Sequential keys starting from a given value
     Sequential {
@@ -208,6 +208,7 @@ impl Default for KeysConfig {
 /// Redis protocol configuration
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
 pub struct RedisConfig {
     /// Key generation strategy
     #[serde(default)]
@@ -305,7 +306,7 @@ impl RedisAuthConfig {
 /// Value size configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(tag = "strategy", rename_all = "lowercase")]
+#[serde(tag = "strategy", rename_all = "lowercase", deny_unknown_fields)]
 pub enum ValueSizeConfig {
     /// Fixed size for all requests
     Fixed { size: usize },
@@ -331,7 +332,7 @@ pub enum ValueSizeConfig {
 /// Value size configuration for a specific command
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(tag = "distribution", rename_all = "lowercase")]
+#[serde(tag = "distribution", rename_all = "lowercase", deny_unknown_fields)]
 pub enum CommandValueSizeConfig {
     Fixed {
         size: usize,
@@ -418,7 +419,7 @@ impl ValueSizeConfig {
 /// Operations configuration for Redis (command selection)
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(tag = "strategy", rename_all = "lowercase")]
+#[serde(tag = "strategy", rename_all = "lowercase", deny_unknown_fields)]
 pub enum RedisOperationsConfig {
     /// Fixed operation (single command)
     Fixed { operation: String },
@@ -429,6 +430,7 @@ pub enum RedisOperationsConfig {
 /// Command weight configuration for Redis
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
 pub struct RedisCommandWeight {
     /// Command name: "get", "set", "incr", "mget", "setex", "setrange",
     /// "getrange", "scan", "wait", "multi", "exec", "discard", or "custom"
@@ -447,7 +449,7 @@ pub struct RedisCommandWeight {
 /// Additional parameters for specific Redis command types
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(untagged)]
+#[serde(untagged, deny_unknown_fields)]
 pub enum RedisCommandParams {
     /// MGET parameters
     MGet { count: usize },
@@ -465,9 +467,27 @@ pub enum RedisCommandParams {
     },
 }
 
+impl RedisCommandParams {
+    /// The `params` keys the Redis command `name` (case-insensitive) takes,
+    /// or None if `name` is no command. The params shapes are untagged, so
+    /// only the command tells which keys belong to it.
+    pub fn keys(name: &str) -> Option<&'static [&'static str]> {
+        Some(match name.to_ascii_lowercase().as_str() {
+            "mget" => &["count"],
+            "wait" => &["num_replicas", "timeout_ms"],
+            "custom" => &["template"],
+            "scan" => &["cursor", "count", "pattern"],
+            "get" | "set" | "incr" | "setex" | "setrange" | "getrange" | "multi" | "exec"
+            | "discard" => &[],
+            _ => return None,
+        })
+    }
+}
+
 /// Memcached protocol configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
 pub struct MemcachedConfig {
     /// Key generation strategy
     #[serde(default)]
@@ -501,6 +521,7 @@ impl Default for MemcachedConfig {
 /// HTTP protocol configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
 pub struct HttpConfig {
     /// HTTP method (GET, POST, PUT)
     #[serde(default = "default_http_method")]
@@ -544,11 +565,13 @@ impl Default for HttpConfig {
 /// The echo protocol has no options: its messages are always 16 bytes.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
 pub struct XylemEchoConfig {}
 
 /// Masstree protocol configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
 pub struct MasstreeConfig {
     /// Key generation configuration
     #[serde(default)]
@@ -601,6 +624,7 @@ pub struct MasstreeConfig {
 /// ```
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
 pub struct InsertPhaseConfig {
     /// Number of keys to insert before measurement begins.
     /// Defaults to keyspace size from keys config (n for Zipfian, max for Random, etc.)
@@ -625,6 +649,7 @@ impl InsertPhaseConfig {
 /// Masstree scan configuration
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
 pub struct MasstreeScanConfig {
     /// Number of records to scan
     #[serde(default = "default_scan_count")]
@@ -780,5 +805,92 @@ mod tests {
         )
         .unwrap();
         assert!(invalid.validate().is_err());
+    }
+
+    /// `config` parses as `T`, and fails with an unknown-field error once it
+    /// has an extra key
+    fn rejects_unknown_keys<T: serde::de::DeserializeOwned>(config: serde_json::Value) {
+        serde_json::from_value::<T>(config.clone()).unwrap();
+        let mut with_unknown = config.clone();
+        with_unknown["bogus"] = 1.into();
+        let Err(error) = serde_json::from_value::<T>(with_unknown) else {
+            panic!("{config} accepts an unknown key");
+        };
+        assert!(error.to_string().contains("unknown field `bogus`"), "{config}: {error}");
+    }
+
+    #[test]
+    fn every_protocol_config_rejects_unknown_keys() {
+        use serde_json::json;
+        rejects_unknown_keys::<RedisConfig>(json!({}));
+        rejects_unknown_keys::<RedisAuthConfig>(json!({ "password": "pw" }));
+        rejects_unknown_keys::<MemcachedConfig>(json!({}));
+        rejects_unknown_keys::<HttpConfig>(json!({}));
+        rejects_unknown_keys::<XylemEchoConfig>(json!({}));
+        rejects_unknown_keys::<MasstreeConfig>(json!({}));
+        rejects_unknown_keys::<MasstreeScanConfig>(json!({}));
+        rejects_unknown_keys::<InsertPhaseConfig>(json!({}));
+        rejects_unknown_keys::<RedisCommandWeight>(json!({ "name": "get", "weight": 1.0 }));
+
+        // Every variant of the tagged enums
+        for keys in [
+            json!({ "strategy": "sequential", "value_size": 8 }),
+            json!({ "strategy": "random", "max": 10, "value_size": 8 }),
+            json!({ "strategy": "round-robin", "max": 10, "value_size": 8 }),
+            json!({ "strategy": "zipfian", "n": 10, "theta": 0.99, "value_size": 8 }),
+            json!({
+                "strategy": "gaussian", "mean_pct": 0.5, "std_dev_pct": 0.1, "max": 10,
+                "value_size": 8
+            }),
+        ] {
+            rejects_unknown_keys::<KeysConfig>(keys);
+        }
+        for size in [
+            json!({ "strategy": "fixed", "size": 8 }),
+            json!({ "strategy": "uniform", "min": 1, "max": 8 }),
+            json!({ "strategy": "normal", "mean": 4.0, "std_dev": 1.0, "min": 1, "max": 8 }),
+            json!({
+                "strategy": "per_command", "commands": {},
+                "default": { "strategy": "fixed", "size": 8 }
+            }),
+        ] {
+            rejects_unknown_keys::<ValueSizeConfig>(size);
+        }
+        for size in [
+            json!({ "distribution": "fixed", "size": 8 }),
+            json!({ "distribution": "uniform", "min": 1, "max": 8 }),
+            json!({ "distribution": "normal", "mean": 4.0, "std_dev": 1.0, "min": 1, "max": 8 }),
+        ] {
+            rejects_unknown_keys::<CommandValueSizeConfig>(size);
+        }
+        for operations in [
+            json!({ "strategy": "fixed", "operation": "get" }),
+            json!({ "strategy": "weighted", "commands": [] }),
+        ] {
+            rejects_unknown_keys::<RedisOperationsConfig>(operations);
+        }
+    }
+
+    #[test]
+    fn redis_command_params_reject_keys_of_no_shape() {
+        use serde_json::json;
+        // The shapes are untagged, so an unknown key leaves no shape to match
+        for params in [
+            json!({ "count": 1 }),
+            json!({ "num_replicas": 1, "timeout_ms": 10 }),
+            json!({ "template": "GET __key__" }),
+            json!({ "cursor": 0, "count": 1, "pattern": "key:*" }),
+        ] {
+            serde_json::from_value::<RedisCommandParams>(params.clone()).unwrap();
+            let mut with_unknown = params.clone();
+            with_unknown["bogus"] = 1.into();
+            assert!(
+                serde_json::from_value::<RedisCommandParams>(with_unknown).is_err(),
+                "{params}"
+            );
+        }
+        // Keys of two shapes match neither
+        let mixed = json!({ "template": "GET __key__", "count": 1 });
+        assert!(serde_json::from_value::<RedisCommandParams>(mixed).is_err());
     }
 }

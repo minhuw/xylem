@@ -149,6 +149,7 @@ fn escape_csv_field(field: &str) -> String {
 /// Configuration for request dumping
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
 pub struct DumpConfig {
     /// Directory to store dump files
     pub directory: PathBuf,
@@ -536,6 +537,17 @@ mod tests {
     use super::*;
     use std::thread;
     use tempfile::TempDir;
+
+    #[test]
+    fn dump_config_rejects_unknown_keys() {
+        let config = serde_json::json!({ "directory": "/tmp/dumps", "rotation": { "size": 10 } });
+        serde_json::from_value::<DumpConfig>(config).unwrap();
+        let unknown = serde_json::json!({ "directory": "/tmp/dumps", "max_file": 3 });
+        let error = serde_json::from_value::<DumpConfig>(unknown).unwrap_err();
+        assert!(error.to_string().contains("unknown field `max_file`"), "{error}");
+        let rotation = serde_json::json!({ "size": 10, "bogus": 1 });
+        assert!(serde_json::from_value::<RotationPolicy>(rotation).is_err());
+    }
 
     #[test]
     fn retention_preserves_other_workers_active_files() {
