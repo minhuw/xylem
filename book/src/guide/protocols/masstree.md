@@ -115,56 +115,68 @@ Real database workloads exhibit patterns: read-heavy vs write-heavy ratios, hot 
 Start with pure operations. A GET-only workload tests read performance under snapshot isolation:
 
 ```toml
-[traffic_groups.protocol_config.operations]
-strategy = "fixed"
+[traffic_groups.protocol_config]
 operation = "get"
 ```
 
-But production databases handle mixed workloads. Model a typical application with 60% reads, 30% updates, 10% deletes:
+But production databases handle mixed workloads. A Masstree traffic group runs a single operation, so model a mix with one group per operation and split the rate between them. A typical application with 60% reads, 30% updates, 10% deletes:
 
 ```toml
-# Define a weighted mix in protocol_config
-[traffic_groups.protocol_config.operations]
-strategy = "weighted"
+[[traffic_groups]]
+name = "reads"
+protocol = "masstree"
+target = "127.0.0.1:2117"
+threads = [0, 1, 2, 3]
+connections_per_thread = 6
+traffic_policy = { type = "fixed-rate", rate = 60000.0 }
+protocol_config = { operation = "get" }
 
-[[traffic_groups.protocol_config.operations.commands]]
-name = "get"
-weight = 0.6
+[[traffic_groups]]
+name = "updates"
+protocol = "masstree"
+target = "127.0.0.1:2117"
+threads = [0, 1, 2, 3]
+connections_per_thread = 3
+traffic_policy = { type = "fixed-rate", rate = 30000.0 }
+protocol_config = { operation = "set" }
 
-[[traffic_groups.protocol_config.operations.commands]]
-name = "set"
-weight = 0.3
-
-[[traffic_groups.protocol_config.operations.commands]]
-name = "remove"
-weight = 0.1
+[[traffic_groups]]
+name = "deletes"
+protocol = "masstree"
+target = "127.0.0.1:2117"
+threads = [0, 1, 2, 3]
+connections_per_thread = 1
+traffic_policy = { type = "fixed-rate", rate = 10000.0 }
+protocol_config = { operation = "remove" }
 ```
 
-Add column-based updates to model partial record modifications:
+Add column-based updates to model partial record modifications. `put_columns` sets how many columns each PUT writes, starting at column 0; Xylem sends each column an empty value:
 
 ```toml
-[[traffic_groups.protocol_config.operations.commands]]
-name = "put"
-weight = 0.1
-# Update columns 0 and 2 (e.g., timestamp and counter)
-params = { columns = [[0, "2024-11-12T10:30:00Z"], [2, "42"]] }
+[traffic_groups.protocol_config]
+operation = "put"
+put_columns = 2  # Update columns 0 and 1 (e.g., timestamp and counter)
 ```
 
-Include range queries for analytics workloads:
+Include range queries for analytics workloads. Each SCAN starts at the first key and returns up to `count` records with the listed fields, or every field if `fields` is empty:
 
 ```toml
-[[traffic_groups.protocol_config.operations.commands]]
-name = "scan"
-weight = 0.05
-params = { firstkey = "user:0", count = 100, fields = [0, 1] }
+[traffic_groups.protocol_config]
+operation = "scan"
+scan = { count = 100, fields = ["0", "1"] }
 ```
 
-Trigger periodic checkpoints to test persistence overhead:
+Trigger periodic checkpoints to test persistence overhead from a group of their own at a low rate:
 
 ```toml
-[[traffic_groups.protocol_config.operations.commands]]
-name = "checkpoint"
-weight = 0.001  # Once per thousand operations
+[[traffic_groups]]
+name = "checkpoints"
+protocol = "masstree"
+target = "127.0.0.1:2117"
+threads = [0]
+connections_per_thread = 1
+traffic_policy = { type = "fixed-rate", rate = 1.0 }  # One checkpoint per second
+protocol_config = { operation = "checkpoint" }
 ```
 
 Now you're testing a realistic mix: mostly reads, some writes, occasional range scans, and periodic checkpoints.
@@ -249,33 +261,34 @@ GET operations never block on writes, and writes never block reads. This provide
 
 ### Benchmarking MVCC Workloads
 
-To test snapshot isolation, run concurrent readers and writers on the same keys:
+To test snapshot isolation, run concurrent readers and writers on the same keys, as two traffic groups with the same key distribution:
 
 ```toml
 [[traffic_groups]]
-name = "mvcc-test"
+name = "mvcc-readers"
 protocol = "masstree"
 target = "127.0.0.1:2117"
-threads = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+threads = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 connections_per_thread = 10
 max_pending_per_connection = 1
+traffic_policy = { type = "closed-loop" }
 
-[traffic_groups.protocol_config.operations]
-strategy = "weighted"
+[traffic_groups.protocol_config]
+operation = "get"
+keys = { strategy = "zipfian", n = 1000, theta = 1.2, value_size = 256 }  # Very hot keys
 
-[[traffic_groups.protocol_config.operations.commands]]
-name = "get"
-weight = 0.7
+[[traffic_groups]]
+name = "mvcc-writers"
+protocol = "masstree"
+target = "127.0.0.1:2117"
+threads = [11, 12, 13, 14, 15]
+connections_per_thread = 10
+max_pending_per_connection = 1
+traffic_policy = { type = "closed-loop" }
 
-[[traffic_groups.protocol_config.operations.commands]]
-name = "set"
-weight = 0.3
-
-[traffic_groups.protocol_config.keys]
-strategy = "zipfian"
-n = 1000
-theta = 1.2  # Very hot keys
-value_size = 256
+[traffic_groups.protocol_config]
+operation = "set"
+keys = { strategy = "zipfian", n = 1000, theta = 1.2, value_size = 256 }
 ```
 
 This creates contention on hot keys. Measure:
@@ -338,18 +351,14 @@ Masstree trades peak throughput for stronger consistency guarantees. Application
 
 ### Range Query Tuning
 
-SCAN performance depends on how much data you're fetching:
+SCAN performance depends on how much data you're fetching. With `operation = "scan"`, the `scan` table sets it:
 
 ```toml
 # Small scans (10 records)
-[[traffic_groups.protocol_config.operations.commands]]
-name = "scan"
-params = { firstkey = "user:0", count = 10, fields = [0, 1] }  # Only essential fields
+scan = { count = 10, fields = ["0", "1"] }  # Only essential fields
 
 # Large scans (1000 records)
-[[traffic_groups.protocol_config.operations.commands]]
-name = "scan"
-params = { firstkey = "metrics:2024-11-01", count = 1000 }  # All fields
+scan = { count = 1000 }  # All fields
 ```
 
 Measure:
@@ -361,18 +370,14 @@ Tuning SCAN is about balancing batch size (larger = more efficient) vs latency (
 
 ### Checkpoint Overhead
 
-Checkpoints serialize the database to disk, consuming time and I/O resources:
+Checkpoints serialize the database to disk, consuming time and I/O resources. The rate of the checkpoint group sets how often they run:
 
 ```toml
 # Frequent checkpoints (high durability, low throughput)
-[[traffic_groups.protocol_config.operations.commands]]
-name = "checkpoint"
-weight = 0.01  # 1% of operations
+traffic_policy = { type = "fixed-rate", rate = 10.0 }  # 10 per second
 
 # Rare checkpoints (high throughput, lower durability)
-[[traffic_groups.protocol_config.operations.commands]]
-name = "checkpoint"
-weight = 0.0001  # 0.01% of operations
+traffic_policy = { type = "fixed-rate", rate = 0.1 }  # One every 10 seconds
 ```
 
 Measure:
@@ -391,9 +396,9 @@ PUT operations are more efficient than read-modify-write cycles:
 # This requires two network round-trips and full value transfer
 
 # Efficient: PUT (update specific columns)
-[[traffic_groups.protocol_config.operations.commands]]
-name = "put"
-params = { columns = [[0, "new_value"]] }  # Only update column 0
+[traffic_groups.protocol_config]
+operation = "put"
+put_columns = 1  # Only update column 0
 ```
 
 Benchmark the difference:
