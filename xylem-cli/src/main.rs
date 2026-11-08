@@ -9,7 +9,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use xylem_core::threading::{CpuPinning, ThreadingRuntime, Worker, WorkerConfig};
 use xylem_transport::{TcpTransportFactory, UdpTransportFactory};
 
-use xylem_cli::{completions, config, output};
+use xylem_cli::{completions, config, output, thresholds};
 
 use config::ProfileConfig;
 
@@ -605,7 +605,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
     };
 
     // Build detailed results (used for all formats except Human)
-    let detailed_results = output::DetailedExperimentResults::from_tuple_stats(
+    let mut detailed_results = output::DetailedExperimentResults::from_tuple_stats(
         config.experiment.name.clone(),
         config.experiment.description.clone(),
         config.experiment.seed,
@@ -617,6 +617,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
         &config.traffic_groups,
         config.stats.include_records,
     );
+    thresholds::evaluate(&mut detailed_results, &config);
 
     tracing::debug!(
         "Output format: {:?}, path: {}",

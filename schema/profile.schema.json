@@ -42,11 +42,30 @@
         "sampling_policy": null
       }
     },
+    "thresholds": {
+      "description": "Pass/fail limits on the results: a metric, optionally filtered to a\ntraffic group, and its expressions, as in\n`\"latency{group=api}\" = [\"p99 < 250us\"]`",
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      }
+    },
     "traffic_groups": {
       "description": "Traffic groups configuration",
       "type": "array",
       "items": {
         "$ref": "#/$defs/TrafficGroupConfig"
+      }
+    },
+    "validity": {
+      "description": "Checks that the run applied its configured load",
+      "$ref": "#/$defs/ValidityConfig",
+      "default": {
+        "enabled": true,
+        "max_late_send_ratio": 0.01,
+        "max_unsent_ratio": 0.001
       }
     }
   },
@@ -800,6 +819,52 @@
         "connections_per_thread",
         "traffic_policy"
       ]
+    },
+    "ValidityCheck": {
+      "description": "Checks that a run applied its configured load",
+      "oneOf": [
+        {
+          "description": "Fraction of a rate-driven group's intended sends that never went out",
+          "type": "string",
+          "const": "unsent"
+        },
+        {
+          "description": "Fraction of a rate-driven group's sends that went out late",
+          "type": "string",
+          "const": "late_sends"
+        }
+      ]
+    },
+    "ValidityConfig": {
+      "description": "Checks that a run applied the load it was configured with. Each applies\nto every traffic group with a rate-driven traffic policy; a closed loop\nhas no schedule to fall behind.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Run the checks (default true). With false, a run is never invalid.",
+          "type": "boolean",
+          "default": true
+        },
+        "max_late_send_ratio": {
+          "description": "Largest fraction of a group's sent requests that may lag their\nintended send time by more than 100 µs (default 0.01)",
+          "type": "number",
+          "format": "double",
+          "default": 0.01
+        },
+        "max_unsent_ratio": {
+          "description": "Largest fraction of a group's intended sends (`sent + unsent`) that may\nremain unsent at the end of the window (default 0.001)",
+          "type": "number",
+          "format": "double",
+          "default": 0.001
+        },
+        "skip": {
+          "description": "Checks to leave out: \"unsent\", \"late_sends\"",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ValidityCheck"
+          }
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

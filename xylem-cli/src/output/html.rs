@@ -105,6 +105,24 @@ pub fn generate_html_report(results: &DetailedExperimentResults, path: &str) -> 
             background: #f8f9fa;
             font-weight: 600;
         }}
+        .verdict {{
+            padding: 10px 15px;
+            border-radius: 4px;
+            font-size: 20px;
+            font-weight: bold;
+        }}
+        .verdict-pass {{
+            background: #d4edda;
+            color: #155724;
+        }}
+        .verdict-fail {{
+            background: #f8d7da;
+            color: #721c24;
+        }}
+        td.fail {{
+            color: #721c24;
+            font-weight: bold;
+        }}
     </style>
 </head>
 <body>
@@ -117,6 +135,8 @@ pub fn generate_html_report(results: &DetailedExperimentResults, path: &str) -> 
             <p><strong>Transport:</strong> {transport}</p>
             {description}
         </div>
+
+        {checks}
 
         <h2>Global Statistics</h2>
         <div class="stats-grid">
@@ -224,6 +244,7 @@ pub fn generate_html_report(results: &DetailedExperimentResults, path: &str) -> 
             .as_ref()
             .map(|d| format!("<p><strong>Description:</strong> {}</p>", escape_html(d)))
             .unwrap_or_default(),
+        checks = checks_section(results),
         requests = results.global.total_requests,
         throughput = results.global.throughput_rps,
         bandwidth = results.global.throughput_mbps,
@@ -356,6 +377,72 @@ fn generate_group_sections(groups: &[super::TrafficGroupResults]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The verdict with tables of the validity checks and thresholds
+fn checks_section(results: &DetailedExperimentResults) -> String {
+    let status = |ok: bool| {
+        if ok {
+            "<td>ok</td>"
+        } else {
+            "<td class=\"fail\">FAIL</td>"
+        }
+    };
+    let validity = if results.validity.is_empty() {
+        "<p>No validity checks applied.</p>".to_string()
+    } else {
+        let rows: Vec<String> = results
+            .validity
+            .iter()
+            .map(|check| {
+                format!(
+                    "<tr>\n{}\n<td>{}</td>\n<td>{}</td>\n<td>{}</td>\n<td>{}</td>\n</tr>",
+                    status(check.ok),
+                    escape_html(&check.key()),
+                    check.observed_text(),
+                    check.limit_text(),
+                    escape_html(check.reason.as_deref().unwrap_or("")),
+                )
+            })
+            .collect();
+        format!(
+            "<table>\n<tr><th>Result</th><th>Check</th><th>Observed</th><th>Limit</th>\
+             <th>Reason</th></tr>\n{}\n</table>",
+            rows.join("\n")
+        )
+    };
+    let thresholds = if results.thresholds.is_empty() {
+        "<p>No thresholds configured.</p>".to_string()
+    } else {
+        let rows: Vec<String> = results
+            .thresholds
+            .iter()
+            .map(|threshold| {
+                format!(
+                    "<tr>\n{}\n<td>{}</td>\n<td>{}</td>\n<td>{}</td>\n</tr>",
+                    status(threshold.ok),
+                    escape_html(&threshold.key()),
+                    escape_html(&threshold.expression),
+                    escape_html(&threshold.observed_text()),
+                )
+            })
+            .collect();
+        format!(
+            "<table>\n<tr><th>Result</th><th>Metric</th><th>Expression</th>\
+             <th>Observed</th></tr>\n{}\n</table>",
+            rows.join("\n")
+        )
+    };
+    let class = if results.verdict == crate::thresholds::Verdict::Pass {
+        "verdict-pass"
+    } else {
+        "verdict-fail"
+    };
+    format!(
+        "<h2>Verdict</h2>\n<div class=\"verdict {class}\">{}</div>\n<h3>Validity</h3>\n{validity}\n\
+         <h3>Thresholds</h3>\n{thresholds}",
+        results.verdict.label()
+    )
 }
 
 /// Table rows for request counts and send lags

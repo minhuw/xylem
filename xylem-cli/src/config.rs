@@ -4,9 +4,11 @@
 //! Configuration files are the primary interface for Xylem, with CLI arguments available
 //! for quick overrides.
 
+use crate::thresholds::{Threshold, ValidityConfig};
 use anyhow::{bail, Context, Result};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use xylem_core::traffic_group::PolicyConfig;
@@ -30,10 +32,22 @@ pub struct ProfileConfig {
     /// User-space TCP settings, required when a group uses transport "ntcp"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ntcp: Option<NtcpConfig>,
+    /// Pass/fail limits on the results: a metric, optionally filtered to a
+    /// traffic group, and its expressions, as in
+    /// `"latency{group=api}" = ["p99 < 250us"]`
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub thresholds: BTreeMap<String, Vec<String>>,
+    /// Checks that the run applied its configured load
+    #[serde(default)]
+    pub validity: ValidityConfig,
     /// Typed protocol_config of each traffic group, in group order.
     /// Empty until `validate` succeeds; not part of the profile format.
     #[serde(skip)]
     pub protocol_configs: Vec<ProtocolConfig>,
+    /// The parsed `thresholds`, in key order. Empty until `validate`
+    /// succeeds; not part of the profile format.
+    #[serde(skip)]
+    pub threshold_checks: Vec<Threshold>,
 }
 
 /// Experiment metadata
@@ -403,6 +417,10 @@ impl ProfileConfig {
         ntcp::validate(self.ntcp.as_ref(), &self.traffic_groups)?;
 
         // Output validation - format is now an enum, so always valid
+
+        self.validity.validate()?;
+        self.threshold_checks =
+            crate::thresholds::parse_thresholds(&self.thresholds, &self.traffic_groups)?;
 
         self.protocol_configs = protocol_configs;
         Ok(())

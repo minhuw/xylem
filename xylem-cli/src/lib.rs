@@ -6,3 +6,4 @@ pub mod completions;
 pub mod config;
 pub mod multi_protocol;
 pub mod output;
+pub mod thresholds;
