@@ -96,6 +96,76 @@ latency (from the send, or its kernel TX timestamp, to the response). Each
 Closed-loop requests have no intended time: their values are `null` and their
 latency is the service latency alone.
 
+## Latency breakdown
+
+Each `latency_breakdown` object in JSON (global and per group) says where the
+latency of the completed measurement requests went. The send lag is not
+repeated there; it stays in `send_lag`. Warmup and setup requests are
+excluded, and requests completed during the drain are included, as in
+`latency`.
+
+```json
+"latency_breakdown": {
+  "clock": "kernel_software",
+  "kernel_split_count": 41230,
+  "service_us": {
+    "sample_count": 41230, "mean_us": 14.1, "p50_us": 13.9,
+    "p99_us": 19.8, "p999_us": 31.2, "max_us": 212.4
+  },
+  "host_stack_us": {
+    "sample_count": 41230, "mean_us": 9.8, "p50_us": 9.6,
+    "p99_us": 14.3, "p999_us": 22.0, "max_us": 190.2
+  },
+  "network_server_us": {
+    "sample_count": 41230, "mean_us": 14.1, "p50_us": 13.9,
+    "p99_us": 19.8, "p999_us": 31.2, "max_us": 212.4
+  }
+}
+```
+
+The parts of one request are:
+
+- `service_us`: actual receive minus actual send, in the clock the latency
+  uses. A request's latency is its send lag plus this. Always present.
+- `network_server_us`: present when the send and the receive both carry a
+  kernel timestamp from the same clock, which needs kernel or NIC timestamps
+  (see [timestamps](configuration/transport.md#timestamps)). It is the kernel
+  round trip: the response's kernel RX timestamp minus the request's kernel
+  TX timestamp. With kernel software timestamps, that is from the request
+  leaving the kernel's stack for the driver to the response entering it, so
+  it covers the NICs, the network and the server; with NIC timestamps, from
+  the request leaving the client NIC to the response arriving at it. Such a
+  request's latency uses this round trip, so its `service_us` equals it.
+- `host_stack_us`: for the same requests, the user-space round trip (cycles
+  read when the send and the receive calls completed) minus the kernel round
+  trip, or zero if that is negative: the client's own stack, syscalls and
+  wakeup, on both paths.
+
+Each part's two terms are measured in one clock; xylem subtracts durations,
+never times from different clocks. `host_stack_us` and `network_server_us`
+are `null` when no request had a kernel split. Requests whose TX or RX
+timestamp did not arrive, or came from different clocks, count in
+`service_us` alone.
+
+- `clock`: the clock of the service latencies: `user_space` (no kernel split),
+  `kernel_software`, `nic_hardware`, or `mixed` when the scope's requests
+  used different ones. `null` when no request completed.
+- `kernel_split_count`: requests with a kernel split. Below
+  `service_us.sample_count`, some requests lacked a usable kernel timestamp.
+
+Every part reports `sample_count`, an exact `mean_us` and `max_us`, and
+`p50_us`, `p99_us` and `p999_us` from an HDR histogram with three significant
+digits; the values are `null` without samples. Each part's percentiles are
+taken over that part alone, so they do not add up: the p99 of
+`host_stack_us` plus the p99 of `network_server_us` is not the p99 of the
+latency, and the slowest requests of one part need not be the slowest of
+another. Only the means add up: `host_stack_us.mean_us +
+network_server_us.mean_us` is the mean user-space round trip of the split
+requests, unless some `host_stack_us` saturated at zero.
+
+The console prints the same parts in one row each, and the HTML report in a
+table per scope.
+
 ## Latency fields
 
 Each `latency` object in JSON (global and per group) holds, in microseconds:

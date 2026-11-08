@@ -95,7 +95,7 @@ fn file_names(dir: &Path) -> Vec<String> {
 }
 
 /// Summary lines that end in a measured value, by their label.
-const MEASURED_LABELS: [&str; 41] = [
+const MEASURED_LABELS: [&str; 43] = [
     "Measured: ",
     "Total Requests:  ",
     "Throughput:      ",
@@ -137,7 +137,12 @@ const MEASURED_LABELS: [&str; 41] = [
     "    Failed:      ",
     "    Late sends:  ",
     "    Unsent:      ",
+    "  Split reqs:    ",
+    "    Split reqs:  ",
 ];
+
+/// Summary rows of measured values in columns, by their label.
+const MEASURED_ROWS: [&str; 2] = ["  Service:       ", "    Service:     "];
 
 /// Mask an integer as `#` and a number with two decimals as `#.##`, keeping a
 /// leading `±`. Any other text is returned unchanged so the comparison shows it.
@@ -166,6 +171,17 @@ fn mask_summary(stdout: &str) -> (String, Vec<String>) {
     let mut values = Vec::new();
     let mut lines = Vec::new();
     for line in stdout.split('\n') {
+        if let Some(label) = MEASURED_ROWS.iter().find(|label| line.starts_with(**label)) {
+            let row: Vec<String> = line[label.len()..]
+                .split_whitespace()
+                .map(|value| {
+                    values.push(value.to_string());
+                    format!("{:<10}", mask_number(value))
+                })
+                .collect();
+            lines.push(format!("{label}{}", row.concat().trim_end()));
+            continue;
+        }
         let Some(label) = MEASURED_LABELS.iter().find(|label| line.starts_with(**label)) else {
             lines.push(line.to_string());
             continue;
@@ -180,6 +196,10 @@ fn mask_summary(stdout: &str) -> (String, Vec<String>) {
     }
     (lines.join("\n"), values)
 }
+
+/// The note the console prints with every latency breakdown
+const BREAKDOWN_NOTE: &str =
+    "Each part's percentiles are of that part alone; they do not add up to the total's.";
 
 /// The console summary of the echo profile with measured values masked.
 fn masked_summary(target: &str) -> String {
@@ -231,6 +251,15 @@ Send lag (μs, late above 100):
   p99:           n/a
   Max:           n/a
 
+Latency breakdown (μs):
+  Clock:         user_space
+  Split reqs:    #
+                 Mean      p50       p99       p99.9     Max
+  Service:       #.##      #.##      #.##      #.##      #.##
+  Host stack:    n/a (no kernel split)
+  Net+server:    n/a (no kernel split)
+  {note}
+
 {single}
 TRAFFIC GROUP 0: echo
 {single}
@@ -270,10 +299,20 @@ Statistics:
     p99:         n/a
     Max:         n/a
 
+  Latency breakdown (μs):
+    Clock:       user_space
+    Split reqs:  #
+                 Mean      p50       p99       p99.9     Max
+    Service:     #.##      #.##      #.##      #.##      #.##
+    Host stack:  n/a (no kernel split)
+    Net+server:  n/a (no kernel split)
+    {note}
+
 {double}
 ",
         double = "=".repeat(70),
         single = "-".repeat(70),
+        note = BREAKDOWN_NOTE,
     )
 }
 
@@ -303,8 +342,10 @@ fn summary_values(json_text: &str) -> Vec<String> {
     let measured: f64 = raw_number(global, "measured_duration_secs").parse().unwrap();
     let mut values = vec![format!("{measured:.2}s")];
     for section in [global, group] {
-        // Latency keys before the request counts; send lag keys after them
+        // Latency keys before the request counts; send lag keys after them,
+        // then the latency breakdown
         let (section, accounting) = section.split_once("\"requests\"").unwrap();
+        let (accounting, breakdown) = accounting.split_once("\"latency_breakdown\"").unwrap();
         let requests: u64 = raw_number(section, "total_requests").parse().unwrap();
         values.push(requests.to_string());
         for key in ["throughput_rps", "throughput_mbps"] {
@@ -342,6 +383,11 @@ fn summary_values(json_text: &str) -> Vec<String> {
         for key in ["mean_us", "p99_us", "max_us"] {
             assert_eq!(raw_number(accounting, key), "null");
             values.push("n/a".to_string());
+        }
+        values.push(raw_number(breakdown, "kernel_split_count").to_string());
+        for key in ["mean_us", "p50_us", "p99_us", "p999_us", "max_us"] {
+            let value: f64 = raw_number(breakdown, key).parse().unwrap();
+            values.push(format!("{value:.2}"));
         }
     }
     values
@@ -446,6 +492,20 @@ const MASKED_JSON: &str = r#"{
       "p99_us": null,
       "max_us": null,
       "late_threshold_us": 100.0
+    },
+    "latency_breakdown": {
+      "clock": "user_space",
+      "kernel_split_count": 0,
+      "service_us": {
+        "sample_count": #,
+        "mean_us": #,
+        "p50_us": #,
+        "p99_us": #,
+        "p999_us": #,
+        "max_us": #
+      },
+      "host_stack_us": null,
+      "network_server_us": null
     }
   },
   "traffic_groups": [
@@ -493,6 +553,20 @@ const MASKED_JSON: &str = r#"{
           "p99_us": null,
           "max_us": null,
           "late_threshold_us": 100.0
+        },
+        "latency_breakdown": {
+          "clock": "user_space",
+          "kernel_split_count": 0,
+          "service_us": {
+            "sample_count": #,
+            "mean_us": #,
+            "p50_us": #,
+            "p99_us": #,
+            "p999_us": #,
+            "max_us": #
+          },
+          "host_stack_us": null,
+          "network_server_us": null
         }
       }
     }
@@ -545,6 +619,18 @@ fn assert_json_results(path: &Path, target: &str) -> String {
         assert_eq!((count("timed_out"), count("failed")), (0, 0));
         assert_eq!((count("late_sends"), count("unsent")), (0, 0));
         assert_eq!(stats["send_lag"]["sample_count"], 0);
+        // Without kernel timestamps the breakdown has only the service part,
+        // which is the latency itself when nothing lags
+        let breakdown = &stats["latency_breakdown"];
+        assert_eq!(breakdown["clock"], "user_space");
+        assert_eq!(breakdown["kernel_split_count"], 0);
+        assert!(breakdown["host_stack_us"].is_null() && breakdown["network_server_us"].is_null());
+        let service = &breakdown["service_us"];
+        assert_eq!(service["sample_count"], stats["latency"]["sample_count"]);
+        for key in ["mean_us", "max_us"] {
+            let (part, total) = (service[key].as_f64().unwrap(), stats["latency"][key].as_f64());
+            assert!((part - total.unwrap()).abs() < 0.002, "{key}: {part} vs {total:?}");
+        }
     }
     assert_eq!(json["global"]["requests"], groups[0]["stats"]["requests"]);
     text

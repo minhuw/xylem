@@ -43,6 +43,7 @@ fn html_report_preserves_data_and_escapes_profile_text() {
             latency: results.global.latency.clone(),
             requests: Default::default(),
             send_lag: Default::default(),
+            latency_breakdown: Default::default(),
         },
         protocol_metadata: None,
     });
@@ -67,8 +68,12 @@ fn html_report_preserves_data_and_escapes_profile_text() {
     assert!(script.contains("data: [1.25,2.5,3.75,4.125]"));
     assert!(script.contains("data: [12.3456]"));
     // No latency was recorded: unavailable values are n/a, never 0. That is
-    // four group latencies, and the global and group mean, p99 and max send lag.
-    assert_eq!(body.matches("<td>n/a</td>").count(), 10);
+    // four group latencies, the global and group mean, p99 and max send lag,
+    // and the five global and group service values of the latency breakdown.
+    assert_eq!(body.matches("<td>n/a</td>").count(), 20);
+    assert_eq!(body.matches("<h4>Latency Breakdown</h4>").count(), 2);
+    assert_eq!(body.matches("<td colspan=\"5\">n/a (no kernel split)</td>").count(), 4);
+    assert_eq!(body.matches("they do not add up to the total").count(), 2);
     assert_eq!(body.matches("<td>Requests Timed Out (no latency)</td>").count(), 2);
     assert!(body.contains("<td>0</td>"), "sample count");
     // Verify JSON labels round-trip even when a JavaScript runtime is unavailable.
