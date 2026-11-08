@@ -18,16 +18,16 @@ libc = { workspace = true }
 nix = { workspace = true }
 # User-space TCP (the `ntcp` and `ntcp-dpdk` features), pinned to one ntcp
 # commit; flake.nix pins the same commit as the `ntcp` input
-ntcp-native = { git = "https://github.com/minhuw/ntcp", rev = "442721efb38ba00958ae3cd5431b883f43788d47", optional = true }
-ntcp-io = { git = "https://github.com/minhuw/ntcp", rev = "442721efb38ba00958ae3cd5431b883f43788d47", optional = true }
-ntcp-io-tun = { git = "https://github.com/minhuw/ntcp", rev = "442721efb38ba00958ae3cd5431b883f43788d47", optional = true }
+ntcp-native = { git = "https://github.com/minhuw/ntcp", rev = "f1e28976470f1f93f2c1d280c77f8439b30421ac", optional = true }
+ntcp-io = { git = "https://github.com/minhuw/ntcp", rev = "f1e28976470f1f93f2c1d280c77f8439b30421ac", optional = true }
+ntcp-io-tun = { git = "https://github.com/minhuw/ntcp", rev = "f1e28976470f1f93f2c1d280c77f8439b30421ac", optional = true }
 # NIC clock calibration (pure Rust) and, with its `static` feature, DPDK ports
 # linked statically against the DPDK SDK (pkg-config libdpdk, from the
 # flake's dev shell)
-ntcp-io-dpdk = { git = "https://github.com/minhuw/ntcp", rev = "442721efb38ba00958ae3cd5431b883f43788d47", optional = true }
+ntcp-io-dpdk = { git = "https://github.com/minhuw/ntcp", rev = "f1e28976470f1f93f2c1d280c77f8439b30421ac", optional = true }
 # AF_XDP sockets with an XDP steering program (the `host` feature: libbpf
 # and a BPF clang, from the flake's dev shell)
-ntcp-io-af-xdp = { git = "https://github.com/minhuw/ntcp", rev = "442721efb38ba00958ae3cd5431b883f43788d47", optional = true }
+ntcp-io-af-xdp = { git = "https://github.com/minhuw/ntcp", rev = "f1e28976470f1f93f2c1d280c77f8439b30421ac", optional = true }
 
 # Non-Linux: I/O multiplexing via mio (kqueue on macOS/BSD, IOCP on Windows)
 [target.'cfg(not(target_os = "linux"))'.dependencies]
