@@ -14,6 +14,9 @@ A complete Xylem configuration file contains the following sections:
 [request_dump]     # Optional request CSV dump settings
 ```
 
+Every section, and every table inside one, rejects unknown keys; see
+[unknown and removed keys](../guide/configuration.md#unknown-and-removed-keys).
+
 ## Experiment Section
 
 The `[experiment]` section defines metadata and experiment-wide settings.
