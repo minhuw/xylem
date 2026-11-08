@@ -234,7 +234,7 @@ impl ProfileConfig {
                 .with_context(|| format!("Invalid override format: {}", override_str))?;
 
             set_toml_path(&mut value, &key, &val)
-                .with_context(|| format!("Failed to apply override: {}", override_str))?;
+                .with_context(|| format!("Invalid --set {}", override_str))?;
         }
         check_keys(&value).with_context(|| {
             format!("Failed to parse config file: {} (with --set overrides)", path.display())
@@ -740,6 +740,9 @@ fn set_toml_path(root: &mut toml::Value, path: &str, value_str: &str) -> Result<
     if parts.is_empty() {
         bail!("Empty path");
     }
+    // Every key must exist in the profile format, so a typo is no silent no-op
+    let profile = serde_json::to_value(&*root).context("Failed to read the profile's keys")?;
+    keys::check_set_path(&profile, &parts)?;
 
     // Navigate to the parent of the target field
     let mut current = root;
@@ -1799,7 +1802,75 @@ duration = "10s""#,
             "../tests/redis/redis-get-zipfian.toml",
             &["nonexistent.field=value".to_string()],
         );
-        let _ = result;
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(
+            error.starts_with(
+                "Invalid --set nonexistent.field=value: unknown field `nonexistent` at the top level"
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn set_paths_must_name_keys_and_indexes_that_exist() {
+        let path = "../tests/redis/redis-bench.toml";
+        for (set, expected) in [
+            (
+                "experiment.duraton=1s",
+                "Invalid --set experiment.duraton=1s: unknown field `duraton` in experiment \
+                 (did you mean `duration`?); expected one of `description`, `drain_timeout`, \
+                 `duration`, `name`, `seed`",
+            ),
+            ("experimnt.seed=1", "unknown field `experimnt` at the top level (did you mean `experiment`?)"),
+            ("traffic_groups.1.traffic_policy.rat=5", "in traffic_groups[1].traffic_policy (did you mean `rate`?)"),
+            (
+                "traffic_groups.0.protocol_config.keys.thetaa=1",
+                "unknown field `thetaa` in traffic_groups[0].protocol_config.keys (did you mean `theta`?)",
+            ),
+            // The keys of the group's protocol, not of another
+            ("traffic_groups.0.protocol_config.method=GET", "unknown field `method` in traffic_groups[0].protocol_config"),
+            (
+                "traffic_groups.2.target=127.0.0.1:1",
+                "Invalid --set traffic_groups.2.target=127.0.0.1:1: index 2 is out of bounds for \
+                 traffic_groups (length: 2)",
+            ),
+            ("traffic_groups.0.threads.3=1", "index 3 is out of bounds for traffic_groups[0].threads (length: 1)"),
+            ("experiment.name.short=x", "experiment.name is not a table"),
+            ("experiment.+=x", "experiment is not an array"),
+            ("stats.streaming.path=x", "stats.streaming was removed with Parquet stats streaming"),
+            (
+                "traffic_groups.0.sampling_rate=0.5",
+                "Traffic group 0 'latency-agent': sampling_rate was replaced by sampling_policy",
+            ),
+        ] {
+            let error = ProfileConfig::from_file_with_overrides(path, &[set.into()]).unwrap_err();
+            let error = format!("{error:#}");
+            assert!(error.starts_with(&format!("Invalid --set {set}: ")), "{set}: {error}");
+            assert!(error.contains(expected), "{set}: {error}");
+        }
+
+        // Keys the file leaves unset, appends, tables and variant fields still work
+        let config = ProfileConfig::from_file_with_overrides(
+            path,
+            &[
+                "traffic_groups.0.threads.+=4".into(),
+                "request_dump.directory=/tmp/dumps".into(),
+                "traffic_groups.1.sampling_policy={ type = \"dd-sketch\" }".into(),
+                "traffic_groups.0.traffic_policy.type=fixed-rate".into(),
+                "traffic_groups.0.traffic_policy.rate=1000".into(),
+                "traffic_groups.0.protocol_config.insert_phase.key_count=10".into(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(config.traffic_groups[0].threads, vec![0, 4]);
+        assert!(config.request_dump.is_some());
+        assert!(matches!(
+            config.traffic_groups[1].sampling_policy,
+            SamplingPolicy::DdSketch { .. }
+        ));
+        assert!(
+            matches!(config.traffic_groups[0].traffic_policy, PolicyConfig::FixedRate { rate } if rate == 1000.0)
+        );
     }
 
     /// A valid profile with every table a profile can have, and one group
@@ -2131,6 +2202,22 @@ protocol_config = {}
             format!("unknown field `count` {params}[2].params, which takes no fields"),
         ] {
             assert!(error.contains(&expected), "{expected}: {error}");
+        }
+    }
+
+    /// Shell completion offers only paths that `--set` accepts
+    #[test]
+    fn completion_paths_are_valid_set_paths() {
+        let mut profile =
+            serde_json::to_value(toml::from_str::<toml::Value>(EVERY_TABLE).unwrap()).unwrap();
+        for path in crate::completions::get_config_paths() {
+            let segments = parse_path(&path).unwrap();
+            // A protocol_config path needs to fit one protocol
+            let valid = PROTOCOLS.iter().any(|(protocol, _)| {
+                profile["traffic_groups"][0]["protocol"] = (*protocol).into();
+                keys::check_set_path(&profile, &segments).is_ok()
+            });
+            assert!(valid, "--set rejects completion path {path}");
         }
     }
 

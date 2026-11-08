@@ -369,6 +369,9 @@ fn add_protocol_config_paths(paths: &mut BTreeSet<String>) {
     paths.insert(format!("{}.operations.commands.0.params.count", base));
     paths.insert(format!("{}.operations.commands.0.params.num_replicas", base));
     paths.insert(format!("{}.operations.commands.0.params.timeout_ms", base));
+    paths.insert(format!("{}.operations.commands.0.params.template", base));
+    paths.insert(format!("{}.operations.commands.0.params.cursor", base));
+    paths.insert(format!("{}.operations.commands.0.params.pattern", base));
 
     // Value size configuration (Redis)
     paths.insert(format!("{}.value_size", base));

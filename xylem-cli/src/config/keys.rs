@@ -1,11 +1,12 @@
-//! Unknown and removed profile keys
+//! Unknown and removed profile keys, and the paths of `--set` overrides
 //!
 //! serde rejects unknown keys too, but stops at the first one and, inside a
 //! protocol_config, cannot say where it is. This module walks a profile
 //! along its JSON schema instead and reports every unknown key with its path
 //! and the keys valid there. serde stays the backstop for anything it skips.
 
-use super::{ProfileConfig, ProtocolKind, PROTOCOLS};
+use super::{PathSegment, ProfileConfig, ProtocolKind, PROTOCOLS};
+use anyhow::{bail, Result};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -151,6 +152,33 @@ fn check_redis_params(pc: &Value, path: &Path, problems: &mut Vec<Problem>) {
             problems.push(Problem::unknown(&params_path, key, valid.iter().copied()));
         }
     }
+}
+
+/// Check the path of a `--set` override against the profile's schema: each
+/// key must exist where it is, and each index must be within its array.
+/// `profile` is the profile the override applies to.
+pub(super) fn check_set_path(profile: &Value, segments: &[PathSegment]) -> Result<()> {
+    let schema = Schema::of::<ProfileConfig>();
+    let groups = profile.get("traffic_groups").and_then(Value::as_array);
+    let name = |index: usize| groups?.get(index)?.get("name")?.as_str();
+    // A protocol_config has the schema of its group's protocol
+    if let [PathSegment::Key(groups_key), PathSegment::Index(index), PathSegment::Key(key), rest @ ..] =
+        segments
+    {
+        if groups_key == "traffic_groups" && key == "protocol_config" {
+            schema.check_path(&schema.0, Some(profile), Path::default(), &segments[..2], name)?;
+            let group = &profile["traffic_groups"][*index];
+            let protocol = group.get("protocol").and_then(Value::as_str).and_then(protocol_kind);
+            // Validation reports an unknown protocol
+            let Some(protocol) = protocol else {
+                return Ok(());
+            };
+            let schema = protocol_schema(protocol);
+            let path = Path::default().key(groups_key).index(*index).key(key);
+            return schema.check_path(&schema.0, group.get("protocol_config"), path, rest, name);
+        }
+    }
+    schema.check_path(&schema.0, Some(profile), Path::default(), segments, name)
 }
 
 fn protocol_kind(name: &str) -> Option<ProtocolKind> {
@@ -486,5 +514,62 @@ impl Schema {
             }
             _ => {}
         }
+    }
+
+    /// Check `segments`, which continue `path`, from `node`. `value` is the
+    /// profile's value at `path`, if it has one.
+    fn check_path<'s, 'a>(
+        &'s self,
+        mut node: &'s Value,
+        mut value: Option<&Value>,
+        mut path: Path,
+        segments: &[PathSegment],
+        group_name: impl Fn(usize) -> Option<&'a str>,
+    ) -> Result<()> {
+        for segment in segments {
+            match segment {
+                PathSegment::Key(key) => {
+                    match self.keys(node, None) {
+                        Keys::Fields(fields) => match fields.get(key.as_str()) {
+                            Some(schema) => node = schema,
+                            None => {
+                                let problem = Problem::unknown(&path, key, fields.keys().copied());
+                                bail!(problem.render(group_name));
+                            }
+                        },
+                        Keys::Map(schema) => node = schema,
+                        Keys::Any => return Ok(()),
+                        Keys::None | Keys::UnknownTag(_) => bail!("{path} is not a table"),
+                    }
+                    value = value.and_then(|value| value.get(key));
+                    path = path.key(key);
+                }
+                PathSegment::Index(index) => {
+                    let Some(items) = self.items(node) else {
+                        bail!("{path} is not an array");
+                    };
+                    match value {
+                        Some(Value::Array(array)) if *index < array.len() => {}
+                        Some(Value::Array(array)) => bail!(
+                            "index {} is out of bounds for {} (length: {})",
+                            index,
+                            path,
+                            array.len()
+                        ),
+                        _ => bail!("index {index} is out of bounds: {path} is not set"),
+                    }
+                    node = items;
+                    value = value.and_then(|value| value.get(index));
+                    path = path.index(*index);
+                }
+                PathSegment::Append => {
+                    if self.items(node).is_none() {
+                        bail!("{path} is not an array, so `+` cannot append to it");
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
     }
 }
