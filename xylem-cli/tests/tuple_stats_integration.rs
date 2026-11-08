@@ -217,6 +217,7 @@ fn test_tuple_stats_output_generation() {
         connections_per_thread: conn_count,
         max_pending_per_connection: 1,
         request_timeout: None,
+        timestamps: Default::default(),
         protocol: "redis".to_string(),
         target: "127.0.0.1:6379".to_string(),
         transport: "tcp".to_string(),

@@ -9,7 +9,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use xylem_core::traffic_group::PolicyConfig;
+use xylem_core::traffic_group::{PolicyConfig, TimestampSourceConfig};
 
 pub mod ntcp;
 pub use ntcp::{NtcpBackend, NtcpConfig, NtcpEndpoint};
@@ -272,6 +272,11 @@ impl ProfileConfig {
         // Track transport per thread for validation
         let mut thread_transports: std::collections::HashMap<usize, (&str, usize, &str)> =
             std::collections::HashMap::new();
+        // And the timestamp source, which a thread's connection group shares
+        let mut thread_timestamps: std::collections::HashMap<
+            usize,
+            (&TimestampSourceConfig, usize, &str),
+        > = std::collections::HashMap::new();
 
         let mut protocol_configs = Vec::with_capacity(self.traffic_groups.len());
 
@@ -307,6 +312,7 @@ impl ProfileConfig {
             };
 
             validate_udp(group, protocol, i)?;
+            validate_timestamps(group, i)?;
 
             if group.threads.is_empty() {
                 bail!("Traffic group {} '{}' must have at least one thread", i, group.name);
@@ -363,6 +369,28 @@ impl ProfileConfig {
                             .insert(thread_id, (group.transport.as_str(), i, group.name.as_str()));
                     }
                     _ => {} // Same transport, nothing to do
+                }
+                match thread_timestamps.get(&thread_id) {
+                    Some((existing, existing_group_idx, existing_group_name))
+                        if **existing != group.timestamps =>
+                    {
+                        bail!(
+                            "Thread {} has mixed timestamp sources: group {} '{}' uses {} but \
+                             group {} '{}' uses {}. All traffic groups on the same thread share \
+                             their sockets' timestamping and must use the same timestamps.",
+                            thread_id,
+                            existing_group_idx,
+                            existing_group_name,
+                            existing,
+                            i,
+                            group.name,
+                            group.timestamps
+                        );
+                    }
+                    None => {
+                        thread_timestamps.insert(thread_id, (&group.timestamps, i, &group.name));
+                    }
+                    _ => {}
                 }
             }
 
@@ -450,6 +478,59 @@ fn validate_udp(
         }
         if timeout.is_zero() {
             bail!("Traffic group {} '{}' request_timeout must be > 0", index, group.name);
+        }
+    }
+    Ok(())
+}
+
+/// Transports that can take kernel or NIC timestamps
+const TIMESTAMPING_TRANSPORTS: [&str; 2] = ["tcp", "udp"];
+
+/// Longest interface name the kernel accepts (IFNAMSIZ less the NUL)
+const MAX_INTERFACE_NAME: usize = 15;
+
+/// Check a group's timestamps setting: anything but "user" needs Linux and
+/// transport "tcp" or "udp". Whether a hardware interface has timestamping
+/// switched on is checked when the run starts, not here.
+fn validate_timestamps(
+    group: &xylem_core::traffic_group::TrafficGroupConfig,
+    index: usize,
+) -> Result<()> {
+    if group.timestamps.is_user() {
+        return Ok(());
+    }
+    if !TIMESTAMPING_TRANSPORTS.contains(&group.transport.as_str()) {
+        bail!(
+            "Traffic group {} '{}' sets timestamps = {}, which only transports 'tcp' and 'udp' \
+             support; '{}' has no kernel timestamps. Remove timestamps or set it to \"user\".",
+            index,
+            group.name,
+            group.timestamps,
+            group.transport
+        );
+    }
+    if !cfg!(target_os = "linux") {
+        bail!(
+            "Traffic group {} '{}' sets timestamps = {}, which needs Linux (SO_TIMESTAMPING)",
+            index,
+            group.name,
+            group.timestamps
+        );
+    }
+    if let TimestampSourceConfig::Hardware(interface) = &group.timestamps {
+        if interface.is_empty()
+            || interface.len() > MAX_INTERFACE_NAME
+            || interface.contains(['\0', '/'])
+            || interface.chars().any(char::is_whitespace)
+        {
+            bail!(
+                "Traffic group {} '{}' timestamps.hardware {:?} is not a network interface name \
+                 (1 to {} bytes, no '/', NUL or whitespace)",
+                index,
+                group.name,
+                interface,
+                MAX_INTERFACE_NAME
+            );
         }
     }
     Ok(())
@@ -1113,6 +1194,120 @@ file = "results/test.json"
         assert!(error.to_string().contains("only transport 'udp'"), "{error}");
         let error = udp_profile("xylem-echo", "udp", r#"request_timeout = "0s""#).unwrap_err();
         assert!(error.to_string().contains("request_timeout must be > 0"), "{error}");
+    }
+
+    const KERNEL: &str = r#"timestamps = "kernel""#;
+    const HARDWARE: &str = r#"timestamps = { hardware = "data0" }"#;
+
+    #[test]
+    fn timestamps_parse_for_tcp_and_udp_and_default_to_user() {
+        use TimestampSourceConfig::{Hardware, Kernel, User};
+        for transport in ["tcp", "udp"] {
+            let config = udp_profile("xylem-echo", transport, "").unwrap();
+            assert_eq!(config.traffic_groups[0].timestamps, User);
+            for (line, expected) in [
+                (r#"timestamps = "user""#, User),
+                (KERNEL, Kernel),
+                (HARDWARE, Hardware("data0".to_string())),
+            ] {
+                // Validation does not probe the interface: that is the run's job
+                let result = udp_profile("xylem-echo", transport, line);
+                if cfg!(target_os = "linux") || expected.is_user() {
+                    assert_eq!(result.unwrap().traffic_groups[0].timestamps, expected);
+                } else {
+                    let error = result.unwrap_err().to_string();
+                    assert!(error.contains("needs Linux"), "{error}");
+                }
+            }
+        }
+        for line in [
+            r#"timestamps = "nic""#,
+            r#"timestamps = "hardware""#,
+            r#"timestamps = { hardware = 1 }"#,
+            r#"timestamps = { software = "lo" }"#,
+            "timestamps = true",
+        ] {
+            let error = udp_profile("xylem-echo", "tcp", line).unwrap_err();
+            assert!(format!("{error:#}").contains("timestamps"), "{line}: {error:#}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn timestamps_round_trip_and_the_default_is_not_written() {
+        let config = udp_profile("xylem-echo", "tcp", "").unwrap();
+        let value = toml::Value::try_from(&config).unwrap();
+        assert!(value["traffic_groups"][0].get("timestamps").is_none());
+        for line in [KERNEL, HARDWARE] {
+            let config = udp_profile("xylem-echo", "udp", line).unwrap();
+            let value = toml::Value::try_from(&config).unwrap();
+            let parsed: ProfileConfig = value.try_into().unwrap();
+            assert_eq!(parsed.traffic_groups[0].timestamps, config.traffic_groups[0].timestamps);
+        }
+        assert_eq!(
+            config.traffic_groups[0].timestamps.to_string(),
+            r#""user""#,
+            "written as in a profile"
+        );
+        let hardware = udp_profile("xylem-echo", "tcp", HARDWARE).unwrap();
+        assert_eq!(hardware.traffic_groups[0].timestamps.to_string(), r#"{ hardware = "data0" }"#);
+    }
+
+    #[test]
+    fn timestamps_are_rejected_for_unix_and_ntcp() {
+        for line in [KERNEL, HARDWARE] {
+            let error = udp_profile("xylem-echo", "unix", line).unwrap_err().to_string();
+            assert!(error.contains("only transports 'tcp' and 'udp' support"), "{error}");
+            assert!(error.contains("'unix' has no kernel timestamps"), "{error}");
+            // ntcp is a transport only in builds with its feature
+            let error = udp_profile("xylem-echo", "ntcp", line).unwrap_err().to_string();
+            if ntcp::SUPPORTED {
+                assert!(error.contains("'ntcp' has no kernel timestamps"), "{error}");
+            }
+        }
+        udp_profile("xylem-echo", "unix", r#"timestamps = "user""#).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hardware_interface_names_are_checked() {
+        // As TOML strings
+        for name in [r#""""#, r#""sixteen-chars-xx""#, r#""eth/0""#, r#""eth 0""#, r#""a\u0000b""#]
+        {
+            let line = format!("timestamps = {{ hardware = {name} }}");
+            let error = udp_profile("xylem-echo", "tcp", &line).unwrap_err().to_string();
+            assert!(error.contains("is not a network interface name"), "{name}: {error}");
+        }
+        udp_profile("xylem-echo", "tcp", r#"timestamps = { hardware = "fifteen-chars-x" }"#)
+            .unwrap();
+    }
+
+    #[test]
+    fn groups_sharing_a_thread_must_share_timestamps() {
+        let profile = |second: &str, threads: &str| {
+            let mut config = udp_profile("xylem-echo", "tcp", "").unwrap();
+            let mut value = toml::Value::try_from(&config).unwrap();
+            let mut group = value["traffic_groups"][0].clone();
+            group["name"] = toml::Value::String("second".into());
+            group["threads"] =
+                toml::from_str::<toml::Value>(&format!("t = {threads}")).unwrap()["t"].clone();
+            if let Some(timestamps) =
+                toml::from_str::<toml::Value>(second).unwrap().get("timestamps")
+            {
+                group.as_table_mut().unwrap().insert("timestamps".into(), timestamps.clone());
+            }
+            value["traffic_groups"].as_array_mut().unwrap().push(group);
+            config = value.try_into().unwrap();
+            config.validate()
+        };
+        let error = profile(KERNEL, "[0]").unwrap_err().to_string();
+        assert!(error.contains("Thread 0 has mixed timestamp sources"), "{error}");
+        assert!(error.contains(r#"group 0 'main' uses "user""#), "{error}");
+        assert!(error.contains(r#"group 1 'second' uses "kernel""#), "{error}");
+        // On other threads, or with the same source, groups may differ or agree
+        let other_thread = profile(KERNEL, "[1]");
+        assert_eq!(other_thread.is_ok(), cfg!(target_os = "linux"), "{other_thread:?}");
+        profile(r#"timestamps = "user""#, "[0]").unwrap();
     }
 
     #[test]

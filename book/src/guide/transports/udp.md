@@ -7,3 +7,7 @@ connection, and reads each reply datagram on its own. It works with
 See [Transport Configuration: UDP](../configuration/transport.md#udp-ipport) for
 the supported protocols, memcached's frame header, and the `request_timeout`
 that recovers from lost datagrams.
+
+On Linux, `timestamps = "kernel"` or `{ hardware = "<interface>" }` adds
+kernel or NIC TX and RX timestamps, one TX timestamp per datagram; see
+[Transport Configuration: Timestamps](../configuration/transport.md#timestamps).

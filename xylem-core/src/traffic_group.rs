@@ -42,6 +42,12 @@ pub struct TrafficGroupConfig {
     #[serde(default, with = "humantime_serde", skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
     pub request_timeout: Option<Duration>,
+    /// Source of the send and receive timestamps latencies are measured
+    /// with: "user" (default), "kernel", or { hardware = "<interface>" }.
+    /// Only for transports "tcp" and "udp" on Linux; traffic groups that
+    /// share a thread must use the same source.
+    #[serde(default, skip_serializing_if = "TimestampSourceConfig::is_user")]
+    pub timestamps: TimestampSourceConfig,
     /// Traffic policy configuration (rate control)
     pub traffic_policy: PolicyConfig,
     /// Latency sampling policy
@@ -56,6 +62,47 @@ pub struct TrafficGroupConfig {
 
 fn default_transport() -> String {
     "tcp".to_string()
+}
+
+/// Source of a traffic group's send and receive timestamps
+///
+/// Every timestamp holds the user-space cycles read when its send or
+/// receive call completed. Kernel and NIC timestamps come in addition, and
+/// a latency uses them when its send and its receive both have one from the
+/// same clock, which splits its round trip in the latency breakdown.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum TimestampSourceConfig {
+    /// User-space cycle counts only (default)
+    #[default]
+    User,
+    /// Kernel software timestamps (SO_TIMESTAMPING) of every send and receive
+    Kernel,
+    /// NIC hardware timestamps of this interface, which must already have
+    /// hardware timestamping switched on: the run fails otherwise, and never
+    /// switches it on or falls back to another source
+    Hardware(String),
+}
+
+impl TimestampSourceConfig {
+    /// Whether this is the default, user-space timestamps
+    pub fn is_user(&self) -> bool {
+        *self == TimestampSourceConfig::User
+    }
+}
+
+impl std::fmt::Display for TimestampSourceConfig {
+    /// The source as written in a profile
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TimestampSourceConfig::User => f.write_str("\"user\""),
+            TimestampSourceConfig::Kernel => f.write_str("\"kernel\""),
+            TimestampSourceConfig::Hardware(interface) => {
+                write!(f, "{{ hardware = {interface:?} }}")
+            }
+        }
+    }
 }
 
 /// Request timeout of a UDP traffic group that sets none
@@ -381,6 +428,7 @@ mod tests {
             connections_per_thread: 10,
             max_pending_per_connection: 5,
             request_timeout: None,
+            timestamps: TimestampSourceConfig::User,
             traffic_policy: PolicyConfig::ClosedLoop,
             sampling_policy: SamplingPolicy::default(),
             protocol_config: None,
@@ -406,6 +454,7 @@ mod tests {
                 connections_per_thread: 5,
                 max_pending_per_connection: 1,
                 request_timeout: None,
+                timestamps: TimestampSourceConfig::User,
                 traffic_policy: PolicyConfig::Poisson { rate: 1000.0 },
                 sampling_policy: SamplingPolicy::Unlimited,
                 protocol_config: Some(serde_json::json!({
@@ -421,6 +470,7 @@ mod tests {
                 connections_per_thread: 20,
                 max_pending_per_connection: 32,
                 request_timeout: None,
+                timestamps: TimestampSourceConfig::User,
                 traffic_policy: PolicyConfig::ClosedLoop,
                 sampling_policy: SamplingPolicy::Limited { max_samples: 10_000, rate: 0.01 },
                 protocol_config: Some(serde_json::json!({
@@ -457,6 +507,7 @@ mod tests {
                 connections_per_thread: 5,
                 max_pending_per_connection: 1,
                 request_timeout: None,
+                timestamps: TimestampSourceConfig::User,
                 traffic_policy: PolicyConfig::ClosedLoop,
                 sampling_policy: SamplingPolicy::default(),
                 protocol_config: None,
@@ -470,6 +521,7 @@ mod tests {
                 connections_per_thread: 10,
                 max_pending_per_connection: 1,
                 request_timeout: None,
+                timestamps: TimestampSourceConfig::User,
                 traffic_policy: PolicyConfig::ClosedLoop,
                 sampling_policy: SamplingPolicy::default(),
                 protocol_config: None,
@@ -493,6 +545,7 @@ mod tests {
                 connections_per_thread: 5,
                 max_pending_per_connection: 1,
                 request_timeout: None,
+                timestamps: TimestampSourceConfig::User,
                 traffic_policy: PolicyConfig::ClosedLoop,
                 sampling_policy: SamplingPolicy::default(),
                 protocol_config: None,
@@ -506,6 +559,7 @@ mod tests {
                 connections_per_thread: 10,
                 max_pending_per_connection: 1,
                 request_timeout: None,
+                timestamps: TimestampSourceConfig::User,
                 traffic_policy: PolicyConfig::ClosedLoop,
                 sampling_policy: SamplingPolicy::default(),
                 protocol_config: None,
