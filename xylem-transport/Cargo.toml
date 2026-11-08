@@ -17,9 +17,9 @@ libc = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { workspace = true }
 # User-space TCP (the `ntcp` feature), pinned to one ntcp commit
-ntcp-native = { git = "https://github.com/minhuw/ntcp", rev = "0a391f8f0b6046eb6a084b6ab7a2f16db6fa8b4c", optional = true }
-ntcp-io = { git = "https://github.com/minhuw/ntcp", rev = "0a391f8f0b6046eb6a084b6ab7a2f16db6fa8b4c", optional = true }
-ntcp-io-tun = { git = "https://github.com/minhuw/ntcp", rev = "0a391f8f0b6046eb6a084b6ab7a2f16db6fa8b4c", optional = true }
+ntcp-native = { git = "https://github.com/minhuw/ntcp", rev = "faed55d1dbbab6df63bb6dfc1673d306ba5323d4", optional = true }
+ntcp-io = { git = "https://github.com/minhuw/ntcp", rev = "faed55d1dbbab6df63bb6dfc1673d306ba5323d4", optional = true }
+ntcp-io-tun = { git = "https://github.com/minhuw/ntcp", rev = "faed55d1dbbab6df63bb6dfc1673d306ba5323d4", optional = true }
 
 # Non-Linux: I/O multiplexing via mio (kqueue on macOS/BSD, IOCP on Windows)
 [target.'cfg(not(target_os = "linux"))'.dependencies]
