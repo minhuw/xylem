@@ -348,13 +348,19 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
         for (group_id, _group_meta) in groups_for_thread.iter() {
             let group_config = &config_for_worker.traffic_groups[*group_id];
 
+            // Each thread's protocol gets its own seed, so threads do not
+            // generate the same keys in lockstep.
+            let protocol_seed = config_for_worker
+                .experiment
+                .seed
+                .map(|seed| xylem_core::seed::protocol_seed(seed, *group_id, thread_idx));
             // Validation parsed each group's protocol_config, in group order.
             // The group's target is the HTTP Host header unless the config sets one.
             let protocol = xylem_cli::multi_protocol::MultiProtocol::from_config(
                 &config_for_worker.protocol_configs[*group_id],
                 &group_config.target,
                 &group_config.transport,
-                config_for_worker.experiment.seed,
+                protocol_seed,
             )?;
 
             protocols.insert(*group_id, protocol);

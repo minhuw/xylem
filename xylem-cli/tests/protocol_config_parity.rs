@@ -129,7 +129,9 @@ fn real_cli_redis_requests_match_constructor_variable_sizes() {
     }))
     .unwrap();
     let (_, requests) = cli_requests("redis", serde_json::to_value(&config).unwrap());
-    let mut protocol = RedisProtocol::from_config(&config, Some(42)).unwrap();
+    // The CLI seeds group 0's protocol on thread 0 from the profile's seed
+    let seed = xylem_core::seed::protocol_seed(42, 0, 0);
+    let mut protocol = RedisProtocol::from_config(&config, Some(seed)).unwrap();
     let mut lengths = std::collections::HashSet::new();
     for request in requests {
         assert_eq!(request, protocol.next_request(0).data);

@@ -31,7 +31,12 @@ seed = 42
 - `name` (string, required): Name of the experiment
 - `description` (string, optional): Description of the experiment
 - `duration` (string, required): Duration in format "Ns", "Nm", "Nh" (seconds, minutes, hours)
-- `seed` (integer, optional): Random seed for reproducibility
+- `seed` (integer, optional): Random seed for reproducibility. Each traffic
+  group's protocol on each thread draws its keys, values and sizes from its
+  own seed derived from this one, so threads do not repeat each other's keys.
+  Without a seed, they come from OS entropy. Earlier versions gave every
+  thread this seed itself, so a given seed now generates different keys than
+  it did there.
 - `drain_timeout` (string, default `"1s"`): after the measurement window, how
   long to wait for responses that are still pending. Nothing is sent during the
   drain. Requests still pending when it ends count as `timed_out`; see
