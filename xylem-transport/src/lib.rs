@@ -249,6 +249,17 @@ pub trait ConnectionGroup {
     /// Unknown connection IDs return `Error::Connection`.
     fn send(&mut self, conn_id: usize, data: &[u8]) -> Result<SendReceipt>;
 
+    /// Put everything sent since the last `flush` or `poll` on the wire
+    ///
+    /// Groups whose `send` transmits at once (kernel sockets) need nothing.
+    /// A user-space stack may only queue in `send` and transmit here, so that
+    /// a round of sends to many connections costs one pass of the stack
+    /// rather than one per send. `poll` flushes too. The default does
+    /// nothing.
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+
     /// Read the bytes available on `conn_id` into `buf`
     ///
     /// Non-blocking. Datagram transports read at most one datagram, which the

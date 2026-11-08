@@ -996,6 +996,13 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
             .map_or(0, |state| std::mem::take(&mut state.late_responses))
     }
 
+    /// Put the requests sent since the last flush or poll on the wire (see
+    /// [`ConnectionGroup::flush`])
+    pub fn flush(&mut self) -> Result<()> {
+        self.group.flush()?;
+        Ok(())
+    }
+
     /// Poll all connections for readability (single syscall)
     ///
     /// Clears `ready`, waits up to `timeout` (zero means do not wait), and
@@ -2250,6 +2257,8 @@ pub(crate) mod test_support {
         pub live_timestamps: bool,
         /// Report a datagram group; read when the pool is built
         pub datagram: bool,
+        /// The number of sends made when each `flush` was called
+        pub flushes: Vec<usize>,
     }
 
     impl Default for FakeIo {
@@ -2267,6 +2276,7 @@ pub(crate) mod test_support {
                 eof: false,
                 live_timestamps: false,
                 datagram: false,
+                flushes: Vec::new(),
             }
         }
     }
@@ -2341,6 +2351,13 @@ pub(crate) mod test_support {
 
         fn is_datagram(&self) -> bool {
             self.io.lock().unwrap().datagram
+        }
+
+        fn flush(&mut self) -> xylem_transport::Result<()> {
+            let mut io = self.io.lock().unwrap();
+            let sends = io.sent.len();
+            io.flushes.push(sends);
+            Ok(())
         }
 
         fn poll(

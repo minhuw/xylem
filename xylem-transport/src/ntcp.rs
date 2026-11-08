@@ -2,16 +2,19 @@
 //!
 //! `NtcpConnectionGroup` runs every connection of a group on one
 //! caller-driven ntcp [`Network`], generic over its packet backend (`P`). The
-//! group drives the network from its own calls: `add_connection`, `send`,
-//! `poll` and `close_all` advance the stack. When the stack has nothing left
-//! to do, `poll` blocks on the backend's file descriptor, or keeps driving a
-//! backend that has none (DPDK).
+//! group drives the network from its own calls: `add_connection`, `flush`,
+//! `poll` and `close_all` advance the stack. `send` only writes into it, so
+//! that a round of sends costs one pass of the stack, at the next `flush` or
+//! `poll`. When the stack has nothing left to do, `poll` blocks on the
+//! backend's file descriptor, or keeps driving a backend that has none
+//! (DPDK, AF_XDP).
 //!
 //! `NtcpTunFactory` builds groups over an existing Linux TUN device,
 //! [`dpdk::NtcpDpdkFactory`] (`ntcp-dpdk` feature) over one queue pair of a
 //! DPDK port, and [`af_xdp::NtcpAfXdpFactory`] (`ntcp-af-xdp` feature) over
-//! an AF_XDP socket on one queue of a network interface. The `Network` is not `Send`: it is built by `create_group` on
-//! the calling (worker) thread and stays there.
+//! an AF_XDP socket on one queue of a network interface. The `Network` is not
+//! `Send`: it is built by `create_group` on the calling (worker) thread and
+//! stays there.
 //!
 //! TCP only. Timestamps are user-space ones unless the group enables NIC
 //! timestamps ([`NtcpConnectionGroup::enable_nic_timestamps`]), which needs
@@ -51,11 +54,11 @@ pub mod dpdk;
 /// drives again before it blocks.
 const WORK_BUDGET: WorkBudget = WorkBudget::new(64, 64, 64, 64);
 
-/// Work done by the drive that puts a request on the wire at the end of
-/// `send`: transmit only
+/// Work done by each drive of `flush`, which puts the round's requests on
+/// the wire: transmit only
 ///
 /// Following ntcp's guidance, received packets and timers wait for the next
-/// `poll` instead of costing every request a full drive.
+/// `poll` instead of costing every round a full drive.
 const FLUSH_BUDGET: WorkBudget = WorkBudget::new(0, WORK_BUDGET.transmit, 0, 0);
 
 /// Number of events taken from the network per `drain_events` call
@@ -183,6 +186,8 @@ struct Slot<H> {
     /// `None` once the connection was closed locally or failed to connect
     handle: Option<H>,
     state: SlotState,
+    /// The id is on the table's ready list
+    queued: bool,
 }
 
 /// Maps xylem connection ids to ntcp handles (`H`) and keeps each
@@ -190,10 +195,17 @@ struct Slot<H> {
 ///
 /// Ids are indices that start at 0 and are never reused, like the kernel
 /// groups' ids, even after a connection closes or fails to connect.
+///
+/// Readiness is kept like epoll's ready list: a connection that becomes
+/// ready is appended once, and entries that stopped being ready (or whose
+/// connection closed) leave the list when it is next read. Finding the ready
+/// connections costs time per ready connection, not per connection.
 struct SlotTable<H> {
     slots: Vec<Slot<H>>,
     by_handle: HashMap<H, usize>,
     live: usize,
+    /// Ids that became ready, in that order, each at most once (`queued`)
+    ready: Vec<usize>,
 }
 
 impl<H: Copy + Eq + Hash> SlotTable<H> {
@@ -202,6 +214,7 @@ impl<H: Copy + Eq + Hash> SlotTable<H> {
             slots: Vec::new(),
             by_handle: HashMap::new(),
             live: 0,
+            ready: Vec::new(),
         }
     }
 
@@ -210,6 +223,7 @@ impl<H: Copy + Eq + Hash> SlotTable<H> {
         self.slots.push(Slot {
             handle: None,
             state: SlotState::default(),
+            queued: false,
         });
         self.slots.len() - 1
     }
@@ -241,6 +255,29 @@ impl<H: Copy + Eq + Hash> SlotTable<H> {
         &mut self.slots[id].state
     }
 
+    /// Put `id` on the ready list unless it is there already
+    fn enqueue(&mut self, id: usize) {
+        let slot = &mut self.slots[id];
+        if !slot.queued {
+            slot.queued = true;
+            self.ready.push(id);
+        }
+    }
+
+    /// Whether data may be waiting on `id`
+    fn set_readable(&mut self, id: usize, readable: bool) {
+        self.slots[id].state.readable = readable;
+        if readable {
+            self.enqueue(id);
+        }
+    }
+
+    /// The peer's FIN has been read on `id`
+    fn set_eof(&mut self, id: usize) {
+        self.slots[id].state.eof = true;
+        self.enqueue(id);
+    }
+
     /// Forget a connection; returns its handle if it was live
     fn remove(&mut self, id: usize) -> Option<H> {
         let handle = self.slots.get_mut(id)?.handle.take()?;
@@ -257,7 +294,7 @@ impl<H: Copy + Eq + Hash> SlotTable<H> {
 
     fn on_readable(&mut self, handle: H) {
         if let Some(&id) = self.by_handle.get(&handle) {
-            self.slots[id].state.readable = true;
+            self.set_readable(id, true);
         }
     }
 
@@ -267,31 +304,44 @@ impl<H: Copy + Eq + Hash> SlotTable<H> {
             let state = &mut self.slots[id].state;
             state.readable = true;
             state.closed = true;
+            self.enqueue(id);
         }
     }
 
     /// The whole network stopped: every live connection has ended
     fn on_stopped(&mut self) {
-        for slot in self.slots.iter_mut().filter(|s| s.handle.is_some()) {
-            slot.state.readable = true;
-            slot.state.closed = true;
+        for id in 0..self.slots.len() {
+            if self.slots[id].handle.is_some() {
+                let state = &mut self.slots[id].state;
+                state.readable = true;
+                state.closed = true;
+                self.enqueue(id);
+            }
         }
     }
 
-    fn any_ready(&self) -> bool {
-        self.slots.iter().any(|s| s.handle.is_some() && s.state.ready())
+    /// Drop the ready list's entries that are no longer live and ready
+    fn prune(&mut self) {
+        let slots = &mut self.slots;
+        self.ready.retain(|&id| {
+            let slot = &mut slots[id];
+            let keep = slot.handle.is_some() && slot.state.ready();
+            slot.queued = keep;
+            keep
+        });
     }
 
-    /// Clear `ready` and fill it with the ids of live connections to report
-    fn collect_ready(&self, ready: &mut Vec<usize>) {
+    fn any_ready(&mut self) -> bool {
+        self.prune();
+        !self.ready.is_empty()
+    }
+
+    /// Clear `ready` and fill it with the ids of live connections to report,
+    /// in the order they became ready
+    fn collect_ready(&mut self, ready: &mut Vec<usize>) {
+        self.prune();
         ready.clear();
-        ready.extend(
-            self.slots
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| s.handle.is_some() && s.state.ready())
-                .map(|(id, _)| id),
-        );
+        ready.extend_from_slice(&self.ready);
     }
 
     fn live_handles(&self) -> impl Iterator<Item = (usize, H)> + '_ {
@@ -419,6 +469,8 @@ pub struct NtcpConnectionGroup<P: NtcpBackend> {
     tx_stamps: Vec<TxTimestampInfo>,
     /// Present once NIC timestamps are enabled
     nic: Option<NicClock>,
+    /// `send` wrote bytes that no drive has transmitted yet
+    unflushed: bool,
     /// The last tick passed to ntcp, which rejects time going backwards
     last_tick: u64,
     /// Source of ticks; tests replace it
@@ -471,6 +523,7 @@ impl<P: NtcpBackend> NtcpConnectionGroup<P> {
             stamp_records: Vec::new(),
             tx_stamps: Vec::new(),
             nic: None,
+            unflushed: false,
             last_tick: now,
             clock: now_ticks,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
@@ -587,7 +640,11 @@ impl<P: NtcpBackend> NtcpConnectionGroup<P> {
     /// Drive the network once with `budget`
     fn drive_with(&mut self, budget: WorkBudget) -> Result<DriveReport> {
         let now = self.now();
-        self.network.drive(now, budget).map_err(|e| network_error("ntcp drive", e))
+        let report = self.network.drive(now, budget).map_err(|e| network_error("ntcp drive", e))?;
+        // What was written before is on its way; a drive that ran out of
+        // transmit budget reports more work, which the caller drives again
+        self.unflushed = false;
+        Ok(report)
     }
 
     /// Drive the network once: receive, transmit, timers and reclaim
@@ -851,19 +908,35 @@ impl<P: NtcpBackend> ConnectionGroup for NtcpConnectionGroup<P> {
                 }
             }
         }
+        // The bytes are in the stack; they go on the wire at the next flush
+        // or poll, which the worker calls after its round of sends
         let timestamp = Timestamp::now();
-        // Put the request on the wire now rather than at the next poll
-        self.drive_with(FLUSH_BUDGET)?;
+        self.unflushed |= !data.is_empty();
         let tx = match range {
-            Some((start, end)) if stamped => {
-                // The flush scheduled the request's bytes unless the peer's
-                // window held them back: its stamp is then ready
-                self.drain_stamps();
-                Some(TxRange { start: start as u32, end: end as u32 })
-            }
+            Some((start, end)) if stamped => Some(TxRange { start: start as u32, end: end as u32 }),
             _ => None,
         };
         Ok(SendReceipt { timestamp, tx })
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if !self.unflushed {
+            return Ok(());
+        }
+        // Transmit until a drive leaves budget over (nothing more to send)
+        // or the backend pushes back; poll transmits the rest
+        loop {
+            let report = self.drive_with(FLUSH_BUDGET)?;
+            if report.transmitted < FLUSH_BUDGET.transmit || report.tx_blocked {
+                break;
+            }
+        }
+        if self.nic.is_some() {
+            // The drive scheduled the requests' bytes unless the peer's
+            // window held them back: their stamps are then ready
+            self.drain_stamps();
+        }
+        Ok(())
     }
 
     fn recv(&mut self, conn_id: usize, buf: &mut [u8]) -> Result<RecvOutcome> {
@@ -876,7 +949,7 @@ impl<P: NtcpBackend> ConnectionGroup for NtcpConnectionGroup<P> {
                 // the ntcp maintainer), so a read that did not fill the
                 // buffer took every byte that was there; it also rearms the
                 // Readable event for the next arrival
-                self.slots.state_mut(conn_id).readable = len == buf.len();
+                self.slots.set_readable(conn_id, len == buf.len());
                 if let Some(nic) = &mut self.nic {
                     if let Some(stamp) = nic.convert(&self.network, last_byte_timestamps) {
                         timestamp = timestamp.with_kernel(stamp);
@@ -885,12 +958,12 @@ impl<P: NtcpBackend> ConnectionGroup for NtcpConnectionGroup<P> {
                 Ok(RecvOutcome::Data { len, timestamp })
             }
             Ok(ReadOutcome::Eof) => {
-                self.slots.state_mut(conn_id).eof = true;
+                self.slots.set_eof(conn_id);
                 Ok(RecvOutcome::Eof)
             }
             Ok(ReadOutcome::EmptyBuffer) => Ok(RecvOutcome::WouldBlock),
             Err(ntcp_native::Error::WouldBlock(BlockReason::Receive | BlockReason::Connecting)) => {
-                self.slots.state_mut(conn_id).readable = false;
+                self.slots.set_readable(conn_id, false);
                 Ok(RecvOutcome::WouldBlock)
             }
             Err(e) => Err(network_error("ntcp recv", e)),
@@ -1099,7 +1172,7 @@ mod tests {
         assert!(ready.is_empty());
 
         // EOF and close stay ready: the worker closes the connection
-        table.state_mut(0).eof = true;
+        table.set_eof(0);
         table.on_closed(2);
         table.collect_ready(&mut ready);
         assert_eq!(ready, [0, 2]);
@@ -1114,6 +1187,33 @@ mod tests {
         assert!(ready.is_empty());
         table.on_readable(2);
         assert!(!table.any_ready());
+    }
+
+    #[test]
+    fn ready_list_holds_only_connections_that_became_ready() {
+        let mut table = SlotTable::<u32>::new();
+        for handle in 0..1000 {
+            let id = table.reserve();
+            table.open(id, handle);
+        }
+        let mut ready = Vec::new();
+        // Reported in the order they became ready, each once
+        table.on_readable(700);
+        table.on_readable(3);
+        table.on_readable(700);
+        table.collect_ready(&mut ready);
+        assert_eq!(ready, [700, 3]);
+        assert_eq!(table.ready, [700, 3]);
+
+        // An entry that stopped being ready leaves the list when it is read,
+        // and comes back once it is ready again
+        table.set_readable(700, false);
+        assert!(table.any_ready());
+        assert_eq!(table.ready, [3]);
+        assert!(!table.slots[700].queued);
+        table.set_readable(700, true);
+        table.collect_ready(&mut ready);
+        assert_eq!(ready, [3, 700]);
     }
 
     #[test]
@@ -1504,6 +1604,7 @@ mod tests {
         // The echo arrives while the next connect drives and drains the
         // network: its Readable event must reach the first slot
         group.send(first, b"early").unwrap();
+        group.flush().unwrap();
         std::thread::sleep(Duration::from_millis(20));
         let second = group.add_connection(&server_addr()).unwrap();
         assert!(group.slots.state_mut(second).connected);

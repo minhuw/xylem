@@ -340,6 +340,12 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
                 break;
             }
         }
+        // One transmit pass for the whole round: a user-space stack's pass
+        // costs time per connection, so one per send would grow with the
+        // square of the connections that send together
+        if sends_this_iteration > 0 {
+            self.pool.flush()?;
+        }
         Ok(())
     }
 
@@ -694,6 +700,20 @@ mod tests {
             scheduler,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn a_round_of_sends_is_flushed_once_after_the_last_send() {
+        let factory = FakeFactory::default();
+        // Closed loop with 4 requests in flight: one round sends 4
+        let mut worker = fake_worker(&factory, 4, Box::new(UniformPolicyScheduler::closed_loop()));
+        worker.send_requests().unwrap();
+        assert_eq!(factory.0.lock().unwrap().sent.len(), 4);
+        assert_eq!(factory.0.lock().unwrap().flushes, [4]);
+
+        // A round that sends nothing flushes nothing
+        worker.send_requests().unwrap();
+        assert_eq!(factory.0.lock().unwrap().flushes, [4]);
     }
 
     #[test]
