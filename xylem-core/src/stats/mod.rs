@@ -10,7 +10,8 @@ pub mod tuple_collector;
 // Re-export main types
 pub use policy::SamplingPolicy;
 pub use requests::{
-    RequestCounts, SendLagStats, SendLagSummary, LATE_SEND_THRESHOLD, UNSENT_WALK_CAP,
+    ErrorKindCounts, RequestCounts, SendLagStats, SendLagSummary, LATE_SEND_THRESHOLD,
+    MAX_ERROR_KINDS, MAX_ERROR_KIND_LEN, OTHER_ERROR_KIND, UNSENT_WALK_CAP,
 };
 pub use tuple_collector::{
     ConnectionStats, LatencyStorage, StatsEntry, StatsKey, TimeSeriesPoint, TupleStatsCollector,
@@ -21,7 +22,7 @@ pub use tuple_collector::{
 /// `TupleStatsCollector` implements this trait and groups stats by
 /// (time_bucket, group_id, connection_id).
 pub trait StatsRecorder: Send {
-    /// Record a latency sample of a completed request
+    /// Record a latency sample of a request completed by a successful response
     ///
     /// A latency recorded after [`Self::end_measurement`] belongs to a request
     /// that completed during the drain: it counts toward the latency
@@ -32,6 +33,20 @@ pub trait StatsRecorder: Send {
     /// * `connection_id` - Connection ID within the group
     /// * `latency` - Measured latency
     fn record_latency(&mut self, group_id: usize, connection_id: usize, latency: Duration);
+
+    /// Record a measurement request completed by an error reply of `kind`
+    ///
+    /// It counts as completed and toward throughput like a successful
+    /// response, and in the errors by kind. Its latency is kept apart from
+    /// the latency distribution of successful responses.
+    fn record_error_reply(
+        &mut self,
+        _group_id: usize,
+        _connection_id: usize,
+        _kind: &str,
+        _latency: Duration,
+    ) {
+    }
 
     /// Record transmitted bytes
     fn record_tx_bytes(&mut self, group_id: usize, connection_id: usize, bytes: usize);
@@ -73,6 +88,16 @@ pub trait StatsRecorder: Send {
 impl StatsRecorder for TupleStatsCollector {
     fn record_latency(&mut self, group_id: usize, connection_id: usize, latency: Duration) {
         TupleStatsCollector::record_latency(self, group_id, connection_id, latency);
+    }
+
+    fn record_error_reply(
+        &mut self,
+        group_id: usize,
+        connection_id: usize,
+        kind: &str,
+        latency: Duration,
+    ) {
+        TupleStatsCollector::record_error_reply(self, group_id, connection_id, kind, latency);
     }
 
     fn record_tx_bytes(&mut self, group_id: usize, connection_id: usize, bytes: usize) {

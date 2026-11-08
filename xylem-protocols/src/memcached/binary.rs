@@ -4,7 +4,7 @@
 
 use super::udp::UdpFraming;
 use super::{frame_udp_request, next_conn_seq, parse_udp_response, InsertPhaseState};
-use crate::Protocol;
+use crate::{Parsed, Protocol};
 use anyhow::Result;
 use std::collections::HashMap;
 
@@ -214,23 +214,23 @@ impl Protocol for MemcachedBinaryProtocol {
         crate::Request::measurement(request_data, (conn_id, seq))
     }
 
-    fn parse_response(
+    fn parse_response<'a>(
         &mut self,
         conn_id: usize,
-        data: &[u8],
-    ) -> Result<(usize, Option<Self::RequestId>)> {
+        data: &'a [u8],
+    ) -> Result<Parsed<'a, Self::RequestId>> {
         if let Some(framing) = &mut self.udp {
             return parse_udp_response(framing, &self.conn_send_seq, conn_id, data, |data| {
                 Ok(response_len(data))
             });
         }
         let Some(total_len) = response_len(data) else {
-            return Ok((0, None));
+            return Ok(Parsed::Incomplete);
         };
 
         // Complete response found
         let seq = next_conn_seq(&mut self.conn_recv_seq, conn_id);
-        Ok((total_len, Some((conn_id, seq))))
+        Ok(Parsed::ok(total_len, (conn_id, seq)))
     }
 
     fn name(&self) -> &'static str {

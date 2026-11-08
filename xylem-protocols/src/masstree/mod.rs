@@ -19,7 +19,7 @@
 
 mod config;
 
-use crate::Protocol;
+use crate::{Parsed, Protocol};
 use anyhow::{anyhow, Result};
 use rmp::decode;
 use rmp::encode;
@@ -509,13 +509,13 @@ impl Protocol for MasstreeProtocol {
         self.generate_request_internal(conn_id, key, self.value_size)
     }
 
-    fn parse_response(
+    fn parse_response<'a>(
         &mut self,
         conn_id: usize,
-        data: &[u8],
-    ) -> Result<(usize, Option<(usize, u16)>)> {
+        data: &'a [u8],
+    ) -> Result<Parsed<'a, (usize, u16)>> {
         if data.is_empty() {
-            return Ok((0, None));
+            return Ok(Parsed::Incomplete);
         }
 
         let mut cursor = Cursor::new(data);
@@ -525,19 +525,19 @@ impl Protocol for MasstreeProtocol {
         let array_len = match decode::read_array_len(&mut cursor) {
             Ok(len) if len >= 2 => len,
             Ok(_) => return Err(anyhow!("Invalid Masstree response: array too short")),
-            Err(_) => return Ok((0, None)), // Incomplete data
+            Err(_) => return Ok(Parsed::Incomplete), // Incomplete data
         };
 
         // Read sequence number (u32)
         let seq = match decode::read_int::<u32, _>(&mut cursor) {
             Ok(s) => s,
-            Err(_) => return Ok((0, None)), // Incomplete data
+            Err(_) => return Ok(Parsed::Incomplete), // Incomplete data
         };
 
         // Read command (u8)
         let cmd = match decode::read_int::<u8, _>(&mut cursor) {
             Ok(c) => c,
-            Err(_) => return Ok((0, None)), // Incomplete data
+            Err(_) => return Ok(Parsed::Incomplete), // Incomplete data
         };
 
         // Parse based on command type (response = request + 1)
@@ -597,7 +597,7 @@ impl Protocol for MasstreeProtocol {
                 }
                 // Checkpoint response is just [seq, cmd], no additional data
                 let bytes_consumed = cursor.position() as usize;
-                Ok((bytes_consumed, Some((conn_id, seq as u16))))
+                Ok(Parsed::ok(bytes_consumed, (conn_id, seq as u16)))
             }
             // HANDSHAKE response: [0, 15, success_bool, thread_id_u32, version_str]
             15 => {
@@ -649,11 +649,11 @@ impl MasstreeProtocol {
         cursor: &mut Cursor<&[u8]>,
         data: &[u8],
         _start_position: u64,
-    ) -> Result<(usize, Option<(usize, u16)>)> {
+    ) -> Result<Parsed<'static, (usize, u16)>> {
         // Read value string length
         let str_len = match decode::read_str_len(cursor) {
             Ok(len) => len as usize,
-            Err(_) => return Ok((0, None)), // Incomplete data
+            Err(_) => return Ok(Parsed::Incomplete), // Incomplete data
         };
 
         let position = cursor.position() as usize;
@@ -662,9 +662,9 @@ impl MasstreeProtocol {
             // Advance cursor past the string data
             cursor.set_position((position + str_len) as u64);
             let total_consumed = cursor.position() as usize;
-            Ok((total_consumed, Some((conn_id, seq as u16))))
+            Ok(Parsed::ok(total_consumed, (conn_id, seq as u16)))
         } else {
-            Ok((0, None)) // Incomplete data
+            Ok(Parsed::Incomplete) // Incomplete data
         }
     }
 
@@ -673,14 +673,14 @@ impl MasstreeProtocol {
         conn_id: usize,
         seq: u32,
         cursor: &mut Cursor<&[u8]>,
-    ) -> Result<(usize, Option<(usize, u16)>)> {
+    ) -> Result<Parsed<'static, (usize, u16)>> {
         // Read result byte (ResultCode enum)
         match decode::read_int::<i8, _>(cursor) {
             Ok(_result) => {
                 let bytes_consumed = cursor.position() as usize;
-                Ok((bytes_consumed, Some((conn_id, seq as u16))))
+                Ok(Parsed::ok(bytes_consumed, (conn_id, seq as u16)))
             }
-            Err(_) => Ok((0, None)), // Incomplete data
+            Err(_) => Ok(Parsed::Incomplete), // Incomplete data
         }
     }
 
@@ -689,14 +689,14 @@ impl MasstreeProtocol {
         conn_id: usize,
         seq: u32,
         cursor: &mut Cursor<&[u8]>,
-    ) -> Result<(usize, Option<(usize, u16)>)> {
+    ) -> Result<Parsed<'static, (usize, u16)>> {
         // Read result byte (ResultCode enum)
         match decode::read_int::<i8, _>(cursor) {
             Ok(_result) => {
                 let bytes_consumed = cursor.position() as usize;
-                Ok((bytes_consumed, Some((conn_id, seq as u16))))
+                Ok(Parsed::ok(bytes_consumed, (conn_id, seq as u16)))
             }
-            Err(_) => Ok((0, None)), // Incomplete data
+            Err(_) => Ok(Parsed::Incomplete), // Incomplete data
         }
     }
 
@@ -705,14 +705,14 @@ impl MasstreeProtocol {
         conn_id: usize,
         seq: u32,
         cursor: &mut Cursor<&[u8]>,
-    ) -> Result<(usize, Option<(usize, u16)>)> {
+    ) -> Result<Parsed<'static, (usize, u16)>> {
         // Read removed boolean
         match decode::read_bool(cursor) {
             Ok(_removed) => {
                 let bytes_consumed = cursor.position() as usize;
-                Ok((bytes_consumed, Some((conn_id, seq as u16))))
+                Ok(Parsed::ok(bytes_consumed, (conn_id, seq as u16)))
             }
-            Err(_) => Ok((0, None)), // Incomplete data
+            Err(_) => Ok(Parsed::Incomplete), // Incomplete data
         }
     }
 
@@ -724,7 +724,7 @@ impl MasstreeProtocol {
         data: &[u8],
         _start_position: u64,
         array_len: u32,
-    ) -> Result<(usize, Option<(usize, u16)>)> {
+    ) -> Result<Parsed<'static, (usize, u16)>> {
         // SCAN response: [seq, 5, key1_str, value1, key2_str, value2, ...]
         // Array length = 2 + 2*count (seq, cmd, then key-value pairs)
 
@@ -739,30 +739,30 @@ impl MasstreeProtocol {
             // Read key string
             let key_len = match decode::read_str_len(cursor) {
                 Ok(len) => len as usize,
-                Err(_) => return Ok((0, None)), // Incomplete data
+                Err(_) => return Ok(Parsed::Incomplete), // Incomplete data
             };
 
             let position = cursor.position() as usize;
             if position + key_len > data.len() {
-                return Ok((0, None)); // Incomplete data
+                return Ok(Parsed::Incomplete); // Incomplete data
             }
             cursor.set_position((position + key_len) as u64);
 
             // Read value string
             let value_len = match decode::read_str_len(cursor) {
                 Ok(len) => len as usize,
-                Err(_) => return Ok((0, None)), // Incomplete data
+                Err(_) => return Ok(Parsed::Incomplete), // Incomplete data
             };
 
             let position = cursor.position() as usize;
             if position + value_len > data.len() {
-                return Ok((0, None)); // Incomplete data
+                return Ok(Parsed::Incomplete); // Incomplete data
             }
             cursor.set_position((position + value_len) as u64);
         }
 
         let total_consumed = cursor.position() as usize;
-        Ok((total_consumed, Some((conn_id, seq as u16))))
+        Ok(Parsed::ok(total_consumed, (conn_id, seq as u16)))
     }
 
     fn parse_handshake_response(
@@ -771,23 +771,23 @@ impl MasstreeProtocol {
         cursor: &mut Cursor<&[u8]>,
         data: &[u8],
         _start_position: u64,
-    ) -> Result<(usize, Option<(usize, u16)>)> {
+    ) -> Result<Parsed<'static, (usize, u16)>> {
         // Read success boolean
         let _success = match decode::read_bool(cursor) {
             Ok(s) => s,
-            Err(_) => return Ok((0, None)), // Incomplete data
+            Err(_) => return Ok(Parsed::Incomplete), // Incomplete data
         };
 
         // Read max_seq (u32)
         let _max_seq = match decode::read_int::<u32, _>(cursor) {
             Ok(s) => s,
-            Err(_) => return Ok((0, None)), // Incomplete data
+            Err(_) => return Ok(Parsed::Incomplete), // Incomplete data
         };
 
         // Read version string length
         let str_len = match decode::read_str_len(cursor) {
             Ok(len) => len as usize,
-            Err(_) => return Ok((0, None)), // Incomplete data
+            Err(_) => return Ok(Parsed::Incomplete), // Incomplete data
         };
 
         let position = cursor.position() as usize;
@@ -796,9 +796,9 @@ impl MasstreeProtocol {
             self.mark_handshake_done(conn_id);
             // Advance cursor past the string data
             let total_consumed = position + str_len;
-            Ok((total_consumed, Some((conn_id, 0))))
+            Ok(Parsed::ok(total_consumed, (conn_id, 0)))
         } else {
-            Ok((0, None)) // Incomplete data
+            Ok(Parsed::Incomplete) // Incomplete data
         }
     }
 }

@@ -124,7 +124,7 @@ mod tests {
     use crate::redis::command_selector::FixedCommandSelector;
     use crate::redis::RedisProtocol;
     use crate::workload::KeyGeneration;
-    use crate::{Protocol, Request};
+    use crate::{Parsed, Protocol, Request};
 
     const AUTH: &[u8] = b"*3\r\n$4\r\nAUTH\r\n$5\r\nbench\r\n$6\r\npw-123\r\n";
     const SELECT: &[u8] = b"*2\r\n$6\r\nSELECT\r\n$1\r\n3\r\n";
@@ -171,7 +171,7 @@ mod tests {
         assert!(!protocol.can_send(conn_id), "nothing else goes out while setup is pending");
         assert_eq!(
             protocol.parse_response(conn_id, reply).unwrap(),
-            (reply.len(), Some((conn_id, seq)))
+            Parsed::ok(reply.len(), (conn_id, seq))
         );
     }
 
@@ -219,12 +219,12 @@ mod tests {
         assert_eq!(protocol.next_request(0), Request::measurement(get.to_vec(), (0, 4)));
         // Pipelined RESP3 replies match in order
         let replies = b"+OK\r\n_\r\n";
-        assert_eq!(protocol.parse_response(0, replies).unwrap(), (5, Some((0, 3))));
-        assert_eq!(protocol.parse_response(0, &replies[5..]).unwrap(), (3, Some((0, 4))));
+        assert_eq!(protocol.parse_response(0, replies).unwrap(), Parsed::ok(5, (0, 3)));
+        assert_eq!(protocol.parse_response(0, &replies[5..]).unwrap(), Parsed::ok(3, (0, 4)));
 
         // Connection 1 is still waiting for its AUTH reply
         assert!(!protocol.can_send(1));
-        assert_eq!(protocol.parse_response(1, b"+OK\r\n").unwrap(), (5, Some((1, 0))));
+        assert_eq!(protocol.parse_response(1, b"+OK\r\n").unwrap(), Parsed::ok(5, (1, 0)));
         assert_eq!(protocol.next_request(1), Request::setup(SELECT.to_vec(), (1, 1)));
     }
 
@@ -236,7 +236,7 @@ mod tests {
         complete_step(&mut protocol, 0, 1, HELLO, HELLO_REPLY);
         let multi = protocol.next_request(0);
         assert_eq!(multi, Request::measurement(b"*1\r\n$5\r\nMULTI\r\n".to_vec(), (0, 2)));
-        assert_eq!(protocol.parse_response(0, b"+OK\r\n").unwrap(), (5, Some((0, 2))));
+        assert_eq!(protocol.parse_response(0, b"+OK\r\n").unwrap(), Parsed::ok(5, (0, 2)));
     }
 
     #[test]
@@ -325,10 +325,13 @@ mod tests {
         let push = b">2\r\n$10\r\ninvalidate\r\n*1\r\n$5\r\nkey:1\r\n";
         let data = [&push[..], HELLO_REPLY].concat();
         // The push alone, or the push and part of the reply, is incomplete
-        assert_eq!(protocol.parse_response(0, push).unwrap(), (0, None));
-        assert_eq!(protocol.parse_response(0, &data[..data.len() - 1]).unwrap(), (0, None));
+        assert_eq!(protocol.parse_response(0, push).unwrap(), Parsed::Incomplete);
+        assert_eq!(
+            protocol.parse_response(0, &data[..data.len() - 1]).unwrap(),
+            Parsed::Incomplete
+        );
         assert_eq!(protocol.push_messages(), 0, "counted once the reply completes");
-        assert_eq!(protocol.parse_response(0, &data).unwrap(), (data.len(), Some((0, 0))));
+        assert_eq!(protocol.parse_response(0, &data).unwrap(), Parsed::ok(data.len(), (0, 0)));
         assert_eq!(protocol.push_messages(), 1);
         assert!(protocol.can_send(0));
     }

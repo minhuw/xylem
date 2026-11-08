@@ -1,7 +1,7 @@
 use xylem_protocols::configs::*;
 use xylem_protocols::http::HttpProtocol;
 use xylem_protocols::memcached::{MemcachedAsciiProtocol, MemcachedBinaryProtocol};
-use xylem_protocols::{Protocol, RedisProtocol};
+use xylem_protocols::{Parsed, Protocol, RedisProtocol};
 
 fn redis() -> RedisProtocol {
     RedisProtocol::from_config(&RedisConfig::default(), Some(42)).unwrap()
@@ -19,15 +19,15 @@ fn redis_maps_attributes_and_pipelined_ids() {
     let mut protocol = redis();
     for (seq, frame) in frames.iter().enumerate() {
         for end in 0..frame.len() {
-            assert_eq!(protocol.parse_response(7, &frame[..end]).unwrap(), (0, None));
+            assert_eq!(protocol.parse_response(7, &frame[..end]).unwrap(), Parsed::Incomplete);
         }
         let data = [*frame, b"+NEXT\r\n"].concat();
         assert_eq!(
             protocol.parse_response(7, &data).unwrap(),
-            (frame.len(), Some((7, seq as u64)))
+            Parsed::ok(frame.len(), (7, seq as u64))
         );
     }
-    assert_eq!(protocol.parse_response(7, b"+NEXT\r\n").unwrap(), (7, Some((7, 3))));
+    assert_eq!(protocol.parse_response(7, b"+NEXT\r\n").unwrap(), Parsed::ok(7, (7, 3)));
     for bad in [b"%999999999999999999999999\r\n".as_slice(), b"|10000001\r\n", b"%-1\r\n"] {
         assert!(protocol.parse_response(7, bad).is_err());
     }
@@ -37,7 +37,7 @@ fn redis_maps_attributes_and_pipelined_ids() {
 fn redis_limits_frames_instead_of_coalesced_buffer() {
     let mut data = b"+OK\r\n".to_vec();
     data.resize(10_485_762, b'x');
-    assert_eq!(redis().parse_response(0, &data).unwrap(), (5, Some((0, 0))));
+    assert_eq!(redis().parse_response(0, &data).unwrap(), Parsed::ok(5, (0, 0)));
 }
 
 #[test]
@@ -50,17 +50,17 @@ fn memcached_value_lengths_are_binary_safe_and_require_end() {
         let header = format!("VALUE key:1 0 {}\r\n", value.len());
         let response = [header.as_bytes(), value, b"\r\nEND\r\n"].concat();
         for end in 0..response.len() {
-            assert_eq!(protocol.parse_response(0, &response[..end]).unwrap(), (0, None));
+            assert_eq!(protocol.parse_response(0, &response[..end]).unwrap(), Parsed::Incomplete);
         }
         let coalesced = [response.as_slice(), b"STORED\r\n"].concat();
         assert_eq!(
             protocol.parse_response(0, &coalesced).unwrap(),
-            (response.len(), Some((0, seq as u64)))
+            Parsed::ok(response.len(), (0, seq as u64))
         );
     }
-    assert_eq!(protocol.parse_response(0, b"STORED\r\n").unwrap(), (8, Some((0, 5))));
+    assert_eq!(protocol.parse_response(0, b"STORED\r\n").unwrap(), Parsed::ok(8, (0, 5)));
     let multi = b"VALUE a 0 1\r\nx\r\nVALUE b 0 0 42\r\n\r\nEND\r\n";
-    assert_eq!(protocol.parse_response(0, multi).unwrap(), (multi.len(), Some((0, 6))));
+    assert_eq!(protocol.parse_response(0, multi).unwrap(), Parsed::ok(multi.len(), (0, 6)));
 }
 
 #[test]
@@ -75,7 +75,7 @@ fn memcached_errors_and_malformed_lengths_do_not_succeed() {
     ] {
         let mut protocol = MemcachedAsciiProtocol::default();
         assert!(protocol.parse_response(0, response).is_err());
-        assert_eq!(protocol.parse_response(0, b"END\r\n").unwrap(), (5, Some((0, 0))));
+        assert_eq!(protocol.parse_response(0, b"END\r\n").unwrap(), Parsed::ok(5, (0, 0)));
     }
 }
 
@@ -91,12 +91,12 @@ fn http_explicit_framing_and_bodyless_responses() {
     ];
     for (seq, response) in responses.iter().enumerate() {
         for end in 0..response.len() {
-            assert_eq!(protocol.parse_response(3, &response[..end]).unwrap(), (0, None));
+            assert_eq!(protocol.parse_response(3, &response[..end]).unwrap(), Parsed::Incomplete);
         }
         let coalesced = [*response, responses[0]].concat();
         assert_eq!(
             protocol.parse_response(3, &coalesced).unwrap(),
-            (response.len(), Some((3, seq as u64)))
+            Parsed::ok(response.len(), (3, seq as u64))
         );
     }
 }
@@ -119,7 +119,7 @@ fn http_rejects_unsupported_and_ambiguous_framing_before_success() {
         let mut protocol = HttpProtocol::default();
         assert!(protocol.parse_response(0, response).is_err());
         let good = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
-        assert_eq!(protocol.parse_response(0, good).unwrap(), (good.len(), Some((0, 0))));
+        assert_eq!(protocol.parse_response(0, good).unwrap(), Parsed::ok(good.len(), (0, 0)));
     }
 }
 

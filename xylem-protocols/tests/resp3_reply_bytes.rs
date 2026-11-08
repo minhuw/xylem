@@ -4,7 +4,7 @@
 //! one byte short, and every shorter prefix must be incomplete rather than
 //! misframed.
 
-use xylem_protocols::{FixedCommandSelector, Protocol, RedisOp, RedisProtocol};
+use xylem_protocols::{FixedCommandSelector, Parsed, Protocol, RedisOp, RedisProtocol};
 
 fn protocol() -> RedisProtocol {
     RedisProtocol::new(Box::new(FixedCommandSelector::new(RedisOp::Get)))
@@ -17,16 +17,16 @@ fn assert_frames(reply: &[u8]) {
     for len in 0..reply.len() {
         assert_eq!(
             protocol().parse_response(0, &reply[..len]).unwrap(),
-            (0, None),
+            Parsed::Incomplete,
             "prefix {} of {} is incomplete",
             reply[..len].escape_ascii(),
             reply.escape_ascii()
         );
     }
     let mut protocol = protocol();
-    assert_eq!(protocol.parse_response(0, reply).unwrap(), (reply.len(), Some((0, 0))));
+    assert_eq!(protocol.parse_response(0, reply).unwrap(), Parsed::ok(reply.len(), (0, 0)));
     let followed = [reply, b"+OK\r\n"].concat();
-    assert_eq!(protocol.parse_response(0, &followed).unwrap(), (reply.len(), Some((0, 1))));
+    assert_eq!(protocol.parse_response(0, &followed).unwrap(), Parsed::ok(reply.len(), (0, 1)));
     assert_eq!(protocol.push_messages(), 0);
 }
 
@@ -116,7 +116,7 @@ fn attributes_before_a_reply() {
 fn blob_errors_are_errors() {
     assert!(protocol().parse_response(0, b"!21\r\nSYNTAX invalid syntax\r\n").is_err());
     // Incomplete, so not an error yet
-    assert_eq!(protocol().parse_response(0, b"!21\r\nSYNTAX").unwrap(), (0, None));
+    assert_eq!(protocol().parse_response(0, b"!21\r\nSYNTAX").unwrap(), Parsed::Incomplete);
 }
 
 #[test]
@@ -125,9 +125,9 @@ fn push_messages_are_skipped_and_counted() {
     let mut protocol = protocol();
     // Redis sends a tracking invalidation right after the reply that caused it
     let read = [&b"+OK\r\n"[..], invalidate].concat();
-    assert_eq!(protocol.parse_response(0, &read).unwrap(), (5, Some((0, 0))));
+    assert_eq!(protocol.parse_response(0, &read).unwrap(), Parsed::ok(5, (0, 0)));
     // The push alone answers no request: nothing is consumed
-    assert_eq!(protocol.parse_response(0, invalidate).unwrap(), (0, None));
+    assert_eq!(protocol.parse_response(0, invalidate).unwrap(), Parsed::Incomplete);
     assert_eq!(protocol.push_messages(), 0);
 
     // Pushes before the next reply are consumed with it, and counted once
@@ -135,10 +135,10 @@ fn push_messages_are_skipped_and_counted() {
     let attributed = b"|1\r\n+a\r\n+b\r\n>2\r\n$10\r\ninvalidate\r\n_\r\n";
     let read = [&invalidate[..], pubsub, attributed, b"$1\r\nv\r\n"].concat();
     for len in 0..read.len() {
-        assert_eq!(protocol.parse_response(0, &read[..len]).unwrap(), (0, None));
+        assert_eq!(protocol.parse_response(0, &read[..len]).unwrap(), Parsed::Incomplete);
     }
     assert_eq!(protocol.push_messages(), 0);
-    assert_eq!(protocol.parse_response(0, &read).unwrap(), (read.len(), Some((0, 1))));
+    assert_eq!(protocol.parse_response(0, &read).unwrap(), Parsed::ok(read.len(), (0, 1)));
     assert_eq!(protocol.push_messages(), 3);
 }
 

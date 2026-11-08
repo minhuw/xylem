@@ -1,6 +1,6 @@
 use crate::config::ProtocolConfig;
 use anyhow::Result;
-use xylem_common::Request;
+use xylem_common::{Parsed, Request};
 use xylem_protocols::Protocol;
 
 /// Multi-protocol wrapper that can dispatch to any supported protocol
@@ -85,11 +85,11 @@ impl Protocol for MultiProtocol {
         }
     }
 
-    fn parse_response(
+    fn parse_response<'a>(
         &mut self,
         conn_id: usize,
-        data: &[u8],
-    ) -> Result<(usize, Option<Self::RequestId>)> {
+        data: &'a [u8],
+    ) -> Result<Parsed<'a, Self::RequestId>> {
         match self {
             MultiProtocol::Redis(p) => p.parse_response(conn_id, data),
             MultiProtocol::MemcachedBinary(p) => p.parse_response(conn_id, data),
@@ -97,8 +97,7 @@ impl Protocol for MultiProtocol {
             MultiProtocol::Http(p) => p.parse_response(conn_id, data),
             MultiProtocol::XylemEcho(p) => p.parse_response(conn_id, data),
             MultiProtocol::Masstree(p) => {
-                let (consumed, req_id) = p.parse_response(conn_id, data)?;
-                Ok((consumed, req_id.map(|(conn, seq)| (conn, seq as u64))))
+                Ok(p.parse_response(conn_id, data)?.map_id(|(conn, seq)| (conn, seq as u64)))
             }
         }
     }

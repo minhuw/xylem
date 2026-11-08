@@ -3,7 +3,7 @@
 use std::time::Duration;
 use xylem_cli::output::{html, DetailedExperimentResults};
 use xylem_core::stats::{SamplingPolicy, TupleStatsCollector};
-use xylem_core::traffic_group::{PolicyConfig, TrafficGroupConfig};
+use xylem_core::traffic_group::{OnError, PolicyConfig, TrafficGroupConfig};
 
 #[test]
 fn test_detailed_json_output_generation() {
@@ -36,6 +36,7 @@ fn test_detailed_json_output_generation() {
             connections_per_thread: 10,
             max_pending_per_connection: 100,
             request_timeout: None,
+            on_error: OnError::Count,
             protocol: "redis".to_string(),
             target: "127.0.0.1:6379".to_string(),
             transport: "tcp".to_string(),
@@ -49,6 +50,7 @@ fn test_detailed_json_output_generation() {
             connections_per_thread: 5,
             max_pending_per_connection: 50,
             request_timeout: None,
+            on_error: OnError::Count,
             protocol: "memcached-binary".to_string(),
             target: "127.0.0.1:6380".to_string(),
             transport: "tcp".to_string(),
@@ -136,6 +138,7 @@ fn test_json_serialization_deserialization() {
         connections_per_thread: 1,
         max_pending_per_connection: 1,
         request_timeout: None,
+        on_error: OnError::Count,
         protocol: "redis".to_string(),
         target: "127.0.0.1:6379".to_string(),
         transport: "tcp".to_string(),
@@ -191,6 +194,7 @@ fn test_html_report_generation() {
         connections_per_thread: 10,
         max_pending_per_connection: 100,
         request_timeout: None,
+        on_error: OnError::Count,
         protocol: "redis".to_string(),
         target: "127.0.0.1:6379".to_string(),
         transport: "tcp".to_string(),
@@ -267,6 +271,7 @@ fn test_per_group_statistics_isolation() {
             connections_per_thread: 10,
             max_pending_per_connection: 100,
             request_timeout: None,
+            on_error: OnError::Count,
             protocol: "redis".to_string(),
             target: "127.0.0.1:6379".to_string(),
             transport: "tcp".to_string(),
@@ -280,6 +285,7 @@ fn test_per_group_statistics_isolation() {
             connections_per_thread: 5,
             max_pending_per_connection: 50,
             request_timeout: None,
+            on_error: OnError::Count,
             protocol: "redis".to_string(),
             target: "127.0.0.1:6379".to_string(),
             transport: "tcp".to_string(),

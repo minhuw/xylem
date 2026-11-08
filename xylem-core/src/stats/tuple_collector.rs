@@ -538,11 +538,17 @@ pub struct TupleStatsCollector {
     request_counts: HashMap<usize, RequestCounts>,
     /// Send lags of open-loop requests per group
     send_lags: HashMap<usize, SendLagStats>,
+    /// Latencies of error replies per group, under the group's policy. They
+    /// are not part of the latency distribution of the entries.
+    error_latencies: HashMap<usize, LatencyStorage>,
+    /// Latencies of every group's error replies, under the global policy
+    global_error_latency: LatencyStorage,
 }
 
 impl TupleStatsCollector {
     /// Create a new tuple stats collector
     pub fn new(sampling_policy: SamplingPolicy, bucket_duration: Duration) -> Self {
+        let global_error_latency = LatencyStorage::from_policy(&sampling_policy);
         Self {
             entries: HashMap::new(),
             thread_id: 0,
@@ -555,6 +561,8 @@ impl TupleStatsCollector {
             measurement_end_ns: None,
             request_counts: HashMap::new(),
             send_lags: HashMap::new(),
+            error_latencies: HashMap::new(),
+            global_error_latency,
         }
     }
 
@@ -564,6 +572,7 @@ impl TupleStatsCollector {
         bucket_duration: Duration,
         start_time_ns: u64,
     ) -> Self {
+        let global_error_latency = LatencyStorage::from_policy(&sampling_policy);
         Self {
             entries: HashMap::new(),
             thread_id: 0,
@@ -576,6 +585,8 @@ impl TupleStatsCollector {
             measurement_end_ns: None,
             request_counts: HashMap::new(),
             send_lags: HashMap::new(),
+            error_latencies: HashMap::new(),
+            global_error_latency,
         }
     }
 
@@ -660,6 +671,56 @@ impl TupleStatsCollector {
         }
     }
 
+    /// Record a measurement request completed by an error reply of `kind`
+    ///
+    /// It counts as completed, in the errors by kind, and toward its bucket's
+    /// requests and throughput unless it completed during the drain. Its
+    /// latency is recorded under the group and global policies apart from
+    /// the entries, so the latency distribution holds successful responses
+    /// only.
+    pub fn record_error_reply(
+        &mut self,
+        group_id: usize,
+        connection_id: usize,
+        kind: &str,
+        latency: Duration,
+    ) {
+        let counts = self.request_counts_mut(group_id);
+        counts.completed += 1;
+        counts.errors += 1;
+        counts.errors_by_kind.add(kind, 1);
+        let policy = self.group_sampling_policies.get(&group_id).unwrap_or(&self.sampling_policy);
+        self.error_latencies
+            .entry(group_id)
+            .or_insert_with(|| LatencyStorage::from_policy(policy))
+            .record(latency);
+        self.global_error_latency.record(latency);
+        let draining = self.measurement_end_ns.is_some();
+        let (entry, global) = self.recording_entries(group_id, connection_id);
+        if !draining {
+            entry.request_count += 1;
+            global.request_count += 1;
+        }
+    }
+
+    /// Latency summary of a group's error replies
+    pub fn error_latency(&self, group_id: usize) -> AggregatedStats {
+        let empty;
+        let latency = match self.error_latencies.get(&group_id) {
+            Some(latency) => latency,
+            None => {
+                empty = LatencyStorage::from_policy(self.get_group_policy(group_id));
+                &empty
+            }
+        };
+        self.compute_aggregated_stats(latency, 0, 0, 0, Duration::ZERO)
+    }
+
+    /// Latency summary of every group's error replies together
+    pub fn error_latency_global(&self) -> AggregatedStats {
+        self.compute_aggregated_stats(&self.global_error_latency, 0, 0, 0, Duration::ZERO)
+    }
+
     /// Record a sent measurement request with its send lag (`None` without
     /// an intended send time); lags above [`LATE_SEND_THRESHOLD`] are late.
     pub fn record_sent(&mut self, group_id: usize, lag: Option<Duration>) {
@@ -680,7 +741,7 @@ impl TupleStatsCollector {
 
     /// Request counts of a group; zero for a group that recorded none
     pub fn request_counts(&self, group_id: usize) -> RequestCounts {
-        self.request_counts.get(&group_id).copied().unwrap_or_default()
+        self.request_counts.get(&group_id).cloned().unwrap_or_default()
     }
 
     /// Request counts of every group together
@@ -1002,6 +1063,8 @@ impl TupleStatsCollector {
             measurement_end_ns: collectors.iter().filter_map(|c| c.measurement_end_ns).max(),
             request_counts: HashMap::new(),
             send_lags: HashMap::new(),
+            error_latencies: HashMap::new(),
+            global_error_latency: LatencyStorage::from_policy(&first.sampling_policy),
         };
 
         // Validate policies before merging any entries.
@@ -1034,6 +1097,16 @@ impl TupleStatsCollector {
             for (group_id, lags) in &collector.send_lags {
                 merged.send_lags.entry(*group_id).or_default().merge(lags);
             }
+            for (group_id, latency) in &collector.error_latencies {
+                let policy =
+                    merged.group_sampling_policies.get(group_id).unwrap_or(&merged.sampling_policy);
+                merged
+                    .error_latencies
+                    .entry(*group_id)
+                    .or_insert_with(|| LatencyStorage::from_policy(policy))
+                    .merge_ref(latency);
+            }
+            merged.global_error_latency.merge_ref(&collector.global_error_latency);
             for (key, entry) in collector.entries {
                 merged.entries.entry(key).and_modify(|e| e.merge_from(&entry)).or_insert(entry);
             }
@@ -1896,5 +1969,51 @@ mod tests {
         assert_eq!(collector.time_buckets(), vec![0]);
         assert_eq!(collector.entries().values().map(|e| e.rx_bytes).sum::<u64>(), 10);
         assert_eq!(collector.request_counts(0).completed, 2);
+    }
+
+    #[test]
+    fn error_replies_are_completed_requests_with_a_separate_latency() {
+        let group_policy = SamplingPolicy::Limited { max_samples: 10, rate: 1.0 };
+        let collector = |thread_id| {
+            let mut collector = TupleStatsCollector::with_start_time(
+                SamplingPolicy::Unlimited,
+                Duration::from_secs(1),
+                crate::timing::time_ns(),
+            );
+            collector.register_group_policy(1, group_policy.clone());
+            collector.set_thread_id(thread_id);
+            collector
+        };
+        let mut first = collector(0);
+        first.record_latency(1, 0, Duration::from_micros(100));
+        first.record_error_reply(1, 0, "WRONGTYPE", Duration::from_micros(5));
+        let mut second = collector(1);
+        second.record_error_reply(1, 0, "OOM", Duration::from_micros(7));
+        second.end_measurement(crate::timing::time_ns());
+        // Drained after the window: completed, but not throughput
+        second.record_error_reply(1, 0, "OOM", Duration::from_micros(9));
+        let merged = TupleStatsCollector::merge(vec![first, second]);
+
+        let counts = merged.request_counts(1);
+        assert_eq!((counts.completed, counts.errors), (4, 3));
+        assert_eq!(counts.errors_by_kind.get("OOM"), 2);
+        assert_eq!(counts.errors_by_kind.get("WRONGTYPE"), 1);
+        assert_eq!(merged.request_counts_global(), counts);
+        for stats in [
+            merged.aggregate_by_group(Duration::from_secs(1))[&1].clone(),
+            merged.aggregate_global(Duration::from_secs(1)),
+        ] {
+            assert_eq!(stats.total_requests, 3);
+            assert_eq!(stats.latency_sample_count, 1);
+            assert_eq!(stats.max_latency, Some(Duration::from_micros(100)));
+        }
+        for errors in [merged.error_latency(1), merged.error_latency_global()] {
+            assert_eq!(errors.latency_sample_count, 3);
+            assert_eq!(errors.min_latency, Some(Duration::from_micros(5)));
+            assert_eq!(errors.max_latency, Some(Duration::from_micros(9)));
+            assert_eq!(errors.mean_latency, Duration::from_micros(7));
+        }
+        // A group without error replies has an empty summary
+        assert_eq!(merged.error_latency(7).latency_sample_count, 0);
     }
 }

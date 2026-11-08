@@ -240,6 +240,21 @@
         "local_ip"
       ]
     },
+    "OnError": {
+      "description": "What an error reply does to a run",
+      "oneOf": [
+        {
+          "description": "Complete the request and count the reply in `requests.errors` and\n`requests.errors_by_kind`, with its latency in `error_latency`",
+          "type": "string",
+          "const": "count"
+        },
+        {
+          "description": "Fail the run, naming the group, connection and reply",
+          "type": "string",
+          "const": "abort"
+        }
+      ]
+    },
     "OutputConfig": {
       "description": "Output configuration",
       "type": "object",
@@ -745,6 +760,11 @@
         "name": {
           "description": "Group name for identification",
           "type": "string"
+        },
+        "on_error": {
+          "description": "What an error reply (a Redis error, an HTTP 4xx or 5xx, ...) does:\n\"count\" it in `requests.errors` (default), or \"abort\" the run",
+          "$ref": "#/$defs/OnError",
+          "default": "count"
         },
         "protocol": {
           "description": "Protocol for this group (redis, memcached-binary, memcached-ascii, http, xylem-echo)",

@@ -40,7 +40,7 @@ fn cli_requests(protocol: &str, config: serde_json::Value) -> (String, Vec<Vec<u
             };
             pending.extend_from_slice(&buf[..n]);
             let len = if is_redis {
-                parser.parse_response(0, &pending).unwrap().0
+                parser.parse_response(0, &pending).unwrap().consumed()
             } else if let Some(end) = pending.windows(4).position(|w| w == b"\r\n\r\n") {
                 let headers = std::str::from_utf8(&pending[..end]).unwrap();
                 let body_size = headers

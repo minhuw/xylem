@@ -7,12 +7,14 @@
 //! poll syscall checks all connections in the pool.
 
 use crate::scheduler::{Policy, ReadyHeap};
+use crate::stats::{MAX_ERROR_KINDS, MAX_ERROR_KIND_LEN, OTHER_ERROR_KIND};
+use crate::traffic_group::OnError;
 use crate::Result;
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
 use std::net::SocketAddr;
 use std::time::Duration;
-use xylem_common::Protocol;
+use xylem_common::{ErrorReply, Parsed, Protocol};
 use xylem_transport::{
     ConnectionGroup, KernelTimestamp, RecvOutcome, Timestamp, TransportFactory, TxRange,
     TxTimestampInfo,
@@ -64,6 +66,68 @@ const TX_QUEUE_STALE_TIMEOUT_NS: u64 = 60_000_000_000;
 /// Most timed-out request IDs a connection remembers to recognise their late
 /// responses; the oldest are forgotten first
 const TIMED_OUT_MEMORY: usize = 4096;
+
+/// Kind of an error reply, numbered by the connection that received it; see
+/// [`ConnectionPool::error_kind`]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ErrorKindId(u8);
+
+impl ErrorKindId {
+    /// Every kind after the first [`MAX_ERROR_KINDS`] of a connection
+    const OTHER: Self = Self(u8::MAX);
+}
+
+/// A completed response: (request_id, latency, is_warmup, bytes_consumed,
+/// error kind). The error kind is set for an error reply; see
+/// [`ConnectionPool::error_kind`].
+pub type CompletedResponse<ReqId> = (ReqId, Duration, bool, usize, Option<ErrorKindId>);
+
+/// What a connection does with error replies, and the kinds it has seen
+#[derive(Debug, Default)]
+struct ErrorReplies {
+    /// Fail on an error reply instead of counting it (`on_error = "abort"`)
+    abort: bool,
+    /// Kinds seen, in order; at most [`MAX_ERROR_KINDS`], each cut to
+    /// [`MAX_ERROR_KIND_LEN`] bytes. Only a new kind allocates.
+    kinds: Vec<Box<str>>,
+}
+
+impl ErrorReplies {
+    /// Report an error reply of traffic group `group_id` on `connection_id`:
+    /// an error when aborting, else the ID of its kind
+    fn report(
+        &mut self,
+        group_id: usize,
+        connection_id: usize,
+        error: &ErrorReply<'_>,
+    ) -> Result<ErrorKindId> {
+        if self.abort {
+            return Err(crate::Error::Protocol(format!(
+                "Traffic group {group_id}, connection {connection_id}: error reply {} \
+                 (on_error = \"abort\"): {}",
+                error.kind.escape_debug(),
+                error.message.escape_debug()
+            )));
+        }
+        let mut len = error.kind.len().min(MAX_ERROR_KIND_LEN);
+        while !error.kind.is_char_boundary(len) {
+            len -= 1;
+        }
+        let kind = &error.kind[..len];
+        if let Some(index) = self.kinds.iter().position(|known| **known == *kind) {
+            return Ok(ErrorKindId(index as u8));
+        }
+        if self.kinds.len() == MAX_ERROR_KINDS {
+            return Ok(ErrorKindId::OTHER);
+        }
+        self.kinds.push(kind.into());
+        Ok(ErrorKindId((self.kinds.len() - 1) as u8))
+    }
+
+    fn kind(&self, id: ErrorKindId) -> &str {
+        self.kinds.get(usize::from(id.0)).map_or(OTHER_ERROR_KIND, |kind| kind)
+    }
+}
 
 /// Pending request tracking
 #[derive(Debug)]
@@ -153,6 +217,8 @@ pub struct ConnectionState<ReqId: Eq + Hash + Clone> {
     /// Datagram bytes the protocol absorbed without completing a request;
     /// they are attributed to the next completed response
     absorbed_bytes: usize,
+    /// Error reply handling and kinds
+    error_replies: ErrorReplies,
 }
 
 impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
@@ -182,6 +248,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
             timed_out_order: VecDeque::new(),
             late_responses: 0,
             absorbed_bytes: 0,
+            error_replies: ErrorReplies::default(),
         }
     }
 
@@ -527,9 +594,9 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         data: &[u8],
         recv_ts: Timestamp,
         process_fn: F,
-    ) -> Result<Vec<(ReqId, Duration, bool, usize)>>
+    ) -> Result<Vec<CompletedResponse<ReqId>>>
     where
-        F: FnMut(&[u8]) -> Result<(usize, Option<ReqId>)>,
+        F: for<'a> FnMut(&'a [u8]) -> Result<Parsed<'a, ReqId>>,
     {
         let needed = self.recv_len + data.len();
         if self.recv_buffer.len() < needed {
@@ -559,17 +626,19 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
 
     /// Process `len` bytes the transport read into `recv_spare()`
     ///
-    /// Returns (request_id, latency, is_warmup, bytes_consumed) for each
-    /// completed response. The latency is the request's send lag plus its
-    /// service latency, from the send to the receive timestamp.
+    /// Returns (request_id, latency, is_warmup, bytes_consumed, error kind)
+    /// for each completed response; the kind is set for an error reply. The
+    /// latency is the request's send lag plus its service latency, from the
+    /// send to the receive timestamp. With `on_error = "abort"`, an error
+    /// reply is an error.
     fn process_received<F>(
         &mut self,
         len: usize,
         recv_ts: Timestamp,
         mut process_fn: F,
-    ) -> Result<Vec<(ReqId, Duration, bool, usize)>>
+    ) -> Result<Vec<CompletedResponse<ReqId>>>
     where
-        F: FnMut(&[u8]) -> Result<(usize, Option<ReqId>)>,
+        F: for<'a> FnMut(&'a [u8]) -> Result<Parsed<'a, ReqId>>,
     {
         if len == 0 {
             return Ok(Vec::new());
@@ -582,7 +651,8 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         let mut cursor = 0;
         while cursor < self.recv_len {
             let available = self.recv_len - cursor;
-            let (consumed, req_id) = process_fn(&self.recv_buffer[cursor..self.recv_len])?;
+            let parsed = process_fn(&self.recv_buffer[cursor..self.recv_len])?;
+            let consumed = parsed.consumed();
             if consumed > available {
                 return Err(crate::Error::Protocol(
                     "Response parser consumed more bytes than available".to_string(),
@@ -596,13 +666,16 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
             if consumed == 0 {
                 break;
             }
-            let req_id = req_id.ok_or_else(|| {
-                crate::Error::Protocol(format!(
+            let Parsed::Complete { id: req_id, error, .. } = parsed else {
+                return Err(crate::Error::Protocol(format!(
                     "Protocol consumed {consumed} bytes but returned no request ID"
-                ))
-            })?;
+                )));
+            };
+            let error = error
+                .map(|error| self.error_replies.report(self.group_id, self.connection_id, &error))
+                .transpose()?;
             if let Some((latency, is_warmup)) = self.complete(&req_id, recv_ts, false)? {
-                responses.push((req_id, latency, is_warmup, consumed));
+                responses.push((req_id, latency, is_warmup, consumed, error));
             }
             cursor += consumed;
         }
@@ -625,16 +698,17 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         len: usize,
         recv_ts: Timestamp,
         mut process_fn: F,
-    ) -> Result<Vec<(ReqId, Duration, bool, usize)>>
+    ) -> Result<Vec<CompletedResponse<ReqId>>>
     where
-        F: FnMut(&[u8]) -> Result<(usize, Option<ReqId>)>,
+        F: for<'a> FnMut(&'a [u8]) -> Result<Parsed<'a, ReqId>>,
     {
         debug_assert_eq!(self.recv_len, 0, "datagrams leave no unparsed bytes");
         let mut responses = Vec::new();
         let mut cursor = 0;
         while cursor < len {
             let available = len - cursor;
-            let (consumed, req_id) = process_fn(&self.recv_buffer[cursor..len])?;
+            let parsed = process_fn(&self.recv_buffer[cursor..len])?;
+            let consumed = parsed.consumed();
             if consumed > available {
                 return Err(crate::Error::Protocol(
                     "Response parser consumed more bytes than available".to_string(),
@@ -647,12 +721,15 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
             }
             cursor += consumed;
             self.absorbed_bytes += consumed;
-            let Some(req_id) = req_id else {
+            let Parsed::Complete { id: req_id, error, .. } = parsed else {
                 continue;
             };
+            let error = error
+                .map(|error| self.error_replies.report(self.group_id, self.connection_id, &error))
+                .transpose()?;
             if let Some((latency, is_warmup)) = self.complete(&req_id, recv_ts, true)? {
                 let bytes = std::mem::take(&mut self.absorbed_bytes);
-                responses.push((req_id, latency, is_warmup, bytes));
+                responses.push((req_id, latency, is_warmup, bytes, error));
             }
         }
         Ok(responses)
@@ -818,6 +895,25 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         }
     }
 
+    /// Set what error replies on traffic group `group_id` do: count them
+    /// (the default), or fail the receive that got one
+    pub fn set_on_error(&mut self, group_id: usize, on_error: OnError) {
+        for state in self.connection_states.values_mut() {
+            if state.group_id == group_id {
+                state.error_replies.abort = on_error == OnError::Abort;
+            }
+        }
+    }
+
+    /// The kind of an error reply received on `connection_id`, as numbered
+    /// by [`Self::recv_responses`]; [`OTHER_ERROR_KIND`] past the
+    /// connection's first [`MAX_ERROR_KINDS`] kinds
+    pub fn error_kind(&self, connection_id: usize, id: ErrorKindId) -> &str {
+        self.connection_states
+            .get(&connection_id)
+            .map_or(OTHER_ERROR_KIND, |state| state.error_replies.kind(id))
+    }
+
     /// Earliest time a pending request may time out (a `timing::time_ns`
     /// value), or `None` if none can. It may be early, never late.
     pub fn next_request_deadline(&self) -> Option<u64> {
@@ -963,16 +1059,18 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
 
     /// Receive and process responses for a connection
     ///
-    /// Returns a vector of (request_id, latency, is_warmup, bytes_consumed) tuples for each completed response.
+    /// Returns a vector of (request_id, latency, is_warmup, bytes_consumed, error kind) tuples for each completed response.
     /// The `is_warmup` flag indicates whether the original request was a warmup request
-    /// and stats should not be collected.
+    /// and stats should not be collected. The error kind is set for an error
+    /// reply; see [`Self::error_kind`]. Only successful measurement responses
+    /// feed their latency back to the policy.
     pub fn recv_responses<F>(
         &mut self,
         connection_id: usize,
         process_fn: F,
-    ) -> Result<Vec<(ReqId, Duration, bool, usize)>>
+    ) -> Result<Vec<CompletedResponse<ReqId>>>
     where
-        F: FnMut(&[u8]) -> Result<(usize, Option<ReqId>)>,
+        F: for<'a> FnMut(&'a [u8]) -> Result<Parsed<'a, ReqId>>,
     {
         let state = self
             .connection_states
@@ -993,8 +1091,9 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
                 return Err(crate::Error::Connection("Connection closed by peer".to_string()))
             }
         };
-        for &(_, latency, is_warmup, _) in &responses {
-            if !is_warmup {
+        for &(_, latency, is_warmup, _, error) in &responses {
+            // A fast error reply would make an adaptive policy speed up
+            if !is_warmup && error.is_none() {
                 state.policy.on_response(latency);
             }
         }
@@ -1272,16 +1371,16 @@ mod tests {
         data
     }
 
-    fn parse_frame(data: &[u8]) -> Result<(usize, Option<u64>)> {
+    fn parse_frame(data: &[u8]) -> Result<Parsed<'_, u64>> {
         if data.len() < 8 {
-            return Ok((0, None));
+            return Ok(Parsed::Incomplete);
         }
         let size = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
         let id = u32::from_le_bytes(data[4..8].try_into().unwrap()) as u64;
         Ok(if data.len() < size {
-            (0, None)
+            Parsed::Incomplete
         } else {
-            (size, Some(id))
+            Parsed::ok(size, id)
         })
     }
 
@@ -1343,7 +1442,7 @@ mod tests {
         let mut state = state();
         let ts = Timestamp::now();
         state.record_send(1, ts, Duration::ZERO, tx(0, 1), false);
-        assert!(state.process_recv(&[0], ts, |_| Ok((2, Some(1)))).is_err());
+        assert!(state.process_recv(&[0], ts, |_| Ok(Parsed::ok(2, 1))).is_err());
         assert_eq!(state.pending_count(), 1);
     }
 
@@ -1352,7 +1451,7 @@ mod tests {
         let mut state = state();
         let ts = Timestamp::now();
         state.record_send(1, ts, Duration::ZERO, tx(0, 1), false);
-        let error = state.process_recv(b"hello", ts, |_| Ok((5, None))).unwrap_err();
+        let error = state.process_recv(b"hello", ts, |_| Ok(Parsed::Absorbed(5))).unwrap_err();
         assert_eq!(
             error.to_string(),
             "Protocol error: Protocol consumed 5 bytes but returned no request ID"
@@ -1360,10 +1459,10 @@ mod tests {
         assert_eq!(state.pending_count(), 1);
 
         // Consuming nothing is an incomplete response, with or without an ID
-        for request_id in [None, Some(1)] {
+        for parsed in [Parsed::Incomplete, Parsed::ok(0, 1)] {
             let mut state = self::state();
             state.record_send(1, ts, Duration::ZERO, tx(0, 1), false);
-            let responses = state.process_recv(b"hel", ts, |_| Ok((0, request_id))).unwrap();
+            let responses = state.process_recv(b"hel", ts, |_| Ok(parsed)).unwrap();
             assert!(responses.is_empty());
             assert_eq!(state.buffered(), b"hel");
             assert_eq!(state.pending_count(), 1);
@@ -1385,8 +1484,8 @@ mod tests {
         pool.send(0, &[0], 7u64, true).unwrap();
         factory.0.lock().unwrap().responses.push_back(Ok(vec![0]));
         assert_eq!(
-            pool.recv_responses(0, |_| Ok((1, Some(7)))).unwrap(),
-            vec![(7, Duration::ZERO, true, 1)]
+            pool.recv_responses(0, |_| Ok(Parsed::ok(1, 7))).unwrap(),
+            vec![(7, Duration::ZERO, true, 1, None)]
         );
         assert_eq!(pool.get_state(0).unwrap().pending_count(), 0);
     }
@@ -1700,11 +1799,151 @@ mod tests {
 
     /// Test datagram parser: an eight-byte frame completes its ID; a datagram
     /// starting with `F` is a four-byte fragment that completes nothing.
-    fn parse_datagram(data: &[u8]) -> Result<(usize, Option<u64>)> {
+    fn parse_datagram(data: &[u8]) -> Result<Parsed<'_, u64>> {
         if data[0] == b'F' {
-            return Ok((4, None));
+            return Ok(Parsed::Absorbed(4));
         }
         parse_frame(data)
+    }
+
+    /// A test frame whose payload is the kind of an error reply
+    fn error_frame(id: u32, kind: &str) -> Vec<u8> {
+        let mut data = frame(id, 8 + kind.len());
+        data[8..].copy_from_slice(kind.as_bytes());
+        data
+    }
+
+    /// Test parser: a frame with a payload is an error reply of the kind in
+    /// it, borrowed from the receive buffer; a datagram starting with `F` is a
+    /// four-byte fragment
+    fn parse_error_frame(data: &[u8]) -> Result<Parsed<'_, u64>> {
+        Ok(match parse_datagram(data)? {
+            Parsed::Complete { consumed, id, .. } if consumed > 8 => {
+                let kind = std::str::from_utf8(&data[8..consumed]).unwrap();
+                Parsed::error(consumed, id, ErrorReply::new(kind, "test error"))
+            }
+            parsed => parsed,
+        })
+    }
+
+    #[test]
+    fn error_replies_complete_their_requests_with_a_kind() {
+        for datagram in [false, true] {
+            let (factory, mut pool) = fake_pool(datagram, 8);
+            for id in 1..=5 {
+                pool.send(0, &[0], id, false).unwrap();
+            }
+            // Pipelined successes and error replies, in one read
+            let data = [
+                frame(1, 8),
+                error_frame(2, "WRONGTYPE"),
+                frame(3, 8),
+                error_frame(4, "OOM"),
+                error_frame(5, "WRONGTYPE"),
+            ]
+            .concat();
+            factory.0.lock().unwrap().responses.push_back(Ok(data));
+            let responses = pool.recv_responses(0, parse_error_frame).unwrap();
+            assert_eq!(pool.get_state(0).unwrap().pending_count(), 0);
+            let kinds: Vec<_> = responses
+                .iter()
+                .map(|r| (r.0, r.3, r.4.map(|kind| pool.error_kind(0, kind))))
+                .collect();
+            assert_eq!(
+                kinds,
+                [
+                    (1, 8, None),
+                    (2, 17, Some("WRONGTYPE")),
+                    (3, 8, None),
+                    (4, 11, Some("OOM")),
+                    (5, 17, Some("WRONGTYPE")),
+                ]
+            );
+            // A kind is numbered once per connection
+            assert_eq!(responses[1].4, responses[4].4);
+        }
+    }
+
+    #[test]
+    fn error_kinds_are_bounded_and_cut() {
+        let mut replies = ErrorReplies::default();
+        let report = |replies: &mut ErrorReplies, kind: &str| {
+            replies.report(0, 0, &ErrorReply::new(kind, kind)).unwrap()
+        };
+        let ids: Vec<_> = (0..MAX_ERROR_KINDS + 2)
+            .map(|n| report(&mut replies, &format!("E{n}")))
+            .collect();
+        assert_eq!(replies.kind(ids[0]), "E0");
+        assert_eq!(replies.kind(ids[MAX_ERROR_KINDS - 1]), format!("E{}", MAX_ERROR_KINDS - 1));
+        assert_eq!(ids[MAX_ERROR_KINDS], ErrorKindId::OTHER);
+        assert_eq!(ids[MAX_ERROR_KINDS + 1], ErrorKindId::OTHER);
+        assert_eq!(replies.kind(ErrorKindId::OTHER), OTHER_ERROR_KIND);
+        assert_eq!(report(&mut replies, "E3"), ids[3]);
+        assert_eq!(replies.kinds.len(), MAX_ERROR_KINDS);
+
+        // A long kind is cut at a character boundary
+        let mut replies = ErrorReplies::default();
+        let long = format!("{}é{}", "x".repeat(MAX_ERROR_KIND_LEN - 1), "y".repeat(10));
+        let id = report(&mut replies, &long);
+        assert_eq!(replies.kind(id), "x".repeat(MAX_ERROR_KIND_LEN - 1));
+        assert_eq!(report(&mut replies, &long), id);
+    }
+
+    #[test]
+    fn abort_on_error_fails_without_completing_the_request() {
+        for datagram in [false, true] {
+            let (factory, mut pool) = fake_pool(datagram, 4);
+            pool.set_on_error(0, OnError::Abort);
+            pool.send(0, &[0], 1, false).unwrap();
+            pool.send(0, &[0], 2, false).unwrap();
+            let data = [frame(1, 8), error_frame(2, "MOVED")].concat();
+            factory.0.lock().unwrap().responses.push_back(Ok(data));
+            let error = pool.recv_responses(0, parse_error_frame).unwrap_err();
+            assert!(matches!(error, crate::Error::Protocol(_)), "{error}");
+            assert_eq!(
+                error.to_string(),
+                "Protocol error: Traffic group 0, connection 0: error reply MOVED \
+                 (on_error = \"abort\"): test error"
+            );
+            assert!(pool.get_state(0).unwrap().pending_map.contains_key(&2));
+
+            // Counted, the default, the reply completes its request
+            let (factory, mut pool) = fake_pool(datagram, 4);
+            pool.send(0, &[0], 2, false).unwrap();
+            factory.0.lock().unwrap().responses.push_back(Ok(error_frame(2, "MOVED")));
+            assert_eq!(pool.recv_responses(0, parse_error_frame).unwrap().len(), 1);
+        }
+    }
+
+    /// Records the latencies a policy is told about
+    struct FeedbackPolicy(std::sync::Arc<std::sync::Mutex<Vec<Duration>>>);
+
+    impl Policy for FeedbackPolicy {
+        fn next_send_time(&mut self, _: u64) -> Option<u64> {
+            None
+        }
+        fn on_response(&mut self, latency: Duration) {
+            self.0.lock().unwrap().push(latency);
+        }
+        fn on_request_sent(&mut self, _: u64) {}
+        fn reset(&mut self) {}
+        fn name(&self) -> &'static str {
+            "Feedback"
+        }
+    }
+
+    #[test]
+    fn error_replies_give_the_policy_no_latency_feedback() {
+        let (factory, mut pool) = fake_pool(false, 4);
+        let feedback = std::sync::Arc::<std::sync::Mutex<Vec<Duration>>>::default();
+        pool.get_state_mut(0).unwrap().policy = Box::new(FeedbackPolicy(feedback.clone()));
+        for id in 1..=3 {
+            pool.send(0, &[0], id, false).unwrap();
+        }
+        let data = [frame(1, 8), error_frame(2, "ERR"), frame(3, 8)].concat();
+        factory.0.lock().unwrap().responses.push_back(Ok(data));
+        assert_eq!(pool.recv_responses(0, parse_error_frame).unwrap().len(), 3);
+        assert_eq!(feedback.lock().unwrap().len(), 2);
     }
 
     #[test]

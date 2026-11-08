@@ -11,6 +11,7 @@ use crate::connection::{ConnectionPool, TrafficGroupConfig};
 use crate::request_dump::RequestDumper;
 use crate::stats::{StatsRecorder, TupleStatsCollector, UNSENT_WALK_CAP};
 use crate::timing;
+use crate::traffic_group::OnError;
 use crate::Result;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -154,6 +155,17 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
     /// excludes an open-loop request's send lag.
     pub fn set_request_timeout(&mut self, group_id: usize, timeout: Option<Duration>) {
         self.pool.set_request_timeout(group_id, timeout);
+    }
+
+    /// Set what error replies on traffic group `group_id` do; see
+    /// [`ConnectionPool::set_on_error`]
+    ///
+    /// Counted error replies (the default) complete their request: they
+    /// count in `completed` and `errors`, by kind, and their latency is
+    /// recorded apart from the latency of successful responses. With
+    /// [`OnError::Abort`], the run fails at the first one, warmup included.
+    pub fn set_on_error(&mut self, group_id: usize, on_error: OnError) {
+        self.pool.set_on_error(group_id, on_error);
     }
 
     /// Set the request dumper for recording all requests
@@ -362,10 +374,17 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
                 }
             };
 
-            for (_, latency, is_warmup, bytes_consumed) in responses {
-                if !is_warmup {
-                    self.stats.record_rx_bytes(group_id, connection_id, bytes_consumed);
-                    self.stats.record_latency(group_id, connection_id, latency);
+            for (_, latency, is_warmup, bytes_consumed, error) in responses {
+                if is_warmup {
+                    continue;
+                }
+                self.stats.record_rx_bytes(group_id, connection_id, bytes_consumed);
+                match error {
+                    None => self.stats.record_latency(group_id, connection_id, latency),
+                    Some(kind) => {
+                        let kind = self.pool.error_kind(connection_id, kind);
+                        self.stats.record_error_reply(group_id, connection_id, kind, latency);
+                    }
                 }
             }
             let late = self.pool.take_late_responses(connection_id);
@@ -524,7 +543,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
-    use xylem_common::{Request, RequestMeta};
+    use xylem_common::{ErrorReply, Parsed, Request, RequestMeta};
     use xylem_transport::TcpTransportFactory;
 
     use crate::connection::test_support::{FakeFactory, FakeGroup};
@@ -541,6 +560,8 @@ mod tests {
         /// the protocol cannot send while one is pending.
         setup: u64,
         setup_pending: bool,
+        /// Responses to these requests are error replies of the given kind
+        errors: HashMap<u64, &'static str>,
     }
 
     impl Protocol for FakeProtocol {
@@ -559,22 +580,23 @@ mod tests {
             Request::measurement(id.to_le_bytes().to_vec(), id)
         }
 
-        fn parse_response(
+        fn parse_response<'a>(
             &mut self,
             _: usize,
-            data: &[u8],
-        ) -> anyhow::Result<(usize, Option<u64>)> {
+            data: &'a [u8],
+        ) -> anyhow::Result<Parsed<'a, u64>> {
             if self.fail {
                 anyhow::bail!("invalid test response");
             }
             if data.len() < 8 {
-                return Ok((0, None));
+                return Ok(Parsed::Incomplete);
             }
             let id = u64::from_le_bytes(data[..8].try_into().unwrap());
             if id < self.setup {
                 self.setup_pending = false;
             }
-            Ok((8, Some(id)))
+            let error = self.errors.get(&id).map(|&kind| ErrorReply::new(kind, "test error"));
+            Ok(Parsed::Complete { consumed: 8, id, error })
         }
 
         fn can_send(&self, _: usize) -> bool {
@@ -641,6 +663,60 @@ mod tests {
         assert!(start - created_ns >= 50_000_000, "warmup time is outside the window");
         assert!(end >= start && end <= timing::time_ns());
         assert_eq!(worker.stats.aggregate_global(Duration::from_secs(1)).total_requests, 0);
+    }
+
+    #[test]
+    fn error_replies_complete_requests_with_their_own_latency() {
+        let factory = FakeFactory::default();
+        let mut worker = fake_worker(&factory, 4, Box::new(UniformPolicyScheduler::closed_loop()));
+        let protocol = worker.protocols.get_mut(&0).unwrap();
+        protocol.warmup = 1;
+        protocol.errors = HashMap::from([(0, "WARMUP"), (2, "WRONGTYPE"), (3, "OOM")]);
+        // Requests 0 (warmup) to 3 fill the pipeline; one read answers them all
+        worker.send_requests().unwrap();
+        let replies: Vec<u8> = (0..4u64).flat_map(u64::to_le_bytes).collect();
+        factory.0.lock().unwrap().responses.push_back(Ok(replies));
+        worker.process_responses(Duration::ZERO).unwrap();
+
+        // The warmup error reply is not counted
+        let counts = worker.stats.request_counts_global();
+        assert_eq!((counts.sent, counts.completed, counts.errors), (3, 3, 2));
+        let kinds: Vec<_> = counts.errors_by_kind.iter().collect();
+        assert_eq!(kinds, [("OOM", 1), ("WRONGTYPE", 1)]);
+        // Error replies count toward throughput and bytes, but only the
+        // success has a latency in the distribution
+        assert_eq!(global(&worker).total_requests, 3);
+        assert_eq!(global(&worker).latency_sample_count, 1);
+        assert_eq!(worker.stats.error_latency(0).latency_sample_count, 2);
+        assert_eq!(worker.stats.error_latency_global().latency_sample_count, 2);
+        assert_eq!(worker.stats.entries().values().map(|entry| entry.rx_bytes).sum::<u64>(), 24);
+
+        worker.config.duration = Duration::ZERO;
+        worker.run().unwrap();
+        let counts = worker.stats.request_counts_global();
+        assert_eq!(counts.sent, counts.completed + counts.timed_out + counts.failed);
+    }
+
+    #[test]
+    fn on_error_abort_fails_at_the_first_error_reply_warmup_included() {
+        for warmup in [0, 1] {
+            let factory = FakeFactory::default();
+            let mut worker =
+                fake_worker(&factory, 1, Box::new(UniformPolicyScheduler::closed_loop()));
+            worker.set_on_error(0, OnError::Abort);
+            let protocol = worker.protocols.get_mut(&0).unwrap();
+            protocol.warmup = warmup;
+            protocol.errors = HashMap::from([(0, "WRONGTYPE")]);
+            worker.send_requests().unwrap();
+            factory.0.lock().unwrap().responses.push_back(Ok(0u64.to_le_bytes().to_vec()));
+            let error = worker.process_responses(Duration::ZERO).unwrap_err().to_string();
+            assert_eq!(
+                error,
+                "Protocol error: Traffic group 0, connection 0: error reply WRONGTYPE \
+                 (on_error = \"abort\"): test error"
+            );
+            assert_eq!(worker.stats.request_counts_global().completed, 0);
+        }
     }
 
     #[test]

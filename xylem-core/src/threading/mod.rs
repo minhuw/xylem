@@ -12,7 +12,7 @@ pub mod worker;
 // Re-export main types
 pub use affinity::{get_core_count, pin_thread, CpuPinning};
 pub use worker::{Worker, WorkerConfig, DEFAULT_DRAIN_TIMEOUT};
-pub use xylem_common::{Protocol, RequestMeta};
+pub use xylem_common::{ErrorReply, Parsed, Protocol, RequestMeta};
 
 /// Multi-threaded runtime for spawning and managing workers
 pub struct ThreadingRuntime {

@@ -65,7 +65,8 @@ pub trait Policy: Send {
     }
 
     /// Feedback from a completed measurement response, with its latency
-    /// measured from the intended send time. Warmup responses are excluded.
+    /// measured from the intended send time. Warmup responses and error
+    /// replies are excluded.
     fn on_response(&mut self, _latency: Duration) {}
 
     /// Notify policy that a request was sent on this connection

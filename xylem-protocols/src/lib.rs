@@ -3,7 +3,7 @@
 //! This crate provides implementations of various application-level protocols
 //! for latency measurement.
 
-pub use xylem_common::{Protocol, Request, RequestMeta};
+pub use xylem_common::{ErrorReply, Parsed, Protocol, Request, RequestMeta};
 
 pub mod configs;
 pub mod http;
