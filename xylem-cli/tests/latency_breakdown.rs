@@ -167,6 +167,7 @@ fn nic_timestamps_that_are_off_fail_the_run_before_it_connects() {
         "{stderr}"
     );
     assert!(stderr.contains("Caused by: Configuration error: "), "{stderr}");
+    assert_eq!(stderr.matches("Configuration error").count(), 1, "{stderr}");
     assert!(stderr.contains("'lo'"), "{stderr}");
     assert!(!dir.path().join("results.json").exists());
     std::thread::sleep(Duration::from_millis(50));

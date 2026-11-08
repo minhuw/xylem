@@ -152,9 +152,10 @@ impl TimestampConfig {
                  `hwstamp_ctl -i {interface} -t 1 -r 1`, as root), or use kernel software \
                  timestamps"
             ))),
-            Err(e) => {
-                Err(Error::Config(format!("{e}; '{interface}' cannot provide hardware timestamps")))
-            }
+            Err(Error::Config(message)) => Err(Error::Config(format!(
+                "{message}; '{interface}' cannot provide hardware timestamps"
+            ))),
+            Err(e) => Err(e),
         }
     }
 

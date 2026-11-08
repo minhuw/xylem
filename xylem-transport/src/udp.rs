@@ -520,7 +520,9 @@ mod tests {
             else {
                 panic!("{interface}: created a group without hardware timestamps");
             };
-            assert!(error.to_string().contains(&format!("'{interface}'")), "{error}");
+            let message = error.to_string();
+            assert!(message.contains(&format!("'{interface}'")), "{message}");
+            assert_eq!(message.matches("Configuration error").count(), 1, "{message}");
         }
     }
 
