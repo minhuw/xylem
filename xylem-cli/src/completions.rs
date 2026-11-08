@@ -552,6 +552,11 @@ mod tests {
             assert!(paths.contains(&path), "Missing {path} path");
         }
 
+        for path in ["thresholds", "validity.enabled", "validity.max_unsent_ratio", "validity.skip"]
+        {
+            assert!(paths.contains(&path.to_string()), "Missing {path} path");
+        }
+
         // Ensure we have a reasonable number of paths (should be > 60 with protocol_config)
         assert!(paths.len() > 60, "Expected > 60 paths, got {}", paths.len());
     }

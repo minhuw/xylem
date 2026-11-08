@@ -1,0 +1,1542 @@
+//! Pass/fail thresholds on the results, and checks that a run applied the
+//! load it was configured with
+//!
+//! A threshold compares a metric of the final results with a limit:
+//! `"latency{group=api}" = ["p99 < 250us"]`. A metric is a path into a
+//! `stats` object of the results JSON, the global one or a traffic group's,
+//! so every numeric field there is a metric without this module naming it.
+//! Paths are checked at load against [`probe_stats`], stats with every field
+//! present, so a misspelled metric fails before the run.
+
+use crate::config::ProfileConfig;
+use crate::output::{
+    BreakdownPartStats, DetailedExperimentResults, GlobalStats, GroupStats, LatencyBreakdownStats,
+    LatencyStats, SendLagStats,
+};
+use anyhow::{bail, Result};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use std::collections::BTreeMap;
+use xylem_core::stats::{BreakdownClock, ErrorKindCounts, RequestCounts, LATE_SEND_THRESHOLD};
+use xylem_core::traffic_group::{PolicyConfig, TrafficGroupConfig};
+
+/// Outcome of a run, from its validity checks and thresholds
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    /// Every validity check and threshold passed, or none applied
+    #[default]
+    Pass,
+    /// The run is valid and a threshold failed
+    ThresholdsFailed,
+    /// A validity check failed: the results do not describe the configured
+    /// load. Takes precedence over failed thresholds.
+    InvalidRun,
+}
+
+impl Verdict {
+    /// Exit status of the CLI: 0 pass, 2 thresholds failed, 3 invalid run
+    pub fn exit_code(self) -> i32 {
+        match self {
+            Verdict::Pass => 0,
+            Verdict::ThresholdsFailed => 2,
+            Verdict::InvalidRun => 3,
+        }
+    }
+
+    /// Label in the console summary and the HTML report
+    pub fn label(self) -> &'static str {
+        match self {
+            Verdict::Pass => "PASS",
+            Verdict::ThresholdsFailed => "THRESHOLDS FAILED",
+            Verdict::InvalidRun => "INVALID RUN",
+        }
+    }
+}
+
+/// Ends the `field` of a rate threshold
+const RATE_DIVISOR: &str = " / requests.sent";
+
+/// `name`, followed by the filter of `group`: `latency{group=api}`
+fn scoped(name: &str, group: Option<&str>) -> String {
+    match group {
+        Some(group) => format!("{name}{{group={group}}}"),
+        None => name.to_string(),
+    }
+}
+
+/// One evaluated threshold expression
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ThresholdResult {
+    /// The metric as configured, without its group filter
+    pub metric: String,
+    /// Traffic group the metric was read from; null for the global stats
+    pub group: Option<String>,
+    /// The expression as configured
+    pub expression: String,
+    /// The stats field compared, such as `latency.p999_us`; a rate divides
+    /// its count by `requests.sent`
+    pub field: String,
+    /// The value compared, in the unit of its field (microseconds for
+    /// durations) or a fraction for a rate; null when the run has no value,
+    /// which fails the threshold
+    pub observed: Option<f64>,
+    pub ok: bool,
+}
+
+impl ThresholdResult {
+    /// The threshold's key, as in the profile: `latency{group=api}`
+    pub fn key(&self) -> String {
+        scoped(&self.metric, self.group.as_deref())
+    }
+
+    /// The observed value with its unit, or `n/a`
+    pub fn observed_text(&self) -> String {
+        match self.observed {
+            None => "n/a".to_string(),
+            Some(value) if self.field.ends_with(RATE_DIVISOR) => format!("{value:.6}"),
+            Some(value) if self.field.ends_with("_us") => format!("{value:.2} μs"),
+            Some(value) if value.fract() == 0.0 => format!("{value:.0}"),
+            Some(value) => format!("{value:.2}"),
+        }
+    }
+}
+
+/// Checks that a run applied its configured load
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidityCheck {
+    /// Fraction of a rate-driven group's intended sends that never went out
+    Unsent,
+    /// Fraction of a rate-driven group's sends that went out late
+    LateSends,
+}
+
+impl ValidityCheck {
+    /// The check's name in the profile and the results
+    pub fn name(self) -> &'static str {
+        match self {
+            ValidityCheck::Unsent => "unsent",
+            ValidityCheck::LateSends => "late_sends",
+        }
+    }
+}
+
+/// One evaluated validity check
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ValidityResult {
+    pub check: ValidityCheck,
+    /// Traffic group checked; null for a check of the whole run
+    pub group: Option<String>,
+    /// The fraction measured; null when the group recorded nothing
+    pub observed: Option<f64>,
+    /// Largest fraction that passes
+    pub limit: f64,
+    pub ok: bool,
+    /// Why the check failed; omitted when it passed
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// A fraction as a percentage with two decimals
+fn percent(fraction: f64) -> String {
+    format!("{:.2}%", fraction * 100.0)
+}
+
+impl ValidityResult {
+    /// The check's name with its group: `unsent{group=api}`
+    pub fn key(&self) -> String {
+        scoped(self.check.name(), self.group.as_deref())
+    }
+
+    /// The observed fraction as a percentage, or `n/a`
+    pub fn observed_text(&self) -> String {
+        self.observed.map_or_else(|| "n/a".to_string(), percent)
+    }
+
+    /// The limit as a percentage
+    pub fn limit_text(&self) -> String {
+        percent(self.limit)
+    }
+}
+
+/// Checks that a run applied the load it was configured with. Each applies
+/// to every traffic group with a rate-driven traffic policy; a closed loop
+/// has no schedule to fall behind.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ValidityConfig {
+    /// Run the checks (default true). With false, a run is never invalid.
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    /// Largest fraction of a group's intended sends (`sent + unsent`) that may
+    /// remain unsent at the end of the window (default 0.001)
+    #[serde(default = "default_max_unsent_ratio")]
+    pub max_unsent_ratio: f64,
+    /// Largest fraction of a group's sent requests that may lag their
+    /// intended send time by more than 100 µs (default 0.01)
+    #[serde(default = "default_max_late_send_ratio")]
+    pub max_late_send_ratio: f64,
+    /// Checks to leave out: "unsent", "late_sends"
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skip: Vec<ValidityCheck>,
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+fn default_max_unsent_ratio() -> f64 {
+    0.001
+}
+
+fn default_max_late_send_ratio() -> f64 {
+    0.01
+}
+
+impl Default for ValidityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_enabled(),
+            max_unsent_ratio: default_max_unsent_ratio(),
+            max_late_send_ratio: default_max_late_send_ratio(),
+            skip: Vec::new(),
+        }
+    }
+}
+
+impl ValidityConfig {
+    /// Add an error to `errors` for each limit that is not a fraction from
+    /// 0 to 1
+    pub fn validate(&self, errors: &mut Vec<anyhow::Error>) {
+        for (name, limit) in [
+            ("max_unsent_ratio", self.max_unsent_ratio),
+            ("max_late_send_ratio", self.max_late_send_ratio),
+        ] {
+            if !(0.0..=1.0).contains(&limit) {
+                errors.push(anyhow::anyhow!(
+                    "validity.{name} must be a fraction from 0 to 1, got {limit}"
+                ));
+            }
+        }
+    }
+
+    /// The checks to run, with their limits
+    fn checks(&self) -> Vec<(ValidityCheck, f64)> {
+        if !self.enabled {
+            return Vec::new();
+        }
+        [
+            (ValidityCheck::Unsent, self.max_unsent_ratio),
+            (ValidityCheck::LateSends, self.max_late_send_ratio),
+        ]
+        .into_iter()
+        .filter(|(check, _)| !self.skip.contains(check))
+        .collect()
+    }
+}
+
+/// Comparison operators of a threshold expression
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Op {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    Ne,
+}
+
+impl Op {
+    fn holds(self, observed: f64, limit: f64) -> bool {
+        match self {
+            Op::Lt => observed < limit,
+            Op::Le => observed <= limit,
+            Op::Gt => observed > limit,
+            Op::Ge => observed >= limit,
+            Op::Eq => observed == limit,
+            Op::Ne => observed != limit,
+        }
+    }
+}
+
+/// A threshold expression on one metric, checked against the probe stats
+#[derive(Debug, Clone, PartialEq)]
+pub struct Threshold {
+    metric: String,
+    group: Option<String>,
+    expression: String,
+    /// Path of the compared field in a stats object
+    path: Vec<String>,
+    /// Whether the field is divided by `requests.sent` of the same stats
+    rate: bool,
+    op: Op,
+    /// Limit in the unit of the field: microseconds for a duration
+    limit: f64,
+}
+
+impl Threshold {
+    /// The stats field compared, as written in results
+    fn field(&self) -> String {
+        let field = self.path.join(".");
+        if self.rate {
+            format!("{field}{RATE_DIVISOR}")
+        } else {
+            field
+        }
+    }
+
+    /// The value this threshold compares in `stats`, if the run has one
+    fn observe(&self, stats: &Value) -> Option<f64> {
+        let value = lookup(stats, &self.path)?.as_f64()?;
+        if !self.rate {
+            return Some(value);
+        }
+        let sent = stats.get("requests")?.get("sent")?.as_f64()?;
+        (sent > 0.0).then(|| value / sent)
+    }
+}
+
+/// The field at `path` in `value`
+fn lookup<'a>(value: &'a Value, path: &[String]) -> Option<&'a Value> {
+    path.iter().try_fold(value, |value, name| value.get(name))
+}
+
+/// Metric names that stand for a stats field
+const ALIASES: [(&str, &str); 1] = [("throughput", "throughput_rps")];
+
+/// Duration units and their length in microseconds
+const DURATION_UNITS: [(&str, f64); 6] = [
+    ("ns", 0.001),
+    ("us", 1.0),
+    ("µs", 1.0),
+    ("μs", 1.0),
+    ("ms", 1_000.0),
+    ("s", 1_000_000.0),
+];
+
+/// Stats with every field present and numeric, which metric paths are
+/// checked against at load. Struct literals, so the compiler asks for every
+/// new stats field: give an `Option` `Some` and a map its keys, and the field
+/// is a metric with no other change. Returns the global and group stats.
+///
+/// `requests.errors_by_kind` stays empty: its keys are the error kinds a
+/// run meets, unknown at load, so its entries are no metrics (see
+/// [`RUNTIME_KEYED`]); `requests.errors` counts them all.
+fn probe_stats() -> (Value, Value) {
+    let latency = LatencyStats {
+        min_us: Some(0.0),
+        max_us: Some(0.0),
+        mean_us: 0.0,
+        p50_us: 0.0,
+        p95_us: 0.0,
+        p99_us: 0.0,
+        p999_us: 0.0,
+        p9999_us: 0.0,
+        p99999_us: 0.0,
+        std_dev_us: Some(0.0),
+        confidence_interval_us: Some(0.0),
+        sample_count: 0,
+        clamped_samples: Some(0),
+    };
+    let requests = RequestCounts {
+        sent: 0,
+        completed: 0,
+        errors: 0,
+        errors_by_kind: ErrorKindCounts::default(),
+        timed_out: 0,
+        late_responses: 0,
+        failed: 0,
+        late_sends: 0,
+        unsent: 0,
+        unsent_capped: false,
+    };
+    let send_lag = SendLagStats {
+        sample_count: 0,
+        mean_us: Some(0.0),
+        p99_us: Some(0.0),
+        max_us: Some(0.0),
+        late_threshold_us: 0.0,
+    };
+    let part = BreakdownPartStats {
+        sample_count: 0,
+        mean_us: Some(0.0),
+        p50_us: Some(0.0),
+        p99_us: Some(0.0),
+        p999_us: Some(0.0),
+        max_us: Some(0.0),
+    };
+    let latency_breakdown = LatencyBreakdownStats {
+        clock: Some(BreakdownClock::KernelSoftware),
+        kernel_split_count: 0,
+        service_us: part.clone(),
+        host_stack_us: Some(part.clone()),
+        network_server_us: Some(part),
+    };
+    let global = GlobalStats {
+        total_requests: 0,
+        throughput_rps: 0.0,
+        throughput_mbps: 0.0,
+        latency: latency.clone(),
+        error_latency: latency.clone(),
+        requests: requests.clone(),
+        send_lag: send_lag.clone(),
+        latency_breakdown: latency_breakdown.clone(),
+    };
+    let group = GroupStats {
+        total_requests: 0,
+        throughput_rps: 0.0,
+        throughput_mbps: 0.0,
+        latency: latency.clone(),
+        error_latency: latency,
+        requests,
+        send_lag,
+        latency_breakdown,
+    };
+    (
+        serde_json::to_value(global).expect("stats serialize"),
+        serde_json::to_value(group).expect("stats serialize"),
+    )
+}
+
+/// Whether an object summarizes durations, such as `latency`: it has
+/// numeric fields in microseconds, which aggregations name
+fn is_summary(fields: &Map<String, Value>) -> bool {
+    fields.iter().any(|(name, value)| name.ends_with("_us") && value.is_number())
+}
+
+/// The aggregation that names a summary field: `p999_us` is `p99.9`
+fn aggregation_name(field: &str) -> Option<String> {
+    let name = field.strip_suffix("_us")?;
+    let Some(digits) = name.strip_prefix('p').filter(|d| d.bytes().all(|b| b.is_ascii_digit()))
+    else {
+        return Some(name.to_string());
+    };
+    if digits.len() <= 2 {
+        return Some(name.to_string());
+    }
+    Some(format!("p{}.{}", &digits[..2], &digits[2..]))
+}
+
+/// The summary field an aggregation names: `p99.9` and `p999` are `p999_us`,
+/// `mean` is `mean_us`
+fn aggregation_field(aggregation: &str) -> Option<String> {
+    let percentile = aggregation
+        .strip_prefix('p')
+        .filter(|rest| rest.starts_with(|c: char| c.is_ascii_digit()));
+    if let Some(percentile) = percentile {
+        let (whole, fraction) = percentile.split_once('.').unwrap_or((percentile, "0"));
+        let digits = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+        return (digits(whole) && digits(fraction))
+            .then(|| format!("p{}_us", percentile.replace('.', "")));
+    }
+    let identifier = aggregation.starts_with(|c: char| c.is_ascii_lowercase())
+        && aggregation
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+    identifier.then(|| format!("{aggregation}_us"))
+}
+
+/// The aggregations of a summary, for error messages
+fn aggregation_names(fields: &Map<String, Value>) -> String {
+    let names: Vec<String> = fields
+        .iter()
+        .filter(|(_, value)| value.is_number())
+        .filter_map(|(name, _)| aggregation_name(name))
+        .collect();
+    names.join(", ")
+}
+
+/// Every metric of a stats probe, for error messages: summaries and numeric
+/// fields, except the fields of a summary that aggregations name
+fn metric_names(probe: &Value) -> String {
+    fn visit(fields: &Map<String, Value>, prefix: &str, summary: bool, names: &mut Vec<String>) {
+        for (name, value) in fields {
+            let path = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}.{name}")
+            };
+            match value {
+                Value::Object(fields) if is_summary(fields) => {
+                    names.push(path.clone());
+                    visit(fields, &path, true, names);
+                }
+                Value::Object(fields) => visit(fields, &path, false, names),
+                Value::Number(_) if !(summary && name.ends_with("_us")) => names.push(path),
+                _ => {}
+            }
+        }
+    }
+    let mut names = Vec::new();
+    if let Value::Object(fields) = probe {
+        visit(fields, "", false, &mut names);
+    }
+    names.join(", ")
+}
+
+/// What a metric path names in the probe stats
+enum Field<'a> {
+    /// A summary of durations, such as `latency`; an aggregation picks a field
+    Summary(&'a Map<String, Value>),
+    /// A single number
+    Number {
+        /// In microseconds: the field name ends in `_us`
+        duration: bool,
+        /// An integer count, which `rate` can divide
+        count: bool,
+    },
+}
+
+/// Split a threshold key into its metric and the group of its filter:
+/// `latency{group=api}` is `latency` of group `api`
+fn parse_key(key: &str) -> Result<(String, Option<String>)> {
+    let key = key.trim();
+    let Some((metric, filter)) = key.split_once('{') else {
+        return Ok((key.to_string(), None));
+    };
+    let Some(filter) = filter.strip_suffix('}') else {
+        bail!("a filter ends with '}}', as in latency{{group=name}}");
+    };
+    let Some((label, group)) = filter.split_once('=') else {
+        bail!("a filter is group=name, as in latency{{group=name}}");
+    };
+    if label.trim() != "group" {
+        bail!("unknown filter '{}'; only group=name is supported", label.trim());
+    }
+    let group = group.trim();
+    let group = group.strip_prefix('"').and_then(|g| g.strip_suffix('"')).unwrap_or(group);
+    if group.is_empty() {
+        bail!("the group filter names no group");
+    }
+    Ok((metric.trim().to_string(), Some(group.to_string())))
+}
+
+/// Check that a filter's group names exactly one traffic group
+fn check_group(group: &str, groups: &[TrafficGroupConfig]) -> Result<()> {
+    match groups.iter().filter(|g| g.name == group).count() {
+        1 => Ok(()),
+        0 => {
+            let names: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
+            bail!("unknown traffic group '{group}'; groups: {}", names.join(", "))
+        }
+        count => bail!(
+            "traffic group name '{group}' is used by {count} groups; a filter needs a unique name"
+        ),
+    }
+}
+
+/// Stats maps whose keys a run names, such as each error kind: the probe
+/// has none of their entries, so a threshold cannot be checked at load, and
+/// a key the run never meets would have no value. Each is with the metric
+/// to use instead.
+const RUNTIME_KEYED: [(&str, &str); 1] = [("requests.errors_by_kind", "requests.errors")];
+
+/// The path of a metric in the stats and what it names in `probe`
+fn resolve<'a>(metric: &str, probe: &'a Value) -> Result<(Vec<String>, Field<'a>)> {
+    let metric = ALIASES.iter().find(|(alias, _)| *alias == metric).map_or(metric, |(_, f)| f);
+    for (map, instead) in RUNTIME_KEYED {
+        if metric == map || metric.strip_prefix(map).is_some_and(|rest| rest.starts_with('.')) {
+            bail!(
+                "'{map}' is keyed by what the run meets, so its entries cannot be checked at \
+                 load; use '{instead}'"
+            );
+        }
+    }
+    let path: Vec<String> = metric.split('.').map(str::to_string).collect();
+    let unknown = || {
+        anyhow::anyhow!("unknown metric '{metric}'; metrics: throughput, {}", metric_names(probe))
+    };
+    if path.iter().any(String::is_empty) {
+        return Err(unknown());
+    }
+    let field = match lookup(probe, &path).ok_or_else(unknown)? {
+        Value::Object(fields) if is_summary(fields) => Field::Summary(fields),
+        Value::Object(fields) => {
+            let names: Vec<String> = fields.keys().map(|name| format!("{metric}.{name}")).collect();
+            bail!("'{metric}' is a group of metrics; name one: {}", names.join(", "))
+        }
+        Value::Number(number) => Field::Number {
+            duration: metric.ends_with("_us"),
+            count: number.is_u64() || number.is_i64(),
+        },
+        _ => bail!("'{metric}' is not a number"),
+    };
+    Ok((path, field))
+}
+
+/// Split an expression into its aggregation, operator and limit text:
+/// `p99 < 250us` is `p99`, `<` and `250us`
+fn split_expression(expression: &str) -> Result<(&str, Op, &str)> {
+    let syntax = "write [aggregation] <op> <value>, with op <, <=, >, >=, == or !=";
+    let Some(start) = expression.find(['<', '>', '=', '!']) else {
+        bail!("no comparison; {syntax}");
+    };
+    let (aggregation, rest) = expression.split_at(start);
+    let (op, width) = match rest.get(..2) {
+        Some("<=") => (Op::Le, 2),
+        Some(">=") => (Op::Ge, 2),
+        Some("==") => (Op::Eq, 2),
+        Some("!=") => (Op::Ne, 2),
+        _ if rest.starts_with('<') => (Op::Lt, 1),
+        _ if rest.starts_with('>') => (Op::Gt, 1),
+        _ => bail!("unknown operator; {syntax}"),
+    };
+    Ok((aggregation.trim(), op, rest[width..].trim()))
+}
+
+/// Parse a limit, in microseconds for a duration
+fn parse_limit(text: &str, duration: bool, what: &str) -> Result<f64> {
+    let number_end = text.trim_end_matches(|c: char| !c.is_ascii_digit() && c != '.').len();
+    let (number, unit) = (text[..number_end].trim(), text[number_end..].trim());
+    let Ok(value) = number.parse::<f64>() else {
+        bail!("'{text}' is not a number");
+    };
+    if !value.is_finite() {
+        bail!("'{text}' is out of range");
+    }
+    match (duration, unit) {
+        (true, "") => bail!("{what} is a duration; give a unit: ns, us, ms or s (as in 250us)"),
+        (true, unit) => match DURATION_UNITS.iter().find(|(name, _)| *name == unit) {
+            Some((_, micros)) => Ok(value * micros),
+            None => bail!("unknown unit '{unit}'; durations take ns, us, ms or s"),
+        },
+        (false, "") => Ok(value),
+        (false, unit) => bail!("{what} is a plain number; remove '{unit}'"),
+    }
+}
+
+/// Parse one expression on a metric that resolved to `field` at `path`
+fn parse_expression(
+    metric: &str,
+    expression: &str,
+    mut path: Vec<String>,
+    field: &Field,
+) -> Result<(Vec<String>, bool, Op, f64)> {
+    let (aggregation, op, limit) = split_expression(expression)?;
+    let (rate, duration, what) = match field {
+        Field::Summary(fields) => {
+            if aggregation.is_empty() {
+                bail!(
+                    "'{metric}' is a summary; name an aggregation, as in \"p99 < 250us\": {}",
+                    aggregation_names(fields)
+                );
+            }
+            let name = aggregation_field(aggregation)
+                .filter(|name| fields.get(name).is_some_and(Value::is_number));
+            let Some(name) = name else {
+                bail!(
+                    "unknown aggregation '{aggregation}' for '{metric}'; aggregations: {}",
+                    aggregation_names(fields)
+                );
+            };
+            path.push(name);
+            (false, true, format!("{metric} {aggregation}"))
+        }
+        Field::Number { duration, count } => match aggregation {
+            "" => (false, *duration, format!("'{metric}'")),
+            "rate" if *count => (true, false, format!("a rate of '{metric}'")),
+            "rate" => bail!("rate divides a count by requests.sent; '{metric}' is not a count"),
+            _ => bail!(
+                "unknown aggregation '{aggregation}': '{metric}' is a single value; compare \
+                 it directly (\"> 0\") or as a fraction of requests.sent (\"rate < 0.01\")"
+            ),
+        },
+    };
+    let limit = parse_limit(limit, duration, &what)?;
+    Ok((path, rate, op, limit))
+}
+
+/// Parse a profile's `[thresholds]`, checking every metric, group and
+/// expression; one error reports every invalid one
+pub fn parse_thresholds(
+    thresholds: &BTreeMap<String, Vec<String>>,
+    groups: &[TrafficGroupConfig],
+) -> Result<Vec<Threshold>> {
+    let (global_probe, group_probe) = probe_stats();
+    let mut parsed = Vec::new();
+    let mut errors = Vec::new();
+    for (key, expressions) in thresholds {
+        let resolved = parse_key(key).and_then(|(metric, group)| {
+            if let Some(group) = &group {
+                check_group(group, groups)?;
+            }
+            let probe = if group.is_some() {
+                &group_probe
+            } else {
+                &global_probe
+            };
+            let (path, field) = resolve(&metric, probe)?;
+            Ok((metric, group, path, field))
+        });
+        let (metric, group, path, field) = match resolved {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                errors.push(format!("{key:?}: {error}"));
+                continue;
+            }
+        };
+        if expressions.is_empty() {
+            errors.push(format!("{key:?}: no expressions"));
+        }
+        for expression in expressions {
+            match parse_expression(&metric, expression, path.clone(), &field) {
+                Ok((path, rate, op, limit)) => parsed.push(Threshold {
+                    metric: metric.clone(),
+                    group: group.clone(),
+                    expression: expression.trim().to_string(),
+                    path,
+                    rate,
+                    op,
+                    limit,
+                }),
+                Err(error) => errors.push(format!("{key:?} = {expression:?}: {error}")),
+            }
+        }
+    }
+    if !errors.is_empty() {
+        bail!("Invalid thresholds:\n  {}", errors.join("\n  "));
+    }
+    Ok(parsed)
+}
+
+/// Evaluate the profile's thresholds and validity checks against the final
+/// results, record them in `results`, and return the verdict
+pub fn evaluate(results: &mut DetailedExperimentResults, config: &ProfileConfig) -> Verdict {
+    let global = serde_json::to_value(&results.global).expect("stats serialize");
+    let groups: Vec<(&str, Value)> = results
+        .traffic_groups
+        .iter()
+        .map(|group| {
+            let stats = serde_json::to_value(&group.stats).expect("stats serialize");
+            (group.name.as_str(), stats)
+        })
+        .collect();
+    let thresholds: Vec<ThresholdResult> = config
+        .threshold_checks
+        .iter()
+        .map(|threshold| {
+            let stats = match &threshold.group {
+                None => Some(&global),
+                Some(name) => groups.iter().find(|(group, _)| group == name).map(|(_, s)| s),
+            };
+            let observed = stats.and_then(|stats| threshold.observe(stats));
+            ThresholdResult {
+                metric: threshold.metric.clone(),
+                group: threshold.group.clone(),
+                expression: threshold.expression.clone(),
+                field: threshold.field(),
+                observed,
+                ok: observed.is_some_and(|value| threshold.op.holds(value, threshold.limit)),
+            }
+        })
+        .collect();
+    let validity = check_validity(results, &config.validity, &config.traffic_groups);
+
+    let verdict = if validity.iter().any(|check| !check.ok) {
+        Verdict::InvalidRun
+    } else if thresholds.iter().any(|threshold| !threshold.ok) {
+        Verdict::ThresholdsFailed
+    } else {
+        Verdict::Pass
+    };
+    results.verdict = verdict;
+    results.thresholds = thresholds;
+    results.validity = validity;
+    verdict
+}
+
+/// Run the validity checks on every rate-driven traffic group
+fn check_validity(
+    results: &DetailedExperimentResults,
+    validity: &ValidityConfig,
+    groups: &[TrafficGroupConfig],
+) -> Vec<ValidityResult> {
+    let checks = validity.checks();
+    let mut outcomes = Vec::new();
+    for (id, group) in groups.iter().enumerate() {
+        // A closed loop sends when a response frees its pipeline, so it has
+        // no schedule to fall behind.
+        if matches!(group.traffic_policy, PolicyConfig::ClosedLoop) {
+            continue;
+        }
+        let requests =
+            results.traffic_groups.iter().find(|g| g.id == id).map(|g| &g.stats.requests);
+        for &(check, limit) in &checks {
+            outcomes.push(check_group_validity(check, limit, &group.name, requests));
+        }
+    }
+    outcomes
+}
+
+/// Run one validity check on a group's request counts
+fn check_group_validity(
+    check: ValidityCheck,
+    limit: f64,
+    group: &str,
+    requests: Option<&RequestCounts>,
+) -> ValidityResult {
+    let outcome = |observed: Option<f64>, reason: Option<String>| ValidityResult {
+        check,
+        group: Some(group.to_string()),
+        observed,
+        limit,
+        ok: reason.is_none(),
+        reason,
+    };
+    let Some(requests) = requests else {
+        return outcome(None, Some("the group recorded no requests".into()));
+    };
+    let (count, total) = match check {
+        ValidityCheck::Unsent => (requests.unsent, requests.sent + requests.unsent),
+        ValidityCheck::LateSends => (requests.late_sends, requests.sent),
+    };
+    let observed = if total == 0 {
+        0.0
+    } else {
+        count as f64 / total as f64
+    };
+    if observed <= limit {
+        return outcome(Some(observed), None);
+    }
+    let reason = match check {
+        ValidityCheck::Unsent => format!(
+            "{count}{bound} of {total} intended sends never went out ({}, limit {}): the \
+             pipelines were full or the generator fell behind, so the configured rate was \
+             not applied",
+            percent(observed),
+            percent(limit),
+            bound = if requests.unsent_capped {
+                " (a lower bound)"
+            } else {
+                ""
+            },
+        ),
+        ValidityCheck::LateSends => format!(
+            "{count} of {total} sends lagged their intended time by more than {} µs ({}, \
+             limit {}): the pipelines were full or the generator fell behind its schedule",
+            LATE_SEND_THRESHOLD.as_micros(),
+            percent(observed),
+            percent(limit),
+        ),
+    };
+    outcome(Some(observed), Some(reason))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use xylem_core::stats::{SamplingPolicy, TupleStatsCollector};
+
+    /// A validated profile with a fixed-rate group "api" and a closed-loop
+    /// group "batch", followed by `extra` TOML
+    fn profile(extra: &str) -> Result<ProfileConfig> {
+        let text = format!(
+            r#"
+[experiment]
+name = "thresholds"
+duration = "1s"
+
+[[traffic_groups]]
+name = "api"
+target = "127.0.0.1:9"
+protocol = "xylem-echo"
+threads = [0]
+connections_per_thread = 1
+traffic_policy = {{ type = "fixed-rate", rate = 1000.0 }}
+
+[[traffic_groups]]
+name = "batch"
+target = "127.0.0.1:9"
+protocol = "xylem-echo"
+threads = [1]
+connections_per_thread = 1
+traffic_policy = {{ type = "closed-loop" }}
+
+[output]
+file = "unused"
+
+{extra}
+"#
+        );
+        let mut config: ProfileConfig = toml::from_str(&text)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Stats of the test profile: group "api" completed 100 requests of
+    /// 1..=100 µs, each with a kernel split of a 1 µs host stack, group
+    /// "batch" 10 requests of 1..=10 ms with user-space timestamps only
+    fn stats() -> TupleStatsCollector {
+        use xylem_core::stats::{KernelSplit, LatencyBreakdown};
+        let mut stats = TupleStatsCollector::new(SamplingPolicy::default(), Duration::from_secs(1));
+        stats.register_group_policy(0, SamplingPolicy::default());
+        stats.register_group_policy(1, SamplingPolicy::default());
+        for us in 1..=100 {
+            let latency = Duration::from_micros(us);
+            stats.record_latency(0, 0, latency);
+            let kernel = KernelSplit {
+                clock: xylem_transport::KernelClock::Realtime,
+                network_server: latency,
+                host_stack: Duration::from_micros(1),
+            };
+            stats.record_breakdown(0, &LatencyBreakdown { service: latency, kernel: Some(kernel) });
+        }
+        for ms in 1..=10 {
+            let latency = Duration::from_millis(ms);
+            stats.record_latency(1, 0, latency);
+            stats.record_breakdown(1, &LatencyBreakdown { service: latency, kernel: None });
+        }
+        stats
+    }
+
+    /// Results of `config`, from [`stats`]. Every request was sent on time.
+    fn results(config: &ProfileConfig) -> DetailedExperimentResults {
+        results_of(config, &stats())
+    }
+
+    /// Results of `config` from `stats`, with "api" and "batch" sending 100
+    /// and 10 requests
+    fn results_of(
+        config: &ProfileConfig,
+        stats: &TupleStatsCollector,
+    ) -> DetailedExperimentResults {
+        let mut results = DetailedExperimentResults::from_tuple_stats(
+            "thresholds".into(),
+            None,
+            None,
+            "127.0.0.1:9".into(),
+            "xylem-echo".into(),
+            "tcp".into(),
+            Duration::from_secs(1),
+            stats,
+            &config.traffic_groups,
+            false,
+        );
+        for (group, sent) in results.traffic_groups.iter_mut().zip([100, 10]) {
+            group.stats.requests.sent = sent;
+        }
+        results.global.requests.sent = 110;
+        results
+    }
+
+    /// Parse the thresholds of one metric key against the test profile
+    fn parse(key: &str, expressions: &[&str]) -> Result<Vec<Threshold>> {
+        let config = profile("")?;
+        let thresholds = BTreeMap::from([(
+            key.to_string(),
+            expressions.iter().map(|e| e.to_string()).collect(),
+        )]);
+        parse_thresholds(&thresholds, &config.traffic_groups)
+    }
+
+    /// The single threshold of one expression
+    fn parse_one(key: &str, expression: &str) -> Threshold {
+        let mut parsed = parse(key, &[expression]).unwrap_or_else(|e| panic!("{key} {e:#}"));
+        assert_eq!(parsed.len(), 1);
+        parsed.remove(0)
+    }
+
+    /// The error of parsing one expression
+    fn parse_error(key: &str, expression: &str) -> String {
+        match parse(key, &[expression]) {
+            Ok(parsed) => panic!("{key} = {expression:?} parsed: {parsed:?}"),
+            Err(error) => format!("{error:#}"),
+        }
+    }
+
+    #[test]
+    fn durations_take_a_unit_and_compare_in_microseconds() {
+        for (expression, limit) in [
+            ("p99 < 250us", 250.0),
+            ("p99 < 250µs", 250.0),
+            ("p99 < 250μs", 250.0),
+            ("p99 < 800ns", 0.8),
+            ("p99 < 1.5ms", 1_500.0),
+            ("p99 < 2s", 2_000_000.0),
+            ("p99<1e3us", 1_000.0),
+            ("p99 < 5 ms", 5_000.0),
+        ] {
+            assert_eq!(parse_one("latency", expression).limit, limit, "{expression}");
+        }
+        assert!(parse_error("latency", "p99 < 250").contains("give a unit"));
+        assert!(parse_error("latency", "p99 < 250m").contains("unknown unit 'm'"));
+        assert!(parse_error("latency.p99_us", "< 250").contains("give a unit"));
+        assert_eq!(parse_one("latency.p99_us", "< 250us").limit, 250.0);
+    }
+
+    #[test]
+    fn counts_and_rates_take_plain_numbers() {
+        assert_eq!(parse_one("requests.unsent", "== 0").limit, 0.0);
+        assert_eq!(parse_one("throughput", "> 90000").limit, 90_000.0);
+        assert_eq!(parse_one("requests.timed_out", "rate < 0.001").limit, 0.001);
+        assert!(parse_error("requests.unsent", "== 0us").contains("plain number; remove 'us'"));
+        assert!(parse_error("requests.timed_out", "rate < 1%").contains("remove '%'"));
+        assert!(parse_error("throughput", "> 90000 rps").contains("remove 'rps'"));
+    }
+
+    #[test]
+    fn aggregations_name_summary_fields() {
+        for (aggregation, field) in [
+            ("p50", "p50_us"),
+            ("p95", "p95_us"),
+            ("p99", "p99_us"),
+            ("p99.9", "p999_us"),
+            ("p999", "p999_us"),
+            ("p99.99", "p9999_us"),
+            ("p99.999", "p99999_us"),
+            ("mean", "mean_us"),
+            ("min", "min_us"),
+            ("max", "max_us"),
+            ("std_dev", "std_dev_us"),
+        ] {
+            let threshold = parse_one("latency", &format!("{aggregation} < 1ms"));
+            assert_eq!(threshold.path, ["latency", field], "{aggregation}");
+            assert!(!threshold.rate);
+        }
+        assert_eq!(parse_one("send_lag", "p99 < 20us").path, ["send_lag", "p99_us"]);
+        let rate = parse_one("requests.timed_out", "rate < 0.001");
+        assert_eq!((rate.path, rate.rate), (vec!["requests".into(), "timed_out".into()], true));
+        assert_eq!(parse_one("throughput", "> 1").path, ["throughput_rps"]);
+    }
+
+    #[test]
+    fn unknown_or_misplaced_aggregations_are_rejected() {
+        let error = parse_error("latency", "p90 < 1ms");
+        assert!(error.contains("unknown aggregation 'p90' for 'latency'"), "{error}");
+        assert!(error.contains("p50, ") && error.contains("p99.9") && error.contains("mean"));
+        assert!(parse_error("latency", "p99.x < 1ms").contains("unknown aggregation 'p99.x'"));
+        assert!(parse_error("latency", "median < 1ms").contains("unknown aggregation"));
+        assert!(parse_error("latency", "< 1ms").contains("'latency' is a summary"));
+        assert!(parse_error("latency", "rate < 0.1").contains("unknown aggregation 'rate'"));
+        assert!(parse_error("requests.unsent", "p99 == 0").contains("is a single value"));
+        assert!(parse_error("throughput", "rate < 1").contains("'throughput' is not a count"));
+        assert!(parse_error("latency.p99_us", "rate < 1").contains("is not a count"));
+    }
+
+    #[test]
+    fn every_operator_compares() {
+        for (op, holds) in [
+            ("<", [true, false, false]),
+            ("<=", [true, true, false]),
+            (">", [false, false, true]),
+            (">=", [false, true, true]),
+            ("==", [false, true, false]),
+            ("!=", [true, false, true]),
+        ] {
+            let threshold = parse_one("requests.sent", &format!("{op} 5"));
+            for (observed, expected) in [4.0, 5.0, 6.0].into_iter().zip(holds) {
+                assert_eq!(
+                    threshold.op.holds(observed, threshold.limit),
+                    expected,
+                    "{observed} {op}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_expressions_and_keys_are_rejected() {
+        for (key, expression, expected) in [
+            ("latency", "p99 250us", "no comparison"),
+            ("latency", "p99 = 250us", "unknown operator"),
+            ("latency", "p99 =< 250us", "unknown operator"),
+            ("latency", "p99 ! 250us", "unknown operator"),
+            ("latency", "p99 <", "is not a number"),
+            ("latency", "p99 < < 250us", "is not a number"),
+            ("latency", "p99 < fast", "is not a number"),
+            ("requests.sent", "> inf", "is not a number"),
+            ("requests.sent", "> 1e999", "out of range"),
+            ("latency{group=api", "p99 < 1ms", "a filter ends with '}'"),
+            ("latency{api}", "p99 < 1ms", "a filter is group=name"),
+            ("latency{thread=0}", "p99 < 1ms", "unknown filter 'thread'"),
+            ("latency{group=}", "p99 < 1ms", "names no group"),
+            ("latency..p99_us", "< 1ms", "unknown metric"),
+        ] {
+            let error = parse_error(key, expression);
+            assert!(error.contains(expected), "{key} = {expression:?}: {error}");
+        }
+        let error = parse("latency", &[]).unwrap_err();
+        assert!(format!("{error:#}").contains("no expressions"));
+    }
+
+    #[test]
+    fn unknown_metrics_and_groups_fail_at_load() {
+        let error =
+            format!("{:#}", profile("[thresholds]\n\"latncy\" = [\"p99 < 1ms\"]").unwrap_err());
+        assert!(error.contains("unknown metric 'latncy'"), "{error}");
+        // The error lists the metrics, including fields this module never names
+        for metric in ["latency", "send_lag", "requests.late_responses", "throughput_mbps"] {
+            assert!(error.contains(metric), "{metric}: {error}");
+        }
+        assert!(!error.contains("latency.p99_us"), "aggregations are not listed: {error}");
+
+        let error = format!(
+            "{:#}",
+            profile("[thresholds]\n\"latency{group=api2}\" = [\"p99 < 1ms\"]").unwrap_err()
+        );
+        assert!(error.contains("unknown traffic group 'api2'; groups: api, batch"), "{error}");
+
+        let error = format!("{:#}", profile("[thresholds]\nrequests = [\"> 0\"]").unwrap_err());
+        assert!(error.contains("'requests' is a group of metrics"), "{error}");
+        assert!(error.contains("requests.unsent"), "{error}");
+        let error = format!(
+            "{:#}",
+            profile("[thresholds]\n\"requests.unsent_capped\" = [\"== 0\"]").unwrap_err()
+        );
+        assert!(error.contains("is not a number"), "{error}");
+
+        // Every invalid threshold is reported at once
+        let thresholds = r#"
+[thresholds]
+latency = ["p99 < 1", "p99 < 1ms", "p0 < 1ms"]
+nope = ["> 1"]
+"#;
+        let error = format!("{:#}", profile(thresholds).unwrap_err());
+        assert_eq!(error.lines().count(), 4, "{error}");
+        assert!(error.starts_with("Invalid thresholds:"), "{error}");
+    }
+
+    #[test]
+    fn a_group_filter_needs_a_unique_name() {
+        let mut config = profile("").unwrap();
+        config.traffic_groups[1].name = "api".into();
+        let thresholds = BTreeMap::from([("latency{group=api}".into(), vec!["p99 < 1ms".into()])]);
+        let error = parse_thresholds(&thresholds, &config.traffic_groups).unwrap_err();
+        assert!(error.to_string().contains("used by 2 groups"), "{error:#}");
+        // Quotes around a name are optional
+        let threshold = parse_one("latency{ group = \"batch\" }", "p99 < 1ms");
+        assert_eq!((threshold.metric, threshold.group), ("latency".into(), Some("batch".into())));
+    }
+
+    /// Every numeric path in `value`
+    fn numeric_paths(value: &Value, prefix: &[String], paths: &mut Vec<Vec<String>>) {
+        match value {
+            Value::Object(fields) => {
+                for (name, field) in fields {
+                    let mut path = prefix.to_vec();
+                    path.push(name.clone());
+                    numeric_paths(field, &path, paths);
+                }
+            }
+            Value::Number(_) => paths.push(prefix.to_vec()),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn the_probe_has_every_stats_field_as_a_number() {
+        // A null hides the fields of an Option; a probe field must be Some.
+        fn assert_no_null(value: &Value, path: &str) {
+            match value {
+                Value::Null => panic!("probe field {path} is null; set it in probe_stats"),
+                Value::Object(fields) => {
+                    fields.iter().for_each(|(name, v)| assert_no_null(v, &format!("{path}.{name}")))
+                }
+                Value::Array(items) => items.iter().for_each(|v| assert_no_null(v, path)),
+                _ => {}
+            }
+        }
+        let (global, group) = probe_stats();
+        assert_no_null(&global, "global");
+        assert_no_null(&group, "group");
+        // Results write every field the probe has, so its metrics exist in results
+        let config = profile("").unwrap();
+        let results = results(&config);
+        for (probe, stats) in [
+            (&global, serde_json::to_value(&results.global).unwrap()),
+            (&group, serde_json::to_value(&results.traffic_groups[0].stats).unwrap()),
+        ] {
+            let mut paths = Vec::new();
+            numeric_paths(probe, &[], &mut paths);
+            for path in paths {
+                // clamped_samples is written only for a bounded HDR histogram
+                if path.last().unwrap() != "clamped_samples" {
+                    assert!(lookup(&stats, &path).is_some(), "{path:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn error_and_breakdown_fields_are_metrics() {
+        let path =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|n| n.to_string()).collect() };
+        for (key, expression, expected, rate) in [
+            ("requests.errors", "== 0", path(&["requests", "errors"]), false),
+            ("requests.errors", "rate < 0.01", path(&["requests", "errors"]), true),
+            ("requests.errors{group=api}", "rate < 0.01", path(&["requests", "errors"]), true),
+            ("error_latency", "p99 < 1ms", path(&["error_latency", "p99_us"]), false),
+            ("error_latency", "mean < 1ms", path(&["error_latency", "mean_us"]), false),
+            (
+                "error_latency{group=api}",
+                "max < 1ms",
+                path(&["error_latency", "max_us"]),
+                false,
+            ),
+            (
+                "error_latency.sample_count",
+                "> 0",
+                path(&["error_latency", "sample_count"]),
+                false,
+            ),
+            (
+                "latency_breakdown.service_us",
+                "p99.9 < 1ms",
+                path(&["latency_breakdown", "service_us", "p999_us"]),
+                false,
+            ),
+            (
+                "latency_breakdown.host_stack_us",
+                "mean < 20us",
+                path(&["latency_breakdown", "host_stack_us", "mean_us"]),
+                false,
+            ),
+            (
+                "latency_breakdown.network_server_us{group=api}",
+                "p99 < 1ms",
+                path(&["latency_breakdown", "network_server_us", "p99_us"]),
+                false,
+            ),
+            (
+                "latency_breakdown.network_server_us",
+                "max < 1ms",
+                path(&["latency_breakdown", "network_server_us", "max_us"]),
+                false,
+            ),
+            (
+                "latency_breakdown.kernel_split_count",
+                "> 0",
+                path(&["latency_breakdown", "kernel_split_count"]),
+                false,
+            ),
+            (
+                "latency_breakdown.kernel_split_count",
+                "rate > 0.5",
+                path(&["latency_breakdown", "kernel_split_count"]),
+                true,
+            ),
+        ] {
+            let threshold = parse_one(key, expression);
+            assert_eq!((&threshold.path, threshold.rate), (&expected, rate), "{key}");
+        }
+        // A breakdown part is a summary of durations
+        let error = parse_error("latency_breakdown.service_us", "p99 < 1");
+        assert!(error.contains("give a unit"), "{error}");
+        let error = parse_error("latency_breakdown.host_stack_us", "p90 < 1ms");
+        for aggregation in ["mean", "p50", "p99", "p99.9", "max"] {
+            assert!(error.contains(aggregation), "{aggregation}: {error}");
+        }
+        assert!(parse_error("latency_breakdown", "> 0").contains("is a group of metrics"));
+        assert!(parse_error("latency_breakdown.clock", "> 0").contains("is not a number"));
+        // Errors by kind are keyed by the kinds a run meets
+        for key in ["requests.errors_by_kind", "requests.errors_by_kind.WRONGTYPE"] {
+            let error = parse_error(key, "> 0");
+            assert!(error.contains("cannot be checked at load; use 'requests.errors'"), "{error}");
+        }
+        assert!(parse_error("requests.errors_by_kinds", "> 0").contains("unknown metric"));
+        // The metrics list names them
+        let error = parse_error("nope", "> 0");
+        for metric in [
+            "requests.errors,",
+            "error_latency,",
+            "latency_breakdown.kernel_split_count",
+            "latency_breakdown.service_us,",
+            "latency_breakdown.host_stack_us,",
+            "latency_breakdown.network_server_us",
+        ] {
+            assert!(error.contains(metric), "{metric}: {error}");
+        }
+        assert!(!error.contains("errors_by_kind"), "{error}");
+    }
+
+    #[test]
+    fn error_and_breakdown_thresholds_evaluate_against_the_results() {
+        let mut stats = stats();
+        for _ in 0..2 {
+            stats.record_error_reply(0, 0, "WRONGTYPE", Duration::from_millis(5));
+        }
+        let thresholds = r#"
+[thresholds]
+"requests.errors" = ["== 2", "rate < 0.02", "rate < 0.01"]
+"requests.errors{group=api}" = ["rate == 0.02"]
+"requests.errors{group=batch}" = ["== 0", "rate == 0"]
+error_latency = ["p99 > 4ms", "max < 1ms"]
+"latency_breakdown.network_server_us{group=api}" = ["max == 100us", "p99 < 99us"]
+"latency_breakdown.host_stack_us" = ["max == 1us"]
+"latency_breakdown.host_stack_us{group=batch}" = ["max < 1s"]
+"latency_breakdown.kernel_split_count" = ["== 100"]
+"latency_breakdown.service_us{group=batch}" = ["max == 10ms"]
+"#;
+        let config = profile(thresholds).unwrap();
+        let mut results = results_of(&config, &stats);
+        assert_eq!(evaluate(&mut results, &config), Verdict::ThresholdsFailed);
+        // Percentiles come from HDR histograms, within 0.1%; means and
+        // maxima are exact
+        let close = |observed: Option<f64>, expected: f64| {
+            observed.is_some_and(|observed| (observed - expected).abs() <= expected * 0.001)
+        };
+        let expected: [(&str, &str, Option<f64>, bool); 14] = [
+            ("error_latency", "p99 > 4ms", Some(5_000.0), true),
+            ("error_latency", "max < 1ms", Some(5_000.0), false),
+            ("latency_breakdown.host_stack_us", "max == 1us", Some(1.0), true),
+            // A group without a kernel split has no host stack value
+            ("latency_breakdown.host_stack_us{group=batch}", "max < 1s", None, false),
+            ("latency_breakdown.kernel_split_count", "== 100", Some(100.0), true),
+            (
+                "latency_breakdown.network_server_us{group=api}",
+                "max == 100us",
+                Some(100.0),
+                true,
+            ),
+            (
+                "latency_breakdown.network_server_us{group=api}",
+                "p99 < 99us",
+                Some(99.0),
+                false,
+            ),
+            ("latency_breakdown.service_us{group=batch}", "max == 10ms", Some(10_000.0), true),
+            ("requests.errors", "== 2", Some(2.0), true),
+            // 2 errors of the 110 sent
+            ("requests.errors", "rate < 0.02", Some(2.0 / 110.0), true),
+            ("requests.errors", "rate < 0.01", Some(2.0 / 110.0), false),
+            ("requests.errors{group=api}", "rate == 0.02", Some(0.02), true),
+            ("requests.errors{group=batch}", "== 0", Some(0.0), true),
+            ("requests.errors{group=batch}", "rate == 0", Some(0.0), true),
+        ];
+        assert_eq!(results.thresholds.len(), expected.len());
+        for (threshold, (key, expression, observed, ok)) in results.thresholds.iter().zip(expected)
+        {
+            assert_eq!(
+                (threshold.key().as_str(), threshold.expression.as_str()),
+                (key, expression)
+            );
+            match observed {
+                Some(observed) => assert!(close(threshold.observed, observed), "{threshold:?}"),
+                None => assert_eq!(threshold.observed, None, "{threshold:?}"),
+            }
+            assert_eq!(threshold.ok, ok, "{threshold:?}");
+        }
+        // Error replies are counted, by kind, apart from the latency
+        let api = &results.traffic_groups[0].stats;
+        assert_eq!(api.requests.errors_by_kind.get("WRONGTYPE"), 2);
+        assert_eq!(api.latency.sample_count, 100);
+        assert_eq!(api.latency_breakdown.service_us.sample_count, 100);
+    }
+
+    #[test]
+    fn every_numeric_stats_field_is_a_metric_without_naming_it() {
+        let config = profile("").unwrap();
+        let mut results = results(&config);
+        let stats = serde_json::to_value(&results.traffic_groups[0].stats).unwrap();
+        let mut paths = Vec::new();
+        numeric_paths(&stats, &[], &mut paths);
+        assert!(paths.len() > 20, "{paths:?}");
+
+        // Compare each field with itself: ">= observed" holds exactly
+        let mut thresholds = BTreeMap::new();
+        for path in &paths {
+            let value = lookup(&stats, path).unwrap().as_f64().unwrap();
+            let unit = if path.last().unwrap().ends_with("_us") {
+                "us"
+            } else {
+                ""
+            };
+            let key = format!("{}{{group=api}}", path.join("."));
+            thresholds.insert(key, vec![format!(">= {value}{unit}"), format!("< {value}{unit}")]);
+        }
+        let mut config = config;
+        config.threshold_checks = parse_thresholds(&thresholds, &config.traffic_groups).unwrap();
+        evaluate(&mut results, &config);
+        assert_eq!(results.thresholds.len(), 2 * paths.len());
+        for pair in results.thresholds.chunks(2) {
+            let expected =
+                lookup(&stats, &pair[0].field.split('.').map(String::from).collect::<Vec<_>>())
+                    .and_then(Value::as_f64);
+            assert_eq!(pair[0].observed, expected, "{}", pair[0].field);
+            assert!(pair[0].ok && !pair[1].ok, "{pair:?}");
+        }
+    }
+
+    #[test]
+    fn metrics_resolve_in_their_scope() {
+        let config = profile(
+            r#"
+[thresholds]
+"latency" = ["max < 1ms", "p99.9 >= 1ms"]
+"latency{group=api}" = ["max <= 100us", "mean < 51us", "std_dev > 0us"]
+"latency{group=batch}" = ["min >= 1ms"]
+"requests.late_responses{group=api}" = ["rate == 0.05"]
+"requests.timed_out" = ["rate < 0.001"]
+"send_lag.sample_count" = ["== 0"]
+"#,
+        )
+        .unwrap();
+        let mut results = results(&config);
+        results.traffic_groups[0].stats.requests.late_responses = 5;
+        assert_eq!(evaluate(&mut results, &config), Verdict::ThresholdsFailed);
+        let outcome: Vec<(String, &str, Option<f64>, bool)> = results
+            .thresholds
+            .iter()
+            .map(|t| (t.key(), t.expression.as_str(), t.observed.map(|v| v.round()), t.ok))
+            .collect();
+        assert_eq!(
+            outcome,
+            [
+                ("latency".into(), "max < 1ms", Some(10_000.0), false),
+                // The HDR histogram keeps three significant digits
+                ("latency".into(), "p99.9 >= 1ms", Some(10_002.0), true),
+                ("latency{group=api}".into(), "max <= 100us", Some(100.0), true),
+                ("latency{group=api}".into(), "mean < 51us", Some(51.0), true),
+                ("latency{group=api}".into(), "std_dev > 0us", Some(29.0), true),
+                ("latency{group=batch}".into(), "min >= 1ms", Some(1_000.0), true),
+                ("requests.late_responses{group=api}".into(), "rate == 0.05", Some(0.0), true),
+                ("requests.timed_out".into(), "rate < 0.001", Some(0.0), true),
+                ("send_lag.sample_count".into(), "== 0", Some(0.0), true),
+            ]
+        );
+        assert_eq!(results.thresholds[0].field, "latency.max_us");
+        assert_eq!(results.thresholds[6].field, "requests.late_responses / requests.sent");
+        assert_eq!(results.thresholds[6].observed, Some(0.05));
+    }
+
+    #[test]
+    fn a_metric_without_a_value_fails() {
+        let config = profile(
+            r#"
+[thresholds]
+"send_lag" = ["p99 < 20us"]
+"requests.timed_out{group=batch}" = ["rate < 0.001"]
+"#,
+        )
+        .unwrap();
+        let mut results = results(&config);
+        // Nothing was sent on a schedule, so the send lag is null; group
+        // "batch" sent nothing, so its rate has no denominator
+        results.traffic_groups[1].stats.requests.sent = 0;
+        assert_eq!(evaluate(&mut results, &config), Verdict::ThresholdsFailed);
+        assert!(results.thresholds.iter().all(|t| t.observed.is_none() && !t.ok));
+        assert_eq!(results.thresholds[0].observed_text(), "n/a");
+
+        // A group without results has no values either
+        results.traffic_groups.remove(1);
+        evaluate(&mut results, &config);
+        assert!(!results.thresholds[0].ok);
+    }
+
+    #[test]
+    fn verdict_is_invalid_before_thresholds_failed_before_pass() {
+        let passing = "[thresholds]\n\"latency{group=api}\" = [\"p50 < 1ms\"]";
+        let failing = "[thresholds]\n\"latency{group=api}\" = [\"p50 < 1us\"]";
+        for (thresholds, unsent, expected) in [
+            ("", 0, Verdict::Pass),
+            (passing, 0, Verdict::Pass),
+            (failing, 0, Verdict::ThresholdsFailed),
+            (passing, 50, Verdict::InvalidRun),
+            (failing, 50, Verdict::InvalidRun),
+        ] {
+            let config = profile(thresholds).unwrap();
+            let mut results = results(&config);
+            results.traffic_groups[0].stats.requests.unsent = unsent;
+            assert_eq!(evaluate(&mut results, &config), expected, "{thresholds} {unsent}");
+            assert_eq!(results.verdict, expected);
+            // Thresholds are recorded even when the run is invalid
+            assert_eq!(results.thresholds.len(), usize::from(!thresholds.is_empty()));
+        }
+        assert_eq!(
+            [Verdict::Pass, Verdict::ThresholdsFailed, Verdict::InvalidRun].map(Verdict::exit_code),
+            [0, 2, 3]
+        );
+        assert_eq!(
+            serde_json::to_value([Verdict::Pass, Verdict::ThresholdsFailed, Verdict::InvalidRun])
+                .unwrap(),
+            serde_json::json!(["pass", "thresholds_failed", "invalid_run"])
+        );
+    }
+
+    #[test]
+    fn validity_checks_rate_driven_groups() {
+        let config = profile("").unwrap();
+        let mut results = results(&config);
+        // Within the default limits: 0.1% unsent, 1% late
+        let api = &mut results.traffic_groups[0].stats.requests;
+        (api.sent, api.unsent, api.late_sends) = (9_990, 10, 99);
+        // The closed-loop group is exempt, whatever its counts
+        results.traffic_groups[1].stats.requests.unsent = 1_000;
+        assert_eq!(evaluate(&mut results, &config), Verdict::Pass);
+        let checks: Vec<(String, Option<f64>, f64, bool)> =
+            results.validity.iter().map(|c| (c.key(), c.observed, c.limit, c.ok)).collect();
+        assert_eq!(
+            checks,
+            [
+                ("unsent{group=api}".into(), Some(0.001), 0.001, true),
+                ("late_sends{group=api}".into(), Some(99.0 / 9990.0), 0.01, true),
+            ]
+        );
+        assert!(results.validity.iter().all(|c| c.reason.is_none()));
+
+        let api = &mut results.traffic_groups[0].stats.requests;
+        (api.unsent, api.late_sends, api.unsent_capped) = (11, 100, true);
+        assert_eq!(evaluate(&mut results, &config), Verdict::InvalidRun);
+        let reasons: Vec<&str> =
+            results.validity.iter().map(|c| c.reason.as_deref().unwrap()).collect();
+        assert!(
+            reasons[0].starts_with(
+                "11 (a lower bound) of 10001 intended sends never went out (0.11%, limit 0.10%)"
+            ),
+            "{}",
+            reasons[0]
+        );
+        assert!(
+            reasons[1].starts_with(
+                "100 of 9990 sends lagged their intended time by more than 100 µs (1.00%"
+            ),
+            "{}",
+            reasons[1]
+        );
+        let json = serde_json::to_value(&results.validity[0]).unwrap();
+        assert_eq!(json["check"], "unsent");
+        assert_eq!(json["group"], "api");
+        assert_eq!(json["ok"], false);
+    }
+
+    #[test]
+    fn validity_checks_can_be_tuned_skipped_or_disabled() {
+        let invalid = |validity: &str| {
+            let config = profile(validity).unwrap();
+            let mut results = results(&config);
+            let api = &mut results.traffic_groups[0].stats.requests;
+            (api.sent, api.unsent, api.late_sends) = (900, 100, 90);
+            evaluate(&mut results, &config);
+            results.validity.iter().map(|c| (c.check, c.ok)).collect::<Vec<_>>()
+        };
+        use ValidityCheck::{LateSends, Unsent};
+        assert_eq!(invalid(""), [(Unsent, false), (LateSends, false)]);
+        assert_eq!(
+            invalid("[validity]\nmax_unsent_ratio = 0.1\nmax_late_send_ratio = 0.1"),
+            [(Unsent, true), (LateSends, true)]
+        );
+        assert_eq!(invalid("[validity]\nskip = [\"late_sends\"]"), [(Unsent, false)]);
+        assert_eq!(invalid("[validity]\nenabled = false"), []);
+
+        // A rate-driven group without results recorded nothing it was asked to
+        let config = profile("").unwrap();
+        let mut results = results(&config);
+        results.traffic_groups.remove(0);
+        assert_eq!(evaluate(&mut results, &config), Verdict::InvalidRun);
+        assert_eq!(results.validity[0].reason.as_deref(), Some("the group recorded no requests"));
+
+        for (validity, expected) in [
+            ("max_unsent_ratio = 1.5", "validity.max_unsent_ratio must be a fraction"),
+            ("max_late_send_ratio = -0.1", "validity.max_late_send_ratio must be a fraction"),
+            ("max_late_send_ratio = nan", "validity.max_late_send_ratio must be a fraction"),
+            ("skip = [\"slow\"]", "unknown variant `slow`"),
+            ("max_unsent = 0.1", "unknown field `max_unsent`"),
+        ] {
+            let error = format!("{:#}", profile(&format!("[validity]\n{validity}")).unwrap_err());
+            assert!(error.contains(expected), "{validity}: {error}");
+        }
+    }
+}

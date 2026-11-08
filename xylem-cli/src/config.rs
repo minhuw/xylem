@@ -4,9 +4,11 @@
 //! Configuration files are the primary interface for Xylem, with CLI arguments available
 //! for quick overrides.
 
+use crate::thresholds::{Threshold, ValidityConfig};
 use anyhow::{anyhow, bail, Context, Result};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use xylem_core::traffic_group::{PolicyConfig, TimestampSourceConfig};
@@ -32,10 +34,22 @@ pub struct ProfileConfig {
     /// User-space TCP settings, required when a group uses transport "ntcp"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ntcp: Option<NtcpConfig>,
+    /// Pass/fail limits on the results: a metric, optionally filtered to a
+    /// traffic group, and its expressions, as in
+    /// `"latency{group=api}" = ["p99 < 250us"]`
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub thresholds: BTreeMap<String, Vec<String>>,
+    /// Checks that the run applied its configured load
+    #[serde(default)]
+    pub validity: ValidityConfig,
     /// Typed protocol_config of each traffic group, in group order.
     /// Empty until `validate` succeeds; not part of the profile format.
     #[serde(skip)]
     pub protocol_configs: Vec<ProtocolConfig>,
+    /// The parsed `thresholds`, in key order. Empty until `validate`
+    /// succeeds; not part of the profile format.
+    #[serde(skip)]
+    pub threshold_checks: Vec<Threshold>,
 }
 
 /// Experiment metadata
@@ -519,8 +533,19 @@ impl ProfileConfig {
 
         // Output validation - format is now an enum, so always valid
 
+        self.validity.validate(&mut errors);
+        let threshold_checks =
+            match crate::thresholds::parse_thresholds(&self.thresholds, &self.traffic_groups) {
+                Ok(threshold_checks) => threshold_checks,
+                Err(error) => {
+                    errors.push(error);
+                    Vec::new()
+                }
+            };
+
         combine(errors)?;
         self.protocol_configs = protocol_configs;
+        self.threshold_checks = threshold_checks;
         Ok(())
     }
 }
@@ -532,13 +557,17 @@ fn check_keys(profile: &toml::Value) -> Result<()> {
 }
 
 /// Fail with every error in `errors`: a single error as it is, several as
-/// a list with one error per line
+/// a list with one error per line, and the further lines of an error that
+/// has several (such as the invalid thresholds) indented below it
 fn combine(mut errors: Vec<anyhow::Error>) -> Result<()> {
     match errors.len() {
         0 => Ok(()),
         1 => Err(errors.remove(0)),
         count => {
-            let lines: Vec<String> = errors.iter().map(|error| format!("  - {error:#}")).collect();
+            let lines: Vec<String> = errors
+                .iter()
+                .map(|error| format!("  - {}", format!("{error:#}").replace('\n', "\n    ")))
+                .collect();
             bail!("The profile has {} errors:\n{}", count, lines.join("\n"))
         }
     }
@@ -2119,6 +2148,13 @@ rotation = { size = 1024 }
 [ntcp]
 endpoints = [{ ifname = "ntcp0", local_ip = "10.0.0.2" }]
 
+[thresholds]
+latency = ["p99 < 1s"]
+"requests.errors{group=redis}" = ["rate < 0.01"]
+
+[validity]
+skip = ["late_sends"]
+
 [[traffic_groups]]
 name = "redis"
 protocol = "redis"
@@ -2214,6 +2250,7 @@ protocol_config = {}
             ("request_dump.rotation", "in request_dump.rotation"),
             ("ntcp", "in ntcp"),
             ("ntcp.endpoints.0", "in ntcp.endpoints[0]"),
+            ("validity", "in validity"),
             ("traffic_groups.0", "in traffic_groups[0]"),
             // A struct variant and a unit variant of each tagged enum
             ("traffic_groups.0.traffic_policy", "in traffic_groups[0].traffic_policy"),
@@ -2432,6 +2469,63 @@ protocol_config = {}
             let text = toml::to_string(&profile).unwrap();
             assert!(toml::from_str::<ProfileConfig>(&text).is_err(), "{text}");
         }
+    }
+
+    #[test]
+    fn threshold_metrics_are_keys_the_key_check_accepts_and_thresholds_check() {
+        // [thresholds] is a map: the key check takes any metric name
+        let metric = "latency_breakdown.network_server_us{group=echo}";
+        let profile = every_table_with("thresholds", metric, toml::Value::Array(vec![]));
+        check_keys(&profile).unwrap();
+        let profile =
+            every_table_with("thresholds", "latncy", toml::Value::Array(vec!["p99 < 1ms".into()]));
+        check_keys(&profile).unwrap();
+        // and the thresholds parser rejects an unknown one, with the other errors
+        let mut profile = profile;
+        profile["experiment"]["duration"] = toml::Value::String("0s".into());
+        let mut config: ProfileConfig = profile.try_into().unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        let expected = [
+            "The profile has 2 errors:",
+            "  - Experiment duration must be > 0",
+            "  - Invalid thresholds:",
+            "      \"latncy\": unknown metric 'latncy'; metrics: throughput, ",
+        ];
+        let lines: Vec<&str> = error.lines().collect();
+        assert_eq!(lines.len(), expected.len(), "{error}");
+        for (line, expected) in lines.iter().zip(expected) {
+            assert!(line.starts_with(expected), "{line} does not start with {expected}");
+        }
+        assert!(config.threshold_checks.is_empty());
+        // A threshold's expressions are its own parser's to check: a list of
+        // strings, which serde enforces
+        let profile = every_table_with("thresholds", "latency", toml::Value::Integer(1));
+        check_keys(&profile).unwrap();
+        let text = toml::to_string(&profile).unwrap();
+        assert!(toml::from_str::<ProfileConfig>(&text).is_err());
+    }
+
+    #[test]
+    fn validity_rejects_unknown_keys_and_reports_every_bad_limit() {
+        let profile = every_table_with("validity", "max_unsnet_ratio", toml::Value::Float(0.1));
+        let error = format!("{:#}", check_keys(&profile).unwrap_err());
+        assert!(
+            error.starts_with(
+                "unknown field `max_unsnet_ratio` in validity (did you mean `max_unsent_ratio`?)"
+            ),
+            "{error}"
+        );
+        let text = toml::to_string(&profile).unwrap();
+        let error = toml::from_str::<ProfileConfig>(&text).unwrap_err().to_string();
+        assert!(error.contains("unknown field `max_unsnet_ratio`"), "{error}");
+
+        let mut profile = every_table_with("validity", "max_unsent_ratio", toml::Value::Float(2.0));
+        insert(&mut profile, "validity", "max_late_send_ratio", toml::Value::Float(-1.0));
+        let mut config: ProfileConfig = profile.try_into().unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.starts_with("The profile has 2 errors:\n"), "{error}");
+        assert!(error.contains("validity.max_unsent_ratio must be a fraction"), "{error}");
+        assert!(error.contains("validity.max_late_send_ratio must be a fraction"), "{error}");
     }
 
     #[test]

@@ -997,6 +997,7 @@ mod tests {
         worker.protocols.get_mut(&0).unwrap().setup = 2;
 
         // Each setup request goes out alone and waits 20 intervals for its reply
+        let mut last_reply_ns = 0;
         for id in 0u64..2 {
             worker.send_requests().unwrap();
             assert_eq!(factory.0.lock().unwrap().sent.len() as u64, id + 1);
@@ -1004,31 +1005,51 @@ mod tests {
             worker.send_requests().unwrap();
             assert_eq!(factory.0.lock().unwrap().sent.len() as u64, id + 1, "setup is pending");
             factory.0.lock().unwrap().responses.push_back(Ok(id.to_le_bytes().to_vec()));
+            last_reply_ns = timing::time_ns();
             worker.process_responses(Duration::ZERO).unwrap();
         }
-        let setup_done_ns = timing::time_ns();
 
-        // The schedule restarted when setup completed, so the 40 ms spent on
-        // setup are neither a backlog of overdue sends nor send lag
+        // The schedule restarted when the last setup reply was processed, so
+        // the 40 ms spent on setup are neither a backlog of overdue sends nor
+        // send lag. The checks read the clock around each step rather than
+        // assume the test thread runs without preemption: a stall after the
+        // restart makes more slots due, and they allow exactly those.
         let intended = worker.pool.get_state(0).unwrap().intended_send_time().unwrap();
-        assert!(intended + 1_000_000 >= setup_done_ns, "schedule restarted after setup");
+        assert!(intended >= last_reply_ns, "schedule restarted after setup");
+        let before_send_ns = timing::time_ns();
         worker.send_requests().unwrap();
-        assert_eq!(factory.0.lock().unwrap().sent.len(), 3, "one measured send, no burst");
+        let after_send_ns = timing::time_ns();
+        // Slots due by a time: the first at `intended`, then one per millisecond
+        let due = |time_ns: u64| (time_ns.saturating_sub(intended) / 1_000_000 + 1) as usize;
+        let measured = factory.0.lock().unwrap().sent.len() - 2;
+        // One call sends at most 16 requests per connection
+        assert!(
+            (due(before_send_ns).min(16)..=due(after_send_ns)).contains(&measured),
+            "{measured} measured sends, due {} to {}: no burst",
+            due(before_send_ns),
+            due(after_send_ns)
+        );
         let counts = worker.stats.request_counts_global();
-        assert_eq!((counts.sent, counts.completed), (1, 0), "setup requests are not counted");
+        assert_eq!(
+            (counts.sent, counts.completed),
+            (measured as u64, 0),
+            "setup requests are not counted"
+        );
         let lag = worker.stats.send_lag_global();
-        assert_eq!(lag.sample_count, 1);
-        assert!(lag.max.unwrap() < Duration::from_millis(10), "{lag:?}");
+        assert_eq!(lag.sample_count, measured as u64);
+        let max_lag = lag.max.unwrap();
+        assert!(max_lag <= Duration::from_nanos(after_send_ns - intended), "{lag:?}");
         assert_eq!(
             worker.pool.get_state(0).unwrap().intended_send_time(),
-            Some(intended + 1_000_000),
-            "the first measured request took the first intended time"
+            Some(intended + measured as u64 * 1_000_000),
+            "the measured requests took the first intended times"
         );
         // Setup bytes are neither dumped nor counted
-        assert_eq!(dumper.total_records(), 1);
+        assert_eq!(dumper.total_records(), measured as u64);
         factory.0.lock().unwrap().responses.push_back(Ok(2u64.to_le_bytes().to_vec()));
         worker.process_responses(Duration::ZERO).unwrap();
-        assert_eq!(worker.stats.entries().values().map(|entry| entry.tx_bytes).sum::<u64>(), 8);
+        let tx_bytes: u64 = worker.stats.entries().values().map(|entry| entry.tx_bytes).sum();
+        assert_eq!(tx_bytes, 8 * measured as u64);
         assert_eq!(worker.stats.entries().values().map(|entry| entry.rx_bytes).sum::<u64>(), 8);
         assert_eq!(global(&worker).latency_sample_count, 1);
     }

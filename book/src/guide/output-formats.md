@@ -8,7 +8,9 @@ format = "both"
 file = "results"
 ```
 
-- `json` (default): Experiment metadata, global statistics, and per-group statistics.
+- `json` (default): Experiment metadata, the verdict with its thresholds and
+  validity checks (see [Thresholds and Validity](./thresholds.md)), global
+  statistics, and per-group statistics.
 - `html`: A report with latency and throughput charts.
 - `both`: JSON and HTML files.
 - `human`: Console statistics only.

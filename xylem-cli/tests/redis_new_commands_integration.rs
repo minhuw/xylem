@@ -57,6 +57,11 @@ impl CliRun {
 /// two threads of two pipelined connections each. `protocol_config` is
 /// TOML for `[traffic_groups.protocol_config]`; `envs` are set for the run.
 fn run_xylem(port: u16, protocol_config: &str, envs: &[(&str, &str)]) -> CliRun {
+    run_xylem_group(port, "", protocol_config, envs)
+}
+
+/// [`run_xylem`] with `group`, TOML keys of the traffic group itself
+fn run_xylem_group(port: u16, group: &str, protocol_config: &str, envs: &[(&str, &str)]) -> CliRun {
     let dir = tempfile::tempdir().unwrap();
     let results_path = dir.path().join("results.json");
     let profile = format!(
@@ -73,6 +78,7 @@ target = "127.0.0.1:{port}"
 threads = [0, 1]
 connections_per_thread = 2
 max_pending_per_connection = 4
+{group}
 
 [traffic_groups.protocol_config]
 {protocol_config}
@@ -136,8 +142,19 @@ fn test_auth_simple_password() {
     let password = redis.get_password();
     let keys = keys_config("auth-test:");
 
-    // Without auth, the first request fails the run
+    // Without auth, every request gets a NOAUTH error reply: by default the
+    // run counts them, none in the latency, and with on_error = "abort" the
+    // first one fails the run
     let run = run_xylem(redis.get_port(), &keys, &[]);
+    assert!(run.success, "{}", run.output);
+    let global = &run.results.as_ref().unwrap()["global"];
+    let requests = &global["requests"];
+    assert!(requests["errors"].as_u64().unwrap() > 0, "{requests}");
+    assert_eq!(requests["errors"], requests["completed"], "{requests}");
+    assert_eq!(requests["errors_by_kind"]["NOAUTH"], requests["errors"], "{requests}");
+    assert_eq!(global["latency"]["sample_count"], 0);
+    assert!(run.output.contains("NOAUTH"), "{}", run.output);
+    let run = run_xylem_group(redis.get_port(), r#"on_error = "abort""#, &keys, &[]);
     assert!(!run.success, "{}", run.output);
     assert!(run.output.contains("NOAUTH"), "{}", run.output);
 

@@ -9,9 +9,20 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use xylem_core::threading::{CpuPinning, StartTicket, ThreadingRuntime, Worker, WorkerConfig};
 use xylem_transport::{TcpTransportFactory, UdpTransportFactory};
 
-use xylem_cli::{completions, config, output};
+use xylem_cli::{completions, config, output, thresholds};
 
 use config::ProfileConfig;
+use thresholds::Verdict;
+
+/// Exit statuses, shown after the options in `--help`
+const EXIT_STATUS_HELP: &str = "\
+Exit status:
+  0  The run passed its validity checks and thresholds, or none applied
+  1  Error, including an invalid profile or unwritable result files
+  2  Thresholds failed: a [thresholds] expression did not hold
+  3  Invalid run: a [validity] check failed, so the results do not describe
+     the configured load (takes precedence over 2)
+Result files are written before the exit with 2 or 3.";
 
 /// Xylem: Reproducible latency measurement tool
 ///
@@ -35,6 +46,7 @@ use config::ProfileConfig;
 #[derive(Parser)]
 #[command(name = "xylem")]
 #[command(version, about = "Latency measurement tool with config-first design", long_about = None)]
+#[command(after_help = EXIT_STATUS_HELP)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -132,8 +144,9 @@ fn main() {
         None => {
             // No subcommand provided - check if profile flag is set
             if let Some(profile) = cli.profile {
-                // Run the experiment
-                run_experiment(profile, cli.set)
+                // Run the experiment; it has written every result file
+                // before a failed verdict exits
+                run_experiment(profile, cli.set).map(exit_on_failed_verdict)
             } else {
                 // No profile provided - show help
                 let mut cmd = Cli::command();
@@ -160,7 +173,15 @@ fn main() {
     }
 }
 
-fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
+/// Exit with the status of a verdict other than pass
+fn exit_on_failed_verdict(verdict: Verdict) {
+    if verdict != Verdict::Pass {
+        let _ = io::Write::flush(&mut io::stdout());
+        std::process::exit(verdict.exit_code());
+    }
+}
+
+fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict> {
     tracing::info!("Xylem latency measurement tool (config-first mode)");
     tracing::info!("Loading profile: {}", profile.display());
 
@@ -649,7 +670,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
     };
 
     // Build detailed results (used for all formats except Human)
-    let detailed_results = output::DetailedExperimentResults::from_tuple_stats(
+    let mut detailed_results = output::DetailedExperimentResults::from_tuple_stats(
         config.experiment.name.clone(),
         config.experiment.description.clone(),
         config.experiment.seed,
@@ -661,6 +682,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
         &config.traffic_groups,
         config.stats.include_records,
     );
+    let verdict = thresholds::evaluate(&mut detailed_results, &config);
 
     tracing::debug!(
         "Output format: {:?}, path: {}",
@@ -669,7 +691,8 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
     );
 
     // Print the summary and write output files if configured
-    output::write_results(&detailed_results, &config.output.format, &config.output.file)
+    output::write_results(&detailed_results, &config.output.format, &config.output.file)?;
+    Ok(verdict)
 }
 
 /// The TCP and UDP timestamp configuration for a group's `timestamps`

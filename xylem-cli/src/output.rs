@@ -3,6 +3,7 @@
 pub mod html;
 
 use crate::config::OutputFormat;
+use crate::thresholds::{ThresholdResult, ValidityResult, Verdict};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -220,6 +221,16 @@ fn write_pretty_json<T: Serialize>(results: &T, path: &str, message: &str) -> Re
 pub struct DetailedExperimentResults {
     pub experiment: ExperimentMetadata,
     pub target: TargetMetadata,
+    /// "invalid_run" when a validity check failed, else "thresholds_failed"
+    /// when a threshold failed, else "pass"
+    #[serde(default)]
+    pub verdict: Verdict,
+    /// Every threshold expression, in key order
+    #[serde(default)]
+    pub thresholds: Vec<ThresholdResult>,
+    /// Every validity check of every rate-driven traffic group
+    #[serde(default)]
+    pub validity: Vec<ValidityResult>,
     pub global: GlobalStats,
     pub traffic_groups: Vec<TrafficGroupResults>,
     /// Raw statistics records at per-second per-connection granularity.
@@ -445,6 +456,10 @@ impl DetailedExperimentResults {
                 protocol: target_protocol,
                 transport: target_transport,
             },
+            // `thresholds::evaluate` records the checks
+            verdict: Verdict::Pass,
+            thresholds: Vec::new(),
+            validity: Vec::new(),
             global,
             traffic_groups,
             records,
@@ -728,7 +743,48 @@ impl DetailedExperimentResults {
             println!();
         }
 
+        self.print_checks();
         println!("{}", "=".repeat(70));
+    }
+
+    /// Print the verdict with every validity check and threshold
+    fn print_checks(&self) {
+        let status = |ok: bool| if ok { "ok" } else { "FAIL" };
+        println!("{}", "-".repeat(70));
+        println!("VERDICT: {}", self.verdict.label());
+        println!("{}", "-".repeat(70));
+        if self.validity.is_empty() {
+            println!("Validity:        none applied");
+        } else {
+            println!("Validity:");
+        }
+        for check in &self.validity {
+            println!(
+                "  {:<6}{}: {} (limit {})",
+                status(check.ok),
+                check.key(),
+                check.observed_text(),
+                check.limit_text()
+            );
+            if let Some(reason) = &check.reason {
+                println!("        {reason}");
+            }
+        }
+        if self.thresholds.is_empty() {
+            println!("Thresholds:      none configured");
+        } else {
+            println!("Thresholds:");
+        }
+        for threshold in &self.thresholds {
+            println!(
+                "  {:<6}{}: {} (observed {})",
+                status(threshold.ok),
+                threshold.key(),
+                threshold.expression,
+                threshold.observed_text()
+            );
+        }
+        println!();
     }
 
     /// Write results to JSON file

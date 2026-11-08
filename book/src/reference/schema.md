@@ -12,9 +12,12 @@ A complete Xylem configuration file contains the following sections:
 [output]           # Output format and destination
 [stats]            # Optional statistics settings
 [request_dump]     # Optional request CSV dump settings
+[thresholds]       # Optional pass/fail limits on the results
+[validity]         # Optional checks that the run applied its load
 ```
 
-Every section, and every table inside one, rejects unknown keys; see
+Every section, and every table inside one, rejects unknown keys, except that
+the keys of `[thresholds]` are metric names; see
 [unknown and removed keys](../guide/configuration.md#unknown-and-removed-keys).
 
 ## Experiment Section
@@ -333,6 +336,38 @@ real_time = false
 - `html.library` (string, default `"chartjs"`): Only `"chartjs"` is supported.
 - `html.theme` (string, default `"light"`): Only `"light"` is supported.
 
+## Thresholds and Validity
+
+`[thresholds]` maps a metric, optionally filtered to a traffic group, to a
+list of expressions; `[validity]` tunes the checks that a run applied its
+configured load:
+
+```toml
+[thresholds]
+"latency" = ["p99 < 250us", "p99.9 < 1ms"]
+"latency{group=latency-agent}" = ["p50 < 80us"]
+"requests.timed_out" = ["rate < 0.001"]
+"requests.errors" = ["rate < 0.01"]
+
+[validity]
+enabled = true
+max_unsent_ratio = 0.001
+max_late_send_ratio = 0.01
+skip = []
+```
+
+- `thresholds` (table of string lists, default empty): see
+  [Thresholds and Validity](../guide/thresholds.md) for metrics (including
+  `requests.errors`, `error_latency` and the `latency_breakdown` parts),
+  aggregations, units and evaluation. Its keys are checked as metrics, not as
+  profile keys.
+- `validity.enabled` (bool, default true): false disables every check.
+- `validity.max_unsent_ratio` (number from 0 to 1, default 0.001)
+- `validity.max_late_send_ratio` (number from 0 to 1, default 0.01)
+- `validity.skip` (list of `"unsent"`, `"late_sends"`, default empty)
+
+Other `[validity]` keys are rejected.
+
 ## Request Dump
 
 Use `[request_dump]` to record outgoing requests as CSV files:
@@ -443,6 +478,7 @@ real_time = false
 ## See Also
 
 - [Configuration Guide](../guide/configuration.md)
+- [Thresholds and Validity](../guide/thresholds.md)
 - [Protocol Configuration](../guide/configuration/workload.md)
 - [CLI Reference](../guide/cli-reference.md)
 - [Example Profiles](https://github.com/minhuw/xylem/tree/main/profiles)

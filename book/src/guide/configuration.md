@@ -40,6 +40,7 @@ The configuration is divided into several sections:
 - **[Protocol Configuration](./configuration/workload.md)** - Define key distributions and operations per traffic group
 - **[Transport Configuration](./configuration/transport.md)** - Configure network transport options
 - **[Protocol Selection](./configuration/protocol.md)** - Protocol-specific settings
+- **[Thresholds and Validity](./thresholds.md)** - `[thresholds]` and `[validity]`: pass/fail limits on the results, checks that the run applied its load, and the exit status
 
 ## Basic Example
 
@@ -108,7 +109,14 @@ Error: Failed to parse config file: profile.toml
   - unknown field `valu_size` in traffic_groups[0].protocol_config.keys (did you mean `value_size`?); expected one of `n`, `prefix`, `strategy`, `theta`, `value_size`
 ```
 
-Then it checks the values, and again reports every problem at once. Keys and
+The one table whose keys are not fixed is `[thresholds]`: its keys are
+metric names, so this check accepts any key there, and the
+[thresholds check](./thresholds.md#metrics) rejects an unknown metric with
+the value errors. `[validity]`, a group's `timestamps = { hardware = ... }`
+table and every other table take only their own keys.
+
+Then it checks the values, and again reports every problem at once, invalid
+thresholds and validity limits included. Keys and
 values that older versions accepted say what replaced them: the top-level
 `[target]` and `[workload]` sections, `stats.streaming`, a traffic group's
 `sampling_rate`, the `adaptive` sampling policy, the `redis-cluster` protocol,
@@ -148,4 +156,5 @@ xylem -P tests/redis/redis-get-zipfian.toml
 - [Protocol Configuration](./configuration/workload.md)
 - [Transport Configuration](./configuration/transport.md)
 - [Protocol Selection](./configuration/protocol.md)
+- [Thresholds and Validity](./thresholds.md)
 - [Configuration Schema](../reference/schema.md)

@@ -312,6 +312,12 @@ Statistics:
     Net+server:  n/a (no kernel split)
     {note}
 
+{single}
+VERDICT: PASS
+{single}
+Validity:        none applied
+Thresholds:      none configured
+
 {double}
 ",
         double = "=".repeat(70),
@@ -465,6 +471,9 @@ const MASKED_JSON: &str = r#"{
     "protocol": "xylem-echo",
     "transport": "tcp"
   },
+  "verdict": "pass",
+  "thresholds": [],
+  "validity": [],
   "global": {
     "total_requests": #,
     "throughput_rps": #,
@@ -623,7 +632,18 @@ fn assert_json_results(path: &Path, target: &str) -> String {
     let text = std::fs::read_to_string(path).unwrap();
     assert_eq!(mask_json(&text), MASKED_JSON.replace("TARGET", target));
     let json: serde_json::Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(sorted_keys(&json), ["experiment", "global", "target", "traffic_groups"]);
+    assert_eq!(
+        sorted_keys(&json),
+        [
+            "experiment",
+            "global",
+            "target",
+            "thresholds",
+            "traffic_groups",
+            "validity",
+            "verdict"
+        ]
+    );
     let groups = json["traffic_groups"].as_array().unwrap();
     assert_eq!(groups.len(), 1);
     assert_eq!(
@@ -699,6 +719,9 @@ fn assert_html_report(path: &Path, target: &str) -> String {
         "                    <td>[0]</td>",
         "                <canvas id=\"groupLatencyChart0\"></canvas>",
         "                labels: [\"echo\"],",
+        "<div class=\"verdict verdict-pass\">PASS</div>",
+        "<p>No validity checks applied.</p>",
+        "<p>No thresholds configured.</p>",
     ] {
         assert_eq!(html.lines().filter(|actual| *actual == line).count(), 1, "{line}");
     }
