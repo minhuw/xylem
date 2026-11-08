@@ -94,6 +94,8 @@ fn parse_redis_operation(
             ("MGET", crate::RedisCommandParams::MGet { .. })
                 | ("WAIT", crate::RedisCommandParams::Wait { .. })
                 | ("SCAN", crate::RedisCommandParams::Scan { .. })
+                // SCAN params with only `count` take the MGET shape, tried first
+                | ("SCAN", crate::RedisCommandParams::MGet { .. })
                 | ("CUSTOM", crate::RedisCommandParams::Custom { .. })
         );
         anyhow::ensure!(matches, "Parameters do not match Redis command {cmd}");
@@ -126,6 +128,7 @@ fn parse_redis_operation(
                 Some(crate::RedisCommandParams::Scan { cursor, count, pattern }) => {
                     (*cursor, *count, pattern.clone())
                 }
+                Some(crate::RedisCommandParams::MGet { count }) => (0, Some(*count), None),
                 _ => (0, None, None),
             };
             Ok(crate::RedisOp::Scan { cursor, count, pattern })
@@ -312,6 +315,65 @@ mod tests {
             protocol.next_request(0).data,
             b"*4\r\n$4\r\nHSET\r\n$5\r\nusers\r\n$5\r\nkey:7\r\n$3\r\nxxx\r\n"
         );
+    }
+
+    /// Every params form the book and the bundled profiles show, and every
+    /// command without params, parses to its command
+    #[test]
+    fn documented_command_params_parse_to_their_command() {
+        use crate::{CommandTemplate, RedisOp};
+        use serde_json::json;
+        let op = |command: serde_json::Value| -> Result<RedisOp> {
+            let command: RedisCommandWeight = serde_json::from_value(command)?;
+            parse_redis_operation(&command.name, command.params.as_ref())
+        };
+        let template = "ZADD leaderboard __value_size__ __key__";
+        let scan = |count, pattern: Option<&str>| RedisOp::Scan {
+            cursor: 0,
+            count,
+            pattern: pattern.map(str::to_string),
+        };
+        for (params, name, expected) in [
+            (
+                json!({ "template": template }),
+                "custom",
+                RedisOp::Custom(CommandTemplate::parse(template).unwrap()),
+            ),
+            (
+                json!({ "cursor": 0, "count": 100, "pattern": "key:*" }),
+                "scan",
+                scan(Some(100), Some("key:*")),
+            ),
+            (json!({ "count": 100 }), "scan", scan(Some(100), None)),
+            (json!({ "pattern": "key:*" }), "scan", scan(None, Some("key:*"))),
+            (json!({}), "scan", scan(None, None)),
+            (json!({ "count": 10 }), "mget", RedisOp::MGet { count: 10 }),
+            (json!({ "count": 5 }), "MGET", RedisOp::MGet { count: 5 }),
+            (
+                json!({ "num_replicas": 2, "timeout_ms": 1000 }),
+                "wait",
+                RedisOp::Wait { num_replicas: 2, timeout_ms: 1000 },
+            ),
+        ] {
+            let command = json!({ "name": name, "weight": 1.0, "params": params });
+            assert_eq!(op(command.clone()).unwrap(), expected, "{command}");
+        }
+        for (name, expected) in [
+            ("get", RedisOp::Get),
+            ("set", RedisOp::Set),
+            ("incr", RedisOp::Incr),
+            ("mget", RedisOp::MGet { count: 10 }),
+            ("wait", RedisOp::Wait { num_replicas: 1, timeout_ms: 1000 }),
+            ("setex", RedisOp::SetEx { ttl_seconds: 3600 }),
+            ("setrange", RedisOp::SetRange { offset: 0 }),
+            ("getrange", RedisOp::GetRange { offset: 0, end: -1 }),
+            ("scan", scan(None, None)),
+            ("multi", RedisOp::Multi),
+            ("exec", RedisOp::Exec),
+            ("discard", RedisOp::Discard),
+        ] {
+            assert_eq!(op(json!({ "name": name, "weight": 1.0 })).unwrap(), expected, "{name}");
+        }
     }
 
     #[test]
