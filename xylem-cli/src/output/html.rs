@@ -143,6 +143,8 @@ pub fn generate_html_report(results: &DetailedExperimentResults, path: &str) -> 
             {global_requests}
         </table>
 
+        {global_breakdown}
+
         <div class="chart-container">
             <canvas id="globalLatencyChart"></canvas>
         </div>
@@ -233,6 +235,7 @@ pub fn generate_html_report(results: &DetailedExperimentResults, path: &str) -> 
             &results.global.error_latency,
             &results.global.send_lag
         ),
+        global_breakdown = breakdown_section(&results.global.latency_breakdown),
         group_sections = generate_group_sections(&results.traffic_groups),
         global_latencies = script_json(&[
             results.global.latency.p50_us,
@@ -331,6 +334,7 @@ fn generate_group_sections(groups: &[super::TrafficGroupResults]) -> String {
                 </tr>
                 {requests_rows}
             </table>
+            {breakdown}
             <div class="chart-container">
                 <canvas id="groupLatencyChart{id}"></canvas>
             </div>
@@ -360,6 +364,7 @@ fn generate_group_sections(groups: &[super::TrafficGroupResults]) -> String {
                     &group.stats.error_latency,
                     &group.stats.send_lag
                 ),
+                breakdown = breakdown_section(&group.stats.latency_breakdown),
             )
         })
         .collect::<Vec<_>>()
@@ -414,6 +419,32 @@ fn request_rows(
     .map(|(label, value)| format!("<tr>\n<td>{label}</td>\n<td>{value}</td>\n</tr>"))
     .collect::<Vec<_>>()
     .join("\n")
+}
+
+/// Heading, clock and table of a latency breakdown: one row per part
+fn breakdown_section(breakdown: &super::LatencyBreakdownStats) -> String {
+    let rows = breakdown
+        .parts()
+        .iter()
+        .map(|(label, part)| {
+            let cells = match part {
+                Some(part) => {
+                    part.values().map(|value| format!("<td>{}</td>", micros_or_na(value))).concat()
+                }
+                None => "<td colspan=\"5\">n/a (no kernel split)</td>".to_string(),
+            };
+            format!("<tr>\n<td>{label}</td>\n{cells}\n</tr>")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "<h4>Latency Breakdown</h4>\n<p>Clock: {clock}; requests with a kernel split: {split}. \
+         {note}</p>\n<table>\n<tr>\n<th>Part</th>\n<th>Mean</th>\n<th>p50</th>\n\
+         <th>p99</th>\n<th>p99.9</th>\n<th>Max</th>\n</tr>\n{rows}\n</table>",
+        clock = breakdown.clock_name(),
+        split = breakdown.kernel_split_count,
+        note = super::BREAKDOWN_NOTE,
+    )
 }
 
 /// Format optional microseconds with two decimals and a unit, or `n/a`.

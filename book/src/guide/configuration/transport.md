@@ -101,4 +101,49 @@ drain, and warmup requests time out without being counted. Stream transports
 (`tcp`, `unix`, `ntcp`) retransmit, never time out requests, and reject
 `request_timeout`.
 
+## Timestamps
+
+`timestamps` chooses where a traffic group's send and receive timestamps come
+from. It applies to `tcp` and `udp` groups on Linux:
+
+```toml
+[[traffic_groups]]
+transport = "udp"
+timestamps = "kernel"        # "user" (default), "kernel", or { hardware = "data0" }
+# ...
+```
+
+- `"user"` (default): only the CPU timestamp counter (RDTSC), read in user
+  space when each send and receive call completes. No `SO_TIMESTAMPING` and no
+  error-queue reads.
+- `"kernel"`: also kernel software timestamps (`SO_TIMESTAMPING`, on the
+  system clock): a TX timestamp when the request leaves the kernel's stack for
+  the driver, read back from the socket's error queue, and an RX timestamp
+  when the response enters the stack. Any interface has them, loopback too.
+- `{ hardware = "<interface>" }`: NIC hardware timestamps, on the NIC's PTP
+  clock, and every socket is bound to the interface. The interface must
+  already have hardware timestamping switched on, for example by a PTP daemon
+  or with linuxptp's `hwstamp_ctl -i data0 -t 1 -r 1` as root. When the run
+  starts, before any worker, xylem reads the interface's setting with
+  `SIOCGHWTSTAMP` and fails with an error if it is off or unsupported. It
+  never switches NIC timestamping on, and never falls back to another source.
+
+Every timestamp keeps its user-space cycles. A request's latency uses the
+kernel timestamps when its send and its response both have one from the same
+clock, and the cycles otherwise; either way the
+[latency breakdown](../output-formats.md#latency-breakdown) reports the
+service latency, and with kernel timestamps it splits the round trip into the
+part between the user-space and the kernel timestamps (`host_stack_us`) and
+the kernel round trip (`network_server_us`). A
+request whose TX or RX timestamp did not arrive is measured in cycles and
+counted in `service_us` alone; `kernel_split_count` says how many were split.
+
+- `unix` and `ntcp` groups reject anything but `"user"`: neither has kernel
+  packet timestamps.
+- Traffic groups that share a thread share its connection group, whose
+  sockets are configured alike, so they must use the same `timestamps`.
+- Kernel timestamps cost an error-queue read per poll for each connection
+  with sends not yet stamped, and a `recvmsg` with ancillary data per read.
+  Compare runs with the same source.
+
 See the [Architecture - Transport Layer](../../architecture/transports.md) for implementation details.

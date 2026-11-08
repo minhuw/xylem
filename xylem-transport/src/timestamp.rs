@@ -81,12 +81,30 @@ impl Timestamp {
     /// Otherwise uses the cycles of both, read when each call completed.
     #[inline]
     pub fn duration_since(&self, earlier: &Timestamp) -> Duration {
-        if let (Some(later), Some(earlier)) = (self.kernel, earlier.kernel) {
-            if later.clock == earlier.clock {
-                return Duration::from_nanos(later.nanos.saturating_sub(earlier.nanos));
-            }
+        match self.kernel_duration_since(earlier) {
+            Some((_, duration)) => duration,
+            None => self.cycles_duration_since(earlier),
         }
+    }
 
+    /// Time from `earlier` to this event by their kernel timestamps, with
+    /// the clock they were taken from
+    ///
+    /// `None` unless both events have a kernel timestamp from the same clock.
+    #[inline]
+    pub fn kernel_duration_since(&self, earlier: &Timestamp) -> Option<(KernelClock, Duration)> {
+        match (self.kernel, earlier.kernel) {
+            (Some(later), Some(earlier)) if later.clock == earlier.clock => {
+                Some((later.clock, Duration::from_nanos(later.nanos.saturating_sub(earlier.nanos))))
+            }
+            _ => None,
+        }
+    }
+
+    /// Time from `earlier` to this event by their cycles, read in user space
+    /// when each call completed, whether or not they have kernel timestamps
+    #[inline]
+    pub fn cycles_duration_since(&self, earlier: &Timestamp) -> Duration {
         let delta_cycles = self.cycles.saturating_sub(earlier.cycles);
         let nanos = get_calibration().cycles_to_nanos(delta_cycles);
         Duration::from_nanos(nanos)
@@ -279,6 +297,26 @@ mod tests {
             let expected = if kernel_used { kernel_delta } else { cycles };
             assert_eq!(recv.duration_since(&send), expected, "{send_clock:?} -> {recv_clock:?}");
         }
+    }
+
+    /// The kernel and cycles views of the same pair of events stay apart
+    #[test]
+    fn test_kernel_and_cycles_durations() {
+        use KernelClock::{NicHardware as Hw, Realtime as Sw};
+        let send = Timestamp::now();
+        std::thread::sleep(Duration::from_millis(5));
+        let recv = Timestamp::now();
+        let cycles = recv.cycles_duration_since(&send);
+        assert!(cycles >= Duration::from_millis(4), "{cycles:?}");
+        assert_eq!(recv.kernel_duration_since(&send), None);
+
+        let send_sw = send.with_kernel(kernel(1_000, Sw));
+        let recv_sw = recv.with_kernel(kernel(3_000, Sw));
+        assert_eq!(recv_sw.kernel_duration_since(&send_sw), Some((Sw, Duration::from_micros(2))));
+        assert_eq!(recv_sw.cycles_duration_since(&send_sw), cycles);
+        let recv_hw = recv.with_kernel(kernel(3_000, Hw));
+        assert_eq!(recv_hw.kernel_duration_since(&send_sw), None);
+        assert_eq!(recv_sw.kernel_duration_since(&send), None);
     }
 
     #[test]

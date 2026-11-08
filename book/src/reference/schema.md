@@ -95,6 +95,10 @@ type = "unlimited"
   - TCP/UDP: numeric `"ip:port"` or `"[ipv6]:port"`
   - Unix socket: `"/path/to/socket"`
 - `transport` (string, default `"tcp"`): `"tcp"`, `"udp"`, or `"unix"`
+- `timestamps` (default `"user"`): timestamp source, `"user"`, `"kernel"`, or
+  `{ hardware = "<interface>" }`; `tcp` and `udp` on Linux only, the same for
+  groups sharing a thread. See
+  [timestamps](../guide/configuration/transport.md#timestamps).
 - `threads` (array of integers, required): Thread IDs to use for this group
 - `connections_per_thread` (integer, required): Number of connections per thread
 - `max_pending_per_connection` (integer, required): Maximum pending requests per connection

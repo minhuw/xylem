@@ -740,6 +740,34 @@
       },
       "additionalProperties": false
     },
+    "TimestampSourceConfig": {
+      "description": "Source of a traffic group's send and receive timestamps\n\nEvery timestamp holds the user-space cycles read when its send or\nreceive call completed. Kernel and NIC timestamps come in addition, and\na latency uses them when its send and its receive both have one from the\nsame clock, which splits its round trip in the latency breakdown.",
+      "oneOf": [
+        {
+          "description": "User-space cycle counts only (default)",
+          "type": "string",
+          "const": "user"
+        },
+        {
+          "description": "Kernel software timestamps (SO_TIMESTAMPING) of every send and receive",
+          "type": "string",
+          "const": "kernel"
+        },
+        {
+          "description": "NIC hardware timestamps of this interface, which must already have\nhardware timestamping switched on: the run fails otherwise, and never\nswitches it on or falls back to another source",
+          "type": "object",
+          "properties": {
+            "hardware": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "hardware"
+          ]
+        }
+      ]
+    },
     "TrafficGroupConfig": {
       "description": "Traffic group configuration",
       "type": "object",
@@ -801,6 +829,10 @@
             "format": "uint",
             "minimum": 0
           }
+        },
+        "timestamps": {
+          "description": "Source of the send and receive timestamps latencies are measured\nwith: \"user\" (default), \"kernel\", or { hardware = \"<interface>\" }.\nOnly for transports \"tcp\" and \"udp\" on Linux; traffic groups that\nshare a thread must use the same source.",
+          "$ref": "#/$defs/TimestampSourceConfig"
         },
         "traffic_policy": {
           "description": "Traffic policy configuration (rate control)",

@@ -37,6 +37,7 @@ fn test_detailed_json_output_generation() {
             max_pending_per_connection: 100,
             request_timeout: None,
             on_error: OnError::Count,
+            timestamps: Default::default(),
             protocol: "redis".to_string(),
             target: "127.0.0.1:6379".to_string(),
             transport: "tcp".to_string(),
@@ -51,6 +52,7 @@ fn test_detailed_json_output_generation() {
             max_pending_per_connection: 50,
             request_timeout: None,
             on_error: OnError::Count,
+            timestamps: Default::default(),
             protocol: "memcached-binary".to_string(),
             target: "127.0.0.1:6380".to_string(),
             transport: "tcp".to_string(),
@@ -139,6 +141,7 @@ fn test_json_serialization_deserialization() {
         max_pending_per_connection: 1,
         request_timeout: None,
         on_error: OnError::Count,
+        timestamps: Default::default(),
         protocol: "redis".to_string(),
         target: "127.0.0.1:6379".to_string(),
         transport: "tcp".to_string(),
@@ -195,6 +198,7 @@ fn test_html_report_generation() {
         max_pending_per_connection: 100,
         request_timeout: None,
         on_error: OnError::Count,
+        timestamps: Default::default(),
         protocol: "redis".to_string(),
         target: "127.0.0.1:6379".to_string(),
         transport: "tcp".to_string(),
@@ -272,6 +276,7 @@ fn test_per_group_statistics_isolation() {
             max_pending_per_connection: 100,
             request_timeout: None,
             on_error: OnError::Count,
+            timestamps: Default::default(),
             protocol: "redis".to_string(),
             target: "127.0.0.1:6379".to_string(),
             transport: "tcp".to_string(),
@@ -286,6 +291,7 @@ fn test_per_group_statistics_isolation() {
             max_pending_per_connection: 50,
             request_timeout: None,
             on_error: OnError::Count,
+            timestamps: Default::default(),
             protocol: "redis".to_string(),
             target: "127.0.0.1:6379".to_string(),
             transport: "tcp".to_string(),
@@ -350,4 +356,95 @@ fn test_tuple_stats_merging_across_threads() {
     // Verify stats were merged correctly
     let aggregated = merged.aggregate_global(Duration::from_secs(1));
     assert_eq!(aggregated.total_requests, 250); // 100 + 150
+}
+
+#[test]
+fn latency_breakdown_is_reported_per_group_and_globally() {
+    use xylem_core::stats::{BreakdownClock, KernelSplit, LatencyBreakdown};
+    use xylem_transport::KernelClock;
+    let mut stats = TupleStatsCollector::default();
+    for us in 1..=100u64 {
+        // Group 0 splits every round trip in NIC timestamps; group 1 cannot
+        stats.record_latency(0, 0, Duration::from_micros(10 * us));
+        stats.record_breakdown(
+            0,
+            &LatencyBreakdown {
+                service: Duration::from_micros(10 * us),
+                kernel: Some(KernelSplit {
+                    clock: KernelClock::NicHardware,
+                    network_server: Duration::from_micros(10 * us),
+                    host_stack: Duration::from_micros(us),
+                }),
+            },
+        );
+        stats.record_latency(1, 0, Duration::from_micros(us));
+        stats.record_breakdown(
+            1,
+            &LatencyBreakdown {
+                service: Duration::from_micros(us),
+                kernel: None,
+            },
+        );
+    }
+    let group = |name: &str| TrafficGroupConfig {
+        name: name.to_string(),
+        threads: vec![0],
+        connections_per_thread: 1,
+        max_pending_per_connection: 1,
+        request_timeout: None,
+        on_error: OnError::Count,
+        timestamps: Default::default(),
+        protocol: "xylem-echo".to_string(),
+        target: "127.0.0.1:9999".to_string(),
+        transport: "tcp".to_string(),
+        traffic_policy: PolicyConfig::ClosedLoop,
+        sampling_policy: SamplingPolicy::default(),
+        protocol_config: None,
+    };
+    let results = DetailedExperimentResults::from_tuple_stats(
+        "breakdown".to_string(),
+        None,
+        None,
+        "127.0.0.1:9999".to_string(),
+        "xylem-echo".to_string(),
+        "tcp".to_string(),
+        Duration::from_secs(1),
+        &stats,
+        &[group("nic"), group("user")],
+        false,
+    );
+    let json = serde_json::to_value(&results).unwrap();
+
+    let nic = &json["traffic_groups"][0]["stats"]["latency_breakdown"];
+    assert_eq!(nic["clock"], "nic_hardware");
+    assert_eq!(nic["kernel_split_count"], 100);
+    assert_eq!(nic["service_us"]["sample_count"], 100);
+    assert_eq!(nic["service_us"]["max_us"], 1000.0);
+    assert_eq!(nic["host_stack_us"]["mean_us"], 50.5);
+    assert_eq!(nic["host_stack_us"]["sample_count"], 100);
+    assert_eq!(nic["network_server_us"]["mean_us"], 505.0);
+    for key in ["p50_us", "p99_us", "p999_us"] {
+        let p = nic["network_server_us"][key].as_f64().unwrap();
+        assert!(p > 0.0 && p <= 1000.0 * 1.001, "{key}: {p}");
+    }
+
+    let user = &json["traffic_groups"][1]["stats"]["latency_breakdown"];
+    assert_eq!(user["clock"], "user_space");
+    assert_eq!(user["kernel_split_count"], 0);
+    assert_eq!(user["service_us"]["mean_us"], 50.5);
+    assert!(user["host_stack_us"].is_null() && user["network_server_us"].is_null());
+
+    // Globally the clocks differ, and only group 0's requests are split
+    let global = &json["global"]["latency_breakdown"];
+    assert_eq!(global["clock"], "mixed");
+    assert_eq!(global["kernel_split_count"], 100);
+    assert_eq!(global["service_us"]["sample_count"], 200);
+    assert_eq!(global["host_stack_us"]["sample_count"], 100);
+    // The send lag stays where it was, outside the breakdown
+    assert!(json["global"]["send_lag"].is_object());
+    assert!(global.get("send_lag").is_none());
+
+    let parsed: DetailedExperimentResults = serde_json::from_value(json).unwrap();
+    assert_eq!(parsed.global.latency_breakdown.clock, Some(BreakdownClock::Mixed));
+    assert_eq!(parsed.traffic_groups[0].stats.latency_breakdown.kernel_split_count, 100);
 }

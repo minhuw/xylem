@@ -7,7 +7,7 @@
 //! poll syscall checks all connections in the pool.
 
 use crate::scheduler::{Policy, ReadyHeap};
-use crate::stats::{MAX_ERROR_KINDS, MAX_ERROR_KIND_LEN, OTHER_ERROR_KIND};
+use crate::stats::{LatencyBreakdown, MAX_ERROR_KINDS, MAX_ERROR_KIND_LEN, OTHER_ERROR_KIND};
 use crate::traffic_group::OnError;
 use crate::Result;
 use std::collections::{HashMap, VecDeque};
@@ -77,10 +77,27 @@ impl ErrorKindId {
     const OTHER: Self = Self(u8::MAX);
 }
 
-/// A completed response: (request_id, latency, is_warmup, bytes_consumed,
-/// error kind). The error kind is set for an error reply; see
-/// [`ConnectionPool::error_kind`].
-pub type CompletedResponse<ReqId> = (ReqId, Duration, bool, usize, Option<ErrorKindId>);
+/// A request completed by its response, as the receive path returns it
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Completion<ReqId> {
+    /// The request's ID
+    pub id: ReqId,
+    /// The request's send lag plus its service latency, from the send to the
+    /// receive timestamp
+    pub latency: Duration,
+    /// Whether the request was a warmup (or setup) request, whose stats are
+    /// not collected
+    pub is_warmup: bool,
+    /// Bytes the response took: those the protocol consumed, plus on a
+    /// datagram connection the absorbed datagrams before it
+    pub bytes_consumed: usize,
+    /// Set for an error reply; see [`ConnectionPool::error_kind`]
+    pub error: Option<ErrorKindId>,
+    /// Where the latency went. The worker records it only for a successful
+    /// response, as it records only those latencies in the latency
+    /// distribution.
+    pub breakdown: LatencyBreakdown,
+}
 
 /// What a connection does with error replies, and the kinds it has seen
 #[derive(Debug, Default)]
@@ -546,8 +563,8 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         self.timed_out_ids.insert(req_id, is_warmup);
     }
 
-    /// Complete the pending request `req_id`, returning its latency and
-    /// whether it was a warmup request
+    /// Complete the pending request `req_id`, returning its latency, whether
+    /// it was a warmup request, and where its latency went
     ///
     /// A response to a timed-out request is dropped (`Ok(None)`) and, for a
     /// measurement request, counted as late. Any other unknown ID is an error
@@ -558,7 +575,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         req_id: &ReqId,
         recv_ts: Timestamp,
         datagram: bool,
-    ) -> Result<Option<(Duration, bool)>> {
+    ) -> Result<Option<(Duration, bool, LatencyBreakdown)>> {
         let Some(pending) = self.pending_map.remove(req_id) else {
             if let Some(is_warmup) = self.timed_out_ids.remove(req_id) {
                 if !is_warmup {
@@ -584,11 +601,12 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
                 pending.send_ts
             }
         };
-        let latency = pending.send_lag + recv_ts.duration_since(&send_ts);
+        let breakdown = LatencyBreakdown::between(&send_ts, &recv_ts);
+        let latency = pending.send_lag + breakdown.service;
         if pending.is_setup {
             self.finish_setup_request();
         }
-        Ok(Some((latency, pending.is_warmup)))
+        Ok(Some((latency, pending.is_warmup, breakdown)))
     }
 
     /// Process `data` as if the transport had just read it into the spare tail
@@ -598,7 +616,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         data: &[u8],
         recv_ts: Timestamp,
         process_fn: F,
-    ) -> Result<Vec<CompletedResponse<ReqId>>>
+    ) -> Result<Vec<Completion<ReqId>>>
     where
         F: for<'a> FnMut(&'a [u8]) -> Result<Parsed<'a, ReqId>>,
     {
@@ -630,17 +648,16 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
 
     /// Process `len` bytes the transport read into `recv_spare()`
     ///
-    /// Returns (request_id, latency, is_warmup, bytes_consumed, error kind)
-    /// for each completed response; the kind is set for an error reply. The
-    /// latency is the request's send lag plus its service latency, from the
-    /// send to the receive timestamp. With `on_error = "abort"`, an error
-    /// reply is an error.
+    /// Returns a [`Completion`] for each completed response; its error kind
+    /// is set for an error reply. The latency is the request's send lag plus
+    /// its service latency, from the send to the receive timestamp. With
+    /// `on_error = "abort"`, an error reply is an error.
     fn process_received<F>(
         &mut self,
         len: usize,
         recv_ts: Timestamp,
         mut process_fn: F,
-    ) -> Result<Vec<CompletedResponse<ReqId>>>
+    ) -> Result<Vec<Completion<ReqId>>>
     where
         F: for<'a> FnMut(&'a [u8]) -> Result<Parsed<'a, ReqId>>,
     {
@@ -678,8 +695,15 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
             let error = error
                 .map(|error| self.error_replies.report(self.group_id, self.connection_id, &error))
                 .transpose()?;
-            if let Some((latency, is_warmup)) = self.complete(&req_id, recv_ts, false)? {
-                responses.push((req_id, latency, is_warmup, consumed, error));
+            if let Some((latency, is_warmup, breakdown)) = self.complete(&req_id, recv_ts, false)? {
+                responses.push(Completion {
+                    id: req_id,
+                    latency,
+                    is_warmup,
+                    bytes_consumed: consumed,
+                    error,
+                    breakdown,
+                });
             }
             cursor += consumed;
         }
@@ -702,7 +726,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         len: usize,
         recv_ts: Timestamp,
         mut process_fn: F,
-    ) -> Result<Vec<CompletedResponse<ReqId>>>
+    ) -> Result<Vec<Completion<ReqId>>>
     where
         F: for<'a> FnMut(&'a [u8]) -> Result<Parsed<'a, ReqId>>,
     {
@@ -731,9 +755,15 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
             let error = error
                 .map(|error| self.error_replies.report(self.group_id, self.connection_id, &error))
                 .transpose()?;
-            if let Some((latency, is_warmup)) = self.complete(&req_id, recv_ts, true)? {
-                let bytes = std::mem::take(&mut self.absorbed_bytes);
-                responses.push((req_id, latency, is_warmup, bytes, error));
+            if let Some((latency, is_warmup, breakdown)) = self.complete(&req_id, recv_ts, true)? {
+                responses.push(Completion {
+                    id: req_id,
+                    latency,
+                    is_warmup,
+                    bytes_consumed: std::mem::take(&mut self.absorbed_bytes),
+                    error,
+                    breakdown,
+                });
             }
         }
         Ok(responses)
@@ -1065,7 +1095,7 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
 
     /// Receive and process responses for a connection
     ///
-    /// Returns a vector of (request_id, latency, is_warmup, bytes_consumed, error kind) tuples for each completed response.
+    /// Returns a [`Completion`] for each completed response.
     /// The `is_warmup` flag indicates whether the original request was a warmup request
     /// and stats should not be collected. The error kind is set for an error
     /// reply; see [`Self::error_kind`]. Only successful measurement responses
@@ -1074,7 +1104,7 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         &mut self,
         connection_id: usize,
         process_fn: F,
-    ) -> Result<Vec<CompletedResponse<ReqId>>>
+    ) -> Result<Vec<Completion<ReqId>>>
     where
         F: for<'a> FnMut(&'a [u8]) -> Result<Parsed<'a, ReqId>>,
     {
@@ -1097,10 +1127,10 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
                 return Err(crate::Error::Connection("Connection closed by peer".to_string()))
             }
         };
-        for &(_, latency, is_warmup, _, error) in &responses {
+        for response in &responses {
             // A fast error reply would make an adaptive policy speed up
-            if !is_warmup && error.is_none() {
-                state.policy.on_response(latency);
+            if !response.is_warmup && response.error.is_none() {
+                state.policy.on_response(response.latency);
             }
         }
         Ok(responses)
@@ -1428,7 +1458,7 @@ mod tests {
         let tail = [&first[MAX_PAYLOAD - 4..], &frame(2, 16)].concat();
         let responses = state.process_recv(&tail, ts, parse_frame).unwrap();
         assert_eq!(
-            responses.iter().map(|r| (r.0, r.3)).collect::<Vec<_>>(),
+            responses.iter().map(|r| (r.id, r.bytes_consumed)).collect::<Vec<_>>(),
             vec![(1, MAX_PAYLOAD), (2, 16)]
         );
         assert!(state.buffered().is_empty());
@@ -1463,7 +1493,7 @@ mod tests {
         data.extend_from_slice(&tail[..6]);
         assert_eq!(state.process_recv(&data, ts, parse_frame).unwrap().len(), 100);
         assert_eq!(state.buffered(), &tail[..6]);
-        assert_eq!(state.process_recv(&tail[6..], ts, parse_frame).unwrap()[0].0, 100);
+        assert_eq!(state.process_recv(&tail[6..], ts, parse_frame).unwrap()[0].id, 100);
         assert!(state.buffered().is_empty());
     }
 
@@ -1513,9 +1543,17 @@ mod tests {
         .unwrap();
         pool.send(0, &[0], 7u64, true).unwrap();
         factory.0.lock().unwrap().responses.push_back(Ok(vec![0]));
+        let breakdown = LatencyBreakdown { service: Duration::ZERO, kernel: None };
         assert_eq!(
             pool.recv_responses(0, |_| Ok(Parsed::ok(1, 7))).unwrap(),
-            vec![(7, Duration::ZERO, true, 1, None)]
+            vec![Completion {
+                id: 7,
+                latency: Duration::ZERO,
+                is_warmup: true,
+                bytes_consumed: 1,
+                error: None,
+                breakdown,
+            }]
         );
         assert_eq!(pool.get_state(0).unwrap().pending_count(), 0);
     }
@@ -1545,7 +1583,7 @@ mod tests {
 
         io.lock().unwrap().responses.push_back(Ok(data[10..].to_vec()));
         let responses = pool.recv_responses(0, parse_frame).unwrap();
-        assert_eq!(responses.iter().map(|r| r.0).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(responses.iter().map(|r| r.id).collect::<Vec<_>>(), vec![1, 2]);
         let state = pool.get_state(0).unwrap();
         assert!(state.buffered().is_empty());
         assert!(state.recv_buffer.len() >= MAX_PAYLOAD);
@@ -1554,7 +1592,7 @@ mod tests {
         // Once large enough, later reads neither grow nor reallocate it
         pool.send(0, &[0], 3u64, false).unwrap();
         io.lock().unwrap().responses.push_back(Ok(frame(3, 8)));
-        assert_eq!(pool.recv_responses(0, parse_frame).unwrap()[0].0, 3);
+        assert_eq!(pool.recv_responses(0, parse_frame).unwrap()[0].id, 3);
         let state = pool.get_state(0).unwrap();
         assert_eq!((state.recv_buffer.as_ptr(), state.recv_buffer.len()), buffer);
 
@@ -1596,7 +1634,8 @@ mod tests {
                 Some(clock) => recv_ts.with_kernel(kernel(1_500_000, clock)),
                 None => recv_ts,
             };
-            let latency = state.process_recv(&frame(1, 8), recv_ts, parse_frame).unwrap()[0].1;
+            let latency =
+                state.process_recv(&frame(1, 8), recv_ts, parse_frame).unwrap()[0].latency;
             if kernel_used {
                 assert_eq!(latency, Duration::from_micros(500));
             } else {
@@ -1782,9 +1821,21 @@ mod tests {
         let responses = state
             .process_recv(&[frame(1, 8), frame(2, 8)].concat(), recv_ts, parse_frame)
             .unwrap();
-        assert_eq!(responses[0].1, lag + Duration::from_micros(500));
+        assert_eq!(responses[0].latency, lag + Duration::from_micros(500));
         // Without one, the service part is measured in cycles
-        assert_eq!(responses[1].1, lag + recv_ts.duration_since(&send_ts));
+        assert_eq!(responses[1].latency, lag + recv_ts.duration_since(&send_ts));
+        // The breakdown's service part is the latency without the send lag;
+        // only the stamped request splits it, against the send's own cycles
+        let (stamped, unstamped) = (responses[0].breakdown, responses[1].breakdown);
+        assert_eq!(stamped.service, Duration::from_micros(500));
+        let split = stamped.kernel.unwrap();
+        assert_eq!(split.network_server, Duration::from_micros(500));
+        assert_eq!(
+            split.host_stack,
+            recv_ts.cycles_duration_since(&send_ts).saturating_sub(split.network_server)
+        );
+        assert_eq!(unstamped.service, recv_ts.duration_since(&send_ts));
+        assert_eq!(unstamped.kernel, None);
     }
 
     #[test]
@@ -1904,7 +1955,7 @@ mod tests {
             assert_eq!(pool.get_state(0).unwrap().pending_count(), 0);
             let kinds: Vec<_> = responses
                 .iter()
-                .map(|r| (r.0, r.3, r.4.map(|kind| pool.error_kind(0, kind))))
+                .map(|r| (r.id, r.bytes_consumed, r.error.map(|kind| pool.error_kind(0, kind))))
                 .collect();
             assert_eq!(
                 kinds,
@@ -1917,7 +1968,7 @@ mod tests {
                 ]
             );
             // A kind is numbered once per connection
-            assert_eq!(responses[1].4, responses[4].4);
+            assert_eq!(responses[1].error, responses[4].error);
         }
     }
 
@@ -2022,13 +2073,19 @@ mod tests {
         assert!(pool.get_state(0).unwrap().buffered().is_empty());
         io.lock().unwrap().responses.push_back(Ok(frame(1, 8)));
         let responses = pool.recv_responses(0, parse_datagram).unwrap();
-        assert_eq!(responses.iter().map(|r| (r.0, r.3)).collect::<Vec<_>>(), vec![(1, 16)]);
+        assert_eq!(
+            responses.iter().map(|r| (r.id, r.bytes_consumed)).collect::<Vec<_>>(),
+            vec![(1, 16)]
+        );
 
         // One datagram may hold several frames, and a fragment after them
         let data = [frame(2, 8), frame(3, 12), b"Fxyz".to_vec()].concat();
         io.lock().unwrap().responses.push_back(Ok(data));
         let responses = pool.recv_responses(0, parse_datagram).unwrap();
-        assert_eq!(responses.iter().map(|r| (r.0, r.3)).collect::<Vec<_>>(), vec![(2, 8), (3, 12)]);
+        assert_eq!(
+            responses.iter().map(|r| (r.id, r.bytes_consumed)).collect::<Vec<_>>(),
+            vec![(2, 8), (3, 12)]
+        );
         assert_eq!(pool.get_state(0).unwrap().pending_count(), 0);
 
         // A datagram is never joined with the next: a partial frame is an error
@@ -2054,7 +2111,7 @@ mod tests {
         factory.0.lock().unwrap().responses.push_back(Ok(data[..10].to_vec()));
         assert!(pool.recv_responses(0, parse_frame).unwrap().is_empty());
         factory.0.lock().unwrap().responses.push_back(Ok(data[10..].to_vec()));
-        assert_eq!(pool.recv_responses(0, parse_frame).unwrap()[0].0, 1);
+        assert_eq!(pool.recv_responses(0, parse_frame).unwrap()[0].id, 1);
         // Unknown IDs and fragments stay errors on a byte stream
         factory.0.lock().unwrap().responses.push_back(Ok(frame(9, 8)));
         assert!(pool.recv_responses(0, parse_frame).is_err());

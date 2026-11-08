@@ -408,16 +408,26 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
                 }
             };
 
-            for (_, latency, is_warmup, bytes_consumed, error) in responses {
-                if is_warmup {
+            for response in responses {
+                if response.is_warmup {
                     continue;
                 }
-                self.stats.record_rx_bytes(group_id, connection_id, bytes_consumed);
-                match error {
-                    None => self.stats.record_latency(group_id, connection_id, latency),
+                self.stats.record_rx_bytes(group_id, connection_id, response.bytes_consumed);
+                match response.error {
+                    // An error reply's latency stays out of the latency
+                    // distribution and of the breakdown alike
+                    None => {
+                        self.stats.record_latency(group_id, connection_id, response.latency);
+                        self.stats.record_breakdown(group_id, connection_id, &response.breakdown);
+                    }
                     Some(kind) => {
                         let kind = self.pool.error_kind(connection_id, kind);
-                        self.stats.record_error_reply(group_id, connection_id, kind, latency);
+                        self.stats.record_error_reply(
+                            group_id,
+                            connection_id,
+                            kind,
+                            response.latency,
+                        );
                     }
                 }
             }
@@ -731,6 +741,9 @@ mod tests {
         assert_eq!(worker.stats.error_latency(0).latency_sample_count, 2);
         assert_eq!(worker.stats.error_latency_global().latency_sample_count, 2);
         assert_eq!(worker.stats.entries().values().map(|entry| entry.rx_bytes).sum::<u64>(), 24);
+        // Like the latency, the breakdown leaves the error replies out
+        assert_eq!(worker.stats.latency_breakdown_global().service.sample_count, 1);
+        assert_eq!(worker.stats.latency_breakdown(0).service.sample_count, 1);
 
         worker.config.duration = Duration::ZERO;
         worker.run().unwrap();
@@ -1115,6 +1128,65 @@ mod tests {
         assert!(first_send >= start, "nothing is sent before the start");
         assert_eq!(end, start + 10_000_000);
         assert_eq!(worker.stats.request_counts_global().sent, 1);
+    }
+
+    #[test]
+    fn latency_breakdown_skips_setup_and_warmup_requests() {
+        use crate::stats::BreakdownClock;
+        let factory = FakeFactory::default();
+        factory.0.lock().unwrap().live_timestamps = true;
+        let mut worker = fake_worker(&factory, 1, Box::new(UniformPolicyScheduler::closed_loop()));
+        let protocol = worker.protocols.get_mut(&0).unwrap();
+        // Request 0 sets the connection up, 1 is warmup, 2 and 3 are measured
+        protocol.setup = 1;
+        protocol.warmup = 2;
+        for id in 0u64..4 {
+            worker.send_requests().unwrap();
+            factory.0.lock().unwrap().responses.push_back(Ok(id.to_le_bytes().to_vec()));
+            worker.process_responses(Duration::ZERO).unwrap();
+        }
+        assert_eq!(factory.0.lock().unwrap().sent.len(), 4);
+        let breakdown = worker.stats.latency_breakdown_global();
+        assert_eq!(breakdown.service.sample_count, 2);
+        assert_eq!(global(&worker).latency_sample_count, 2);
+        // User-space timestamps only: the service latency, no kernel split
+        assert_eq!(breakdown.clock, Some(BreakdownClock::UserSpace));
+        assert_eq!((breakdown.kernel_split_count, breakdown.host_stack), (0, None));
+        assert_eq!(worker.stats.latency_breakdown(0), breakdown);
+    }
+
+    #[test]
+    fn kernel_tx_and_rx_timestamps_split_the_recorded_round_trip() {
+        use crate::stats::BreakdownClock;
+        use xylem_transport::{KernelClock, KernelTimestamp, Timestamp, TxTimestampInfo};
+        let kernel = |nanos| KernelTimestamp { nanos, clock: KernelClock::Realtime };
+        let factory = FakeFactory::default();
+        let mut worker = fake_worker(&factory, 1, Box::new(UniformPolicyScheduler::closed_loop()));
+        worker.send_requests().unwrap();
+        thread::sleep(Duration::from_millis(1));
+        {
+            // The send's TX stamp arrives; the response has an RX stamp 5 µs later
+            let mut io = factory.0.lock().unwrap();
+            io.tx_timestamps.push(TxTimestampInfo {
+                conn_id: 0,
+                tx_end: 1,
+                cumulative: true,
+                timestamp: kernel(1_000),
+            });
+            io.timestamp = Timestamp::now().with_kernel(kernel(6_000));
+            io.responses.push_back(Ok(0u64.to_le_bytes().to_vec()));
+        }
+        worker.process_responses(Duration::ZERO).unwrap();
+        let breakdown = worker.stats.latency_breakdown_global();
+        assert_eq!(breakdown.clock, Some(BreakdownClock::KernelSoftware));
+        assert_eq!((breakdown.kernel_split_count, breakdown.service.sample_count), (1, 1));
+        let network = breakdown.network_server.unwrap();
+        assert_eq!(network.max, Some(Duration::from_micros(5)));
+        assert_eq!(breakdown.service.max, network.max, "the latency's clock");
+        // The cycles round trip spans the 1 ms sleep
+        let host = breakdown.host_stack.unwrap().max.unwrap();
+        assert!(host >= Duration::from_micros(900), "{host:?}");
+        assert_eq!(global(&worker).max_latency, Some(Duration::from_micros(5)));
     }
 
     #[test]

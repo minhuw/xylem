@@ -48,6 +48,11 @@ impl std::fmt::Display for TimestampSource {
 /// group with `SIOCGHWTSTAMP`). Otherwise it uses kernel software
 /// timestamps if `software_timestamps` is set, and user-space timestamps by
 /// default. See [`TimestampSource`].
+///
+/// With `require_hardware`, a group never falls back: creating it fails
+/// unless the interface has hardware timestamping switched on, and adding a
+/// connection fails unless its socket is bound to the interface and has
+/// hardware timestamping enabled.
 #[derive(Debug, Clone)]
 pub struct TimestampConfig {
     /// Network interface to bind to and take hardware timestamps from (e.g., "eth0")
@@ -64,6 +69,12 @@ pub struct TimestampConfig {
     /// Default: false (user-space timestamps)
     #[cfg(target_os = "linux")]
     pub software_timestamps: bool,
+
+    /// Fail instead of falling back when `interface` cannot provide hardware
+    /// timestamps. Never switches NIC timestamping on.
+    /// Default: false
+    #[cfg(target_os = "linux")]
+    pub require_hardware: bool,
 }
 
 // Not derivable on Linux, where the fields have non-default defaults
@@ -77,6 +88,8 @@ impl Default for TimestampConfig {
             enable_timestamps: true,
             #[cfg(target_os = "linux")]
             software_timestamps: false,
+            #[cfg(target_os = "linux")]
+            require_hardware: false,
         }
     }
 }
@@ -106,11 +119,57 @@ impl TimestampConfig {
         }
     }
 
+    /// Create config that uses the hardware timestamps of `interface` and
+    /// never falls back to another source (see `require_hardware`)
+    #[cfg(target_os = "linux")]
+    pub fn require_hardware(interface: impl Into<String>) -> Self {
+        Self {
+            require_hardware: true,
+            ..Self::with_interface(interface)
+        }
+    }
+
+    /// Check that the required hardware timestamps are available
+    ///
+    /// Without `require_hardware`, always succeeds. With it, reads the
+    /// interface's configuration with `SIOCGHWTSTAMP` and fails unless
+    /// hardware timestamping is switched on.
+    #[cfg(target_os = "linux")]
+    pub fn check(&self) -> Result<()> {
+        if !self.require_hardware {
+            return Ok(());
+        }
+        let Some(interface) = &self.interface else {
+            return Err(Error::Config(
+                "Hardware timestamps are required, but no interface is configured".to_string(),
+            ));
+        };
+        match hw_timestamp::nic_timestamping_enabled(interface) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(Error::Config(format!(
+                "Hardware timestamping is not enabled on '{interface}': SIOCGHWTSTAMP reports \
+                 TX timestamping off or no RX filter. Switch it on for the NIC (e.g. \
+                 `hwstamp_ctl -i {interface} -t 1 -r 1`, as root), or use kernel software \
+                 timestamps"
+            ))),
+            Err(Error::Config(message)) => Err(Error::Config(format!(
+                "{message}; '{interface}' cannot provide hardware timestamps"
+            ))),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Decide the timestamp source for a new group and log it at info level
     ///
-    /// `transport` names the transport in log messages (e.g., "TCP").
+    /// `transport` names the transport in log messages (e.g., "TCP"). Fails
+    /// only when hardware timestamps are required and unavailable.
     #[cfg(target_os = "linux")]
-    pub(crate) fn resolve_source(&self, transport: &str) -> TimestampSource {
+    pub(crate) fn resolve_source(&self, transport: &str) -> Result<TimestampSource> {
+        if self.require_hardware {
+            self.check()?;
+            tracing::info!("{} connection group timestamp source: hardware", transport);
+            return Ok(TimestampSource::Hardware);
+        }
         let hardware = match (&self.interface, self.enable_timestamps) {
             (Some(interface), true) => match hw_timestamp::nic_timestamping_enabled(interface) {
                 Ok(true) => true,
@@ -136,12 +195,13 @@ impl TimestampConfig {
             TimestampSource::UserSpace
         };
         tracing::info!("{} connection group timestamp source: {}", transport, source);
-        source
+        Ok(source)
     }
 
     /// Bind a new socket to the interface and enable `source` on it (Linux only)
     ///
-    /// Returns true if kernel timestamping is enabled on the socket.
+    /// Returns true if kernel timestamping is enabled on the socket. Fails
+    /// only when hardware timestamps are required and either step fails.
     #[cfg(target_os = "linux")]
     pub(crate) fn configure_socket(
         &self,
@@ -149,9 +209,12 @@ impl TimestampConfig {
         source: TimestampSource,
         transport: &str,
         conn_id: usize,
-    ) -> bool {
+    ) -> Result<bool> {
         if let (Some(interface), true) = (&self.interface, self.enable_timestamps) {
             if let Err(e) = hw_timestamp::bind_to_device(fd, interface) {
+                if self.require_hardware {
+                    return Err(e);
+                }
                 tracing::warn!("Could not bind to device '{}': {}", interface, e);
             }
         }
@@ -159,10 +222,11 @@ impl TimestampConfig {
         let result = match source {
             TimestampSource::Hardware => hw_timestamp::enable_socket_timestamping(fd),
             TimestampSource::KernelSoftware => hw_timestamp::enable_software_timestamping(fd),
-            TimestampSource::UserSpace => return false,
+            TimestampSource::UserSpace => return Ok(false),
         };
         match result {
-            Ok(()) => true,
+            Ok(()) => Ok(true),
+            Err(e) if self.require_hardware => Err(e),
             Err(e) => {
                 tracing::warn!(
                     "Could not enable {} timestamps on {} connection {}: {}",
@@ -171,7 +235,7 @@ impl TimestampConfig {
                     conn_id,
                     e
                 );
-                false
+                Ok(false)
             }
         }
     }

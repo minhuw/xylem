@@ -11,7 +11,8 @@ use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
 use xylem_core::stats::{
-    AggregatedStats, RequestCounts, SendLagSummary, TupleStatsCollector, LATE_SEND_THRESHOLD,
+    AggregatedStats, BreakdownClock, BreakdownSummary, PartSummary, RequestCounts, SendLagSummary,
+    TupleStatsCollector, LATE_SEND_THRESHOLD,
 };
 
 /// Latency summary in microseconds. Values the sampling policy cannot provide
@@ -67,6 +68,100 @@ impl SendLagStats {
         }
     }
 }
+
+/// Where the latency of completed measurement requests went, apart from the
+/// send lag (see [`SendLagStats`]).
+///
+/// Each part is summarized over its own distribution: the percentiles of the
+/// parts do not add up to the percentiles of the total latency.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LatencyBreakdownStats {
+    /// Clock of the service latencies: `user_space`, `kernel_software`,
+    /// `nic_hardware`, or `mixed` when requests differ. Null when no request
+    /// completed.
+    pub clock: Option<BreakdownClock>,
+    /// Requests whose send and receive had kernel timestamps from the same
+    /// clock, which split their round trip into `host_stack_us` and
+    /// `network_server_us`
+    pub kernel_split_count: u64,
+    /// Actual receive minus actual send, in the clock each latency uses: a
+    /// request's latency minus its send lag. Always present.
+    pub service_us: BreakdownPartStats,
+    /// User-space round trip minus kernel round trip, zero if negative; null
+    /// when no request had a kernel split
+    pub host_stack_us: Option<BreakdownPartStats>,
+    /// Kernel round trip, kernel RX minus kernel TX timestamp; null when no
+    /// request had a kernel split
+    pub network_server_us: Option<BreakdownPartStats>,
+}
+
+impl LatencyBreakdownStats {
+    fn new(summary: &BreakdownSummary) -> Self {
+        Self {
+            clock: summary.clock,
+            kernel_split_count: summary.kernel_split_count,
+            service_us: BreakdownPartStats::new(&summary.service),
+            host_stack_us: summary.host_stack.as_ref().map(BreakdownPartStats::new),
+            network_server_us: summary.network_server.as_ref().map(BreakdownPartStats::new),
+        }
+    }
+
+    /// Each part with its label, in output order
+    pub(crate) fn parts(&self) -> [(&'static str, Option<&BreakdownPartStats>); 3] {
+        [
+            ("Service", Some(&self.service_us)),
+            ("Host stack", self.host_stack_us.as_ref()),
+            ("Net+server", self.network_server_us.as_ref()),
+        ]
+    }
+
+    /// The clock as written in JSON, or `n/a`
+    pub(crate) fn clock_name(&self) -> &'static str {
+        match self.clock {
+            None => "n/a",
+            Some(BreakdownClock::UserSpace) => "user_space",
+            Some(BreakdownClock::KernelSoftware) => "kernel_software",
+            Some(BreakdownClock::NicHardware) => "nic_hardware",
+            Some(BreakdownClock::Mixed) => "mixed",
+        }
+    }
+}
+
+/// One part of the latency breakdown in microseconds; the values are null
+/// when the part has no samples
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BreakdownPartStats {
+    pub sample_count: u64,
+    /// Exact mean
+    pub mean_us: Option<f64>,
+    pub p50_us: Option<f64>,
+    pub p99_us: Option<f64>,
+    pub p999_us: Option<f64>,
+    /// Exact maximum
+    pub max_us: Option<f64>,
+}
+
+impl BreakdownPartStats {
+    fn new(summary: &PartSummary) -> Self {
+        Self {
+            sample_count: summary.sample_count,
+            mean_us: summary.mean.map(micros),
+            p50_us: summary.p50.map(micros),
+            p99_us: summary.p99.map(micros),
+            p999_us: summary.p999.map(micros),
+            max_us: summary.max.map(micros),
+        }
+    }
+
+    /// The values in output order: mean, p50, p99, p99.9, max
+    pub(crate) fn values(&self) -> [Option<f64>; 5] {
+        [self.mean_us, self.p50_us, self.p99_us, self.p999_us, self.max_us]
+    }
+}
+
+/// Note shown with every latency breakdown
+pub(crate) const BREAKDOWN_NOTE: &str =
+    "Each part's percentiles are of that part alone; they do not add up to the total's.";
 
 /// Microseconds in a duration.
 fn micros(duration: Duration) -> f64 {
@@ -177,6 +272,9 @@ pub struct GlobalStats {
     pub requests: RequestCounts,
     #[serde(default)]
     pub send_lag: SendLagStats,
+    /// Where the latency went, apart from the send lag
+    #[serde(default)]
+    pub latency_breakdown: LatencyBreakdownStats,
 }
 
 /// Per-traffic-group results
@@ -214,6 +312,9 @@ pub struct GroupStats {
     pub requests: RequestCounts,
     #[serde(default)]
     pub send_lag: SendLagStats,
+    /// Where the latency went, apart from the send lag
+    #[serde(default)]
+    pub latency_breakdown: LatencyBreakdownStats,
 }
 
 impl DetailedExperimentResults {
@@ -293,6 +394,7 @@ impl DetailedExperimentResults {
             error_latency: Self::latency_stats(&tuple_stats.error_latency_global()),
             requests: tuple_stats.request_counts_global(),
             send_lag: SendLagStats::new(&tuple_stats.send_lag_global()),
+            latency_breakdown: LatencyBreakdownStats::new(&tuple_stats.latency_breakdown_global()),
         };
 
         // Build per-group results
@@ -319,6 +421,9 @@ impl DetailedExperimentResults {
                         error_latency: Self::latency_stats(&tuple_stats.error_latency(group_id)),
                         requests: tuple_stats.request_counts(group_id),
                         send_lag: SendLagStats::new(&tuple_stats.send_lag(group_id)),
+                        latency_breakdown: LatencyBreakdownStats::new(
+                            &tuple_stats.latency_breakdown(group_id),
+                        ),
                     },
                     protocol_metadata: None,
                 };
@@ -440,6 +545,30 @@ impl DetailedExperimentResults {
         line("  Max:", format_optional(send_lag.max_us));
     }
 
+    /// Print the latency breakdown with `indent` before each label: one row
+    /// per part, with the mean, p50, p99, p99.9 and max in columns.
+    fn print_breakdown(breakdown: &LatencyBreakdownStats, indent: &str) {
+        let width = 17 - indent.len();
+        let line = |label: &str, value: String| println!("{indent}{label:<width$}{value}");
+        println!("{indent}Latency breakdown (μs):");
+        line("  Clock:", breakdown.clock_name().to_string());
+        line("  Split reqs:", breakdown.kernel_split_count.to_string());
+        line("", "Mean      p50       p99       p99.9     Max".to_string());
+        for (label, part) in breakdown.parts() {
+            let row = match part {
+                Some(part) => part
+                    .values()
+                    .map(|value| format!("{:<10}", format_optional(value)))
+                    .concat()
+                    .trim_end()
+                    .to_string(),
+                None => "n/a (no kernel split)".to_string(),
+            };
+            line(&format!("  {label}:"), row);
+        }
+        println!("{indent}  {BREAKDOWN_NOTE}");
+    }
+
     /// Format a policy config as a human-readable string
     fn format_policy_config(policy: &xylem_core::traffic_group::PolicyConfig) -> String {
         match policy {
@@ -523,6 +652,8 @@ impl DetailedExperimentResults {
             "",
         );
         println!();
+        Self::print_breakdown(&self.global.latency_breakdown, "");
+        println!();
 
         for (i, group) in self.traffic_groups.iter().enumerate() {
             println!("{}", "-".repeat(70));
@@ -547,6 +678,8 @@ impl DetailedExperimentResults {
                 &group.stats.send_lag,
                 "  ",
             );
+            println!();
+            Self::print_breakdown(&group.stats.latency_breakdown, "  ");
 
             if let Some(ref metadata) = group.protocol_metadata {
                 println!();

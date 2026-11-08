@@ -214,6 +214,16 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
     }
     tracing::info!("================================");
 
+    // Fail before any worker starts when a group's NIC cannot provide the
+    // hardware timestamps it requires; a worker's error would only surface
+    // once every other thread finished its run
+    #[cfg(target_os = "linux")]
+    for (i, group) in config.traffic_groups.iter().enumerate() {
+        timestamp_config(&group.timestamps).check().with_context(|| {
+            format!("Traffic group {} '{}' sets timestamps = {}", i, group.name, group.timestamps)
+        })?;
+    }
+
     let duration = config.experiment.duration;
 
     // Extract thread assignment from traffic groups
@@ -390,6 +400,14 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
             .map(|(group_id, _)| config_for_worker.traffic_groups[*group_id].transport.as_str())
             .unwrap_or("tcp");
         let is_unix_transport = thread_transport == "unix";
+        // Validation ensures all groups on a thread use the same timestamps
+        #[cfg(target_os = "linux")]
+        let thread_timestamps = timestamp_config(
+            &groups_for_thread
+                .first()
+                .map(|(group_id, _)| config_for_worker.traffic_groups[*group_id].timestamps.clone())
+                .unwrap_or_default(),
+        );
 
         for (group_id, group_meta) in groups_for_thread.iter() {
             let group_config = &config_for_worker.traffic_groups[*group_id];
@@ -495,6 +513,9 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
         // Select transport factory based on thread's transport
         match thread_transport {
             "tcp" => {
+                #[cfg(target_os = "linux")]
+                let factory = TcpTransportFactory::with_timestamp_config(thread_timestamps);
+                #[cfg(not(target_os = "linux"))]
                 let factory = TcpTransportFactory::default();
                 let worker = Worker::new_multi_group_with_targets(
                     &factory,
@@ -513,6 +534,9 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                 )
             }
             "udp" => {
+                #[cfg(target_os = "linux")]
+                let factory = UdpTransportFactory::with_timestamp_config(thread_timestamps);
+                #[cfg(not(target_os = "linux"))]
                 let factory = UdpTransportFactory::default();
                 let worker = Worker::new_multi_group_with_targets(
                     &factory,
@@ -648,9 +672,42 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
     output::write_results(&detailed_results, &config.output.format, &config.output.file)
 }
 
+/// The TCP and UDP timestamp configuration for a group's `timestamps`
+///
+/// "user" is the transports' default. Hardware timestamps are required, so
+/// a group never falls back to another source.
+#[cfg(target_os = "linux")]
+fn timestamp_config(
+    timestamps: &xylem_core::traffic_group::TimestampSourceConfig,
+) -> xylem_transport::TcpTimestampConfig {
+    use xylem_core::traffic_group::TimestampSourceConfig;
+    use xylem_transport::TcpTimestampConfig;
+    match timestamps {
+        TimestampSourceConfig::User => TcpTimestampConfig::default(),
+        TimestampSourceConfig::Kernel => TcpTimestampConfig::with_software_timestamps(),
+        TimestampSourceConfig::Hardware(interface) => {
+            TcpTimestampConfig::require_hardware(interface.clone())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn timestamp_sources_map_to_transport_configs() {
+        use xylem_core::traffic_group::TimestampSourceConfig;
+        let user = timestamp_config(&TimestampSourceConfig::User);
+        assert!(!user.software_timestamps && !user.require_hardware && user.interface.is_none());
+        let kernel = timestamp_config(&TimestampSourceConfig::Kernel);
+        assert!(kernel.software_timestamps && !kernel.require_hardware);
+        assert!(kernel.interface.is_none());
+        let hardware = timestamp_config(&TimestampSourceConfig::Hardware("data0".into()));
+        assert!(hardware.require_hardware && !hardware.software_timestamps);
+        assert_eq!(hardware.interface.as_deref(), Some("data0"));
+    }
 
     #[test]
     fn completion_scripts_list_every_flag() {

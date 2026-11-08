@@ -22,10 +22,12 @@ Every timestamp holds the CPU cycle counter (RDTSC on x86_64) read when the send
 
 On Linux, TCP and UDP groups can also use kernel timestamps (`SO_TIMESTAMPING`), configured through `TimestampConfig`:
 
-- **Hardware** timestamps from the NIC, when an interface is configured and has hardware timestamping switched on (checked with `SIOCGHWTSTAMP`).
+- **Hardware** timestamps from the NIC, when an interface is configured and has hardware timestamping switched on (checked with `SIOCGHWTSTAMP`). With `require_hardware`, a group that cannot get them fails instead of falling back.
 - **Kernel software** timestamps, when requested explicitly.
 
-Each group logs the source in effect once, at info level. A latency uses kernel timestamps only when the send and the receive both have one from the same clock (the system clock for software stamps, the NIC's clock for hardware stamps). Otherwise it uses the cycle counts of both events.
+A profile chooses the source per traffic group with [`timestamps`](../guide/configuration/transport.md#timestamps); `{ hardware = "..." }` always requires hardware timestamps.
+
+Each group logs the source in effect once, at info level. A latency uses kernel timestamps only when the send and the receive both have one from the same clock (the system clock for software stamps, the NIC's clock for hardware stamps). Otherwise it uses the cycle counts of both events. The cycles of both events are kept either way, so the [latency breakdown](../guide/output-formats.md#latency-breakdown) can subtract the kernel round trip from the user-space one.
 
 TX timestamps arrive later than the send that caused them, and are matched to sends by a per-connection counter: bytes for TCP and datagrams for UDP. A TCP stamp covers every send up to the byte it reports. A UDP stamp covers exactly one datagram. The [correlation contract](https://github.com/minhuw/xylem/blob/main/xylem-transport/src/lib.rs) is documented in the crate.
 
