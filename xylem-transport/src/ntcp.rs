@@ -24,7 +24,7 @@ use crate::{
     Result, SendReceipt, Timestamp, TransportFactory, TxRange, TxTimestampInfo,
 };
 use ntcp_io::{ClockDescriptor, PacketIo};
-use ntcp_io_dpdk::ClockCalibration;
+use ntcp_io_dpdk::{bracketed_reading, ClockCalibration};
 use ntcp_native::{
     BlockReason, CloseReason, ConnId, DriveReport, Event, Network, NetworkConfig, ReadOutcome,
     RxReadTimestamps, SharedNeighbors, State, TimestampClock, TimestampEvent, TxTimestampEvent,
@@ -109,9 +109,8 @@ const CALIBRATION_READS: usize = 3;
 /// Paired clock readings taken when NIC timestamps are enabled, and the
 /// time between them, so that the first receives already have a fit
 ///
-/// ntcp's robust fit drops readings beyond three robust deviations; with
-/// only three readings one of them always looks like an outlier, which
-/// leaves too few for a fit.
+/// Three readings fit, but ntcp's fit rejects outliers only from four on:
+/// a few more keep one disturbed reading out of the first fit.
 const CALIBRATION_SEED_SAMPLES: usize = 8;
 const CALIBRATION_SEED_SPACING: Duration = Duration::from_millis(15);
 
@@ -323,10 +322,9 @@ struct NicClock {
 }
 
 impl NicClock {
-    /// Add one paired reading: the device clock read between two group
-    /// clock reads `before` and `after`
-    fn push(&mut self, before: u64, device: u64, after: u64) {
-        let caller = before + after.saturating_sub(before) / 2;
+    /// Add one paired reading: the device clock and the group's clock at
+    /// the same moment
+    fn push(&mut self, caller: u64, device: u64) {
         if self.calibration.push(caller, device).is_err() {
             self.rejected_samples += 1;
             return;
@@ -521,8 +519,8 @@ impl<P: NtcpBackend> NtcpConnectionGroup<P> {
             if sample > 0 {
                 std::thread::sleep(CALIBRATION_SEED_SPACING);
             }
-            let (before, device, after) = self.read_clocks()?;
-            nic.push(before, device, after);
+            let (caller, device) = self.read_clocks()?;
+            nic.push(caller, device);
         }
         nic.next_sample = self.now().saturating_add(CALIBRATION_PERIOD);
         self.nic = Some(nic);
@@ -562,23 +560,14 @@ impl<P: NtcpBackend> NtcpConnectionGroup<P> {
         self.now().saturating_add(ticks(timeout))
     }
 
-    /// Read the device clock between two reads of the group's clock, a few
-    /// times, and keep the narrowest bracket: an interrupt or preemption
-    /// between the reads widens one and moves its midpoint
-    fn read_clocks(&self) -> Result<(u64, u64, u64)> {
-        let mut best: Option<(u64, u64, u64)> = None;
-        for _ in 0..CALIBRATION_READS {
-            let before = (self.clock)();
-            let device = self.network.backend().read_device_clock().map_err(|e| {
-                Error::Io(io::Error::new(e.kind(), format!("read the NIC clock: {e}")))
-            })?;
-            let after = (self.clock)();
-            let width = after.saturating_sub(before);
-            if best.is_none_or(|(b, _, a)| width < a.saturating_sub(b)) {
-                best = Some((before, device, after));
-            }
-        }
-        Ok(best.expect("CALIBRATION_READS is not zero"))
+    /// One paired reading of the group's clock and the device clock: the
+    /// device clock read a few times between two reads of the group's
+    /// clock, keeping the narrowest bracket and its midpoint (an interrupt
+    /// or preemption between the reads widens one and moves its midpoint)
+    fn read_clocks(&self) -> Result<(u64, u64)> {
+        let backend = self.network.backend();
+        bracketed_reading(CALIBRATION_READS, self.clock, || backend.read_device_clock())
+            .map_err(|e| Error::Io(io::Error::new(e.kind(), format!("read the NIC clock: {e}"))))
     }
 
     /// Take a paired clock reading for the NIC clock calibration when one
@@ -588,10 +577,10 @@ impl<P: NtcpBackend> NtcpConnectionGroup<P> {
             Some(nic) if now >= nic.next_sample => {}
             _ => return Ok(()),
         }
-        let (before, device, after) = self.read_clocks()?;
+        let (caller, device) = self.read_clocks()?;
         let nic = self.nic.as_mut().expect("checked above");
         nic.next_sample = now.saturating_add(CALIBRATION_PERIOD);
-        nic.push(before, device, after);
+        nic.push(caller, device);
         Ok(())
     }
 
