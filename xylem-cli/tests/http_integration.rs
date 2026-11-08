@@ -20,7 +20,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 use xylem_core::stats::TupleStatsCollector;
 use xylem_core::threading::{ThreadingRuntime, Worker, WorkerConfig};
-use xylem_protocols::Protocol;
+use xylem_protocols::{Parsed, Protocol};
 
 use xylem_transport::TcpTransportFactory;
 
@@ -369,7 +369,9 @@ fn fetch_one(target_addr: SocketAddr, path: &str) -> Vec<u8> {
         let n = stream.read(&mut buf).expect("Failed to read the nginx response");
         assert!(n > 0, "nginx closed the connection mid-response");
         response.extend_from_slice(&buf[..n]);
-        if let (len @ 1.., _) = protocol.parse_response(0, &response).unwrap() {
+        if let Parsed::Complete { consumed: len, .. } =
+            protocol.parse_response(0, &response).unwrap()
+        {
             assert_eq!(len, response.len(), "nginx sent bytes past the response");
             return response;
         }

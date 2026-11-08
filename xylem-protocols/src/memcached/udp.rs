@@ -293,7 +293,7 @@ mod tests {
         use super::datagram;
         use crate::memcached::{MemcachedAsciiProtocol, MemcachedBinaryProtocol, MemcachedOp};
         use crate::workload::KeyGeneration;
-        use crate::Protocol;
+        use crate::{ErrorReply, Parsed, Protocol};
 
         fn ascii(op: MemcachedOp) -> MemcachedAsciiProtocol {
             MemcachedAsciiProtocol::with_workload(op, KeyGeneration::sequential(0), 4)
@@ -324,21 +324,30 @@ mod tests {
             }
             // Response 2 overtakes 1, which spans three datagrams sent out of order
             let r2 = datagram(2, 0, 1, b"END\r\n");
-            assert_eq!(protocol.parse_response(0, &r2).unwrap(), (r2.len(), Some((0, 2))));
+            assert_eq!(protocol.parse_response(0, &r2).unwrap(), Parsed::ok(r2.len(), (0, 2)));
             let value = b"VALUE key:1 0 4\r\nxxxx\r\nEND\r\n";
             let parts = [&value[..6], &value[6..20], &value[20..]];
             for number in [1, 2] {
                 let data = datagram(1, number, 3, parts[number as usize]);
-                assert_eq!(protocol.parse_response(0, &data).unwrap(), (data.len(), None));
+                assert_eq!(
+                    protocol.parse_response(0, &data).unwrap(),
+                    Parsed::Absorbed(data.len())
+                );
             }
             let data = datagram(1, 0, 3, parts[0]);
-            assert_eq!(protocol.parse_response(0, &data).unwrap(), (data.len(), Some((0, 1))));
+            assert_eq!(protocol.parse_response(0, &data).unwrap(), Parsed::ok(data.len(), (0, 1)));
             // Duplicates and unknown ids are absorbed without a request ID
-            assert_eq!(protocol.parse_response(0, &r2).unwrap(), (r2.len(), None));
+            assert_eq!(protocol.parse_response(0, &r2).unwrap(), Parsed::Absorbed(r2.len()));
             let unknown = datagram(9, 0, 1, b"END\r\n");
-            assert_eq!(protocol.parse_response(0, &unknown).unwrap(), (unknown.len(), None));
+            assert_eq!(
+                protocol.parse_response(0, &unknown).unwrap(),
+                Parsed::Absorbed(unknown.len())
+            );
             let stored = datagram(0, 0, 1, b"STORED\r\n");
-            assert_eq!(protocol.parse_response(0, &stored).unwrap().1, Some((0, 0)));
+            assert_eq!(
+                protocol.parse_response(0, &stored).unwrap(),
+                Parsed::ok(stored.len(), (0, 0))
+            );
         }
 
         #[test]
@@ -348,9 +357,16 @@ mod tests {
             protocol.next_request(0);
             let truncated = datagram(0, 0, 1, b"VALUE key:0 0 4\r\nxx");
             assert!(protocol.parse_response(0, &truncated).is_err());
+            // An error line is a complete response: an error reply
             let error = datagram(1, 0, 1, b"SERVER_ERROR out of memory\r\n");
-            let message = protocol.parse_response(0, &error).unwrap_err().to_string();
-            assert!(message.contains("SERVER_ERROR"), "{message}");
+            assert_eq!(
+                protocol.parse_response(0, &error).unwrap(),
+                Parsed::error(
+                    error.len(),
+                    (0, 1),
+                    ErrorReply::new("SERVER_ERROR", "SERVER_ERROR out of memory")
+                )
+            );
             protocol.reset();
             assert_eq!(protocol.next_request(0).request_id, (0, 0));
         }
@@ -375,8 +391,14 @@ mod tests {
             response.extend_from_slice(b"key:1abcd");
             let first = datagram(1, 0, 2, &response[..20]);
             let second = datagram(1, 1, 2, &response[20..]);
-            assert_eq!(protocol.parse_response(0, &second).unwrap(), (second.len(), None));
-            assert_eq!(protocol.parse_response(0, &first).unwrap(), (first.len(), Some((0, 1))));
+            assert_eq!(
+                protocol.parse_response(0, &second).unwrap(),
+                Parsed::Absorbed(second.len())
+            );
+            assert_eq!(
+                protocol.parse_response(0, &first).unwrap(),
+                Parsed::ok(first.len(), (0, 1))
+            );
             // A response shorter than its header's body length is an error
             let short = datagram(0, 0, 1, &response[..30]);
             assert!(protocol.parse_response(0, &short).is_err());

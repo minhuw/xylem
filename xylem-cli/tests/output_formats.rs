@@ -95,7 +95,7 @@ fn file_names(dir: &Path) -> Vec<String> {
 }
 
 /// Summary lines that end in a measured value, by their label.
-const MEASURED_LABELS: [&str; 41] = [
+const MEASURED_LABELS: [&str; 43] = [
     "Measured: ",
     "Total Requests:  ",
     "Throughput:      ",
@@ -125,6 +125,7 @@ const MEASURED_LABELS: [&str; 41] = [
     "    Samples:     ",
     "  Sent:          ",
     "  Completed:     ",
+    "  Errors:        ",
     "  Timed out:     ",
     "  Late resp.:    ",
     "  Failed:        ",
@@ -132,6 +133,7 @@ const MEASURED_LABELS: [&str; 41] = [
     "  Unsent:        ",
     "    Sent:        ",
     "    Completed:   ",
+    "    Errors:      ",
     "    Timed out:   ",
     "    Late resp.:  ",
     "    Failed:      ",
@@ -220,6 +222,7 @@ Latency (μs):
 Requests:
   Sent:          #
   Completed:     #
+  Errors:        #
   Timed out:     #
   Late resp.:    #
   Failed:        #
@@ -259,6 +262,7 @@ Statistics:
   Requests:
     Sent:        #
     Completed:   #
+    Errors:      #
     Timed out:   #
     Late resp.:  #
     Failed:      #
@@ -303,8 +307,11 @@ fn summary_values(json_text: &str) -> Vec<String> {
     let measured: f64 = raw_number(global, "measured_duration_secs").parse().unwrap();
     let mut values = vec![format!("{measured:.2}s")];
     for section in [global, group] {
-        // Latency keys before the request counts; send lag keys after them
+        // Latency keys, then error latency keys, before the request counts;
+        // send lag keys after them. Without errors, the console prints no
+        // error latency.
         let (section, accounting) = section.split_once("\"requests\"").unwrap();
+        let (section, _) = section.split_once("\"error_latency\"").unwrap();
         let requests: u64 = raw_number(section, "total_requests").parse().unwrap();
         values.push(requests.to_string());
         for key in ["throughput_rps", "throughput_mbps"] {
@@ -330,6 +337,7 @@ fn summary_values(json_text: &str) -> Vec<String> {
         for key in [
             "sent",
             "completed",
+            "errors",
             "timed_out",
             "late_responses",
             "failed",
@@ -430,9 +438,25 @@ const MASKED_JSON: &str = r#"{
       "confidence_interval_us": #,
       "sample_count": #
     },
+    "error_latency": {
+      "min_us": null,
+      "max_us": null,
+      "mean_us": #,
+      "p50_us": #,
+      "p95_us": #,
+      "p99_us": #,
+      "p999_us": #,
+      "p9999_us": #,
+      "p99999_us": #,
+      "std_dev_us": null,
+      "confidence_interval_us": null,
+      "sample_count": #
+    },
     "requests": {
       "sent": #,
       "completed": #,
+      "errors": 0,
+      "errors_by_kind": {},
       "timed_out": #,
       "late_responses": 0,
       "failed": #,
@@ -477,9 +501,25 @@ const MASKED_JSON: &str = r#"{
           "confidence_interval_us": #,
           "sample_count": #
         },
+        "error_latency": {
+          "min_us": null,
+          "max_us": null,
+          "mean_us": #,
+          "p50_us": #,
+          "p95_us": #,
+          "p99_us": #,
+          "p999_us": #,
+          "p9999_us": #,
+          "p99999_us": #,
+          "std_dev_us": null,
+          "confidence_interval_us": null,
+          "sample_count": #
+        },
         "requests": {
           "sent": #,
           "completed": #,
+          "errors": 0,
+          "errors_by_kind": {},
           "timed_out": #,
           "late_responses": 0,
           "failed": #,
@@ -534,11 +574,16 @@ fn assert_json_results(path: &Path, target: &str) -> String {
     let requests = json["global"]["total_requests"].as_f64().unwrap();
     assert!((rps * measured - requests).abs() <= 1e-6 * requests, "{rps} * {measured}");
     for stats in [&json["global"], &groups[0]["stats"]] {
-        // Every completed request has a latency, including one completed
-        // during the drain, which throughput does not count. Every sent
-        // request is accounted for; a closed loop has no schedule to lag.
+        // Every successfully completed request has a latency, including one
+        // completed during the drain, which throughput does not count. Every
+        // sent request is accounted for; a closed loop has no schedule to lag.
+        // An echo is never an error reply.
         let count = |key: &str| stats["requests"][key].as_u64().unwrap();
-        assert_eq!(stats["latency"]["sample_count"].as_u64().unwrap(), count("completed"));
+        let successful = count("completed") - count("errors");
+        assert_eq!(stats["latency"]["sample_count"].as_u64().unwrap(), successful);
+        assert_eq!(count("errors"), 0);
+        assert_eq!(stats["requests"]["errors_by_kind"], serde_json::json!({}));
+        assert_eq!(stats["error_latency"]["sample_count"], 0);
         let in_window = stats["total_requests"].as_u64().unwrap();
         assert!(in_window <= count("completed") && count("completed") <= in_window + 1);
         assert_eq!(count("sent"), count("completed") + count("timed_out") + count("failed"));
@@ -669,8 +714,10 @@ fn both_format_strips_one_extension_then_replaces_the_next() {
         // The HTML report shows the same results as the JSON file. Both write
         // numbers with serde_json, so the chart data repeats the JSON text.
         let (global, group) = json_sections(&json_text);
-        // The send lag has percentiles too; read the latencies before it
-        let latencies = |section| -> &str { str::split_once(section, "\"requests\"").unwrap().0 };
+        // The error latency and send lag have percentiles too; read the
+        // latencies before them
+        let latencies =
+            |section| -> &str { str::split_once(section, "\"error_latency\"").unwrap().0 };
         let (global, group) = (latencies(global), latencies(group));
         let global_latencies: Vec<&str> = ["p50_us", "p95_us", "p99_us", "p999_us", "p9999_us"]
             .iter()

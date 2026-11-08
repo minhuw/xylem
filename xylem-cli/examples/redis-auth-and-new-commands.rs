@@ -10,7 +10,7 @@
 
 use xylem_protocols::redis::command_selector::FixedCommandSelector;
 use xylem_protocols::redis::{RedisOp, RedisProtocol};
-use xylem_protocols::{CommandTemplate, Protocol, RedisAuthConfig, RedisConfig};
+use xylem_protocols::{CommandTemplate, Parsed, Protocol, RedisAuthConfig, RedisConfig};
 
 fn main() {
     println!("=== Redis Connection Setup ===\n");
@@ -108,7 +108,9 @@ fn main() {
     ];
     for (name, reply) in replies {
         match resp3_protocol.parse_response(0, reply) {
-            Ok((consumed, Some(_))) => println!("✓ RESP3 {name} parsed ({consumed} bytes)"),
+            Ok(Parsed::Complete { consumed, error: None, .. }) => {
+                println!("✓ RESP3 {name} parsed ({consumed} bytes)")
+            }
             _ => println!("✗ Failed to parse RESP3 {name}"),
         }
     }

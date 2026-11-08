@@ -106,6 +106,8 @@ Masstree responses include result codes that tell you what happened:
 
 These codes matter for correctness testing. If you're doing a read-your-writes test, you want to verify that SET returns Inserted or Updated, then GET returns Found with the same value.
 
+Xylem counts a PUT or REPLACE response with result code Retry or OutOfDate, or a code outside the list above, as an error reply named by the code (`Retry`, `OutOfDate`, `UnknownResult`): it completes its request, counts in `requests.errors`, and its latency goes to `error_latency` (see [Output Formats](../output-formats.md#error-replies)). A missing key is not an error: the server answers a GET miss with the key itself in place of a value, NotFound is a successful result, and so is a REMOVE that removed nothing. Set `on_error = "abort"` on the traffic group to stop the run at the first error reply instead. A failed handshake always stops the run.
+
 ## Building Realistic Workloads
 
 Real database workloads exhibit patterns: read-heavy vs write-heavy ratios, hot keys vs uniform access, point queries vs range scans. Xylem provides configuration options to model these patterns.

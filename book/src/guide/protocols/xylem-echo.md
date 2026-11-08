@@ -15,6 +15,10 @@ answers each with one datagram after the request's delay; replies may arrive
 out of order and match their requests by request ID. See the server's
 `README.md` and the [UDP transport](../configuration/transport.md#udp-ipport).
 
+## Error Replies
+
+An echo is never an error reply, so `requests.errors` is always zero.
+
 ## See Also
 
 - [Protocol Configuration](../configuration/protocol.md)

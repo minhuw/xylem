@@ -27,6 +27,23 @@ key_count = 10000   # SET every key as warmup before measuring
 type = "closed-loop"
 ```
 
+## Error Replies
+
+An error reply completes its request and counts in `requests.errors`, with
+its latency in `error_latency` rather than the latency distribution (see
+[Output Formats](../output-formats.md#error-replies)):
+
+- ASCII: an `ERROR`, `CLIENT_ERROR ...` or `SERVER_ERROR ...` line, by that
+  keyword. An error line also ends a GET response after any values before it.
+  A miss (`END` alone) is a successful reply.
+- Binary: a non-zero response status, by its name in memcached's
+  `protocol_binary.h` (`KEY_EEXISTS`, `E2BIG`, `ENOMEM`, ...; `UNKNOWN_STATUS`
+  for others), except `KEY_ENOENT` on a GET, which is a miss.
+
+Error replies are classified the same way over UDP. Set `on_error = "abort"`
+on the traffic group to stop the run at the first error reply instead. Lines
+xylem cannot parse, such as `NOT_STORED`, still stop the run.
+
 ## Over UDP
 
 Set `transport = "udp"` on the group; no other setting changes. memcached 1.5.6

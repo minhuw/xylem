@@ -23,6 +23,9 @@ fn html_report_preserves_data_and_escapes_profile_text() {
         &[],
         false,
     );
+    // Error reply kinds come from the server
+    results.global.requests.errors = 2;
+    results.global.requests.errors_by_kind.add(text, 2);
     results.global.latency.p50_us = 1.25;
     results.global.latency.p95_us = 2.5;
     results.global.latency.p99_us = 3.75;
@@ -41,6 +44,7 @@ fn html_report_preserves_data_and_escapes_profile_text() {
             throughput_rps: 12.3456,
             throughput_mbps: 1.0,
             latency: results.global.latency.clone(),
+            error_latency: Default::default(),
             requests: Default::default(),
             send_lag: Default::default(),
         },
@@ -58,8 +62,9 @@ fn html_report_preserves_data_and_escapes_profile_text() {
     assert!(!body.contains(text));
     let escaped = "O&#39;Reilly \\&quot; &lt;b&gt;&amp; &lt;/script&gt;&lt;script&gt;throw &#39;injected&#39;&lt;/script&gt;\u{2028}\u{2029}";
     // Name (title/header), description, address, protocol, transport, group
-    // name, group protocol and policy must all be escaped in HTML.
-    assert_eq!(body.matches(escaped).count(), 9);
+    // name, group protocol, policy and error kind must all be escaped in HTML.
+    assert_eq!(body.matches(escaped).count(), 10);
+    assert!(body.contains(&format!("<td>2 ({escaped}: 2)</td>")));
     assert!(!script.contains('<'));
     assert!(!script.contains('\u{2028}'));
     assert!(!script.contains('\u{2029}'));
@@ -67,8 +72,9 @@ fn html_report_preserves_data_and_escapes_profile_text() {
     assert!(script.contains("data: [1.25,2.5,3.75,4.125]"));
     assert!(script.contains("data: [12.3456]"));
     // No latency was recorded: unavailable values are n/a, never 0. That is
-    // four group latencies, and the global and group mean, p99 and max send lag.
-    assert_eq!(body.matches("<td>n/a</td>").count(), 10);
+    // four group latencies, the global and group mean, p99 and max send lag,
+    // and the global and group mean and p99 error reply latency.
+    assert_eq!(body.matches("<td>n/a</td>").count(), 14);
     assert_eq!(body.matches("<td>Requests Timed Out (no latency)</td>").count(), 2);
     assert!(body.contains("<td>0</td>"), "sample count");
     // Verify JSON labels round-trip even when a JavaScript runtime is unavailable.

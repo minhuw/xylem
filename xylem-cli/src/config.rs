@@ -1116,6 +1116,17 @@ file = "results/test.json"
     }
 
     #[test]
+    fn on_error_defaults_to_count_and_accepts_abort() {
+        use xylem_core::traffic_group::OnError;
+        let config = udp_profile("xylem-echo", "tcp", "").unwrap();
+        assert_eq!(config.traffic_groups[0].on_error, OnError::Count);
+        let config = udp_profile("xylem-echo", "tcp", r#"on_error = "abort""#).unwrap();
+        assert_eq!(config.traffic_groups[0].on_error, OnError::Abort);
+        let error = udp_profile("xylem-echo", "tcp", r#"on_error = "ignore""#).unwrap_err();
+        assert!(error.to_string().contains("unknown variant `ignore`"), "{error}");
+    }
+
+    #[test]
     fn memcached_udp_values_must_fit_one_datagram() {
         let max = xylem_protocols::memcached::MAX_UDP_VALUE_SIZE;
         let at = |size: usize| {

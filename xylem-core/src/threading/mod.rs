@@ -12,7 +12,7 @@ pub mod worker;
 // Re-export main types
 pub use affinity::{get_core_count, pin_thread, CpuPinning};
 pub use worker::{Worker, WorkerConfig, DEFAULT_DRAIN_TIMEOUT};
-pub use xylem_common::{Protocol, RequestMeta};
+pub use xylem_common::{ErrorReply, Parsed, Protocol, RequestMeta};
 
 /// How long after the last thread reaches the start gate the run starts, so
 /// every thread is awake and spinning by then

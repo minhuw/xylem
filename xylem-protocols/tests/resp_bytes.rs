@@ -5,8 +5,8 @@
 
 use xylem_protocols::workload::KeyGeneration;
 use xylem_protocols::{
-    CommandTemplate, FixedCommandSelector, KeyGenerator, Protocol, RedisOp, RedisProtocol, Request,
-    WeightedCommandSelector,
+    CommandTemplate, ErrorReply, FixedCommandSelector, KeyGenerator, Parsed, Protocol, RedisOp,
+    RedisProtocol, Request, WeightedCommandSelector,
 };
 
 /// Seed for the random-data tests.
@@ -582,21 +582,29 @@ fn template_replies_frame_through_the_generic_parser() {
     for (seq, (what, frame)) in replies.iter().enumerate() {
         // A truncated frame is not a reply yet.
         let partial = &stream[offset..offset + frame.len() - 1];
-        assert_eq!(protocol.parse_response(0, partial).unwrap(), (0, None), "partial {what}");
+        assert_eq!(
+            protocol.parse_response(0, partial).unwrap(),
+            Parsed::Incomplete,
+            "partial {what}"
+        );
         let got = protocol.parse_response(0, &stream[offset..]).unwrap();
-        assert_eq!(got, (frame.len(), Some((0, seq as u64))), "{what}");
+        assert_eq!(got, Parsed::ok(frame.len(), (0, seq as u64)), "{what}");
         offset += frame.len();
     }
     assert_eq!(offset, stream.len());
 
-    // An error reply, such as WRONGTYPE from mixing types on one key, is an error.
-    let err = protocol
-        .parse_response(
-            0,
-            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+    // An error reply, such as WRONGTYPE from mixing types on one key, is an
+    // error reply named by its code that completes the next request.
+    let reply = b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
+    let message = "WRONGTYPE Operation against a key holding the wrong kind of value";
+    assert_eq!(
+        protocol.parse_response(0, reply).unwrap(),
+        Parsed::error(
+            reply.len(),
+            (0, replies.len() as u64),
+            ErrorReply::new("WRONGTYPE", message)
         )
-        .unwrap_err();
-    assert!(err.to_string().contains("WRONGTYPE"), "{err}");
+    );
 }
 
 // Value sizes and protocol defaults

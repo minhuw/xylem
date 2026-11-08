@@ -9,7 +9,7 @@ use xylem_protocols::memcached::MemcachedOp as BinaryOp;
 use xylem_protocols::memcached::{MemcachedAsciiProtocol, MemcachedBinaryProtocol};
 use xylem_protocols::workload::KeyGeneration;
 use xylem_protocols::xylem_echo::XylemEchoProtocol;
-use xylem_protocols::{Protocol, Request};
+use xylem_protocols::{Parsed, Protocol, Request};
 
 /// Sends one request per entry on the entry's connection and compares the whole
 /// request with the expected one: bytes, request id, and warmup tag.
@@ -302,12 +302,12 @@ fn memcached_ascii_reset_restarts_ids_and_keys_but_not_insert_phase() {
 #[test]
 fn memcached_ascii_response_ids_count_per_connection() {
     let mut protocol = MemcachedAsciiProtocol::new(AsciiOp::Get);
-    assert_eq!(protocol.parse_response(0, b"END\r\n").unwrap(), (5, Some((0, 0))));
-    assert_eq!(protocol.parse_response(1, b"STORED\r\n").unwrap(), (8, Some((1, 0))));
-    assert_eq!(protocol.parse_response(0, b"STORED\r\n").unwrap(), (8, Some((0, 1))));
-    assert_eq!(protocol.parse_response(1, b"END\r\n").unwrap(), (5, Some((1, 1))));
+    assert_eq!(protocol.parse_response(0, b"END\r\n").unwrap(), Parsed::ok(5, (0, 0)));
+    assert_eq!(protocol.parse_response(1, b"STORED\r\n").unwrap(), Parsed::ok(8, (1, 0)));
+    assert_eq!(protocol.parse_response(0, b"STORED\r\n").unwrap(), Parsed::ok(8, (0, 1)));
+    assert_eq!(protocol.parse_response(1, b"END\r\n").unwrap(), Parsed::ok(5, (1, 1)));
     protocol.reset();
-    assert_eq!(protocol.parse_response(1, b"END\r\n").unwrap(), (5, Some((1, 0))));
+    assert_eq!(protocol.parse_response(1, b"END\r\n").unwrap(), Parsed::ok(5, (1, 0)));
 }
 
 #[test]
@@ -546,12 +546,12 @@ fn memcached_binary_response_ids_count_per_connection() {
     ]
     .concat();
     let mut protocol = MemcachedBinaryProtocol::new(BinaryOp::Get);
-    assert_eq!(protocol.parse_response(0, &hit).unwrap(), (36, Some((0, 0))));
-    assert_eq!(protocol.parse_response(1, &stored).unwrap(), (24, Some((1, 0))));
-    assert_eq!(protocol.parse_response(0, &stored).unwrap(), (24, Some((0, 1))));
-    assert_eq!(protocol.parse_response(1, &hit).unwrap(), (36, Some((1, 1))));
+    assert_eq!(protocol.parse_response(0, &hit).unwrap(), Parsed::ok(36, (0, 0)));
+    assert_eq!(protocol.parse_response(1, &stored).unwrap(), Parsed::ok(24, (1, 0)));
+    assert_eq!(protocol.parse_response(0, &stored).unwrap(), Parsed::ok(24, (0, 1)));
+    assert_eq!(protocol.parse_response(1, &hit).unwrap(), Parsed::ok(36, (1, 1)));
     protocol.reset();
-    assert_eq!(protocol.parse_response(1, &stored).unwrap(), (24, Some((1, 0))));
+    assert_eq!(protocol.parse_response(1, &stored).unwrap(), Parsed::ok(24, (1, 0)));
 }
 
 /// HTTP/1.1 request with a `body_len`-byte body of b'x', as POST and PUT send it.
@@ -941,7 +941,7 @@ fn complete_masstree_handshake(protocol: &mut MasstreeProtocol, conn_id: usize) 
     assert!(!protocol.can_send(conn_id));
     assert_eq!(
         protocol.parse_response(conn_id, MASSTREE_HANDSHAKE_REPLY).unwrap(),
-        (MASSTREE_HANDSHAKE_REPLY.len(), Some((conn_id, 0)))
+        Parsed::ok(MASSTREE_HANDSHAKE_REPLY.len(), (conn_id, 0))
     );
     assert!(protocol.can_send(conn_id));
 }
@@ -970,7 +970,7 @@ fn masstree_new_and_default_handshake_each_connection_before_key_zero_gets() {
         assert!(!protocol.can_send(1));
         assert_eq!(
             protocol.parse_response(1, MASSTREE_HANDSHAKE_REPLY).unwrap(),
-            (9, Some((1, 0)))
+            Parsed::ok(9, (1, 0))
         );
         assert!(!protocol.can_send(0));
         assert!(protocol.can_send(1));
@@ -983,7 +983,7 @@ fn masstree_new_and_default_handshake_each_connection_before_key_zero_gets() {
         );
         assert_eq!(
             protocol.parse_response(0, MASSTREE_HANDSHAKE_REPLY).unwrap(),
-            (9, Some((0, 0)))
+            Parsed::ok(9, (0, 0))
         );
         assert!(protocol.can_send(0));
         assert_requests(
@@ -1285,7 +1285,10 @@ fn masstree_with_workload_and_options_inserts_before_measuring() {
             (1, Request::setup(MASSTREE_HANDSHAKE.to_vec(), (1, 0))),
         ],
     );
-    assert_eq!(protocol.parse_response(1, MASSTREE_HANDSHAKE_REPLY).unwrap(), (9, Some((1, 0))));
+    assert_eq!(
+        protocol.parse_response(1, MASSTREE_HANDSHAKE_REPLY).unwrap(),
+        Parsed::ok(9, (1, 0))
+    );
     assert_requests(
         &mut protocol,
         vec![

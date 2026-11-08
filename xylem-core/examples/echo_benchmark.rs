@@ -9,7 +9,7 @@
 use std::net::SocketAddr;
 use std::thread;
 use std::time::Duration;
-use xylem_common::Request;
+use xylem_common::{Parsed, Request};
 use xylem_core::stats::{SamplingPolicy, TupleStatsCollector};
 use xylem_core::threading::{Worker, WorkerConfig};
 use xylem_transport::TcpTransportFactory;
@@ -51,20 +51,20 @@ impl xylem_core::threading::Protocol for EchoProtocol {
         Request::measurement(buf, req_id)
     }
 
-    fn parse_response(
+    fn parse_response<'a>(
         &mut self,
         _conn_id: usize,
-        data: &[u8],
-    ) -> anyhow::Result<(usize, Option<Self::RequestId>)> {
+        data: &'a [u8],
+    ) -> anyhow::Result<Parsed<'a, Self::RequestId>> {
         if data.len() < MESSAGE_SIZE {
-            return Ok((0, None)); // Incomplete
+            return Ok(Parsed::Incomplete);
         }
 
         let req_id = u64::from_le_bytes([
             data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
         ]);
 
-        Ok((MESSAGE_SIZE, Some(req_id)))
+        Ok(Parsed::ok(MESSAGE_SIZE, req_id))
     }
 
     fn name(&self) -> &'static str {

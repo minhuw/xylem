@@ -8,8 +8,8 @@ use std::collections::{HashMap, HashSet};
 use xylem_cli::multi_protocol::MultiProtocol;
 use xylem_protocols::configs::*;
 use xylem_protocols::{
-    MasstreeProtocol, MemcachedAsciiProtocol, MemcachedBinaryProtocol, Protocol, RedisProtocol,
-    Request,
+    MasstreeProtocol, MemcachedAsciiProtocol, MemcachedBinaryProtocol, Parsed, Protocol,
+    RedisProtocol, Request,
 };
 
 const SEED: Option<u64> = Some(42);
@@ -603,7 +603,7 @@ fn masstree_requests(
         requests.push(protocol.next_request(conn_id));
         if handshaken.insert(conn_id) {
             let parsed = protocol.parse_response(conn_id, HANDSHAKE_REPLY).unwrap();
-            assert_eq!(parsed, (HANDSHAKE_REPLY.len(), Some((conn_id, 0))));
+            assert_eq!(parsed, Parsed::ok(HANDSHAKE_REPLY.len(), (conn_id, 0)));
         }
     }
     requests

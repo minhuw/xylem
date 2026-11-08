@@ -17,7 +17,7 @@
 //! The server waits for `delay_us` microseconds before echoing the message back.
 //! This allows controlled latency testing with explicit request ID tracking.
 
-use crate::Protocol;
+use crate::{Parsed, Protocol};
 use anyhow::Result;
 use std::collections::HashMap;
 
@@ -77,14 +77,14 @@ impl Protocol for XylemEchoProtocol {
         crate::Request::measurement(buf, request_id)
     }
 
-    fn parse_response(
+    fn parse_response<'a>(
         &mut self,
         _conn_id: usize,
-        data: &[u8],
-    ) -> Result<(usize, Option<Self::RequestId>)> {
+        data: &'a [u8],
+    ) -> Result<Parsed<'a, Self::RequestId>> {
         if data.len() < MESSAGE_SIZE {
             // Incomplete response
-            return Ok((0, None));
+            return Ok(Parsed::Incomplete);
         }
 
         // Parse encoded request_id from first 8 bytes
@@ -100,7 +100,8 @@ impl Protocol for XylemEchoProtocol {
         // We could also parse delay_us from bytes 8-15 if needed for validation
         // let delay_us = u64::from_le_bytes([...]);
 
-        Ok((MESSAGE_SIZE, Some(request_id)))
+        // An echo is never an error reply
+        Ok(Parsed::ok(MESSAGE_SIZE, request_id))
     }
 
     fn name(&self) -> &'static str {
@@ -174,10 +175,9 @@ mod tests {
         response.extend_from_slice(&delay_us.to_le_bytes());
 
         // Parse the response
-        let (consumed, parsed_id) = protocol.parse_response(0, &response).unwrap();
+        let parsed = protocol.parse_response(0, &response).unwrap();
 
-        assert_eq!(consumed, MESSAGE_SIZE);
-        assert_eq!(parsed_id, Some((conn_id, key)));
+        assert_eq!(parsed, Parsed::ok(MESSAGE_SIZE, (conn_id, key)));
     }
 
     #[test]
@@ -187,10 +187,9 @@ mod tests {
         // Incomplete response (only 10 bytes)
         let incomplete = vec![0u8; 10];
 
-        let (consumed, parsed_id) = protocol.parse_response(0, &incomplete).unwrap();
+        let parsed = protocol.parse_response(0, &incomplete).unwrap();
 
-        assert_eq!(consumed, 0);
-        assert_eq!(parsed_id, None);
+        assert_eq!(parsed, Parsed::Incomplete);
     }
 
     #[test]

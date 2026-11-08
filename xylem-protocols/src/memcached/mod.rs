@@ -7,7 +7,13 @@
 //! per-connection sequence numbers. Over UDP (`with_udp_framing`), every
 //! datagram carries memcached's frame header (see [`udp`]), and responses
 //! match requests by its request id, so loss and reordering are tolerated.
+//!
+//! Error replies are counted by kind: the ASCII `ERROR`, `CLIENT_ERROR` and
+//! `SERVER_ERROR` lines by keyword, and binary responses with a non-zero
+//! status by the status name, except a GET miss (`KEY_ENOENT`).
 
+use crate::{ErrorReply, Parsed};
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 pub mod ascii;
@@ -91,28 +97,54 @@ fn frame_udp_request(seq: u64, body: Vec<u8>, framing: Option<&udp::UdpFraming>)
     }
 }
 
-/// Parse one response datagram for a codec whose complete responses are
-/// `response_len` bytes long (`Ok(None)` while incomplete)
+/// The end of a complete response: its length and, for an error reply, its
+/// kind and its text
+type ResponseEnd<'r> = (usize, Option<(&'static str, &'r [u8])>);
+
+/// The error reply of an error with `kind` and text `text`
+fn error_reply<'r>((kind, text): (&'static str, &'r [u8])) -> ErrorReply<'r> {
+    ErrorReply::from_bytes(kind.as_bytes(), text)
+}
+
+/// Parse one response datagram for a codec whose complete responses end
+/// where `response_end` says (`Ok(None)` while incomplete)
 ///
 /// Consumes the whole datagram. Returns the request ID once the datagram
 /// completes a response; a reassembled response must be exactly one
 /// complete response of the codec.
-fn parse_udp_response(
+fn parse_udp_response<'a>(
     framing: &mut udp::UdpFraming,
     conn_send_seq: &HashMap<usize, u64>,
     conn_id: usize,
-    datagram: &[u8],
-    response_len: impl FnOnce(&[u8]) -> anyhow::Result<Option<usize>>,
-) -> anyhow::Result<(usize, Option<(usize, u64)>)> {
+    datagram: &'a [u8],
+    response_end: impl for<'r> FnOnce(&'r [u8]) -> anyhow::Result<Option<ResponseEnd<'r>>>,
+) -> anyhow::Result<Parsed<'a, (usize, u64)>> {
     let sent = conn_send_seq.get(&conn_id).copied().unwrap_or(0);
     let Some((seq, response)) = framing.receive(conn_id, sent, datagram)? else {
-        return Ok((datagram.len(), None));
+        return Ok(Parsed::Absorbed(datagram.len()));
     };
-    let len = response_len(&response)?;
+    let (end, error) = match &response {
+        Cow::Borrowed(payload) => {
+            let end = response_end(payload)?;
+            (end.map(|(len, _)| len), end.and_then(|(_, error)| error).map(error_reply))
+        }
+        // A reassembled response is gone after this call, so only its
+        // static kind is kept
+        Cow::Owned(payload) => {
+            let end = response_end(payload)?;
+            let error =
+                end.and_then(|(_, error)| error).map(|(kind, _)| ErrorReply::new(kind, kind));
+            (end.map(|(len, _)| len), error)
+        }
+    };
     anyhow::ensure!(
-        len == Some(response.len()),
+        end == Some(response.len()),
         "Memcached UDP response of {} bytes is not one complete response",
         response.len()
     );
-    Ok((datagram.len(), Some((conn_id, seq))))
+    Ok(Parsed::Complete {
+        consumed: datagram.len(),
+        id: (conn_id, seq),
+        error,
+    })
 }

@@ -228,7 +228,11 @@ pub fn generate_html_report(results: &DetailedExperimentResults, path: &str) -> 
         throughput = results.global.throughput_rps,
         bandwidth = results.global.throughput_mbps,
         median = results.global.latency.p50_us,
-        global_requests = request_rows(&results.global.requests, &results.global.send_lag),
+        global_requests = request_rows(
+            &results.global.requests,
+            &results.global.error_latency,
+            &results.global.send_lag
+        ),
         group_sections = generate_group_sections(&results.traffic_groups),
         global_latencies = script_json(&[
             results.global.latency.p50_us,
@@ -351,23 +355,49 @@ fn generate_group_sections(groups: &[super::TrafficGroupResults]) -> String {
                     .confidence_interval_us
                     .map_or_else(|| "n/a".to_string(), |ci| format!("±{ci:.2} μs")),
                 samples = group.stats.latency.sample_count,
-                requests_rows = request_rows(&group.stats.requests, &group.stats.send_lag),
+                requests_rows = request_rows(
+                    &group.stats.requests,
+                    &group.stats.error_latency,
+                    &group.stats.send_lag
+                ),
             )
         })
         .collect::<Vec<_>>()
         .join("\n")
 }
 
-/// Table rows for request counts and send lags
-fn request_rows(requests: &xylem_core::stats::RequestCounts, lag: &super::SendLagStats) -> String {
+/// Table rows for request counts, error replies and send lags
+fn request_rows(
+    requests: &xylem_core::stats::RequestCounts,
+    error_latency: &super::LatencyStats,
+    lag: &super::SendLagStats,
+) -> String {
     let capped = if requests.unsent_capped {
         " (lower bound)"
     } else {
         ""
     };
+    // Kinds come from the server
+    let kinds: Vec<_> = requests
+        .errors_by_kind
+        .iter()
+        .map(|(kind, count)| format!("{}: {count}", escape_html(kind)))
+        .collect();
+    let errors = if kinds.is_empty() {
+        requests.errors.to_string()
+    } else {
+        format!("{} ({})", requests.errors, kinds.join(", "))
+    };
+    let error_latency_row = |value: f64| match error_latency.sample_count {
+        0 => "n/a".to_string(),
+        _ => format!("{value:.2} μs"),
+    };
     [
         ("Requests Sent", requests.sent.to_string()),
         ("Requests Completed", requests.completed.to_string()),
+        ("Error Replies", errors),
+        ("Mean Error Reply Latency", error_latency_row(error_latency.mean_us)),
+        ("p99 Error Reply Latency", error_latency_row(error_latency.p99_us)),
         ("Requests Timed Out (no latency)", requests.timed_out.to_string()),
         ("Late Responses (dropped)", requests.late_responses.to_string()),
         ("Requests Failed", requests.failed.to_string()),

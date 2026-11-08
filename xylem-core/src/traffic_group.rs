@@ -47,6 +47,10 @@ pub struct TrafficGroupConfig {
     #[serde(default, with = "humantime_serde", skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
     pub request_timeout: Option<Duration>,
+    /// What an error reply (a Redis error, an HTTP 4xx or 5xx, ...) does:
+    /// "count" it in `requests.errors` (default), or "abort" the run
+    #[serde(default)]
+    pub on_error: OnError,
     /// Traffic policy configuration (rate control)
     pub traffic_policy: PolicyConfig,
     /// Latency sampling policy
@@ -61,6 +65,19 @@ pub struct TrafficGroupConfig {
 
 fn default_transport() -> String {
     "tcp".to_string()
+}
+
+/// What an error reply does to a run
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum OnError {
+    /// Complete the request and count the reply in `requests.errors` and
+    /// `requests.errors_by_kind`, with its latency in `error_latency`
+    #[default]
+    Count,
+    /// Fail the run, naming the group, connection and reply
+    Abort,
 }
 
 /// Request timeout of a UDP traffic group that sets none
@@ -433,6 +450,7 @@ mod tests {
             connections_per_thread: 10,
             max_pending_per_connection: 5,
             request_timeout: None,
+            on_error: OnError::Count,
             traffic_policy: PolicyConfig::ClosedLoop,
             sampling_policy: SamplingPolicy::default(),
             protocol_config: None,
@@ -458,6 +476,7 @@ mod tests {
                 connections_per_thread: 5,
                 max_pending_per_connection: 1,
                 request_timeout: None,
+                on_error: OnError::Count,
                 traffic_policy: PolicyConfig::Poisson { rate: 1000.0 },
                 sampling_policy: SamplingPolicy::Unlimited,
                 protocol_config: Some(serde_json::json!({
@@ -473,6 +492,7 @@ mod tests {
                 connections_per_thread: 20,
                 max_pending_per_connection: 32,
                 request_timeout: None,
+                on_error: OnError::Count,
                 traffic_policy: PolicyConfig::ClosedLoop,
                 sampling_policy: SamplingPolicy::Limited { max_samples: 10_000, rate: 0.01 },
                 protocol_config: Some(serde_json::json!({
@@ -509,6 +529,7 @@ mod tests {
                 connections_per_thread: 5,
                 max_pending_per_connection: 1,
                 request_timeout: None,
+                on_error: OnError::Count,
                 traffic_policy: PolicyConfig::ClosedLoop,
                 sampling_policy: SamplingPolicy::default(),
                 protocol_config: None,
@@ -522,6 +543,7 @@ mod tests {
                 connections_per_thread: 10,
                 max_pending_per_connection: 1,
                 request_timeout: None,
+                on_error: OnError::Count,
                 traffic_policy: PolicyConfig::ClosedLoop,
                 sampling_policy: SamplingPolicy::default(),
                 protocol_config: None,
@@ -545,6 +567,7 @@ mod tests {
                 connections_per_thread: 5,
                 max_pending_per_connection: 1,
                 request_timeout: None,
+                on_error: OnError::Count,
                 traffic_policy: PolicyConfig::ClosedLoop,
                 sampling_policy: SamplingPolicy::default(),
                 protocol_config: None,
@@ -558,6 +581,7 @@ mod tests {
                 connections_per_thread: 10,
                 max_pending_per_connection: 1,
                 request_timeout: None,
+                on_error: OnError::Count,
                 traffic_policy: PolicyConfig::ClosedLoop,
                 sampling_policy: SamplingPolicy::default(),
                 protocol_config: None,
@@ -585,6 +609,7 @@ mod tests {
             connections_per_thread: connections,
             max_pending_per_connection: 1,
             request_timeout: None,
+            on_error: OnError::Count,
             traffic_policy: policy,
             sampling_policy: SamplingPolicy::default(),
             protocol_config: None,

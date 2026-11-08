@@ -14,11 +14,11 @@ pub trait Protocol: Send {
 
     fn next_request(&mut self, conn_id: usize) -> Request<Self::RequestId>;
 
-    fn parse_response(
+    fn parse_response<'a>(
         &mut self,
         conn_id: usize,
-        data: &[u8],
-    ) -> anyhow::Result<(usize, Option<Self::RequestId>)>;
+        data: &'a [u8],
+    ) -> anyhow::Result<Parsed<'a, Self::RequestId>>;
 
     fn can_send(&self, _conn_id: usize) -> bool {
         true
@@ -38,9 +38,15 @@ pub trait Protocol: Send {
   own workload state (command selection, keys, value sizes, insert phase). The
   returned `Request` carries the bytes, the request ID, and metadata that marks
   warm-up requests, whose latency is not recorded.
-- `parse_response` returns the bytes consumed and the ID of the completed
-  request, or `(0, None)` when the response is still incomplete. Consuming
-  bytes without returning an ID is an error.
+- `parse_response` returns `Parsed::Complete { consumed, id, error }` for a
+  complete response, or `Parsed::Incomplete`. `error` is set for an error
+  reply (a Redis error, an HTTP 4xx or 5xx, ...): an `ErrorReply` with a
+  `kind` by which it is counted and a `message`, both borrowed from `data` or
+  static, so reporting one allocates nothing. An error reply completes its
+  request; `Err` is for bytes that cannot be framed and for failed connection
+  setup, and fails the run. `Parsed::Absorbed(n)` consumes bytes that
+  complete no request, such as one datagram of a multi-datagram UDP response;
+  on a byte stream that is an error.
 - `can_send` lets a protocol hold back requests on a connection, for example
   until the Masstree handshake completes.
 - `setup_pending` reports a connection that is still in connection setup

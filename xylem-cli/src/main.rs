@@ -456,14 +456,21 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                 (*group_id, group_config.effective_request_timeout())
             })
             .collect();
+        // What each group's error replies do
+        let on_errors: Vec<_> = groups_for_thread
+            .iter()
+            .map(|(group_id, _)| (*group_id, config_for_worker.traffic_groups[*group_id].on_error))
+            .collect();
 
-        // Helper function to wire the request dumper and request timeouts into a
-        // created worker, run it from the shared start time, and return its stats.
+        // Helper function to wire the request dumper, request timeouts and error
+        // handling into a created worker, run it from the shared start time, and
+        // return its stats.
         fn run_worker<G, S>(
             mut worker: Worker<G, xylem_cli::multi_protocol::MultiProtocol, S>,
             request_dumper: Option<&Arc<xylem_core::request_dump::RequestDumper>>,
             thread_idx: usize,
             request_timeouts: &[(usize, Option<std::time::Duration>)],
+            on_errors: &[(usize, xylem_core::traffic_group::OnError)],
             start: StartTicket,
         ) -> xylem_core::Result<S>
         where
@@ -476,6 +483,9 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
             }
             for &(group_id, timeout) in request_timeouts {
                 worker.set_request_timeout(group_id, timeout);
+            }
+            for &(group_id, on_error) in on_errors {
+                worker.set_on_error(group_id, on_error);
             }
 
             worker.run_at(start.wait())?;
@@ -498,6 +508,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                     request_dumper_for_worker.as_ref(),
                     thread_idx,
                     &request_timeouts,
+                    &on_errors,
                     start,
                 )
             }
@@ -515,6 +526,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                     request_dumper_for_worker.as_ref(),
                     thread_idx,
                     &request_timeouts,
+                    &on_errors,
                     start,
                 )
             }
@@ -551,6 +563,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                     request_dumper_for_worker.as_ref(),
                     thread_idx,
                     &request_timeouts,
+                    &on_errors,
                     start,
                 )
             }
@@ -581,6 +594,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<()> {
                     request_dumper_for_worker.as_ref(),
                     thread_idx,
                     &request_timeouts,
+                    &on_errors,
                     start,
                 )
             }

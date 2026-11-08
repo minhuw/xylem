@@ -2,6 +2,12 @@
 //!
 //! Commands and their encoding live in `command.rs`; RESP request encoding and
 //! reply framing live in `resp.rs`.
+//!
+//! A top-level error reply (`-` or a RESP3 blob error `!`) is reported as an
+//! error reply whose kind is its error code, the first word of its text
+//! (`ERR`, `WRONGTYPE`, `MOVED`, ...). Errors nested in an aggregate, such
+//! as the reply of a failed command inside an `EXEC` array, are not: the
+//! aggregate is a successful reply. A nil reply is a successful reply too.
 
 mod command;
 pub mod command_selector;
@@ -13,7 +19,7 @@ mod setup;
 pub use command::RedisOp;
 pub use setup::ConnectionSetup;
 
-use crate::Protocol;
+use crate::{ErrorReply, Parsed, Protocol};
 use anyhow::{anyhow, Result};
 use command_selector::CommandSelector;
 use resp::ReplyKind;
@@ -354,23 +360,23 @@ impl Protocol for RedisProtocol {
         request
     }
 
-    fn parse_response(
+    fn parse_response<'a>(
         &mut self,
         conn_id: usize,
-        data: &[u8],
-    ) -> Result<(usize, Option<Self::RequestId>)> {
+        data: &'a [u8],
+    ) -> Result<Parsed<'a, Self::RequestId>> {
         let Some(reply) = self.parse_framed_reply(conn_id, data)? else {
-            return Ok((0, None));
+            return Ok(Parsed::Incomplete);
         };
         if let SetupState::Awaiting(step) = self.conn_setup.state(conn_id) {
             // Setup commands go out one at a time, so this reply is the
-            // pending command's.
+            // pending command's. A failed setup fails the run.
             let name = self.setup.step(step).name();
-            if let ReplyKind::Error(error) = &reply.kind {
+            if let ReplyKind::Error(error) = reply.kind {
                 return Err(anyhow!(
                     "Redis connection setup failed: {name} on connection {conn_id} was \
                      rejected: {}",
-                    self.setup.redact(error)
+                    self.setup.redact(&String::from_utf8_lossy(error))
                 ));
             }
             let next = step + 1;
@@ -380,11 +386,13 @@ impl Protocol for RedisProtocol {
                 SetupState::Next(next)
             };
             self.conn_setup.set(conn_id, state);
-            return Ok((reply.consumed, Some(reply.id)));
+            return Ok(Parsed::ok(reply.consumed, reply.id));
         }
         match reply.kind {
-            ReplyKind::Success => Ok((reply.consumed, Some(reply.id))),
-            ReplyKind::Error(error) => Err(anyhow!("Redis error: {}", error)),
+            ReplyKind::Success => Ok(Parsed::ok(reply.consumed, reply.id)),
+            ReplyKind::Error(error) => {
+                Ok(Parsed::error(reply.consumed, reply.id, error_reply(error)))
+            }
             ReplyKind::Push => unreachable!("parse_framed_reply skips push messages"),
         }
     }
@@ -424,20 +432,31 @@ impl Protocol for RedisProtocol {
     }
 }
 
+/// The error reply of an error with text `text`; its kind is the error code,
+/// the first word of the text
+fn error_reply(text: &[u8]) -> ErrorReply<'_> {
+    let code = text.split(u8::is_ascii_whitespace).next().unwrap_or_default();
+    let mut reply = ErrorReply::from_bytes(code, text);
+    if reply.kind.is_empty() {
+        reply.kind = "unknown";
+    }
+    reply
+}
+
 /// A complete reply, including attributes and any push messages before it.
 /// Errors occupy one FIFO response slot too.
-pub(crate) struct FramedReply {
+pub(crate) struct FramedReply<'a> {
     pub consumed: usize,
     pub id: (usize, u64),
-    pub kind: ReplyKind,
+    pub kind: ReplyKind<'a>,
 }
 
 impl RedisProtocol {
-    pub(crate) fn parse_framed_reply(
+    pub(crate) fn parse_framed_reply<'a>(
         &mut self,
         conn_id: usize,
-        data: &[u8],
-    ) -> Result<Option<FramedReply>> {
+        data: &'a [u8],
+    ) -> Result<Option<FramedReply<'a>>> {
         // RESP3 push messages are out of band: skip them, so they are never
         // matched to a pending request. They are counted only once a reply
         // after them completes, since until then the caller keeps the
@@ -594,10 +613,7 @@ mod tests {
         let response = b"+OK\r\n";
         let result = protocol.parse_response(0, response);
 
-        assert!(result.is_ok());
-        let (consumed, id) = result.unwrap();
-        assert_eq!(consumed, 5);
-        assert_eq!(id, Some((0, 0)));
+        assert_eq!(result.unwrap(), Parsed::ok(5, (0, 0)));
     }
 
     #[test]
@@ -608,10 +624,7 @@ mod tests {
         let response = b":42\r\n";
         let result = protocol.parse_response(0, response);
 
-        assert!(result.is_ok());
-        let (consumed, id) = result.unwrap();
-        assert_eq!(consumed, 5);
-        assert_eq!(id, Some((0, 0)));
+        assert_eq!(result.unwrap(), Parsed::ok(5, (0, 0)));
     }
 
     #[test]
@@ -622,10 +635,7 @@ mod tests {
         let response = b"$5\r\nhello\r\n";
         let result = protocol.parse_response(0, response);
 
-        assert!(result.is_ok());
-        let (consumed, id) = result.unwrap();
-        assert_eq!(consumed, 11);
-        assert_eq!(id, Some((0, 0)));
+        assert_eq!(result.unwrap(), Parsed::ok(11, (0, 0)));
     }
 
     #[test]
@@ -636,9 +646,7 @@ mod tests {
         let response = b"$-1\r\n";
         let result = protocol.parse_response(0, response);
 
-        assert!(result.is_ok());
-        let (consumed, _) = result.unwrap();
-        assert_eq!(consumed, 5);
+        assert_eq!(result.unwrap().consumed(), 5);
     }
 
     #[test]
@@ -650,9 +658,7 @@ mod tests {
         let response = b"*3\r\n+one\r\n+two\r\n+three\r\n";
         let result = protocol.parse_response(0, response);
 
-        assert!(result.is_ok());
-        let (consumed, _) = result.unwrap();
-        assert_eq!(consumed, 24); // *3\r\n (4) + +one\r\n (6) + +two\r\n (6) + +three\r\n (8)
+        assert_eq!(result.unwrap().consumed(), 24); // *3\r\n (4) + +one\r\n (6) + +two\r\n (6) + +three\r\n (8)
     }
 
     #[test]
@@ -663,8 +669,8 @@ mod tests {
         let response = b"-ERR unknown command\r\n";
         let result = protocol.parse_response(0, response);
 
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("ERR unknown command"));
+        let error = ErrorReply::new("ERR", "ERR unknown command");
+        assert_eq!(result.unwrap(), Parsed::error(response.len(), (0, 0), error));
     }
 
     #[test]
@@ -675,10 +681,7 @@ mod tests {
         let response = b"+OK"; // Missing \r\n
         let result = protocol.parse_response(0, response);
 
-        assert!(result.is_ok());
-        let (consumed, id) = result.unwrap();
-        assert_eq!(consumed, 0);
-        assert_eq!(id, None);
+        assert_eq!(result.unwrap(), Parsed::Incomplete);
     }
 
     #[test]
@@ -689,10 +692,7 @@ mod tests {
         let response = b"";
         let result = protocol.parse_response(0, response);
 
-        assert!(result.is_ok());
-        let (consumed, id) = result.unwrap();
-        assert_eq!(consumed, 0);
-        assert_eq!(id, None);
+        assert_eq!(result.unwrap(), Parsed::Incomplete);
     }
 
     #[test]
@@ -714,10 +714,7 @@ mod tests {
         let response = b"$10\r\nhello"; // Only 5 bytes of 10
         let result = protocol.parse_response(0, response);
 
-        assert!(result.is_ok());
-        let (consumed, id) = result.unwrap();
-        assert_eq!(consumed, 0); // Incomplete
-        assert_eq!(id, None);
+        assert_eq!(result.unwrap(), Parsed::Incomplete); // Incomplete
     }
 
     #[test]
@@ -768,13 +765,9 @@ mod tests {
         // Parse multiple responses on same connection
         let response = b"+OK\r\n";
 
-        let (_, id1) = protocol.parse_response(0, response).unwrap();
-        let (_, id2) = protocol.parse_response(0, response).unwrap();
-        let (_, id3) = protocol.parse_response(0, response).unwrap();
-
-        assert_eq!(id1, Some((0, 0)));
-        assert_eq!(id2, Some((0, 1)));
-        assert_eq!(id3, Some((0, 2)));
+        for seq in 0..3 {
+            assert_eq!(protocol.parse_response(0, response).unwrap(), Parsed::ok(5, (0, seq)));
+        }
     }
 
     #[test]
@@ -797,7 +790,7 @@ mod tests {
         // Incomplete array (no \r\n)
         let incomplete = b"*2";
         let result = protocol.parse_response(0, incomplete).unwrap();
-        assert_eq!(result, (0, None)); // Should indicate incomplete
+        assert_eq!(result, Parsed::Incomplete); // Should indicate incomplete
     }
 
     #[test]
@@ -808,7 +801,7 @@ mod tests {
         // Incomplete bulk string (no \r\n after length)
         let incomplete = b"$10";
         let result = protocol.parse_response(0, incomplete).unwrap();
-        assert_eq!(result, (0, None)); // Should indicate incomplete
+        assert_eq!(result, Parsed::Incomplete); // Should indicate incomplete
     }
 
     #[test]
@@ -823,18 +816,25 @@ mod tests {
     }
 
     #[test]
-    fn test_error_replies_are_redis_errors() {
+    fn test_error_replies_are_named_by_their_error_code() {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
         let mut protocol = RedisProtocol::new(selector);
 
-        // Every error reply, including MOVED and ASK, fails the same way
-        for (reply, message) in [
-            (b"-ERR unknown command\r\n".as_slice(), "Redis error: ERR unknown command"),
-            (b"-MOVED 3999 127.0.0.1:7001\r\n", "Redis error: MOVED 3999 127.0.0.1:7001"),
-            (b"-ASK 5000 127.0.0.1:7002\r\n", "Redis error: ASK 5000 127.0.0.1:7002"),
-        ] {
-            let err = protocol.parse_response(0, reply).unwrap_err();
-            assert_eq!(err.to_string(), message);
+        // Every error reply, including MOVED and ASK, completes its request
+        for (seq, (reply, kind, message)) in [
+            (b"-ERR unknown command\r\n".as_slice(), "ERR", "ERR unknown command"),
+            (b"-MOVED 3999 127.0.0.1:7001\r\n", "MOVED", "MOVED 3999 127.0.0.1:7001"),
+            (b"-ASK 5000 127.0.0.1:7002\r\n", "ASK", "ASK 5000 127.0.0.1:7002"),
+            (b"-NOCODE\r\n", "NOCODE", "NOCODE"),
+            (b"-\r\n", "unknown", ""),
+            (b"-\xffBAD x\r\n", "unknown", ""),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let error = ErrorReply::new(kind, message);
+            let expected = Parsed::error(reply.len(), (0, seq as u64), error);
+            assert_eq!(protocol.parse_response(0, reply).unwrap(), expected);
         }
     }
 
@@ -971,10 +971,7 @@ mod tests {
         let response = b"_\r\n";
         let result = protocol.parse_response(0, response);
 
-        assert!(result.is_ok());
-        let (consumed, id) = result.unwrap();
-        assert_eq!(consumed, 3);
-        assert_eq!(id, Some((0, 0)));
+        assert_eq!(result.unwrap(), Parsed::ok(3, (0, 0)));
     }
 
     #[test]
@@ -985,10 +982,7 @@ mod tests {
         let response = b"#t\r\n";
         let result = protocol.parse_response(0, response);
 
-        assert!(result.is_ok());
-        let (consumed, id) = result.unwrap();
-        assert_eq!(consumed, 4);
-        assert_eq!(id, Some((0, 0)));
+        assert_eq!(result.unwrap(), Parsed::ok(4, (0, 0)));
     }
 
     #[test]
@@ -999,9 +993,7 @@ mod tests {
         let response = b"#f\r\n";
         let result = protocol.parse_response(0, response);
 
-        assert!(result.is_ok());
-        let (consumed, _) = result.unwrap();
-        assert_eq!(consumed, 4);
+        assert_eq!(result.unwrap().consumed(), 4);
     }
 
     #[test]
@@ -1012,9 +1004,7 @@ mod tests {
         let response = b",3.14159\r\n";
         let result = protocol.parse_response(0, response);
 
-        assert!(result.is_ok());
-        let (consumed, _) = result.unwrap();
-        assert_eq!(consumed, 10);
+        assert_eq!(result.unwrap().consumed(), 10);
     }
 
     #[test]
@@ -1025,9 +1015,7 @@ mod tests {
         let response = b"(3492890328409238509324850943850943825024385\r\n";
         let result = protocol.parse_response(0, response);
 
-        assert!(result.is_ok());
-        let (consumed, _) = result.unwrap();
-        assert_eq!(consumed, 46); // 1 + 43 digits + 2 (\r\n)
+        assert_eq!(result.unwrap().consumed(), 46); // 1 + 43 digits + 2 (\r\n)
     }
 
     #[test]
@@ -1038,8 +1026,9 @@ mod tests {
         let response = b"!21\r\nSYNTAX invalid syntax\r\n";
         let result = protocol.parse_response(0, response);
 
-        assert!(result.unwrap_err().to_string().contains("SYNTAX invalid syntax"));
-        assert_eq!(protocol.parse_response(0, b"+OK\r\n").unwrap(), (5, Some((0, 1))));
+        let error = ErrorReply::new("SYNTAX", "SYNTAX invalid syntax");
+        assert_eq!(result.unwrap(), Parsed::error(response.len(), (0, 0), error));
+        assert_eq!(protocol.parse_response(0, b"+OK\r\n").unwrap(), Parsed::ok(5, (0, 1)));
     }
 
     #[test]
@@ -1050,9 +1039,7 @@ mod tests {
         let response = b"=15\r\ntxt:Some string\r\n";
         let result = protocol.parse_response(0, response);
 
-        assert!(result.is_ok());
-        let (consumed, _) = result.unwrap();
-        assert_eq!(consumed, 22); // =15\r\n (4) + txt:Some string (15) + \r\n (2) + 1 = 22
+        assert_eq!(result.unwrap().consumed(), 22); // =15\r\n (4) + txt:Some string (15) + \r\n (2) + 1 = 22
     }
 
     #[test]
@@ -1064,9 +1051,7 @@ mod tests {
         let response = b"%2\r\n+k1\r\n+v1\r\n+k2\r\n+v2\r\n";
         let result = protocol.parse_response(0, response);
 
-        assert!(result.is_ok());
-        let (consumed, _) = result.unwrap();
-        assert_eq!(consumed, response.len());
+        assert_eq!(result.unwrap().consumed(), response.len());
     }
 
     #[test]
@@ -1078,9 +1063,7 @@ mod tests {
         let response = b"~5\r\n+a\r\n+b\r\n+c\r\n+d\r\n+e\r\n";
         let result = protocol.parse_response(0, response);
 
-        assert!(result.is_ok());
-        let (consumed, _) = result.unwrap();
-        assert_eq!(consumed, 24); // ~5\r\n (4) + 5 * +X\r\n (4 each)
+        assert_eq!(result.unwrap().consumed(), 24); // ~5\r\n (4) + 5 * +X\r\n (4 each)
     }
 
     #[test]
@@ -1092,9 +1075,7 @@ mod tests {
         let response = b"|1\r\n+key\r\n+value\r\n+OK\r\n";
         let result = protocol.parse_response(0, response);
 
-        assert!(result.is_ok());
-        let (consumed, _) = result.unwrap();
-        assert_eq!(consumed, response.len());
+        assert_eq!(result.unwrap().consumed(), response.len());
     }
 
     #[test]
@@ -1105,10 +1086,7 @@ mod tests {
         let response = b"_\r"; // Missing \n
         let result = protocol.parse_response(0, response);
 
-        assert!(result.is_ok());
-        let (consumed, id) = result.unwrap();
-        assert_eq!(consumed, 0); // Incomplete
-        assert_eq!(id, None);
+        assert_eq!(result.unwrap(), Parsed::Incomplete); // Incomplete
     }
 
     #[test]
@@ -1119,10 +1097,7 @@ mod tests {
         let response = b"#t"; // Missing \r\n
         let result = protocol.parse_response(0, response);
 
-        assert!(result.is_ok());
-        let (consumed, id) = result.unwrap();
-        assert_eq!(consumed, 0); // Incomplete
-        assert_eq!(id, None);
+        assert_eq!(result.unwrap(), Parsed::Incomplete); // Incomplete
     }
 
     #[test]
@@ -1235,10 +1210,7 @@ mod tests {
         let response = b"*2\r\n:0\r\n*2\r\n+key1\r\n+key2\r\n";
         let result = protocol.parse_response(0, response);
 
-        assert!(result.is_ok());
-        let (consumed, id) = result.unwrap();
-        assert_eq!(consumed, 26); // *2\r\n (4) + :0\r\n (4) + *2\r\n (4) + +key1\r\n (7) + +key2\r\n (7) = 26
-        assert_eq!(id, Some((0, 0)));
+        assert_eq!(result.unwrap(), Parsed::ok(26, (0, 0))); // *2\r\n (4) + :0\r\n (4) + *2\r\n (4) + +key1\r\n (7) + +key2\r\n (7) = 26
     }
 
     #[test]
@@ -1286,10 +1258,7 @@ mod tests {
         let response = b"+OK\r\n";
         let result = protocol.parse_response(0, response);
 
-        assert!(result.is_ok());
-        let (consumed, id) = result.unwrap();
-        assert_eq!(consumed, 5);
-        assert_eq!(id, Some((0, 0)));
+        assert_eq!(result.unwrap(), Parsed::ok(5, (0, 0)));
     }
 
     #[test]
@@ -1301,10 +1270,7 @@ mod tests {
         let response = b"+QUEUED\r\n";
         let result = protocol.parse_response(0, response);
 
-        assert!(result.is_ok());
-        let (consumed, id) = result.unwrap();
-        assert_eq!(consumed, 9);
-        assert_eq!(id, Some((0, 0)));
+        assert_eq!(result.unwrap(), Parsed::ok(9, (0, 0)));
     }
 
     #[test]
@@ -1317,10 +1283,7 @@ mod tests {
         let response = b"*2\r\n+OK\r\n:1\r\n";
         let result = protocol.parse_response(0, response);
 
-        assert!(result.is_ok());
-        let (consumed, id) = result.unwrap();
-        assert_eq!(consumed, 13); // *2\r\n (4) + +OK\r\n (5) + :1\r\n (4) = 13
-        assert_eq!(id, Some((0, 0)));
+        assert_eq!(result.unwrap(), Parsed::ok(13, (0, 0))); // *2\r\n (4) + +OK\r\n (5) + :1\r\n (4) = 13
     }
 
     #[test]

@@ -43,7 +43,8 @@ phases:
 `experiment.measured_duration_secs`: from the first measured request, after
 connection setup and any protocol warmup (such as the Masstree insert phase),
 to the end of the measurement phase. `total_requests` counts the requests
-completed inside that window, which is what throughput divides; requests
+completed inside that window, error replies included, which is what
+throughput divides; requests
 completed during the drain are excluded from it and from the bytes behind
 `throughput_mbps`. Their latencies are recorded in the window's last time
 bucket. With `stats.include_records = true`, every record's rate divides by
@@ -57,9 +58,13 @@ Each `requests` object in JSON (global and per group) counts measurement
 requests; warmup requests are excluded:
 
 - `sent`: requests sent.
-- `completed`: requests whose response arrived, in the window or the drain.
-  Equal to the latency `sample_count` unless the sampling policy is `none` or
-  a `limited` rate drops latencies.
+- `completed`: requests whose response arrived, in the window or the drain,
+  successful or an [error reply](#error-replies). `completed - errors` equals
+  the latency `sample_count` unless the sampling policy is `none` or a
+  `limited` rate drops latencies.
+- `errors`: completed requests whose response was an error reply. The console
+  prints a warning when this is nonzero.
+- `errors_by_kind`: `errors` by kind, such as `{"WRONGTYPE": 12, "OOM": 3}`.
 - `timed_out`: no response within the group's `request_timeout` (UDP groups,
   default 1 s; see [UDP](configuration/transport.md#udp-ipport)), or still pending
   when the drain timeout passed. Their latency is unknown, so they are not in
@@ -83,6 +88,51 @@ requests; warmup requests are excluded:
   `unsent` is a lower bound.
 
 After a run, `sent = completed + timed_out + failed`.
+
+## Error replies
+
+An error reply is a complete response that says its request failed: a Redis
+error such as `-WRONGTYPE`, an HTTP status of 400 or above, a memcached
+`SERVER_ERROR` line or non-zero binary status, a Masstree `Retry` result.
+Each protocol page lists what it counts and how it names the kind. Nil
+replies and misses are successful replies.
+
+By default (`on_error = "count"` on the traffic group), an error reply
+completes its request:
+
+- It counts in `completed`, `errors` and `errors_by_kind`, and toward
+  `total_requests`, throughput and received bytes like any response.
+- Its latency goes to `error_latency`, which has the same fields as
+  `latency` and uses the group's sampling policy, and not to `latency`. Fast
+  rejections would otherwise pull the percentiles down, so `latency` and its
+  `sample_count` cover successful responses only.
+- It is not fed back to an adaptive traffic policy, which would otherwise
+  speed up on fast rejections.
+- Warmup requests and connection setup are excluded, as from every count.
+
+`errors_by_kind` names at most 32 kinds; error replies of later kinds count
+under `"other"`, and a kind is cut to 64 bytes. The bound holds per thread and
+after merging threads, so with more than 32 kinds in a run a kind may be split
+between its own entry and `other`.
+
+```json
+"latency": { "mean_us": 52.7, "p50_us": 50.1, "p99_us": 96.3, "sample_count": 39000, ... },
+"error_latency": { "mean_us": 41.2, "p50_us": 39.1, "p99_us": 88.0, "sample_count": 13000, ... },
+"requests": {
+  "sent": 52000,
+  "completed": 52000,
+  "errors": 13000,
+  "errors_by_kind": { "WRONGTYPE": 13000 },
+  "timed_out": 0,
+  ...
+}
+```
+
+With `on_error = "abort"`, the first error reply fails the run, warmup
+included, with an error naming the traffic group, the connection and the
+reply, and no results are written. Malformed responses and failed connection
+setup (a rejected Redis AUTH, a failed Masstree handshake) fail the run
+either way.
 
 ## Send lag
 
@@ -113,6 +163,8 @@ Each `latency` object in JSON (global and per group) holds, in microseconds:
 - `confidence_interval_us`: half-width of the 95% confidence interval of the
   mean, `1.96 * std_dev / sqrt(sample_count)`.
 - `sample_count`: number of latencies recorded, after any `limited` rate.
+  `latency` records successful responses only; `error_latency`, with the same
+  fields, records [error replies](#error-replies).
 - `clamped_samples`: present only for an HDR histogram with `max_value_us`;
   the number of latencies above that bound, recorded as the bound.
 

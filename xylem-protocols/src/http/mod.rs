@@ -3,15 +3,41 @@
 //! Supports GET, POST, PUT with Content-Length, chunked, or bodyless responses.
 //! Other transfer codings and close-delimited bodies are explicitly unsupported.
 //! Informational responses are consumed without completing a request.
+//! A response with status 400 or above is an error reply whose kind is its
+//! status code (`"503"`); 1xx, 2xx and 3xx responses are not.
 //! Uses httparse for zero-copy, fast HTTP response parsing.
 //!
 //! Request sequence tracking is done per-connection to support pipelining.
 
 mod config;
 
-use crate::Protocol;
+use crate::{ErrorReply, Parsed, Protocol};
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
+
+/// The three digits of every status code below 600, so the kind of an error
+/// reply is a static string
+static STATUS_DIGITS: [[u8; 3]; 600] = {
+    let mut digits = [[0; 3]; 600];
+    let mut code = 0;
+    while code < 600 {
+        digits[code] = [
+            b'0' + (code / 100) as u8,
+            b'0' + (code / 10 % 10) as u8,
+            b'0' + (code % 10) as u8,
+        ];
+        code += 1;
+    }
+    digits
+};
+
+/// The error reply of a response with status `code` (400 to 599) whose head
+/// starts with `head`: the code is its kind, the status line its message
+fn error_reply(code: u16, head: &[u8]) -> ErrorReply<'_> {
+    let kind = &STATUS_DIGITS[usize::from(code)];
+    let line = &head[..head.iter().position(|&b| b == b'\n').unwrap_or(head.len())];
+    ErrorReply::from_bytes(kind, line.strip_suffix(b"\r").unwrap_or(line))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpMethod {
@@ -108,13 +134,13 @@ impl Protocol for HttpProtocol {
         crate::Request::measurement(self.request.clone(), (conn_id, seq))
     }
 
-    fn parse_response(
+    fn parse_response<'a>(
         &mut self,
         conn_id: usize,
-        data: &[u8],
-    ) -> Result<(usize, Option<Self::RequestId>)> {
+        data: &'a [u8],
+    ) -> Result<Parsed<'a, Self::RequestId>> {
         if data.is_empty() {
-            return Ok((0, None));
+            return Ok(Parsed::Incomplete);
         }
 
         let mut offset = 0;
@@ -126,7 +152,7 @@ impl Protocol for HttpProtocol {
 
             let headers_len = match response.parse(remaining) {
                 Ok(httparse::Status::Complete(length)) => length,
-                Ok(httparse::Status::Partial) => return Ok((0, None)),
+                Ok(httparse::Status::Partial) => return Ok(Parsed::Incomplete),
                 Err(error) => return Err(anyhow!("HTTP parse error: {}", error)),
             };
             let status_code = response.code.unwrap_or(0);
@@ -176,7 +202,7 @@ impl Protocol for HttpProtocol {
                 ensure_chunked_only(response.headers)?;
                 match chunked_body_len(&remaining[headers_len..])? {
                     Some(length) => length,
-                    None => return Ok((0, None)),
+                    None => return Ok(Parsed::Incomplete),
                 }
             } else {
                 content_length.ok_or_else(|| anyhow!("HTTP response requires Content-Length or chunked Transfer-Encoding; close-delimited bodies are unsupported"))?
@@ -185,12 +211,16 @@ impl Protocol for HttpProtocol {
                 .checked_add(body_length)
                 .ok_or_else(|| anyhow!("HTTP response length overflow"))?;
             if remaining.len() < total_len {
-                return Ok((0, None));
+                return Ok(Parsed::Incomplete);
             }
             let response_seq = self.conn_response_seq.entry(conn_id).or_insert(0);
             let seq = *response_seq;
             *response_seq = response_seq.wrapping_add(1);
-            return Ok((offset + total_len, Some((conn_id, seq))));
+            return Ok(Parsed::Complete {
+                consumed: offset + total_len,
+                id: (conn_id, seq),
+                error: (status_code >= 400).then(|| error_reply(status_code, remaining)),
+            });
         }
     }
 
@@ -385,10 +415,9 @@ mod tests {
         let response =
             b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: keep-alive\r\n\r\nOK\n";
 
-        let (bytes_consumed, req_id) = proto.parse_response(0, response).unwrap();
+        let parsed = proto.parse_response(0, response).unwrap();
 
-        assert_eq!(bytes_consumed, response.len());
-        assert_eq!(req_id, Some((0, 0)));
+        assert_eq!(parsed, Parsed::ok(response.len(), (0, 0)));
     }
 
     /// A 200 response with a chunked body made of `body`
@@ -397,7 +426,7 @@ mod tests {
     }
 
     /// Parse `data` on a fresh connection, expecting one whole response
-    fn parse_one(data: &[u8]) -> Result<(usize, Option<(usize, u64)>)> {
+    fn parse_one(data: &[u8]) -> Result<Parsed<'_, (usize, u64)>> {
         HttpProtocol::default().parse_response(0, data)
     }
 
@@ -407,10 +436,10 @@ mod tests {
         for size in ["1a", "1A", "01A", "1f", "1F"] {
             let len = usize::from_str_radix(size, 16).unwrap();
             let response = chunked(&format!("{size}\r\n{}\r\n0\r\n\r\n", &alphabet[..len]));
-            assert_eq!(parse_one(&response).unwrap(), (response.len(), Some((0, 0))), "{size}");
+            assert_eq!(parse_one(&response).unwrap(), Parsed::ok(response.len(), (0, 0)), "{size}");
         }
         let response = [chunked("aB\r\n"), vec![b'x'; 0xab], b"\r\n0\r\n\r\n".to_vec()].concat();
-        assert_eq!(parse_one(&response).unwrap().0, response.len());
+        assert_eq!(parse_one(&response).unwrap().consumed(), response.len());
     }
 
     #[test]
@@ -421,24 +450,28 @@ mod tests {
             "5 ; a = b\r\nhello\r\n000\t;x\r\n\r\n",
         ] {
             let response = chunked(body);
-            assert_eq!(parse_one(&response).unwrap(), (response.len(), Some((0, 0))), "{body:?}");
+            assert_eq!(
+                parse_one(&response).unwrap(),
+                Parsed::ok(response.len(), (0, 0)),
+                "{body:?}"
+            );
         }
     }
 
     #[test]
     fn test_chunked_trailers_are_skipped() {
         let response = chunked("3\r\nabc\r\n0\r\nExpires: never\r\nX-Checksum:\t1234\r\n\r\n");
-        assert_eq!(parse_one(&response).unwrap(), (response.len(), Some((0, 0))));
+        assert_eq!(parse_one(&response).unwrap(), Parsed::ok(response.len(), (0, 0)));
         // A trailer that looks like a response does not end the message early
         let response = chunked("0\r\nX-Next: HTTP/1.1 200 OK\r\n\r\n");
-        assert_eq!(parse_one(&response).unwrap(), (response.len(), Some((0, 0))));
+        assert_eq!(parse_one(&response).unwrap(), Parsed::ok(response.len(), (0, 0)));
     }
 
     #[test]
     fn test_chunked_zero_length_body() {
         for body in ["0\r\n\r\n", "000\r\n\r\n"] {
             let response = chunked(body);
-            assert_eq!(parse_one(&response).unwrap(), (response.len(), Some((0, 0))));
+            assert_eq!(parse_one(&response).unwrap(), Parsed::ok(response.len(), (0, 0)));
         }
     }
 
@@ -452,11 +485,18 @@ mod tests {
         let next = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
         let mut proto = HttpProtocol::default();
         for end in 0..response.len() {
-            assert_eq!(proto.parse_response(1, &response[..end]).unwrap(), (0, None), "{end}");
+            assert_eq!(
+                proto.parse_response(1, &response[..end]).unwrap(),
+                Parsed::Incomplete,
+                "{end}"
+            );
         }
-        assert_eq!(proto.parse_response(1, &response).unwrap(), (response.len(), Some((1, 0))));
+        assert_eq!(proto.parse_response(1, &response).unwrap(), Parsed::ok(response.len(), (1, 0)));
         let coalesced = [response.as_slice(), next].concat();
-        assert_eq!(proto.parse_response(1, &coalesced).unwrap(), (response.len(), Some((1, 1))));
+        assert_eq!(
+            proto.parse_response(1, &coalesced).unwrap(),
+            Parsed::ok(response.len(), (1, 1))
+        );
     }
 
     #[test]
@@ -471,9 +511,9 @@ mod tests {
         let mut proto = HttpProtocol::default();
         let mut offset = 0;
         for (seq, response) in responses.iter().enumerate() {
-            let (consumed, id) = proto.parse_response(2, &wire[offset..]).unwrap();
-            assert_eq!((consumed, id), (response.len(), Some((2, seq as u64))));
-            offset += consumed;
+            let parsed = proto.parse_response(2, &wire[offset..]).unwrap();
+            assert_eq!(parsed, Parsed::ok(response.len(), (2, seq as u64)));
+            offset += parsed.consumed();
         }
         assert_eq!(offset, wire.len());
     }
@@ -496,7 +536,7 @@ mod tests {
             assert!(parse_one(&chunked(body)).is_err(), "{body:?}");
         }
         // Huge sizes that fit are incomplete; the core limits the buffered length
-        assert_eq!(parse_one(&chunked("ffffffff\r\nabc")).unwrap(), (0, None));
+        assert_eq!(parse_one(&chunked("ffffffff\r\nabc")).unwrap(), Parsed::Incomplete);
     }
 
     #[test]
@@ -524,8 +564,8 @@ mod tests {
         let body = format!("9c40\r\n{chunk}\r\n9c40\r\n{chunk}\r\n0\r\n\r\n");
         let response = chunked(&body);
         assert!(response.len() > 80_000);
-        assert_eq!(parse_one(&response[..70_000]).unwrap(), (0, None));
-        assert_eq!(parse_one(&response).unwrap(), (response.len(), Some((0, 0))));
+        assert_eq!(parse_one(&response[..70_000]).unwrap(), Parsed::Incomplete);
+        assert_eq!(parse_one(&response).unwrap(), Parsed::ok(response.len(), (0, 0)));
     }
 
     #[test]
@@ -533,7 +573,11 @@ mod tests {
         for value in ["Chunked", "chunked ", " chunked, ", ",chunked"] {
             let response =
                 format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: {value}\r\n\r\n0\r\n\r\n");
-            assert_eq!(parse_one(response.as_bytes()).unwrap().0, response.len(), "{value:?}");
+            assert_eq!(
+                parse_one(response.as_bytes()).unwrap().consumed(),
+                response.len(),
+                "{value:?}"
+            );
         }
         for headers in [
             "Transfer-Encoding: gzip\r\n",
@@ -573,11 +617,11 @@ mod tests {
             "HTTP/1.1 304 Not Modified\r\nContent-Length: 10\r\n\r\n",
         ] {
             let wire = [head.as_bytes(), next].concat();
-            assert_eq!(parse_one(&wire).unwrap(), (head.len(), Some((0, 0))), "{head:?}");
+            assert_eq!(parse_one(&wire).unwrap(), Parsed::ok(head.len(), (0, 0)), "{head:?}");
         }
         // Interim responses are counted in the final response's bytes
         let interim = "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nTransfer-Encoding: chunked\r\n\r\n";
         let response = [interim.as_bytes(), &chunked("1\r\nx\r\n0\r\n\r\n")].concat();
-        assert_eq!(parse_one(&response).unwrap(), (response.len(), Some((0, 0))));
+        assert_eq!(parse_one(&response).unwrap(), Parsed::ok(response.len(), (0, 0)));
     }
 }
