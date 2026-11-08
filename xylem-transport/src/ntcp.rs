@@ -4,8 +4,8 @@
 //! caller-driven ntcp [`Network`], generic over its packet backend (`P`). The
 //! group drives the network from its own calls: `add_connection`, `flush`,
 //! `poll` and `close_all` advance the stack. `send` only writes into it, so
-//! that a round of sends costs one pass of the stack, at the next `flush` or
-//! `poll`. When the stack has nothing left to do, `poll` blocks on the
+//! that a round of sends costs a pass or two of the stack, at the worker's
+//! `flush` calls or the next `poll`. When the stack has nothing left to do, `poll` blocks on the
 //! backend's file descriptor, or keeps driving a backend that has none
 //! (DPDK, AF_XDP).
 //!

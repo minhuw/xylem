@@ -161,7 +161,7 @@ Each worker thread converts the NIC's clock to xylem's clock with a calibration 
 - **TCP only.** There is no user-space UDP.
 - **Timestamps.** With TUN and AF_XDP, user-space timestamps only: latencies use the CPU timestamp counter read when the send was accepted by ntcp and when a receive completed, and `poll_tx_timestamps` reports nothing. With DPDK, `timestamps = "nic"` adds the NIC timestamps above; there are no kernel timestamps.
 - **One endpoint per thread.** Threads never share a stack.
-- **Polling.** A group drives its stack once after each round of sends (a worker's sends to every connection that may send) and whenever xylem polls. With TUN it sleeps on the device's file descriptor when the stack has nothing left to do; with DPDK and AF_XDP it busy-polls its queue. Each connection's stack work costs CPU time on the worker thread, and that time is part of the measured latency.
+- **Polling.** A group drives its stack after the first send of each round (a worker's sends to every connection that may send), once more after the round's last send, and whenever xylem polls. With TUN it sleeps on the device's file descriptor when the stack has nothing left to do; with DPDK and AF_XDP it busy-polls its queue. Each connection's stack work costs CPU time on the worker thread, and that time is part of the measured latency.
 - **No startup wait.** Like Linux after a reboot, ntcp opens connections as soon as a run starts. It does not wait out the 2×MSL (240 s) TIME-WAIT state of a previous run. A run that reuses an ntcp address and port against the same server within 4 minutes of an earlier run could in principle meet that run's old segments; ntcp's per-run secret and TCP timestamps make this very unlikely.
 
 ## See Also

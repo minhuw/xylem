@@ -332,6 +332,11 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             self.pool.try_schedule_connection(connection_id, protocol);
 
             sends_this_iteration += 1;
+            // The round's first request goes out at once, as on a kernel
+            // socket; the rest wait for one transmit pass after the loop
+            if sends_this_iteration == 1 {
+                self.pool.flush()?;
+            }
             if sends_this_iteration >= max_sends_per_iteration {
                 eprintln!(
                     "[WARN] Hit send limit ({}) in one iteration - forcing receive phase",
@@ -340,10 +345,10 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
                 break;
             }
         }
-        // One transmit pass for the whole round: a user-space stack's pass
-        // costs time per connection, so one per send would grow with the
-        // square of the connections that send together
-        if sends_this_iteration > 0 {
+        // One transmit pass for the rest of the round: a user-space stack's
+        // pass costs time per connection, so one per send would grow with
+        // the square of the connections that send together
+        if sends_this_iteration > 1 {
             self.pool.flush()?;
         }
         Ok(())
@@ -703,17 +708,25 @@ mod tests {
     }
 
     #[test]
-    fn a_round_of_sends_is_flushed_once_after_the_last_send() {
+    fn a_round_flushes_its_first_send_at_once_and_the_rest_together() {
         let factory = FakeFactory::default();
         // Closed loop with 4 requests in flight: one round sends 4
         let mut worker = fake_worker(&factory, 4, Box::new(UniformPolicyScheduler::closed_loop()));
         worker.send_requests().unwrap();
         assert_eq!(factory.0.lock().unwrap().sent.len(), 4);
-        assert_eq!(factory.0.lock().unwrap().flushes, [4]);
+        assert_eq!(factory.0.lock().unwrap().flushes, [1, 4]);
 
         // A round that sends nothing flushes nothing
         worker.send_requests().unwrap();
-        assert_eq!(factory.0.lock().unwrap().flushes, [4]);
+        assert_eq!(factory.0.lock().unwrap().flushes, [1, 4]);
+    }
+
+    #[test]
+    fn a_round_of_one_send_flushes_once() {
+        let factory = FakeFactory::default();
+        let mut worker = fake_worker(&factory, 1, Box::new(UniformPolicyScheduler::closed_loop()));
+        worker.send_requests().unwrap();
+        assert_eq!(factory.0.lock().unwrap().flushes, [1]);
     }
 
     #[test]
