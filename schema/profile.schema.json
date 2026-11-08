@@ -50,6 +50,7 @@
       }
     }
   },
+  "additionalProperties": false,
   "required": [
     "experiment",
     "traffic_groups",
@@ -120,6 +121,7 @@
           "default": "never"
         }
       },
+      "additionalProperties": false,
       "required": [
         "directory"
       ]
@@ -160,6 +162,7 @@
           "minimum": 0
         }
       },
+      "additionalProperties": false,
       "required": [
         "name",
         "duration"
@@ -179,7 +182,8 @@
           "type": "string",
           "default": "light"
         }
-      }
+      },
+      "additionalProperties": false
     },
     "NtcpBackend": {
       "description": "Packet backend of the ntcp transport",
@@ -267,6 +271,7 @@
           "default": false
         }
       },
+      "additionalProperties": false,
       "required": [
         "file"
       ]
@@ -308,6 +313,7 @@
               "const": "closed-loop"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type"
           ]
@@ -326,6 +332,7 @@
               "const": "fixed-rate"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "rate"
@@ -345,6 +352,7 @@
               "const": "poisson"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "rate"
@@ -382,6 +390,7 @@
               "const": "adaptive"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "initial_rate",
@@ -419,6 +428,7 @@
               "const": "sinusoidal"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "base_rate",
@@ -449,6 +459,7 @@
               "const": "ramp"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "start_rate",
@@ -483,6 +494,7 @@
               "const": "spike"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "normal_rate",
@@ -514,6 +526,7 @@
               "const": "sawtooth"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "min_rate",
@@ -575,6 +588,7 @@
               "const": "none"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type"
           ]
@@ -601,6 +615,7 @@
               "const": "limited"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type"
           ]
@@ -614,6 +629,7 @@
               "const": "unlimited"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type"
           ]
@@ -640,6 +656,7 @@
               "const": "dd-sketch"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type"
           ]
@@ -660,6 +677,7 @@
               "const": "t-digest"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type"
           ]
@@ -690,6 +708,7 @@
               "const": "hdr-histogram"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type"
           ]
@@ -792,6 +811,7 @@
           "default": "tcp"
         }
       },
+      "additionalProperties": false,
       "required": [
         "name",
         "protocol",

@@ -10,6 +10,7 @@ pub mod request_dump;
 pub mod scheduler;
 pub mod seed;
 pub mod stats;
+mod strict;
 pub mod threading;
 pub mod timing;
 pub mod traffic_group;

@@ -16,6 +16,7 @@ pub use ntcp::{NtcpBackend, NtcpConfig, NtcpEndpoint};
 
 /// Top-level profile configuration
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ProfileConfig {
     pub experiment: ExperimentConfig,
     /// Traffic groups configuration
@@ -38,6 +39,7 @@ pub struct ProfileConfig {
 
 /// Experiment metadata
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ExperimentConfig {
     /// Experiment name
     pub name: String,
@@ -67,6 +69,7 @@ pub use xylem_protocols::KeysConfig;
 
 /// Output configuration
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct OutputConfig {
     /// Output format: json, html, both, or human
     #[serde(default = "default_output_format")]
@@ -103,6 +106,7 @@ fn default_output_format() -> OutputFormat {
 
 /// HTML output configuration
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct HtmlOutputConfig {
     /// Chart library; only "chartjs" is currently supported.
     #[serde(default = "default_chart_library")]
@@ -1017,7 +1021,6 @@ target = "127.0.0.1:6379"
 threads = [0]
 connections_per_thread = 1
 max_pending_per_connection = 1
-sampling_rate = 1.0
 
 [traffic_groups.protocol_config.keys]
 strategy = "sequential"
@@ -1051,6 +1054,13 @@ file = "results/test.json"
 
     /// A one-group profile with `group` (protocol, transport, extra lines)
     fn udp_profile(protocol: &str, transport: &str, extra: &str) -> Result<ProfileConfig> {
+        // xylem-echo and http take no keys
+        let keys = match protocol {
+            "xylem-echo" | "http" => "",
+            _ => {
+                "[traffic_groups.protocol_config.keys]\nstrategy = \"sequential\"\nvalue_size = 64"
+            }
+        };
         let profile = format!(
             r#"
 [experiment]
@@ -1066,10 +1076,7 @@ threads = [0]
 connections_per_thread = 1
 {extra}
 
-[traffic_groups.protocol_config.keys]
-strategy = "sequential"
-start = 0
-value_size = 64
+{keys}
 
 [traffic_groups.traffic_policy]
 type = "closed-loop"
@@ -1145,7 +1152,6 @@ target = ""
 threads = [0]
 connections_per_thread = 1
 max_pending_per_connection = 1
-sampling_rate = 1.0
 
 [traffic_groups.protocol_config.keys]
 strategy = "sequential"
@@ -1310,7 +1316,6 @@ target = "127.0.0.1:6379"
 threads = [0]
 connections_per_thread = 1
 max_pending_per_connection = 1
-sampling_rate = 1.0
 
 [traffic_groups.protocol_config.keys]
 strategy = "sequential"
@@ -1391,6 +1396,11 @@ max = 5000"#,
         let protocols = vec!["redis", "memcached-binary", "memcached-ascii", "http", "xylem-echo"];
 
         for protocol in protocols {
+            // http and xylem-echo take no keys
+            let keys = match protocol {
+                "http" | "xylem-echo" => "",
+                _ => "[traffic_groups.protocol_config.keys]\nstrategy = \"sequential\"\nvalue_size = 64",
+            };
             let config_str = format!(
                 r#"
 [experiment]
@@ -1404,12 +1414,8 @@ target = "127.0.0.1:6379"
 threads = [0]
 connections_per_thread = 1
 max_pending_per_connection = 1
-sampling_rate = 1.0
 
-[traffic_groups.protocol_config.keys]
-strategy = "sequential"
-start = 0
-value_size = 64
+{keys}
 
 [traffic_groups.traffic_policy]
 type = "closed-loop"
@@ -1445,7 +1451,6 @@ target = "127.0.0.1:6379"
 threads = [0]
 connections_per_thread = 1
 max_pending_per_connection = 1
-sampling_rate = 1.0
 
 [traffic_groups.protocol_config.keys]
 strategy = "sequential"
@@ -1490,7 +1495,6 @@ target = "127.0.0.1:6379"
 threads = [0]
 connections_per_thread = 1
 max_pending_per_connection = 1
-sampling_rate = 1.0
 
 [traffic_groups.protocol_config.keys]
 strategy = "sequential"
@@ -1528,7 +1532,6 @@ target = "127.0.0.1:6379"
 threads = [0]
 connections_per_thread = 1
 max_pending_per_connection = 1
-sampling_rate = 1.0
 
 [traffic_groups.protocol_config.keys]
 strategy = "random"
@@ -1636,7 +1639,7 @@ duration = "10s""#,
                 "traffic_groups.0.target=192.168.1.100:6379".to_string(),
                 "experiment.duration=5m".to_string(),
                 "experiment.seed=999".to_string(),
-                "traffic_groups.0.protocol=memcached-binary".to_string(),
+                "traffic_groups.0.connections_per_thread=8".to_string(),
             ],
         )
         .unwrap();
@@ -1644,7 +1647,7 @@ duration = "10s""#,
         assert_eq!(config.traffic_groups[0].target, "192.168.1.100:6379");
         assert_eq!(config.experiment.duration, Duration::from_secs(300));
         assert_eq!(config.experiment.seed, Some(999));
-        assert_eq!(config.traffic_groups[0].protocol, "memcached-binary");
+        assert_eq!(config.traffic_groups[0].connections_per_thread, 8);
     }
 
     #[test]
@@ -1685,9 +1688,13 @@ duration = "10s""#,
 
     #[test]
     fn test_set_type_inference_string() {
+        // The Redis protocol_config does not fit http, so replace it too
         let config = ProfileConfig::from_file_with_overrides(
             "../tests/redis/redis-get-zipfian.toml",
-            &["traffic_groups.0.protocol=http".to_string()],
+            &[
+                "traffic_groups.0.protocol=http".to_string(),
+                "traffic_groups.0.protocol_config={}".to_string(),
+            ],
         )
         .unwrap();
         assert_eq!(config.traffic_groups[0].protocol, "http");

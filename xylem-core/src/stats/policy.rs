@@ -5,9 +5,10 @@ use serde::{Deserialize, Serialize};
 /// Sampling policy configuration for latency measurement
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(tag = "type", rename_all = "kebab-case")]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum SamplingPolicy {
     /// Disable latency sampling entirely (still counts bytes/requests)
+    #[serde(deserialize_with = "crate::strict::unit_variant")]
     None,
     /// Uniform random sample of at most `max_samples` latencies per entry.
     /// Each latency is first kept with probability `rate`; the kept latencies
@@ -24,6 +25,7 @@ pub enum SamplingPolicy {
     },
     /// Zero sampling: record every latency (unlimited storage)
     /// WARNING: Can consume large amounts of memory for high-throughput workloads
+    #[serde(deserialize_with = "crate::strict::unit_variant")]
     Unlimited,
     /// DDSketch: Distributed quantile sketch with relative-error guarantees
     /// Memory-efficient and fully mergeable across traffic groups
@@ -117,5 +119,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(bounded, SamplingPolicy::HdrHistogram { sigfigs: 2, max_value_us: Some(1000) });
+    }
+
+    #[test]
+    fn every_policy_rejects_unknown_keys() {
+        for policy in ["none", "limited", "unlimited", "dd-sketch", "t-digest", "hdr-histogram"] {
+            serde_json::from_value::<SamplingPolicy>(serde_json::json!({ "type": policy }))
+                .unwrap();
+            let with_unknown = serde_json::json!({ "type": policy, "bogus": 1 });
+            let error = serde_json::from_value::<SamplingPolicy>(with_unknown).unwrap_err();
+            assert!(error.to_string().contains("unknown field `bogus`"), "{policy}: {error}");
+        }
     }
 }
