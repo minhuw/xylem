@@ -283,6 +283,13 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
     // and until every worker finished
     #[cfg(all(target_os = "linux", feature = "ntcp-dpdk"))]
     let ntcp_dpdk_port = start_ntcp_dpdk(&config, &thread_assignment)?;
+    // Likewise the XDP program, addresses and steering rules of the ntcp
+    // "af_xdp" backend
+    #[cfg(all(target_os = "linux", feature = "ntcp-af-xdp"))]
+    let ntcp_xdp_port = start_ntcp_af_xdp(&config, &thread_assignment)?;
+    // Read after the run for the frames that reached no ntcp socket
+    #[cfg(all(target_os = "linux", feature = "ntcp-af-xdp"))]
+    let ntcp_xdp_report = ntcp_xdp_port.clone();
 
     // Initialize evalsync if enabled and environment variables are set
     #[cfg(feature = "evalsync")]
@@ -685,6 +692,35 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
                     NtcpBackend::Dpdk => {
                         unreachable!("validation rejects ntcp.backend \"dpdk\" in this build")
                     }
+                    #[cfg(feature = "ntcp-af-xdp")]
+                    NtcpBackend::AfXdp => {
+                        // Pinned already: the queue's socket is used from here
+                        let port = ntcp_xdp_port.as_ref().expect("the port of the ntcp threads");
+                        let member = config::ntcp::thread_index(
+                            &config_for_worker.traffic_groups,
+                            thread_idx,
+                        )
+                        .expect("an ntcp thread");
+                        let worker = Worker::new_multi_group_with_targets(
+                            &port.factory(member),
+                            protocols,
+                            stats,
+                            worker_config,
+                            groups_config,
+                        )?;
+                        run_worker(
+                            worker,
+                            request_dumper_for_worker.as_ref(),
+                            thread_idx,
+                            &request_timeouts,
+                            &on_errors,
+                            start,
+                        )
+                    }
+                    #[cfg(not(feature = "ntcp-af-xdp"))]
+                    NtcpBackend::AfXdp => {
+                        unreachable!("validation rejects ntcp.backend \"af_xdp\" in this build")
+                    }
                 }
             }
             other => Err(xylem_core::Error::Config(format!("Unsupported transport: {}", other)))?,
@@ -702,6 +738,17 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
     }
 
     tracing::info!("Experiment completed successfully");
+    #[cfg(all(target_os = "linux", feature = "ntcp-af-xdp"))]
+    if let Some(port) = ntcp_xdp_report {
+        match port.unsteered() {
+            Ok(0) => {}
+            Ok(dropped) => tracing::warn!(
+                "ntcp AF_XDP: {dropped} frames for ntcp's addresses arrived on a queue without \
+                 an ntcp socket and were dropped"
+            ),
+            Err(e) => tracing::warn!("ntcp AF_XDP: cannot read the dropped-frame count: {e}"),
+        }
+    }
     let (results, calibrations): (Vec<_>, Vec<_>) = results.into_iter().unzip();
     let stats = xylem_core::stats::TupleStatsCollector::merge(results);
 
@@ -789,6 +836,54 @@ fn start_ntcp_dpdk(
         members,
     })
     .with_context(|| format!("Failed to start the DPDK port {}", dpdk.device))?;
+    Ok(Some(port))
+}
+
+/// Attach the AF_XDP backend's XDP program to its interface, if a thread
+/// uses it: one member per ntcp thread, in ascending thread order like
+/// `local_ips`
+#[cfg(all(target_os = "linux", feature = "ntcp-af-xdp"))]
+fn start_ntcp_af_xdp(
+    config: &ProfileConfig,
+    assignment: &xylem_core::traffic_group::ThreadGroupAssignment,
+) -> anyhow::Result<Option<Arc<xylem_transport::NtcpAfXdpPort>>> {
+    use config::ntcp::{thread_ids, NtcpBackend, NtcpXdpMode};
+    use xylem_transport::{NtcpAfXdpConfig, NtcpAfXdpMember, NtcpAfXdpPort, XdpMode};
+
+    let Some(ntcp) = config.ntcp.as_ref().filter(|ntcp| ntcp.backend == NtcpBackend::AfXdp) else {
+        return Ok(None);
+    };
+    let threads = thread_ids(&config.traffic_groups);
+    if threads.is_empty() {
+        return Ok(None);
+    }
+    let af_xdp = ntcp.af_xdp.as_ref().expect("validated [ntcp.af_xdp] section");
+    let members = threads
+        .iter()
+        .zip(&af_xdp.local_ips)
+        .enumerate()
+        .map(|(queue, (&thread, &local_ip))| {
+            let groups = assignment.get_groups_for_thread(thread).expect("ntcp threads run groups");
+            NtcpAfXdpMember {
+                local_ip,
+                // The i-th ntcp thread takes the interface's queue i
+                queue: queue as u32,
+                max_connections: groups.iter().map(|(_, g)| g.connections_per_thread).sum(),
+            }
+        })
+        .collect();
+    let port = NtcpAfXdpPort::start(NtcpAfXdpConfig {
+        interface: af_xdp.ifname.clone(),
+        mode: match af_xdp.mode {
+            NtcpXdpMode::Native => XdpMode::Native,
+            NtcpXdpMode::Generic => XdpMode::Generic,
+        },
+        mtu: ntcp.mtu,
+        prefix_len: af_xdp.prefix_len,
+        gateway: af_xdp.gateway,
+        members,
+    })
+    .with_context(|| format!("Failed to attach the AF_XDP backend to {}", af_xdp.ifname))?;
     Ok(Some(port))
 }
 

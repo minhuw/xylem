@@ -2187,6 +2187,13 @@ local_ips = ["10.0.0.3"]
 prefix_len = 24
 gateway = "10.0.0.1"
 
+[ntcp.af_xdp]
+ifname = "eth0"
+mode = "generic"
+local_ips = ["10.0.0.4"]
+prefix_len = 24
+gateway = "10.0.0.1"
+
 [thresholds]
 latency = ["p99 < 1s"]
 "requests.errors{group=redis}" = ["rate < 0.01"]

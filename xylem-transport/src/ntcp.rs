@@ -7,9 +7,10 @@
 //! to do, `poll` blocks on the backend's file descriptor, or keeps driving a
 //! backend that has none (DPDK).
 //!
-//! `NtcpTunFactory` builds groups over an existing Linux TUN device, and
+//! `NtcpTunFactory` builds groups over an existing Linux TUN device,
 //! [`dpdk::NtcpDpdkFactory`] (`ntcp-dpdk` feature) over one queue pair of a
-//! DPDK port. The `Network` is not `Send`: it is built by `create_group` on
+//! DPDK port, and [`af_xdp::NtcpAfXdpFactory`] (`ntcp-af-xdp` feature) over
+//! an AF_XDP socket on one queue of a network interface. The `Network` is not `Send`: it is built by `create_group` on
 //! the calling (worker) thread and stays there.
 //!
 //! TCP only. Timestamps are user-space ones unless the group enables NIC
@@ -37,6 +38,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::Duration;
 
+#[cfg(feature = "ntcp-af-xdp")]
+pub mod af_xdp;
 #[cfg(feature = "ntcp-dpdk")]
 pub mod dpdk;
 

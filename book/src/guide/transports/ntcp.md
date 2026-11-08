@@ -1,6 +1,6 @@
 # ntcp (User-Space TCP)
 
-The `ntcp` transport runs TCP in user space with [ntcp](https://github.com/minhuw/ntcp), a caller-driven TCP/IP stack, instead of the kernel's TCP. Each worker thread runs its own ntcp stack, which sends and receives packets through a packet backend: a Linux TUN device (raw IP packets) or a DPDK port (Ethernet frames, with ARP). An AF_XDP backend is planned.
+The `ntcp` transport runs TCP in user space with [ntcp](https://github.com/minhuw/ntcp), a caller-driven TCP/IP stack, instead of the kernel's TCP. Each worker thread runs its own ntcp stack, which sends and receives packets through a packet backend: a Linux TUN device (raw IP packets), a DPDK port, or AF_XDP sockets on a network interface (Ethernet frames, with ARP).
 
 The target server sees an ordinary TCP client. Only the client side changes, so you can compare the kernel stack with a user-space stack against the same server.
 
@@ -20,7 +20,13 @@ nix develop --command cargo build --release --features xylem-cli/ntcp-dpdk
 
 Build and run DPDK binaries with nix's toolchain only: a binary linked against the host's glibc fails to load nix's rdma-core when EAL starts.
 
-A build without the feature rejects `transport = "ntcp"` (or `backend = "dpdk"`) with an error saying that xylem was built without that support.
+The AF_XDP backend needs the `ntcp-af-xdp` feature. It links libbpf and compiles an XDP program for the BPF target; the nix dev shell provides libbpf, a BPF-capable clang (`NTCP_BPF_CLANG`) and the Linux UAPI headers (`NTCP_BPF_CFLAGS`):
+
+```bash
+nix develop --command cargo build --release --features xylem-cli/ntcp-af-xdp
+```
+
+A build without the feature rejects `transport = "ntcp"` (or `backend = "dpdk"` or `"af_xdp"`) with an error saying that xylem was built without that support.
 
 ## TUN setup
 
@@ -46,6 +52,17 @@ The DPDK backend drives one Ethernet port. Each worker thread that runs ntcp tra
 - **Addresses.** ntcp's addresses must be unused on the network, and must not be the kernel's address on that device.
 - **The port takes the device's traffic.** The port is not isolated (on mlx5, an isolated port cannot read the NIC's clock, which NIC timestamps need), so while xylem runs, the kernel no longer receives the device's traffic. Keep management traffic on another interface.
 - **CPUs.** xylem pins worker thread N to CPU N, and attaches the thread's queue after pinning it. Unless `eal_args` name lcores, EAL's main lcore is the first CPU xylem may run on, and EAL starts no threads of its own. Busy-polling keeps each ntcp thread's CPU at 100%.
+
+## AF_XDP setup
+
+The AF_XDP backend shares a network interface with the kernel. xylem attaches an XDP program to the interface; it hands IPv4 packets addressed to ntcp's addresses, and ARP for them, to an AF_XDP socket per worker thread, and passes all other traffic to the kernel, which keeps its own address and connections on the interface.
+
+- **Privileges.** Run xylem as root (it needs `CAP_BPF`, `CAP_NET_ADMIN` and `CAP_NET_RAW`). Hosts with `kernel.unprivileged_bpf_disabled` still allow root.
+- **Mode.** `mode = "native"` (default) runs the program in the driver and fails on a driver without native XDP; `"generic"` works on any interface, veth included, but is slower.
+- **Queues.** With several threads, xylem installs ntuple rules (`ethtool -N`) that steer each thread's address to its queue, and ARP to one queue; the interface needs that many combined queues and ntuple filtering. One thread needs neither.
+- **Addresses.** ntcp's addresses must be unused on the network and must not be the kernel's addresses.
+- **Cleanup.** xylem removes the program, its addresses and its rules when the run ends.
+- **Timestamps.** Copy mode, user-space timestamps only: no NIC timestamps, so `timestamps` must be `"user"`.
 
 ## Configuration
 
@@ -95,6 +112,19 @@ prefix_len = 24
 # gateway = "10.80.0.254"      # for targets outside 10.80.0.0/24
 ```
 
+With the AF_XDP backend, the `[ntcp]` section is:
+
+```toml
+[ntcp]
+backend = "af_xdp"
+
+[ntcp.af_xdp]
+ifname = "enp5s0"
+mode = "native"                # or "generic"
+local_ips = ["10.80.0.20", "10.80.0.21"]
+prefix_len = 24
+```
+
 | Field | Description |
 |-------|-------------|
 | `backend` | Packet backend: `"tun"` (default), an existing Linux TUN device without packet information headers per thread; or `"dpdk"`, one DPDK port shared by the threads. |
@@ -107,6 +137,9 @@ prefix_len = 24
 | `dpdk.local_ips` | ntcp's IPv4 address for each worker thread that runs ntcp traffic groups, in ascending thread-ID order like `endpoints`. |
 | `dpdk.prefix_len` | Prefix length of the on-link network of `local_ips`, 1 to 32. |
 | `dpdk.gateway` | Router for targets outside that network (optional): another address on it. |
+| `af_xdp.ifname` | AF_XDP: the network interface. |
+| `af_xdp.mode` | `"native"` (default) or `"generic"` XDP. |
+| `af_xdp.local_ips`, `af_xdp.prefix_len`, `af_xdp.gateway` | As for DPDK: one address per ntcp thread, the on-link prefix and an optional router. |
 
 Validation requires the `[ntcp]` section whenever a group uses ntcp, and checks the selected backend's settings: exactly one endpoint (TUN) or address (DPDK) per ntcp thread, each address used once, and for TUN a different device per endpoint. The other backend's settings are ignored, so a profile can keep both and switch with `--set ntcp.backend=dpdk`. Groups sharing a thread share its endpoint or address. Groups on a thread must all use the same transport, as with every transport.
 
@@ -126,9 +159,9 @@ Each worker thread converts the NIC's clock to xylem's clock with a calibration 
 ## Current limitations
 
 - **TCP only.** There is no user-space UDP.
-- **Timestamps.** With TUN, user-space timestamps only: latencies use the CPU timestamp counter read when the send was accepted by ntcp and when a receive completed, and `poll_tx_timestamps` reports nothing. With DPDK, `timestamps = "nic"` adds the NIC timestamps above; there are no kernel timestamps.
+- **Timestamps.** With TUN and AF_XDP, user-space timestamps only: latencies use the CPU timestamp counter read when the send was accepted by ntcp and when a receive completed, and `poll_tx_timestamps` reports nothing. With DPDK, `timestamps = "nic"` adds the NIC timestamps above; there are no kernel timestamps.
 - **One endpoint per thread.** Threads never share a stack.
-- **Polling.** A group drives its stack whenever xylem sends or polls. With TUN it sleeps on the device's file descriptor when the stack has nothing left to do; with DPDK it busy-polls its queue. Each connection's stack work costs CPU time on the worker thread, and that time is part of the measured latency.
+- **Polling.** A group drives its stack whenever xylem sends or polls. With TUN it sleeps on the device's file descriptor when the stack has nothing left to do; with DPDK and AF_XDP it busy-polls its queue. Each connection's stack work costs CPU time on the worker thread, and that time is part of the measured latency.
 - **No startup wait.** Like Linux after a reboot, ntcp opens connections as soon as a run starts. It does not wait out the 2×MSL (240 s) TIME-WAIT state of a previous run. A run that reuses an ntcp address and port against the same server within 4 minutes of an earlier run could in principle meet that run's old segments; ntcp's per-run secret and TCP timestamps make this very unlikely.
 
 ## See Also

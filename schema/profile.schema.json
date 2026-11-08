@@ -204,6 +204,50 @@
       },
       "additionalProperties": false
     },
+    "NtcpAfXdp": {
+      "description": "The network interface of backend \"af_xdp\"\n\nEach worker thread that runs ntcp traffic groups gets one AF_XDP socket on\none queue of the interface and its own IPv4 address. An XDP program hands\nthe threads' addresses (and ARP for them) to their sockets and passes the\nrest of the traffic to the kernel, which keeps its own address on the\ninterface. The threads share one ARP table.",
+      "type": "object",
+      "properties": {
+        "gateway": {
+          "description": "Router for destinations outside that network",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "ipv4"
+        },
+        "ifname": {
+          "description": "Network interface (e.g. \"enp5s0\")",
+          "type": "string"
+        },
+        "local_ips": {
+          "description": "ntcp's own IPv4 address for each worker thread that runs ntcp traffic\ngroups, in ascending thread-id order; not the kernel's addresses",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "ipv4"
+          }
+        },
+        "mode": {
+          "description": "XDP attach mode: \"native\" (in the driver) or \"generic\" (any\ninterface, slower)",
+          "$ref": "#/$defs/NtcpXdpMode",
+          "default": "native"
+        },
+        "prefix_len": {
+          "description": "Prefix length of the on-link network of `local_ips`",
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "ifname",
+        "local_ips",
+        "prefix_len"
+      ]
+    },
     "NtcpBackend": {
       "description": "Packet backend of the ntcp transport",
       "oneOf": [
@@ -216,6 +260,11 @@
           "description": "A DPDK port (needs a build with the `ntcp-dpdk` feature)",
           "type": "string",
           "const": "dpdk"
+        },
+        {
+          "description": "AF_XDP sockets on a network interface (needs a build with the\n`ntcp-af-xdp` feature)",
+          "type": "string",
+          "const": "af_xdp"
         }
       ]
     },
@@ -223,13 +272,24 @@
       "description": "User-space TCP (ntcp) settings, required when a traffic group uses\n`transport = \"ntcp\"`",
       "type": "object",
       "properties": {
+        "af_xdp": {
+          "description": "Backend \"af_xdp\": the interface and the threads' addresses (ignored by\nthe other backends)",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NtcpAfXdp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "backend": {
-          "description": "Packet backend: \"tun\" (an existing Linux TUN device per thread, in\n`endpoints`) or \"dpdk\" (one DPDK port shared by the threads, in\n`[ntcp.dpdk]`)",
+          "description": "Packet backend: \"tun\" (an existing Linux TUN device per thread, in\n`endpoints`), \"dpdk\" (one DPDK port shared by the threads, in\n`[ntcp.dpdk]`) or \"af_xdp\" (AF_XDP sockets on one network interface,\nin `[ntcp.af_xdp]`)",
           "$ref": "#/$defs/NtcpBackend",
           "default": "tun"
         },
         "dpdk": {
-          "description": "Backend \"dpdk\": the port and the threads' addresses (ignored by\nbackend \"tun\")",
+          "description": "Backend \"dpdk\": the port and the threads' addresses (ignored by the\nother backends)",
           "anyOf": [
             {
               "$ref": "#/$defs/NtcpDpdk"
@@ -240,7 +300,7 @@
           ]
         },
         "endpoints": {
-          "description": "Backend \"tun\": one endpoint per worker thread that runs ntcp traffic\ngroups, in ascending thread-id order (ignored by backend \"dpdk\")",
+          "description": "Backend \"tun\": one endpoint per worker thread that runs ntcp traffic\ngroups, in ascending thread-id order (ignored by the other backends)",
           "type": "array",
           "items": {
             "$ref": "#/$defs/NtcpEndpoint"
@@ -320,6 +380,21 @@
       "required": [
         "ifname",
         "local_ip"
+      ]
+    },
+    "NtcpXdpMode": {
+      "description": "How the AF_XDP backend attaches its XDP program",
+      "oneOf": [
+        {
+          "description": "In the driver (XDP_FLAGS_DRV_MODE)",
+          "type": "string",
+          "const": "native"
+        },
+        {
+          "description": "In the kernel's generic path, for any interface (XDP_FLAGS_SKB_MODE)",
+          "type": "string",
+          "const": "generic"
+        }
       ]
     },
     "OnError": {

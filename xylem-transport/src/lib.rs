@@ -11,7 +11,8 @@
 //! - **UDP**: Non-blocking UDP sockets
 //! - **Unix**: Unix domain sockets (Unix only)
 //! - **ntcp**: User-space TCP over a packet backend: a Linux TUN device
-//!   (Linux only, `ntcp` feature) or a DPDK port (`ntcp-dpdk` feature)
+//!   (Linux only, `ntcp` feature), a DPDK port (`ntcp-dpdk` feature) or
+//!   AF_XDP sockets (`ntcp-af-xdp` feature)
 //!
 //! ## Kernel Timestamping (Linux only)
 //!
@@ -362,6 +363,10 @@ pub use timestamp::{time_ns, KernelClock, KernelTimestamp, Timestamp};
 #[cfg(target_os = "linux")]
 pub use group::TimestampSource;
 
+#[cfg(all(target_os = "linux", feature = "ntcp-af-xdp"))]
+pub use ntcp::af_xdp::{
+    NtcpAfXdpConfig, NtcpAfXdpFactory, NtcpAfXdpMember, NtcpAfXdpPort, XdpMode,
+};
 #[cfg(all(target_os = "linux", feature = "ntcp-dpdk"))]
 pub use ntcp::dpdk::{NtcpDpdkConfig, NtcpDpdkFactory, NtcpDpdkMember, NtcpDpdkPort};
 #[cfg(all(target_os = "linux", feature = "ntcp"))]

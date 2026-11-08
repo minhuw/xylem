@@ -20,27 +20,35 @@ pub const SUPPORTED: bool = cfg!(all(target_os = "linux", feature = "ntcp"));
 /// Whether this build can run the ntcp transport's DPDK backend
 pub const SUPPORTED_DPDK: bool = cfg!(all(target_os = "linux", feature = "ntcp-dpdk"));
 
+/// Whether this build can run the ntcp transport's AF_XDP backend
+pub const SUPPORTED_AF_XDP: bool = cfg!(all(target_os = "linux", feature = "ntcp-af-xdp"));
+
 /// User-space TCP (ntcp) settings, required when a traffic group uses
 /// `transport = "ntcp"`
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NtcpConfig {
     /// Packet backend: "tun" (an existing Linux TUN device per thread, in
-    /// `endpoints`) or "dpdk" (one DPDK port shared by the threads, in
-    /// `[ntcp.dpdk]`)
+    /// `endpoints`), "dpdk" (one DPDK port shared by the threads, in
+    /// `[ntcp.dpdk]`) or "af_xdp" (AF_XDP sockets on one network interface,
+    /// in `[ntcp.af_xdp]`)
     #[serde(default)]
     pub backend: NtcpBackend,
     /// IP MTU of every endpoint's link
     #[serde(default = "default_mtu")]
     pub mtu: u32,
     /// Backend "tun": one endpoint per worker thread that runs ntcp traffic
-    /// groups, in ascending thread-id order (ignored by backend "dpdk")
+    /// groups, in ascending thread-id order (ignored by the other backends)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub endpoints: Vec<NtcpEndpoint>,
-    /// Backend "dpdk": the port and the threads' addresses (ignored by
-    /// backend "tun")
+    /// Backend "dpdk": the port and the threads' addresses (ignored by the
+    /// other backends)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dpdk: Option<NtcpDpdk>,
+    /// Backend "af_xdp": the interface and the threads' addresses (ignored by
+    /// the other backends)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub af_xdp: Option<NtcpAfXdp>,
 }
 
 /// Packet backend of the ntcp transport
@@ -52,6 +60,10 @@ pub enum NtcpBackend {
     Tun,
     /// A DPDK port (needs a build with the `ntcp-dpdk` feature)
     Dpdk,
+    /// AF_XDP sockets on a network interface (needs a build with the
+    /// `ntcp-af-xdp` feature)
+    #[serde(rename = "af_xdp")]
+    AfXdp,
 }
 
 /// The device and address one worker thread's ntcp stack uses
@@ -90,6 +102,43 @@ pub struct NtcpDpdk {
     /// Router for destinations outside that network
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gateway: Option<Ipv4Addr>,
+}
+
+/// The network interface of backend "af_xdp"
+///
+/// Each worker thread that runs ntcp traffic groups gets one AF_XDP socket on
+/// one queue of the interface and its own IPv4 address. An XDP program hands
+/// the threads' addresses (and ARP for them) to their sockets and passes the
+/// rest of the traffic to the kernel, which keeps its own address on the
+/// interface. The threads share one ARP table.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NtcpAfXdp {
+    /// Network interface (e.g. "enp5s0")
+    pub ifname: String,
+    /// XDP attach mode: "native" (in the driver) or "generic" (any
+    /// interface, slower)
+    #[serde(default)]
+    pub mode: NtcpXdpMode,
+    /// ntcp's own IPv4 address for each worker thread that runs ntcp traffic
+    /// groups, in ascending thread-id order; not the kernel's addresses
+    pub local_ips: Vec<Ipv4Addr>,
+    /// Prefix length of the on-link network of `local_ips`
+    pub prefix_len: u8,
+    /// Router for destinations outside that network
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<Ipv4Addr>,
+}
+
+/// How the AF_XDP backend attaches its XDP program
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum NtcpXdpMode {
+    /// In the driver (XDP_FLAGS_DRV_MODE)
+    #[default]
+    Native,
+    /// In the kernel's generic path, for any interface (XDP_FLAGS_SKB_MODE)
+    Generic,
 }
 
 fn default_mtu() -> u32 {
@@ -161,6 +210,7 @@ pub fn validate(config: Option<&NtcpConfig>, groups: &[TrafficGroupConfig]) -> R
     match config.backend {
         NtcpBackend::Tun => validate_tun(config, &threads)?,
         NtcpBackend::Dpdk => validate_dpdk(config, &threads)?,
+        NtcpBackend::AfXdp => validate_af_xdp(config, &threads)?,
     }
     for (i, group) in groups.iter().enumerate() {
         if group.transport == TRANSPORT
@@ -239,41 +289,71 @@ fn validate_dpdk(config: &NtcpConfig, threads: &[usize]) -> Result<()> {
     if dpdk.device.trim().is_empty() {
         bail!("ntcp.dpdk.device cannot be empty");
     }
-    if !(1..=32).contains(&dpdk.prefix_len) {
-        bail!("ntcp.dpdk.prefix_len must be between 1 and 32, got {}", dpdk.prefix_len);
-    }
     if config.mtu > u32::from(u16::MAX) {
         bail!("ntcp.mtu must fit 16 bits for the DPDK backend, got {}", config.mtu);
     }
+    validate_addresses("dpdk", &dpdk.local_ips, dpdk.prefix_len, dpdk.gateway, threads)
+}
+
+fn validate_af_xdp(config: &NtcpConfig, threads: &[usize]) -> Result<()> {
+    let Some(af_xdp) = &config.af_xdp else {
+        bail!(
+            "ntcp.backend = \"af_xdp\" needs an [ntcp.af_xdp] section with the interface's \
+             ifname, local_ips and prefix_len"
+        );
+    };
+    if !threads.is_empty() && !SUPPORTED_AF_XDP {
+        bail!(
+            "ntcp.backend = \"af_xdp\", but xylem was built without AF_XDP support; rebuild \
+             on Linux with `--features ntcp-af-xdp` in the nix dev shell"
+        );
+    }
+    let ifname = &af_xdp.ifname;
+    if ifname.is_empty() || ifname.len() > 15 || ifname.contains(['/', '\0']) {
+        bail!("ntcp.af_xdp.ifname {:?} is not a network interface name", ifname);
+    }
+    validate_addresses("af_xdp", &af_xdp.local_ips, af_xdp.prefix_len, af_xdp.gateway, threads)
+}
+
+/// Check the IPv4 addresses of a backend with one address per thread on one
+/// network, `[ntcp.<section>]`
+fn validate_addresses(
+    section: &str,
+    local_ips: &[Ipv4Addr],
+    prefix_len: u8,
+    gateway: Option<Ipv4Addr>,
+    threads: &[usize],
+) -> Result<()> {
+    if !(1..=32).contains(&prefix_len) {
+        bail!("ntcp.{section}.prefix_len must be between 1 and 32, got {prefix_len}");
+    }
     let mut ips = HashSet::new();
-    for (i, &ip) in dpdk.local_ips.iter().enumerate() {
+    for (i, &ip) in local_ips.iter().enumerate() {
         if !unicast(ip) {
-            bail!("ntcp.dpdk.local_ips[{}] must be a unicast address, got {}", i, ip);
+            bail!("ntcp.{section}.local_ips[{i}] must be a unicast address, got {ip}");
         }
         if !ips.insert(ip) {
-            bail!("ntcp.dpdk.local_ips[{}] {} is used by another thread", i, ip);
+            bail!("ntcp.{section}.local_ips[{i}] {ip} is used by another thread");
         }
-        if let Some(gateway) = dpdk.gateway {
-            if gateway == ip || !same_network(ip, gateway, dpdk.prefix_len) {
+        if let Some(gateway) = gateway {
+            if gateway == ip || !same_network(ip, gateway, prefix_len) {
                 bail!(
-                    "ntcp.dpdk.gateway {} must be another address in the network {}/{}",
-                    gateway,
-                    ip,
-                    dpdk.prefix_len
+                    "ntcp.{section}.gateway {gateway} must be another address in the network \
+                     {ip}/{prefix_len}"
                 );
             }
         }
     }
-    if let Some(gateway) = dpdk.gateway {
+    if let Some(gateway) = gateway {
         if !unicast(gateway) {
-            bail!("ntcp.dpdk.gateway must be a unicast address, got {}", gateway);
+            bail!("ntcp.{section}.gateway must be a unicast address, got {gateway}");
         }
     }
-    if !threads.is_empty() && dpdk.local_ips.len() != threads.len() {
+    if !threads.is_empty() && local_ips.len() != threads.len() {
         bail!(
-            "ntcp.dpdk.local_ips has {} entries but {} threads run ntcp traffic groups {:?}; \
-             give one address per thread, in ascending thread order",
-            dpdk.local_ips.len(),
+            "ntcp.{section}.local_ips has {} entries but {} threads run ntcp traffic groups \
+             {:?}; give one address per thread, in ascending thread order",
+            local_ips.len(),
             threads.len(),
             threads
         );
@@ -385,17 +465,64 @@ prefix_len = 24
         assert_eq!((dpdk.prefix_len, dpdk.gateway), (24, None));
     }
 
+    const AF_XDP: &str = r#"
+[ntcp]
+backend = "af_xdp"
+
+[ntcp.af_xdp]
+ifname = "enp5s0"
+local_ips = ["10.80.0.20", "10.80.0.21"]
+prefix_len = 24
+"#;
+
+    #[test]
+    fn af_xdp_section_parses() {
+        let config = profile(&[("tcp", "[0]")], AF_XDP);
+        let ntcp = config.ntcp.unwrap();
+        assert_eq!(ntcp.backend, super::NtcpBackend::AfXdp);
+        let af_xdp = ntcp.af_xdp.unwrap();
+        assert_eq!(af_xdp.ifname, "enp5s0");
+        assert_eq!(af_xdp.mode, super::NtcpXdpMode::Native);
+        assert_eq!(af_xdp.local_ips[1].to_string(), "10.80.0.21");
+        assert_eq!((af_xdp.prefix_len, af_xdp.gateway), (24, None));
+        let generic = AF_XDP.replace("prefix_len = 24", "prefix_len = 24\nmode = \"generic\"");
+        let config = profile(&[("tcp", "[0]")], &generic);
+        assert_eq!(config.ntcp.unwrap().af_xdp.unwrap().mode, super::NtcpXdpMode::Generic);
+        let section = "backend = \"af_xdp\"\n[af_xdp]\nifname = \"e\"\nlocal_ips = []\n\
+                       prefix_len = 24\n";
+        assert!(toml::from_str::<super::NtcpConfig>(section).is_ok());
+        let offload = format!("{section}mode = \"offload\"\n");
+        assert!(toml::from_str::<super::NtcpConfig>(&offload).is_err());
+    }
+
+    #[test]
+    fn af_xdp_backend_checks_its_section() {
+        let tcp = [("tcp", "[0]")];
+        let message = error(&tcp, "[ntcp]\nbackend = \"af_xdp\"\n");
+        assert!(message.contains("needs an [ntcp.af_xdp] section"), "{message}");
+        for (from, to, expected) in [
+            ("ifname = \"enp5s0\"", "ifname = \"\"", "not a network interface name"),
+            ("ifname = \"enp5s0\"", "ifname = \"a/b\"", "not a network interface name"),
+            ("prefix_len = 24", "prefix_len = 0", "ntcp.af_xdp.prefix_len"),
+            ("\"10.80.0.21\"", "\"10.80.0.20\"", "used by another thread"),
+        ] {
+            let message = error(&tcp, &AF_XDP.replace(from, to));
+            assert!(message.contains(expected), "{to}: {message}");
+        }
+    }
+
     #[test]
     fn dpdk_backend_needs_its_section() {
         let message = error(&[("tcp", "[0]")], "[ntcp]\nbackend = \"dpdk\"\n");
         assert!(message.contains("needs an [ntcp.dpdk] section"), "{message}");
     }
 
-    /// Both backends' settings, backend "tun"
+    /// Every backend's settings, backend "tun"
     #[cfg(all(target_os = "linux", feature = "ntcp"))]
     fn both_backends() -> String {
         let dpdk = DPDK.split_once("[ntcp.dpdk]").unwrap().1;
-        format!("{TWO_ENDPOINTS}\n[ntcp.dpdk]{dpdk}")
+        let af_xdp = AF_XDP.split_once("[ntcp.af_xdp]").unwrap().1;
+        format!("{TWO_ENDPOINTS}\n[ntcp.dpdk]{dpdk}\n[ntcp.af_xdp]{af_xdp}")
     }
 
     #[test]
@@ -548,6 +675,26 @@ endpoints = [
             timestamped("[0, 1]", "\"nic\"", TWO_ENDPOINTS).validate().unwrap_err()
         );
         assert!(message.contains("needs ntcp.backend = \"dpdk\""), "{message}");
+    }
+
+    #[cfg(all(target_os = "linux", feature = "ntcp-af-xdp"))]
+    #[test]
+    fn valid_af_xdp_profile_passes() {
+        profile(&[("ntcp", "[2, 3]")], AF_XDP).validate().unwrap();
+        let both = both_backends().replace("backend = \"tun\"", "backend = \"af_xdp\"");
+        profile(&[("ntcp", "[2, 3]")], &both).validate().unwrap();
+        let message = error(&[("ntcp", "[2]")], AF_XDP);
+        assert!(message.contains("local_ips has 2 entries but 1 threads"), "{message}");
+        let message =
+            format!("{:#}", timestamped("[2, 3]", "\"nic\"", AF_XDP).validate().unwrap_err());
+        assert!(message.contains("needs ntcp.backend = \"dpdk\""), "{message}");
+    }
+
+    #[cfg(all(target_os = "linux", feature = "ntcp", not(feature = "ntcp-af-xdp")))]
+    #[test]
+    fn af_xdp_backend_needs_the_feature() {
+        let message = error(&[("ntcp", "[2, 3]")], AF_XDP);
+        assert!(message.contains("built without AF_XDP support"), "{message}");
     }
 
     #[cfg(all(target_os = "linux", feature = "ntcp", not(feature = "ntcp-dpdk")))]

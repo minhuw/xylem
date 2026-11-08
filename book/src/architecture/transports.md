@@ -39,8 +39,8 @@ TX timestamps arrive later than the send that caused them, and are matched to se
 - **UDP** - Connectionless datagram communication
 - **Unix Domain Sockets** - Local inter-process communication
 - **ntcp** - User-space TCP ([ntcp](https://github.com/minhuw/ntcp)), one
-  stack per worker thread, over a TUN device or a DPDK port (Linux, `ntcp` and
-  `ntcp-dpdk` build features). With DPDK, NIC RX timestamps are converted to
+  stack per worker thread, over a TUN device, a DPDK port or AF_XDP sockets
+  (Linux, `ntcp`, `ntcp-dpdk` and `ntcp-af-xdp` build features). With DPDK, NIC RX timestamps are converted to
   xylem's clock by a per-thread calibration, and TX timestamps are the time
   the stack queued a request to the NIC.
 
