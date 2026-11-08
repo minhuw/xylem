@@ -58,6 +58,13 @@ response are consumed with it. The bytes counted as received are the whole
 response on the wire: interim responses, headers, chunk framing and
 trailers.
 
+A response with status 400 or above is an error reply: it completes its
+request and counts in `requests.errors`, by its status code (`"404"`,
+`"503"`), and its latency goes to `error_latency`, not the latency
+distribution; see [Output Formats](../output-formats.md#error-replies). 1xx,
+2xx and 3xx responses are successful. Set `on_error = "abort"` on the traffic
+group to stop the run at the first error reply instead.
+
 The following end the run with an error, since xylem cannot frame them on a
 keep-alive connection:
 

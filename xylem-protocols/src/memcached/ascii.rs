@@ -3,7 +3,10 @@
 //! Implements the Memcached text protocol with GET and SET commands.
 
 use super::udp::UdpFraming;
-use super::{frame_udp_request, next_conn_seq, parse_udp_response, InsertPhaseState};
+use super::{
+    error_reply, frame_udp_request, next_conn_seq, parse_udp_response, InsertPhaseState,
+    ResponseEnd,
+};
 use crate::{Parsed, Protocol};
 use anyhow::Result;
 use std::collections::HashMap;
@@ -146,13 +149,17 @@ impl Protocol for MemcachedAsciiProtocol {
         data: &'a [u8],
     ) -> Result<Parsed<'a, Self::RequestId>> {
         if let Some(framing) = &mut self.udp {
-            return parse_udp_response(framing, &self.conn_send_seq, conn_id, data, response_len);
+            return parse_udp_response(framing, &self.conn_send_seq, conn_id, data, response_end);
         }
-        let Some(len) = response_len(data)? else {
+        let Some((len, error)) = response_end(data)? else {
             return Ok(Parsed::Incomplete);
         };
         let seq = next_conn_seq(&mut self.conn_recv_seq, conn_id);
-        Ok(Parsed::ok(len, (conn_id, seq)))
+        Ok(Parsed::Complete {
+            consumed: len,
+            id: (conn_id, seq),
+            error: error.map(error_reply),
+        })
     }
 
     fn name(&self) -> &'static str {
@@ -171,9 +178,9 @@ impl Protocol for MemcachedAsciiProtocol {
     }
 }
 
-/// Length of the complete response at the start of `data`, `None` if it is
+/// The end of the complete response at the start of `data`, `None` if it is
 /// incomplete
-fn response_len(data: &[u8]) -> Result<Option<usize>> {
+fn response_end(data: &[u8]) -> Result<Option<ResponseEnd<'_>>> {
     let mut pos = 0;
     loop {
         let Some(line_end) = data[pos..].windows(2).position(|w| w == b"\r\n") else {
@@ -182,13 +189,11 @@ fn response_len(data: &[u8]) -> Result<Option<usize>> {
         let line = &data[pos..pos + line_end];
         pos += line_end + 2;
         if line == b"END" || (pos == line_end + 2 && line == b"STORED") {
-            return Ok(Some(pos));
+            return Ok(Some((pos, None)));
         }
-        if line == b"ERROR"
-            || line.starts_with(b"CLIENT_ERROR ")
-            || line.starts_with(b"SERVER_ERROR ")
-        {
-            anyhow::bail!("Memcached error: {}", String::from_utf8_lossy(line));
+        // An error line ends the response, after any values before it
+        if let Some(kind) = error_kind(line) {
+            return Ok(Some((pos, Some((kind, line)))));
         }
         let header = std::str::from_utf8(line)?;
         let fields: Vec<_> = header.split_whitespace().collect();
@@ -204,5 +209,18 @@ fn response_len(data: &[u8]) -> Result<Option<usize>> {
         }
         anyhow::ensure!(&data[end - 2..end] == b"\r\n", "Missing Memcached value terminator");
         pos = end;
+    }
+}
+
+/// The keyword of an error line, `None` for any other line
+fn error_kind(line: &[u8]) -> Option<&'static str> {
+    if line == b"ERROR" {
+        Some("ERROR")
+    } else if line.starts_with(b"CLIENT_ERROR ") {
+        Some("CLIENT_ERROR")
+    } else if line.starts_with(b"SERVER_ERROR ") {
+        Some("SERVER_ERROR")
+    } else {
+        None
     }
 }

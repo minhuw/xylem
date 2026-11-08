@@ -276,7 +276,7 @@ mod tests {
             (
                 0,
                 b"!17\r\nERR blob pw-123!!\r\n",
-                "AUTH on connection 2 was rejected: !17\r\nERR blob <redacted>!!",
+                "AUTH on connection 2 was rejected: ERR blob <redacted>!!",
             ),
             (
                 1,

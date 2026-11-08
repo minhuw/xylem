@@ -110,7 +110,13 @@ Templates for common commands:
 | Sorted set | `ZADD leaderboard __value_size__ __key__`, `ZSCORE leaderboard __key__`, `ZRANGE leaderboard 0 9 WITHSCORES`, `ZREM leaderboard __key__`, `ZCARD leaderboard` |
 | Cluster | `CLUSTER SLOTS` |
 
-Replies are framed generically, so integers, bulk strings, nils, arrays, nested arrays and RESP3 types all count as one completed request. An error reply, such as `WRONGTYPE` when a template uses a key that already holds another type, counts as a failure. Watch for this when templates and `get`/`set` draw from the same keyspace.
+Replies are framed generically, so integers, bulk strings, nils, arrays, nested arrays and RESP3 types all count as one completed request. An error reply, such as `WRONGTYPE` when a template uses a key that already holds another type, completes its request as an error reply (see below). Watch for this when templates and `get`/`set` draw from the same keyspace.
+
+### Error Replies
+
+A top-level error reply, a simple error (`-`) or a RESP3 blob error (`!`), completes its request and counts in `requests.errors`, by its error code: the first word of its text, such as `ERR`, `WRONGTYPE`, `OOM`, `NOAUTH`, `MOVED` or `EXECABORT`. Its latency goes to `error_latency`, not the latency distribution; see [Output Formats](../output-formats.md#error-replies). A nil (`$-1`, `*-1`, `_`) is a successful reply. Only the top-level reply counts: an `EXEC` array holding the error of one of its commands is a successful reply. Set `on_error = "abort"` on the traffic group to stop the run at the first error reply instead.
+
+Malformed RESP still stops the run, and so does an error reply to connection setup (below).
 
 ## Connection Setup: AUTH, SELECT and HELLO
 

@@ -5,8 +5,8 @@
 
 use xylem_protocols::workload::KeyGeneration;
 use xylem_protocols::{
-    CommandTemplate, FixedCommandSelector, KeyGenerator, Parsed, Protocol, RedisOp, RedisProtocol,
-    Request, WeightedCommandSelector,
+    CommandTemplate, ErrorReply, FixedCommandSelector, KeyGenerator, Parsed, Protocol, RedisOp,
+    RedisProtocol, Request, WeightedCommandSelector,
 };
 
 /// Seed for the random-data tests.
@@ -593,14 +593,18 @@ fn template_replies_frame_through_the_generic_parser() {
     }
     assert_eq!(offset, stream.len());
 
-    // An error reply, such as WRONGTYPE from mixing types on one key, is an error.
-    let err = protocol
-        .parse_response(
-            0,
-            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+    // An error reply, such as WRONGTYPE from mixing types on one key, is an
+    // error reply named by its code that completes the next request.
+    let reply = b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
+    let message = "WRONGTYPE Operation against a key holding the wrong kind of value";
+    assert_eq!(
+        protocol.parse_response(0, reply).unwrap(),
+        Parsed::error(
+            reply.len(),
+            (0, replies.len() as u64),
+            ErrorReply::new("WRONGTYPE", message)
         )
-        .unwrap_err();
-    assert!(err.to_string().contains("WRONGTYPE"), "{err}");
+    );
 }
 
 // Value sizes and protocol defaults

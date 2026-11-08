@@ -94,6 +94,12 @@ type = "unlimited"
 - `max_pending_per_connection` (integer, required): Maximum pending requests per connection
   - `1` = no pipelining (accurate latency measurement)
   - Higher values = pipelining enabled
+- `on_error` (string, default `"count"`): what an error reply (a Redis error,
+  an HTTP 4xx or 5xx, a memcached `SERVER_ERROR`, ...) does
+  - `"count"` = it completes its request and counts in `requests.errors`; see
+    [error replies](../guide/output-formats.md#error-replies)
+  - `"abort"` = the run fails at the first one, naming the group, connection
+    and reply; no results are written
 
 ### Protocol Configuration
 

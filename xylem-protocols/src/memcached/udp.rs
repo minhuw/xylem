@@ -293,7 +293,7 @@ mod tests {
         use super::datagram;
         use crate::memcached::{MemcachedAsciiProtocol, MemcachedBinaryProtocol, MemcachedOp};
         use crate::workload::KeyGeneration;
-        use crate::{Parsed, Protocol};
+        use crate::{ErrorReply, Parsed, Protocol};
 
         fn ascii(op: MemcachedOp) -> MemcachedAsciiProtocol {
             MemcachedAsciiProtocol::with_workload(op, KeyGeneration::sequential(0), 4)
@@ -357,9 +357,16 @@ mod tests {
             protocol.next_request(0);
             let truncated = datagram(0, 0, 1, b"VALUE key:0 0 4\r\nxx");
             assert!(protocol.parse_response(0, &truncated).is_err());
+            // An error line is a complete response: an error reply
             let error = datagram(1, 0, 1, b"SERVER_ERROR out of memory\r\n");
-            let message = protocol.parse_response(0, &error).unwrap_err().to_string();
-            assert!(message.contains("SERVER_ERROR"), "{message}");
+            assert_eq!(
+                protocol.parse_response(0, &error).unwrap(),
+                Parsed::error(
+                    error.len(),
+                    (0, 1),
+                    ErrorReply::new("SERVER_ERROR", "SERVER_ERROR out of memory")
+                )
+            );
             protocol.reset();
             assert_eq!(protocol.next_request(0).request_id, (0, 0));
         }

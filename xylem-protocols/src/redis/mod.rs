@@ -2,6 +2,12 @@
 //!
 //! Commands and their encoding live in `command.rs`; RESP request encoding and
 //! reply framing live in `resp.rs`.
+//!
+//! A top-level error reply (`-` or a RESP3 blob error `!`) is reported as an
+//! error reply whose kind is its error code, the first word of its text
+//! (`ERR`, `WRONGTYPE`, `MOVED`, ...). Errors nested in an aggregate, such
+//! as the reply of a failed command inside an `EXEC` array, are not: the
+//! aggregate is a successful reply. A nil reply is a successful reply too.
 
 mod command;
 pub mod command_selector;
@@ -13,7 +19,7 @@ mod setup;
 pub use command::RedisOp;
 pub use setup::ConnectionSetup;
 
-use crate::{Parsed, Protocol};
+use crate::{ErrorReply, Parsed, Protocol};
 use anyhow::{anyhow, Result};
 use command_selector::CommandSelector;
 use resp::ReplyKind;
@@ -364,13 +370,13 @@ impl Protocol for RedisProtocol {
         };
         if let SetupState::Awaiting(step) = self.conn_setup.state(conn_id) {
             // Setup commands go out one at a time, so this reply is the
-            // pending command's.
+            // pending command's. A failed setup fails the run.
             let name = self.setup.step(step).name();
-            if let ReplyKind::Error(error) = &reply.kind {
+            if let ReplyKind::Error(error) = reply.kind {
                 return Err(anyhow!(
                     "Redis connection setup failed: {name} on connection {conn_id} was \
                      rejected: {}",
-                    self.setup.redact(error)
+                    self.setup.redact(&String::from_utf8_lossy(error))
                 ));
             }
             let next = step + 1;
@@ -384,7 +390,9 @@ impl Protocol for RedisProtocol {
         }
         match reply.kind {
             ReplyKind::Success => Ok(Parsed::ok(reply.consumed, reply.id)),
-            ReplyKind::Error(error) => Err(anyhow!("Redis error: {}", error)),
+            ReplyKind::Error(error) => {
+                Ok(Parsed::error(reply.consumed, reply.id, error_reply(error)))
+            }
             ReplyKind::Push => unreachable!("parse_framed_reply skips push messages"),
         }
     }
@@ -420,20 +428,31 @@ impl Protocol for RedisProtocol {
     }
 }
 
+/// The error reply of an error with text `text`; its kind is the error code,
+/// the first word of the text
+fn error_reply(text: &[u8]) -> ErrorReply<'_> {
+    let code = text.split(u8::is_ascii_whitespace).next().unwrap_or_default();
+    let mut reply = ErrorReply::from_bytes(code, text);
+    if reply.kind.is_empty() {
+        reply.kind = "unknown";
+    }
+    reply
+}
+
 /// A complete reply, including attributes and any push messages before it.
 /// Errors occupy one FIFO response slot too.
-pub(crate) struct FramedReply {
+pub(crate) struct FramedReply<'a> {
     pub consumed: usize,
     pub id: (usize, u64),
-    pub kind: ReplyKind,
+    pub kind: ReplyKind<'a>,
 }
 
 impl RedisProtocol {
-    pub(crate) fn parse_framed_reply(
+    pub(crate) fn parse_framed_reply<'a>(
         &mut self,
         conn_id: usize,
-        data: &[u8],
-    ) -> Result<Option<FramedReply>> {
+        data: &'a [u8],
+    ) -> Result<Option<FramedReply<'a>>> {
         // RESP3 push messages are out of band: skip them, so they are never
         // matched to a pending request. They are counted only once a reply
         // after them completes, since until then the caller keeps the
@@ -646,8 +665,8 @@ mod tests {
         let response = b"-ERR unknown command\r\n";
         let result = protocol.parse_response(0, response);
 
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("ERR unknown command"));
+        let error = ErrorReply::new("ERR", "ERR unknown command");
+        assert_eq!(result.unwrap(), Parsed::error(response.len(), (0, 0), error));
     }
 
     #[test]
@@ -793,18 +812,25 @@ mod tests {
     }
 
     #[test]
-    fn test_error_replies_are_redis_errors() {
+    fn test_error_replies_are_named_by_their_error_code() {
         let selector = Box::new(FixedCommandSelector::new(RedisOp::Get));
         let mut protocol = RedisProtocol::new(selector);
 
-        // Every error reply, including MOVED and ASK, fails the same way
-        for (reply, message) in [
-            (b"-ERR unknown command\r\n".as_slice(), "Redis error: ERR unknown command"),
-            (b"-MOVED 3999 127.0.0.1:7001\r\n", "Redis error: MOVED 3999 127.0.0.1:7001"),
-            (b"-ASK 5000 127.0.0.1:7002\r\n", "Redis error: ASK 5000 127.0.0.1:7002"),
-        ] {
-            let err = protocol.parse_response(0, reply).unwrap_err();
-            assert_eq!(err.to_string(), message);
+        // Every error reply, including MOVED and ASK, completes its request
+        for (seq, (reply, kind, message)) in [
+            (b"-ERR unknown command\r\n".as_slice(), "ERR", "ERR unknown command"),
+            (b"-MOVED 3999 127.0.0.1:7001\r\n", "MOVED", "MOVED 3999 127.0.0.1:7001"),
+            (b"-ASK 5000 127.0.0.1:7002\r\n", "ASK", "ASK 5000 127.0.0.1:7002"),
+            (b"-NOCODE\r\n", "NOCODE", "NOCODE"),
+            (b"-\r\n", "unknown", ""),
+            (b"-\xffBAD x\r\n", "unknown", ""),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let error = ErrorReply::new(kind, message);
+            let expected = Parsed::error(reply.len(), (0, seq as u64), error);
+            assert_eq!(protocol.parse_response(0, reply).unwrap(), expected);
         }
     }
 
@@ -996,7 +1022,8 @@ mod tests {
         let response = b"!21\r\nSYNTAX invalid syntax\r\n";
         let result = protocol.parse_response(0, response);
 
-        assert!(result.unwrap_err().to_string().contains("SYNTAX invalid syntax"));
+        let error = ErrorReply::new("SYNTAX", "SYNTAX invalid syntax");
+        assert_eq!(result.unwrap(), Parsed::error(response.len(), (0, 0), error));
         assert_eq!(protocol.parse_response(0, b"+OK\r\n").unwrap(), Parsed::ok(5, (0, 1)));
     }
 

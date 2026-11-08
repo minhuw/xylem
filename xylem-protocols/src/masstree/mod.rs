@@ -16,10 +16,16 @@
 //! - Cmd_Get = 2 (response: Cmd_Get + 1 = 3)
 //! - Cmd_Replace = 8 (response: Cmd_Replace + 1 = 9)
 //! - Cmd_Handshake = 14 (response: Cmd_Handshake + 1 = 15)
+//!
+//! A PUT or REPLACE response whose result code is Retry or OutOfDate, or a
+//! code outside [`ResultCode`], is an error reply named by the code. A
+//! missing key is not an error: the server answers a GET miss with the key
+//! itself, and NotFound is a successful result. A failed handshake fails
+//! the run.
 
 mod config;
 
-use crate::{Parsed, Protocol};
+use crate::{ErrorReply, Parsed, Protocol};
 use anyhow::{anyhow, Result};
 use rmp::decode;
 use rmp::encode;
@@ -46,6 +52,22 @@ pub enum ResultCode {
     Updated = 2,
     Found = 3,
     ScanDone = 4,
+}
+
+/// The error reply of a PUT or REPLACE result code, `None` for a success
+fn result_error(code: i8) -> Option<ErrorReply<'static>> {
+    const RETRY: i8 = ResultCode::Retry as i8;
+    const OUT_OF_DATE: i8 = ResultCode::OutOfDate as i8;
+    let kind = match code {
+        RETRY => "Retry",
+        OUT_OF_DATE => "OutOfDate",
+        // NotFound, Inserted, Updated, Found, ScanDone
+        code if (ResultCode::NotFound as i8..=ResultCode::ScanDone as i8).contains(&code) => {
+            return None
+        }
+        _ => "UnknownResult",
+    };
+    Some(ErrorReply::new(kind, kind))
 }
 
 #[derive(Debug, Clone)]
@@ -676,9 +698,14 @@ impl MasstreeProtocol {
     ) -> Result<Parsed<'static, (usize, u16)>> {
         // Read result byte (ResultCode enum)
         match decode::read_int::<i8, _>(cursor) {
-            Ok(_result) => {
+            Ok(result) => {
                 let bytes_consumed = cursor.position() as usize;
-                Ok(Parsed::ok(bytes_consumed, (conn_id, seq as u16)))
+                let id = (conn_id, seq as u16);
+                Ok(Parsed::Complete {
+                    consumed: bytes_consumed,
+                    id,
+                    error: result_error(result),
+                })
             }
             Err(_) => Ok(Parsed::Incomplete), // Incomplete data
         }
@@ -692,9 +719,14 @@ impl MasstreeProtocol {
     ) -> Result<Parsed<'static, (usize, u16)>> {
         // Read result byte (ResultCode enum)
         match decode::read_int::<i8, _>(cursor) {
-            Ok(_result) => {
+            Ok(result) => {
                 let bytes_consumed = cursor.position() as usize;
-                Ok(Parsed::ok(bytes_consumed, (conn_id, seq as u16)))
+                let id = (conn_id, seq as u16);
+                Ok(Parsed::Complete {
+                    consumed: bytes_consumed,
+                    id,
+                    error: result_error(result),
+                })
             }
             Err(_) => Ok(Parsed::Incomplete), // Incomplete data
         }
@@ -773,10 +805,13 @@ impl MasstreeProtocol {
         _start_position: u64,
     ) -> Result<Parsed<'static, (usize, u16)>> {
         // Read success boolean
-        let _success = match decode::read_bool(cursor) {
+        let success = match decode::read_bool(cursor) {
             Ok(s) => s,
             Err(_) => return Ok(Parsed::Incomplete), // Incomplete data
         };
+        if !success {
+            return Err(anyhow!("Masstree handshake failed on connection {conn_id}"));
+        }
 
         // Read max_seq (u32)
         let _max_seq = match decode::read_int::<u32, _>(cursor) {

@@ -29,29 +29,32 @@ pub(crate) fn encode_command(args: &[&str]) -> Vec<u8> {
     request
 }
 
-pub(crate) enum ReplyKind {
+pub(crate) enum ReplyKind<'a> {
     Success,
-    Error(String),
+    /// A top-level error: the text of a simple error, or the content of a
+    /// RESP3 blob error
+    Error(&'a [u8]),
     /// RESP3 out-of-band push message, which answers no request
     Push,
 }
 
 /// Classify one complete reply, as measured by [`find_resp_message_end`],
 /// looking past any attributes to the reply they are attached to.
-pub(crate) fn classify_reply(frame: &[u8]) -> Result<ReplyKind> {
+pub(crate) fn classify_reply(frame: &[u8]) -> Result<ReplyKind<'_>> {
     let mut payload = frame;
     while payload[0] == b'|' {
         let offset = attribute_payload_offset(payload, 0)?;
         payload = &payload[offset..];
     }
-    let kind = if payload[0] == b'-' {
-        ReplyKind::Error(String::from_utf8_lossy(&payload[1..payload.len() - 2]).into_owned())
-    } else if payload[0] == b'!' {
-        ReplyKind::Error(String::from_utf8_lossy(payload).into_owned())
-    } else if payload[0] == b'>' {
-        ReplyKind::Push
-    } else {
-        ReplyKind::Success
+    let kind = match payload[0] {
+        b'-' => ReplyKind::Error(&payload[1..payload.len() - 2]),
+        b'!' => {
+            // !<length>\r\n<content>\r\n; a null one has no content
+            let start = payload.windows(2).position(|w| w == b"\r\n").map_or(0, |pos| pos + 2);
+            ReplyKind::Error(payload.get(start..payload.len() - 2).unwrap_or_default())
+        }
+        b'>' => ReplyKind::Push,
+        _ => ReplyKind::Success,
     };
     Ok(kind)
 }

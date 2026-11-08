@@ -3,7 +3,10 @@
 //! Implements the Memcached binary protocol (memcache_bin.h).
 
 use super::udp::UdpFraming;
-use super::{frame_udp_request, next_conn_seq, parse_udp_response, InsertPhaseState};
+use super::{
+    error_reply, frame_udp_request, next_conn_seq, parse_udp_response, InsertPhaseState,
+    ResponseEnd,
+};
 use crate::{Parsed, Protocol};
 use anyhow::Result;
 use std::collections::HashMap;
@@ -11,8 +14,36 @@ use std::collections::HashMap;
 pub use super::MemcachedOp;
 
 // Command opcodes
+const CMD_GET: u8 = 0x00;
+const CMD_GETQ: u8 = 0x09;
 const CMD_GETK: u8 = 0x0c;
+const CMD_GETKQ: u8 = 0x0d;
 const CMD_SET: u8 = 0x01;
+
+/// Response status of a missing key
+const STATUS_KEY_ENOENT: u16 = 0x0001;
+
+/// Name of a non-zero response status, as in memcached's `protocol_binary.h`
+fn status_name(status: u16) -> &'static str {
+    match status {
+        STATUS_KEY_ENOENT => "KEY_ENOENT",
+        0x0002 => "KEY_EEXISTS",
+        0x0003 => "E2BIG",
+        0x0004 => "EINVAL",
+        0x0005 => "NOT_STORED",
+        0x0006 => "DELTA_BADVAL",
+        0x0007 => "NOT_MY_VBUCKET",
+        0x0020 => "AUTH_ERROR",
+        0x0021 => "AUTH_CONTINUE",
+        0x0081 => "UNKNOWN_COMMAND",
+        0x0082 => "ENOMEM",
+        0x0083 => "NOT_SUPPORTED",
+        0x0084 => "EINTERNAL",
+        0x0085 => "EBUSY",
+        0x0086 => "ETMPFAIL",
+        _ => "UNKNOWN_STATUS",
+    }
+}
 
 /// Memcached binary protocol header (24 bytes)
 #[repr(C, packed)]
@@ -63,6 +94,15 @@ impl BmcHeader {
 
     fn body_len(&self) -> u32 {
         u32::from_be(self.body_len)
+    }
+
+    fn status(&self) -> u16 {
+        u16::from_be(self.vbucket_or_status)
+    }
+
+    /// Offset of the value in the message: after the header, extras and key
+    fn value_offset(&self) -> usize {
+        Self::SIZE + usize::from(self.extra_len) + usize::from(u16::from_be(self.key_len))
     }
 }
 
@@ -221,16 +261,20 @@ impl Protocol for MemcachedBinaryProtocol {
     ) -> Result<Parsed<'a, Self::RequestId>> {
         if let Some(framing) = &mut self.udp {
             return parse_udp_response(framing, &self.conn_send_seq, conn_id, data, |data| {
-                Ok(response_len(data))
+                Ok(response_end(data))
             });
         }
-        let Some(total_len) = response_len(data) else {
+        let Some((total_len, error)) = response_end(data) else {
             return Ok(Parsed::Incomplete);
         };
 
         // Complete response found
         let seq = next_conn_seq(&mut self.conn_recv_seq, conn_id);
-        Ok(Parsed::ok(total_len, (conn_id, seq)))
+        Ok(Parsed::Complete {
+            consumed: total_len,
+            id: (conn_id, seq),
+            error: error.map(error_reply),
+        })
     }
 
     fn name(&self) -> &'static str {
@@ -249,12 +293,26 @@ impl Protocol for MemcachedBinaryProtocol {
     }
 }
 
-/// Length of the complete response at the start of `data`, `None` if it is
+/// The end of the complete response at the start of `data`, `None` if it is
 /// incomplete
-fn response_len(data: &[u8]) -> Option<usize> {
+///
+/// A non-zero status is an error reply named by the status, with the value
+/// (memcached's error text) as its text, except a missing key on a GET: a miss.
+fn response_end(data: &[u8]) -> Option<ResponseEnd<'_>> {
     // Need at least the header
     let header = BmcHeader::from_bytes(data)?;
     let total_len = BmcHeader::SIZE + header.body_len() as usize;
     // Check if we have the complete message
-    (data.len() >= total_len).then_some(total_len)
+    if data.len() < total_len {
+        return None;
+    }
+    let status = header.status();
+    let miss = status == STATUS_KEY_ENOENT
+        && matches!(header.opcode, CMD_GET | CMD_GETQ | CMD_GETK | CMD_GETKQ);
+    let error = (status != 0 && !miss).then(|| {
+        let name = status_name(status);
+        let text = data.get(header.value_offset()..total_len).filter(|text| !text.is_empty());
+        (name, text.unwrap_or(name.as_bytes()))
+    });
+    Some((total_len, error))
 }

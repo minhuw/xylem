@@ -64,12 +64,9 @@ fn memcached_value_lengths_are_binary_safe_and_require_end() {
 }
 
 #[test]
-fn memcached_errors_and_malformed_lengths_do_not_succeed() {
+fn memcached_malformed_lengths_do_not_succeed() {
     for response in [
-        b"ERROR\r\n".as_slice(),
-        b"CLIENT_ERROR bad command\r\n",
-        b"SERVER_ERROR unavailable\r\n",
-        b"VALUE k 0 nope\r\n",
+        b"VALUE k 0 nope\r\n".as_slice(),
         b"VALUE k 0 1\r\nx!!END\r\n",
         b"NOT_STORED\r\n",
     ] {

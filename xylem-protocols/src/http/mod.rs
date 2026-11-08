@@ -3,15 +3,41 @@
 //! Supports GET, POST, PUT with Content-Length, chunked, or bodyless responses.
 //! Other transfer codings and close-delimited bodies are explicitly unsupported.
 //! Informational responses are consumed without completing a request.
+//! A response with status 400 or above is an error reply whose kind is its
+//! status code (`"503"`); 1xx, 2xx and 3xx responses are not.
 //! Uses httparse for zero-copy, fast HTTP response parsing.
 //!
 //! Request sequence tracking is done per-connection to support pipelining.
 
 mod config;
 
-use crate::{Parsed, Protocol};
+use crate::{ErrorReply, Parsed, Protocol};
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
+
+/// The three digits of every status code below 600, so the kind of an error
+/// reply is a static string
+static STATUS_DIGITS: [[u8; 3]; 600] = {
+    let mut digits = [[0; 3]; 600];
+    let mut code = 0;
+    while code < 600 {
+        digits[code] = [
+            b'0' + (code / 100) as u8,
+            b'0' + (code / 10 % 10) as u8,
+            b'0' + (code % 10) as u8,
+        ];
+        code += 1;
+    }
+    digits
+};
+
+/// The error reply of a response with status `code` (400 to 599) whose head
+/// starts with `head`: the code is its kind, the status line its message
+fn error_reply(code: u16, head: &[u8]) -> ErrorReply<'_> {
+    let kind = &STATUS_DIGITS[usize::from(code)];
+    let line = &head[..head.iter().position(|&b| b == b'\n').unwrap_or(head.len())];
+    ErrorReply::from_bytes(kind, line.strip_suffix(b"\r").unwrap_or(line))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpMethod {
@@ -190,7 +216,11 @@ impl Protocol for HttpProtocol {
             let response_seq = self.conn_response_seq.entry(conn_id).or_insert(0);
             let seq = *response_seq;
             *response_seq = response_seq.wrapping_add(1);
-            return Ok(Parsed::ok(offset + total_len, (conn_id, seq)));
+            return Ok(Parsed::Complete {
+                consumed: offset + total_len,
+                id: (conn_id, seq),
+                error: (status_code >= 400).then(|| error_reply(status_code, remaining)),
+            });
         }
     }
 

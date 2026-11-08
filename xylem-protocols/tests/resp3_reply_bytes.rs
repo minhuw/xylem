@@ -4,7 +4,7 @@
 //! one byte short, and every shorter prefix must be incomplete rather than
 //! misframed.
 
-use xylem_protocols::{FixedCommandSelector, Parsed, Protocol, RedisOp, RedisProtocol};
+use xylem_protocols::{ErrorReply, FixedCommandSelector, Parsed, Protocol, RedisOp, RedisProtocol};
 
 fn protocol() -> RedisProtocol {
     RedisProtocol::new(Box::new(FixedCommandSelector::new(RedisOp::Get)))
@@ -107,14 +107,33 @@ fn attributes_before_a_reply() {
     // Several attributes in a row, and an attribute on an aggregate element
     assert_frames(b"|1\r\n+a\r\n+b\r\n|1\r\n+c\r\n+d\r\n+OK\r\n");
     assert_frames(b"*2\r\n|1\r\n+ttl\r\n:3600\r\n$1\r\nv\r\n:7\r\n");
-    // An attribute before an error is still an error
-    let error = protocol().parse_response(0, b"|1\r\n+a\r\n+b\r\n-ERR boom\r\n");
-    assert_eq!(error.unwrap_err().to_string(), "Redis error: ERR boom");
+    // An attribute before an error is still an error reply
+    let reply = b"|1\r\n+a\r\n+b\r\n-ERR boom\r\n";
+    let error = ErrorReply::new("ERR", "ERR boom");
+    assert_eq!(
+        protocol().parse_response(0, reply).unwrap(),
+        Parsed::error(reply.len(), (0, 0), error)
+    );
 }
 
 #[test]
 fn blob_errors_are_errors() {
-    assert!(protocol().parse_response(0, b"!21\r\nSYNTAX invalid syntax\r\n").is_err());
+    // The kind is the first word of the content; the content may hold CRLF
+    for (reply, kind, message) in [
+        (
+            b"!21\r\nSYNTAX invalid syntax\r\n".as_slice(),
+            "SYNTAX",
+            "SYNTAX invalid syntax",
+        ),
+        (b"!9\r\nERR\r\nmore\r\n", "ERR", "ERR\r\nmore"),
+        (b"!0\r\n\r\n", "unknown", ""),
+    ] {
+        let error = ErrorReply::new(kind, message);
+        assert_eq!(
+            protocol().parse_response(0, reply).unwrap(),
+            Parsed::error(reply.len(), (0, 0), error)
+        );
+    }
     // Incomplete, so not an error yet
     assert_eq!(protocol().parse_response(0, b"!21\r\nSYNTAX").unwrap(), Parsed::Incomplete);
 }
