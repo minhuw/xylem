@@ -376,6 +376,39 @@ mod tests {
         }
     }
 
+    /// `RedisCommandParams::keys` lists exactly the keys each command parses
+    #[test]
+    fn params_keys_are_the_keys_each_command_takes() {
+        use crate::RedisCommandParams;
+        let commands = [
+            "get", "set", "incr", "mget", "wait", "setex", "setrange", "getrange", "scan", "multi",
+            "exec", "discard", "custom",
+        ];
+        for name in commands {
+            let keys = RedisCommandParams::keys(name).unwrap();
+            if keys.is_empty() {
+                let params = RedisCommandParams::MGet { count: 1 };
+                assert!(parse_redis_operation(name, Some(&params)).is_err(), "{name}");
+                continue;
+            }
+            let params: serde_json::Map<String, serde_json::Value> = keys
+                .iter()
+                .map(|&key| {
+                    let value = match key {
+                        "template" => serde_json::json!("GET __key__"),
+                        "pattern" => serde_json::json!("key:*"),
+                        _ => serde_json::json!(1),
+                    };
+                    (key.to_string(), value)
+                })
+                .collect();
+            let params: RedisCommandParams = serde_json::from_value(params.into()).unwrap();
+            parse_redis_operation(name, Some(&params)).unwrap();
+        }
+        assert_eq!(RedisCommandParams::keys("SCAN"), RedisCommandParams::keys("scan"));
+        assert!(RedisCommandParams::keys("del").is_none());
+    }
+
     #[test]
     fn test_invalid_command() {
         let config = RedisConfig {

@@ -467,6 +467,23 @@ pub enum RedisCommandParams {
     },
 }
 
+impl RedisCommandParams {
+    /// The `params` keys the Redis command `name` (case-insensitive) takes,
+    /// or None if `name` is no command. The params shapes are untagged, so
+    /// only the command tells which keys belong to it.
+    pub fn keys(name: &str) -> Option<&'static [&'static str]> {
+        Some(match name.to_ascii_lowercase().as_str() {
+            "mget" => &["count"],
+            "wait" => &["num_replicas", "timeout_ms"],
+            "custom" => &["template"],
+            "scan" => &["cursor", "count", "pattern"],
+            "get" | "set" | "incr" | "setex" | "setrange" | "getrange" | "multi" | "exec"
+            | "discard" => &[],
+            _ => return None,
+        })
+    }
+}
+
 /// Memcached protocol configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

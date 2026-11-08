@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use xylem_core::traffic_group::PolicyConfig;
 
+mod keys;
 pub mod ntcp;
 pub use ntcp::{NtcpBackend, NtcpConfig, NtcpEndpoint};
 
@@ -200,14 +201,18 @@ pub enum ProtocolConfig {
 }
 
 impl ProfileConfig {
-    /// Load profile from TOML file
+    /// Load profile from TOML file. Every unknown or removed key is reported
+    /// at once; they stop loading before any other check.
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
+        let context = || format!("Failed to parse config file: {}", path.display());
 
-        let config: ProfileConfig = toml::from_str(&content)
-            .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
+        let value: toml::Value = toml::from_str(&content).with_context(context)?;
+        check_keys(&value).with_context(context)?;
+        // Parse the text again, not the value, so that errors point at a line
+        let config: ProfileConfig = toml::from_str(&content).with_context(context)?;
 
         // Validate explicitly or use from_file_with_overrides() to validate after overrides.
         Ok(config)
@@ -231,6 +236,9 @@ impl ProfileConfig {
             set_toml_path(&mut value, &key, &val)
                 .with_context(|| format!("Failed to apply override: {}", override_str))?;
         }
+        check_keys(&value).with_context(|| {
+            format!("Failed to parse config file: {} (with --set overrides)", path.display())
+        })?;
 
         // Deserialize modified TOML to ProfileConfig
         let mut config: ProfileConfig = value
@@ -301,13 +309,17 @@ impl ProfileConfig {
             let Some(&(_, protocol)) = PROTOCOLS.iter().find(|(name, _)| *name == group.protocol)
             else {
                 let names: Vec<&str> = PROTOCOLS.iter().map(|(name, _)| *name).collect();
-                bail!(
+                let mut error = format!(
                     "Invalid protocol '{}' for traffic group {} '{}'. Valid options: {}",
                     group.protocol,
                     i,
                     group.name,
                     names.join(", ")
                 );
+                if let Some(message) = keys::removed_protocol(&group.protocol) {
+                    error = format!("{error}. {message}");
+                }
+                bail!(error);
             };
 
             validate_udp(group, protocol, i)?;
@@ -388,6 +400,12 @@ impl ProfileConfig {
                 );
             }
 
+            // Reject unknown and removed keys, every one of them, before parsing
+            if let Some(pc) = &group.protocol_config {
+                let problems = keys::check_protocol_config(protocol, pc, i, &group.name);
+                combine(problems.into_iter().map(anyhow::Error::msg).collect())?;
+            }
+
             // Parse protocol_config once as the appropriate typed struct.
             // This validates the structure, provides better error messages,
             // and gives workers the config they build protocols from.
@@ -410,6 +428,25 @@ impl ProfileConfig {
 
         self.protocol_configs = protocol_configs;
         Ok(())
+    }
+}
+
+/// Reject the unknown and removed keys of a whole profile, all of them at once
+fn check_keys(profile: &toml::Value) -> Result<()> {
+    let profile = serde_json::to_value(profile).context("Failed to read the profile's keys")?;
+    combine(keys::check_profile(&profile).into_iter().map(anyhow::Error::msg).collect())
+}
+
+/// Fail with every error in `errors`: a single error as it is, several as
+/// a list with one error per line
+fn combine(mut errors: Vec<anyhow::Error>) -> Result<()> {
+    match errors.len() {
+        0 => Ok(()),
+        1 => Err(errors.remove(0)),
+        count => {
+            let lines: Vec<String> = errors.iter().map(|error| format!("  - {error:#}")).collect();
+            bail!("The profile has {} errors:\n{}", count, lines.join("\n"))
+        }
     }
 }
 
@@ -509,15 +546,6 @@ fn parse_protocol_config(
 ) -> Result<ProtocolConfig> {
     match protocol {
         ProtocolKind::Redis => {
-            // data_import was removed; reject it rather than silently ignore it
-            if pc.is_some_and(|pc| pc.get("data_import").is_some()) {
-                bail!(
-                    "Traffic group {} '{}': data_import is not supported for redis protocol. \
-                     Remove protocol_config.data_import.",
-                    group_idx,
-                    group_name
-                );
-            }
             let config: xylem_protocols::RedisConfig =
                 parse_typed_config(pc, "Redis", group_idx, group_name)
                     .map_err(|e| anyhow::anyhow!(redact_auth(pc, &e.to_string())))?;
@@ -819,8 +847,8 @@ mod tests {
     fn unsupported_options_are_rejected_after_overrides() {
         let path = "../tests/redis/redis-get-zipfian.toml";
         for (option, expected) in [
-            // Parquet streaming was removed; its section is an unknown field.
-            ("stats.streaming.path=stats.parquet", "unknown field `streaming`"),
+            // Parquet streaming was removed; its section gets a migration message.
+            ("stats.streaming.path=stats.parquet", "stats.streaming was removed"),
             ("output.real_time=true", "output.real_time"),
             ("output.html.library=plotly", "output.html.library"),
             ("output.html.theme=dark", "output.html.theme"),
@@ -1709,6 +1737,282 @@ duration = "10s""#,
         let _ = result;
     }
 
+    /// A valid profile with every table a profile can have, and one group
+    /// per protocol
+    const EVERY_TABLE: &str = r#"
+[experiment]
+name = "every-table"
+duration = "1s"
+
+[output]
+file = "/tmp/every-table.json"
+html = { library = "chartjs" }
+
+[stats]
+sampling_policy = { type = "hdr-histogram" }
+
+[request_dump]
+directory = "/tmp/every-table-dumps"
+rotation = { size = 1024 }
+
+[ntcp]
+endpoints = [{ ifname = "ntcp0", local_ip = "10.0.0.2" }]
+
+[[traffic_groups]]
+name = "redis"
+protocol = "redis"
+target = "127.0.0.1:6379"
+threads = [0]
+connections_per_thread = 1
+traffic_policy = { type = "fixed-rate", rate = 100.0 }
+sampling_policy = { type = "limited" }
+
+[traffic_groups.protocol_config]
+auth = { password = "pw" }
+insert_phase = { key_count = 10 }
+keys = { strategy = "zipfian", n = 10, theta = 0.99, value_size = 8 }
+operations = { strategy = "weighted", commands = [{ name = "scan", weight = 1.0, params = { count = 5 } }] }
+
+[traffic_groups.protocol_config.value_size]
+strategy = "per_command"
+commands = { set = { distribution = "fixed", size = 8 } }
+default = { strategy = "fixed", size = 8 }
+
+[[traffic_groups]]
+name = "memcached"
+protocol = "memcached-ascii"
+target = "127.0.0.1:11211"
+threads = [0]
+connections_per_thread = 1
+traffic_policy = { type = "closed-loop" }
+sampling_policy = { type = "unlimited" }
+protocol_config = { keys = { strategy = "round-robin", max = 10, value_size = 8 }, insert_phase = {} }
+
+[[traffic_groups]]
+name = "http"
+protocol = "http"
+target = "127.0.0.1:80"
+threads = [0]
+connections_per_thread = 1
+traffic_policy = { type = "closed-loop" }
+protocol_config = { method = "GET" }
+
+[[traffic_groups]]
+name = "masstree"
+protocol = "masstree"
+target = "127.0.0.1:2117"
+threads = [0]
+connections_per_thread = 1
+traffic_policy = { type = "closed-loop" }
+protocol_config = { operation = "scan", scan = { count = 5 } }
+
+[[traffic_groups]]
+name = "echo"
+protocol = "xylem-echo"
+target = "127.0.0.1:9999"
+threads = [0]
+connections_per_thread = 1
+traffic_policy = { type = "closed-loop" }
+protocol_config = {}
+"#;
+
+    /// Set `key = value` in the table of `profile` at the dotted `path`
+    fn insert(profile: &mut toml::Value, path: &str, key: &str, value: toml::Value) {
+        let mut table = profile;
+        for step in path.split('.').filter(|step| !step.is_empty()) {
+            table = match step.parse::<usize>() {
+                Ok(index) => &mut table[index],
+                Err(_) => &mut table[step],
+            };
+        }
+        table.as_table_mut().unwrap().insert(key.into(), value);
+    }
+
+    /// `EVERY_TABLE` with `key = value` added to the table at the dotted `path`
+    fn every_table_with(path: &str, key: &str, value: toml::Value) -> toml::Value {
+        let mut profile: toml::Value = toml::from_str(EVERY_TABLE).unwrap();
+        insert(&mut profile, path, key, value);
+        profile
+    }
+
+    #[test]
+    fn unknown_keys_are_rejected_at_every_level() {
+        let profile: toml::Value = toml::from_str(EVERY_TABLE).unwrap();
+        check_keys(&profile).unwrap();
+        let mut config: ProfileConfig = toml::from_str(EVERY_TABLE).unwrap();
+        config.validate().unwrap();
+
+        for (path, location) in [
+            ("", "at the top level"),
+            ("experiment", "in experiment"),
+            ("output", "in output"),
+            ("output.html", "in output.html"),
+            ("stats", "in stats"),
+            ("stats.sampling_policy", "in stats.sampling_policy"),
+            ("request_dump", "in request_dump"),
+            ("request_dump.rotation", "in request_dump.rotation"),
+            ("ntcp", "in ntcp"),
+            ("ntcp.endpoints.0", "in ntcp.endpoints[0]"),
+            ("traffic_groups.0", "in traffic_groups[0]"),
+            // A struct variant and a unit variant of each tagged enum
+            ("traffic_groups.0.traffic_policy", "in traffic_groups[0].traffic_policy"),
+            ("traffic_groups.1.traffic_policy", "in traffic_groups[1].traffic_policy"),
+            ("traffic_groups.0.sampling_policy", "in traffic_groups[0].sampling_policy"),
+            ("traffic_groups.1.sampling_policy", "in traffic_groups[1].sampling_policy"),
+            ("traffic_groups.0.protocol_config", "in traffic_groups[0].protocol_config"),
+            (
+                "traffic_groups.0.protocol_config.auth",
+                "in traffic_groups[0].protocol_config.auth",
+            ),
+            (
+                "traffic_groups.0.protocol_config.keys",
+                "in traffic_groups[0].protocol_config.keys",
+            ),
+            (
+                "traffic_groups.0.protocol_config.insert_phase",
+                "in traffic_groups[0].protocol_config.insert_phase",
+            ),
+            (
+                "traffic_groups.0.protocol_config.value_size",
+                "in traffic_groups[0].protocol_config.value_size",
+            ),
+            (
+                "traffic_groups.0.protocol_config.value_size.commands.set",
+                "in traffic_groups[0].protocol_config.value_size.commands.set",
+            ),
+            (
+                "traffic_groups.0.protocol_config.value_size.default",
+                "in traffic_groups[0].protocol_config.value_size.default",
+            ),
+            (
+                "traffic_groups.0.protocol_config.operations",
+                "in traffic_groups[0].protocol_config.operations",
+            ),
+            (
+                "traffic_groups.0.protocol_config.operations.commands.0",
+                "in traffic_groups[0].protocol_config.operations.commands[0]",
+            ),
+            (
+                "traffic_groups.0.protocol_config.operations.commands.0.params",
+                "in traffic_groups[0].protocol_config.operations.commands[0].params",
+            ),
+            ("traffic_groups.1.protocol_config", "in traffic_groups[1].protocol_config"),
+            (
+                "traffic_groups.1.protocol_config.keys",
+                "in traffic_groups[1].protocol_config.keys",
+            ),
+            (
+                "traffic_groups.1.protocol_config.insert_phase",
+                "in traffic_groups[1].protocol_config.insert_phase",
+            ),
+            ("traffic_groups.2.protocol_config", "in traffic_groups[2].protocol_config"),
+            ("traffic_groups.3.protocol_config", "in traffic_groups[3].protocol_config"),
+            (
+                "traffic_groups.3.protocol_config.scan",
+                "in traffic_groups[3].protocol_config.scan",
+            ),
+            ("traffic_groups.4.protocol_config", "in traffic_groups[4].protocol_config"),
+        ] {
+            let profile = every_table_with(path, "bogus", toml::Value::Integer(1));
+            let error = format!("{:#}", check_keys(&profile).unwrap_err());
+            let expected = format!("unknown field `bogus` {location}");
+            assert!(error.starts_with(&expected), "{path}: {error}");
+            // Without the key check, serde or validation rejects it too
+            let text = toml::to_string(&profile).unwrap();
+            let parsed = toml::from_str::<ProfileConfig>(&text).map(|mut config| config.validate());
+            assert!(!matches!(parsed, Ok(Ok(()))), "{path}: accepted without the key check");
+        }
+    }
+
+    #[test]
+    fn removed_keys_give_their_migration_message() {
+        let table = |text: &str| -> toml::Value { toml::from_str(text).unwrap() };
+        let string = |text: &str| toml::Value::String(text.into());
+        for (path, key, value, expected) in [
+            (
+                "",
+                "target",
+                table("address = \"x\""),
+                "The top-level [target] section was removed",
+            ),
+            ("", "workload", table(""), "The top-level [workload] section was removed"),
+            ("stats", "streaming", table("path = \"x\""), "stats.streaming was removed"),
+            (
+                "stats.sampling_policy",
+                "type",
+                string("adaptive"),
+                "The adaptive sampling policy was removed",
+            ),
+            (
+                "traffic_groups.1",
+                "sampling_rate",
+                toml::Value::Float(0.5),
+                "Traffic group 1 'memcached': sampling_rate was replaced by sampling_policy",
+            ),
+            (
+                "traffic_groups.0.sampling_policy",
+                "type",
+                string("adaptive"),
+                "Traffic group 0 'redis': the adaptive sampling policy was removed",
+            ),
+            (
+                "traffic_groups.0.protocol_config",
+                "data_import",
+                table("file = \"x.csv\""),
+                "Traffic group 0 'redis': data_import is not supported for redis protocol. \
+                 Remove protocol_config.data_import.",
+            ),
+        ] {
+            let profile = every_table_with(path, key, value);
+            let error = format!("{:#}", check_keys(&profile).unwrap_err());
+            assert!(error.starts_with(expected), "{path}.{key}: {error}");
+        }
+    }
+
+    #[test]
+    fn loading_reports_every_unknown_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profile.toml");
+        let mut profile = every_table_with("experiment", "durationn", toml::Value::Integer(1));
+        insert(&mut profile, "traffic_groups.1.traffic_policy", "rate", toml::Value::Float(5.0));
+        let keys = "traffic_groups.0.protocol_config.keys";
+        insert(&mut profile, keys, "valu_size", toml::Value::Integer(1));
+        std::fs::write(&path, toml::to_string(&profile).unwrap()).unwrap();
+        let error = format!("{:#}", ProfileConfig::from_file(&path).unwrap_err());
+        assert!(error.contains("The profile has 3 errors:\n"), "{error}");
+        for expected in [
+            "  - unknown field `durationn` in experiment (did you mean `duration`?)",
+            "  - unknown field `rate` in traffic_groups[1].traffic_policy; expected one of `type`",
+            "  - unknown field `valu_size` in traffic_groups[0].protocol_config.keys (did you mean `value_size`?)",
+        ] {
+            assert!(error.contains(expected), "{expected}: {error}");
+        }
+    }
+
+    #[test]
+    fn redis_command_params_are_checked_against_their_command() {
+        let mut profile: toml::Value = toml::from_str(EVERY_TABLE).unwrap();
+        let commands = toml::from_str::<toml::Value>(
+            r#"commands = [
+                { name = "scan", weight = 1.0, params = { cursor = 0, count = 5, patern = "k*" } },
+                { name = "custom", weight = 1.0, params = { template = "GET __key__", count = 1 } },
+                { name = "get", weight = 1.0, params = { count = 1 } },
+            ]"#,
+        )
+        .unwrap();
+        profile["traffic_groups"][0]["protocol_config"]["operations"]["commands"] =
+            commands["commands"].clone();
+        let error = format!("{:#}", check_keys(&profile).unwrap_err());
+        let params = "in traffic_groups[0].protocol_config.operations.commands";
+        for expected in [
+            format!("unknown field `patern` {params}[0].params (did you mean `pattern`?); expected one of `cursor`, `count`, `pattern`"),
+            format!("unknown field `count` {params}[1].params; expected one of `template`"),
+            format!("unknown field `count` {params}[2].params, which takes no fields"),
+        ] {
+            assert!(error.contains(&expected), "{expected}: {error}");
+        }
+    }
+
     #[test]
     fn test_set_invalid_format() {
         let result = ProfileConfig::from_file_with_overrides(
@@ -1748,7 +2052,8 @@ duration = "10s""#,
         assert!(
             format!("{err:#}").contains(
                 "Invalid protocol 'redis-cluster' for traffic group 0 'main'. Valid options: \
-                 redis, memcached-binary, memcached-ascii, http, masstree, xylem-echo"
+                 redis, memcached-binary, memcached-ascii, http, masstree, xylem-echo. \
+                 Redis Cluster support was removed"
             ),
             "{err:#}"
         );
