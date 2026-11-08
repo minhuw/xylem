@@ -18,14 +18,18 @@ required even for `human`. All formats also print a human-readable summary.
 
 ## Run phases
 
-A run has three phases:
+Every thread first opens its connections. Once all threads have, the run
+starts at one time they share, shortly after the last one is ready; every
+rate-driven schedule counts from it (see
+[traffic policy](../reference/schema.md#traffic-policy)). Then a run has three
+phases:
 
-1. **Warmup**: requests a protocol marks as warmup, such as the Masstree
-   handshake and insert phase, after connection setup. They are excluded from
-   every statistic and count.
-2. **Measurement**: from the first measured request to the end of
-   `experiment.duration`. Only responses that arrive in this window count
-   toward throughput.
+1. **Warmup**: connection setup (such as Redis AUTH or the Masstree
+   handshake) and requests a protocol marks as warmup, such as an insert
+   phase. They are excluded from every statistic and count.
+2. **Measurement**: from the first measured request to `experiment.duration`
+   after the start. Only responses that arrive in this window count toward
+   throughput.
 3. **Drain**: sending stops, and the run waits up to
    `experiment.drain_timeout` (default 1 s) until no request is pending.
    Requests completed during the drain contribute their latency to the
@@ -44,7 +48,8 @@ completed during the drain are excluded from it and from the bytes behind
 `throughput_mbps`. Their latencies are recorded in the window's last time
 bucket. With `stats.include_records = true`, every record's rate divides by
 the part of its time bucket inside the measured window, so the first and last
-buckets are not understated. All threads share one bucket epoch.
+buckets are not understated. All threads' time buckets count from the
+shared start.
 
 ## Request accounting
 
@@ -71,7 +76,8 @@ requests; warmup requests are excluded:
   up. Counting walks each connection's schedule from its next intended time to
   the end of the window, at most 10,000,000 requests per connection; Poisson
   schedules are sampled forward with the policy's own generator. Connections
-  that failed keep counting their schedule.
+  that failed keep counting their schedule. A connection's schedule starts
+  once it can first send, so the slots before then are not unsent.
 - `unsent_capped`: whether that walk stopped at its cap on some connection, so
   `unsent` is a lower bound.
 

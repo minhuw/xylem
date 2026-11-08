@@ -33,10 +33,11 @@ seed = 42
 - `duration` (string, required): Duration in format "Ns", "Nm", "Nh" (seconds, minutes, hours)
 - `seed` (integer, optional): Random seed for reproducibility. Each traffic
   group's protocol on each thread draws its keys, values and sizes from its
-  own seed derived from this one, so threads do not repeat each other's keys.
-  Without a seed, they come from OS entropy. Earlier versions gave every
-  thread this seed itself, so a given seed now generates different keys than
-  it did there.
+  own seed derived from this one, so threads do not repeat each other's keys,
+  and each connection of a `poisson` group draws its arrivals from its own
+  derived seed. Without a seed, both come from OS entropy. Earlier versions
+  gave every thread this seed itself, so a given seed now generates different
+  keys than it did there.
 - `drain_timeout` (string, default `"1s"`): after the measurement window, how
   long to wait for responses that are still pending. Nothing is sent during the
   drain. Requests still pending when it ends count as `timed_out`; see
@@ -181,15 +182,32 @@ Setup requests are not measured, counted or dumped, and an error reply to one fa
 
 - `type` (string, required):
   - `"closed-loop"`: Send as fast as possible (max throughput)
-  - `"fixed-rate"`: Fixed rate per connection
+  - `"fixed-rate"`: Evenly spaced sends at a fixed rate
   - `"poisson"`: Poisson arrival process (open-loop)
-- `rate` (float, required for fixed-rate/poisson): Requests per second per connection
+- `rate` (float, required for fixed-rate/poisson): Requests per second of the
+  whole group, across all its threads and connections
 
 Every policy except `closed-loop` is rate-driven, including `adaptive` and the
 time-varying `sinusoidal`, `ramp`, `spike` and `sawtooth` patterns. Each
-connection of a rate-driven group follows an *intended schedule* that starts
-when the connection is established: every request is due one inter-arrival
-time after the previous request's intended time, not after its actual send.
+connection of a rate-driven group follows an *intended schedule*: every
+request is due one inter-arrival time after the previous request's intended
+time, not after its actual send.
+
+The rates are the group's, shared by its `N` connections
+(`connections_per_thread` times the length of `threads`), numbered
+`c = 0 .. N-1` across its threads. Every connection of every thread and group
+counts its schedule from one start time that all threads share, set once every
+thread has connected. `fixed-rate` interleaves the connections into one stream:
+connection `c` sends its `k`-th request `(c + k·N)/rate` seconds after the
+start (to the nanosecond, rounded down, without accumulating error), so the
+group sends one request every `1/rate` seconds and no two connections share a
+send time. A `poisson` connection is a Poisson process at `rate/N`, its first
+arrival one exponential inter-arrival after the start. `adaptive` and the
+patterns run each connection at `1/N` of the configured rates, connection `c`
+starting `c/N` of a request into its schedule, and a pattern's time counts from
+the start. A connection that can first send after the start, because it was
+still connecting or setting up, begins at its first intended time from then
+on; the sends it missed are not counted as `unsent`.
 Inter-arrival times are fixed (`fixed-rate`), exponential samples (`poisson`),
 one interval at the current rate (`adaptive`), or, for patterns, the time until
 the pattern's rate, held constant over 10 ms steps, accumulates one request.
@@ -214,13 +232,13 @@ type = "closed-loop"
 ```toml
 [traffic_groups.traffic_policy]
 type = "fixed-rate"
-rate = 100.0  # 100 req/s per connection
+rate = 100.0  # 100 req/s for the group, evenly spaced
 ```
 
 ```toml
 [traffic_groups.traffic_policy]
 type = "poisson"
-rate = 50.0  # Mean 50 req/s per connection
+rate = 50.0  # Mean 50 req/s for the group
 ```
 
 ### Sampling Policy

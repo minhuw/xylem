@@ -1059,6 +1059,15 @@ impl TupleStatsCollector {
         self.entries
     }
 
+    /// Take the start of the measurement loop, shared by every thread, as the
+    /// epoch of the time buckets. Ignored once something was recorded, whose
+    /// bucket was computed from the previous epoch.
+    pub fn start_measurement(&mut self, start_ns: u64) {
+        if self.first_record_ns.is_none() {
+            self.experiment_start_ns = start_ns;
+        }
+    }
+
     /// Record the end of the measurement loop; a merge keeps the latest end.
     pub fn end_measurement(&mut self, end_ns: u64) {
         self.measurement_end_ns = Some(self.measurement_end_ns.map_or(end_ns, |e| e.max(end_ns)));

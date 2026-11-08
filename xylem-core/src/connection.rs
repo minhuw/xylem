@@ -309,9 +309,9 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
 
     /// Restart the intended schedule once the last pending setup request of
     /// the connection completed. Setup requests never advance the schedule,
-    /// but the schedule started when the connection was established, so
-    /// without a restart the time spent waiting for setup replies would
-    /// become send lag and a burst of overdue sends.
+    /// but a schedule started before setup would otherwise turn the time
+    /// spent waiting for setup replies into send lag and a burst of overdue
+    /// sends. The schedule restarts at its first intended time from then on.
     fn finish_setup_request(&mut self) {
         if !self.pending_map.values().any(|pending| pending.is_setup) {
             self.policy.reset();
@@ -744,8 +744,8 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
     /// Build a pool by adding every group's connections to `group`
     ///
     /// `add_connection` opens one connection to a group's target and returns its
-    /// connection ID and the address recorded in its state. Policies are assigned
-    /// with a pool-wide index that counts connections across groups in order.
+    /// connection ID and the address recorded in its state. Each group's
+    /// scheduler assigns policies by the connection's index within that group.
     fn build<T>(
         mut group: G,
         groups: Vec<GroupConfig<T>>,
@@ -755,7 +755,6 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         let mut connection_states = HashMap::with_capacity(total_connections);
         let mut connection_ids = Vec::with_capacity(total_connections);
         let mut ready_heap = ReadyHeap::new();
-        let mut idx = 0;
 
         for (
             group_id,
@@ -765,12 +764,13 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
             mut policy_scheduler,
         ) in groups
         {
-            for _ in 0..connection_count {
+            for index in 0..connection_count {
                 let (connection_id, address) = add_connection(&mut group, &target)?;
-                let mut policy = policy_scheduler.assign_policy(idx);
+                let mut policy = policy_scheduler.assign_policy(index);
 
                 // The first call starts the connection's intended schedule once
-                // it is connected. Then add it to the heap.
+                // it is connected; anchoring the schedules restarts it. Then add
+                // it to the heap.
                 let next_send_time = policy.next_send_time(crate::timing::time_ns());
                 ready_heap.push(connection_id, next_send_time);
 
@@ -785,7 +785,6 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
                 state.set_on_heap(true);
                 connection_states.insert(connection_id, state);
                 connection_ids.push(connection_id);
-                idx += 1;
             }
         }
 
@@ -1138,6 +1137,19 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
 
     pub(crate) fn has_ready(&self, current_time_ns: u64) -> bool {
         self.ready_heap.has_ready(current_time_ns)
+    }
+
+    /// Anchor every connection's intended schedule at `start_ns`, the start
+    /// time all connections of all threads share (see [`Policy::anchor`]), and
+    /// take every connection off the ready heap. Reschedule them with
+    /// [`Self::try_schedule_connection`]; a schedule then starts at its first
+    /// intended time at or after both `start_ns` and that call.
+    pub fn anchor_schedules(&mut self, start_ns: u64) {
+        self.ready_heap.clear();
+        for state in self.connection_states.values_mut() {
+            state.policy.anchor(start_ns);
+            state.set_on_heap(false);
+        }
     }
 
     /// Count each connection's intended sends from its next intended time up
@@ -1696,6 +1708,33 @@ mod tests {
         )
         .unwrap();
         (factory, pool)
+    }
+
+    #[test]
+    fn anchored_groups_number_their_connections_from_zero() {
+        use crate::scheduler::{FixedRatePolicy, GroupPolicyScheduler};
+        // Two groups of one pool, each this thread's connections 2.. of 4
+        // sharing 4000 req/s, whose slots are 250 µs apart
+        let striped = || -> Box<dyn crate::scheduler::PolicyScheduler> {
+            Box::new(GroupPolicyScheduler::new(2, |c| {
+                Box::new(FixedRatePolicy::striped(4000.0, c, 4))
+            }))
+        };
+        let factory = test_support::FakeFactory::default();
+        let target: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let mut pool: ConnectionPool<test_support::FakeGroup, u64> =
+            ConnectionPool::new_multi_group_with_targets(
+                &factory,
+                vec![(0, target, 2, 1, striped()), (1, target, 2, 1, striped())],
+            )
+            .unwrap();
+        let start = crate::timing::time_ns() + 1_000_000_000;
+        pool.anchor_schedules(start);
+        assert_eq!(pool.peek_next_ready_time(), None, "anchoring empties the heap");
+        let firsts: Vec<_> = (0..4)
+            .map(|id| pool.get_state_mut(id).unwrap().next_send_time(0).unwrap() - start)
+            .collect();
+        assert_eq!(firsts, [500_000, 750_000, 500_000, 750_000]);
     }
 
     /// Test datagram parser: an eight-byte frame completes its ID; a datagram

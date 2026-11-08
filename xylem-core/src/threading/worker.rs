@@ -180,9 +180,29 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         }
     }
 
-    /// Run the pipelined measurement loop (Lancet symmetric_tcp_main style)
+    /// Run the pipelined measurement loop from now; see [`Self::run_at`]
     pub fn run(&mut self) -> Result<()> {
-        let start_ns = timing::time_ns();
+        self.run_at(timing::time_ns())
+    }
+
+    /// Run the pipelined measurement loop (Lancet symmetric_tcp_main style)
+    /// from `start_ns` (a `timing::time_ns` value) to `start_ns + duration`
+    ///
+    /// `start_ns` is the start time every thread shares: every connection's
+    /// intended schedule is anchored at it, so the connections of a traffic
+    /// group interleave across threads, and it is the epoch of the stats' time
+    /// buckets. Nothing is sent before it. A connection still setting up
+    /// starts its schedule once setup is done.
+    pub fn run_at(&mut self, start_ns: u64) -> Result<()> {
+        self.stats.start_measurement(start_ns);
+        self.anchor_schedules(start_ns);
+        let now_ns = timing::time_ns();
+        if start_ns.saturating_sub(now_ns) > 2_000_000 {
+            // Sleep until shortly before the start, then spin to it
+            std::thread::sleep(Duration::from_nanos(start_ns - now_ns - 1_000_000));
+        }
+        timing::busy_wait_until(start_ns);
+
         let duration_ns = self.config.duration.as_nanos().min(u64::MAX as u128) as u64;
         let end_ns = start_ns.saturating_add(duration_ns);
 
@@ -214,6 +234,20 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         self.pool.close_all()?;
 
         Ok(())
+    }
+
+    /// Anchor every connection's schedule at `start_ns` and reschedule the
+    /// connections that can send
+    fn anchor_schedules(&mut self, start_ns: u64) {
+        self.pool.anchor_schedules(start_ns);
+        for connection_id in self.pool.connection_ids().to_vec() {
+            let Some(state) = self.pool.get_state(connection_id) else {
+                continue;
+            };
+            let protocol =
+                self.protocols.get(&state.group_id()).expect("Protocol not found for group_id");
+            self.pool.try_schedule_connection(connection_id, protocol);
+        }
     }
 
     fn send_requests(&mut self) -> Result<()> {
@@ -901,6 +935,20 @@ mod tests {
         assert_eq!(worker.stats.entries().values().map(|entry| entry.tx_bytes).sum::<u64>(), 8);
         assert_eq!(worker.stats.entries().values().map(|entry| entry.rx_bytes).sum::<u64>(), 8);
         assert_eq!(global(&worker).latency_sample_count, 1);
+    }
+
+    #[test]
+    fn run_at_starts_at_the_shared_start_and_takes_it_as_the_bucket_epoch() {
+        let factory = FakeFactory::default();
+        let mut worker = fake_worker(&factory, 1, Box::new(UniformPolicyScheduler::closed_loop()));
+        worker.config.duration = Duration::from_millis(10);
+        let start = timing::time_ns() + 30_000_000;
+        worker.run_at(start).unwrap();
+        assert_eq!(worker.stats.experiment_start_ns(), start);
+        let (first_send, end) = worker.stats.measurement_window_ns().unwrap();
+        assert!(first_send >= start, "nothing is sent before the start");
+        assert_eq!(end, start + 10_000_000);
+        assert_eq!(worker.stats.request_counts_global().sent, 1);
     }
 
     #[test]

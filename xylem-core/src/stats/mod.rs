@@ -39,6 +39,11 @@ pub trait StatsRecorder: Send {
     /// Record received bytes
     fn record_rx_bytes(&mut self, group_id: usize, connection_id: usize, bytes: usize);
 
+    /// Mark the start of the measurement loop (a `timing::time_ns` value),
+    /// which every thread shares, before anything is recorded. Collectors
+    /// take it as the epoch of their time buckets.
+    fn start_measurement(&mut self, _start_ns: u64) {}
+
     /// Mark the end of the measurement loop (a `timing::time_ns` value).
     /// Responses drained after it still count toward latency, not throughput.
     fn end_measurement(&mut self, _end_ns: u64) {}
@@ -81,6 +86,10 @@ impl StatsRecorder for TupleStatsCollector {
 
     fn record_rx_bytes(&mut self, group_id: usize, connection_id: usize, bytes: usize) {
         TupleStatsCollector::record_rx_bytes(self, group_id, connection_id, bytes);
+    }
+
+    fn start_measurement(&mut self, start_ns: u64) {
+        TupleStatsCollector::start_measurement(self, start_ns);
     }
 
     fn end_measurement(&mut self, end_ns: u64) {
