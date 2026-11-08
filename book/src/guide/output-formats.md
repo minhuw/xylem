@@ -137,9 +137,14 @@ The parts of one request are:
   the request leaving the client NIC to the response arriving at it. Such a
   request's latency uses this round trip, so its `service_us` equals it.
 - `host_stack_us`: for the same requests, the user-space round trip (cycles
-  read when the send and the receive calls completed) minus the kernel round
-  trip, or zero if that is negative: the client's own stack, syscalls and
-  wakeup, on both paths.
+  read when the send call and the receive call returned) minus the kernel
+  round trip, or zero if that is negative. That is the time from the
+  response's kernel RX timestamp to the receive call's return (the client's
+  receive stack, wakeup and syscall) minus the time from the request's kernel
+  TX timestamp to the send call's return. A kernel software TX timestamp is
+  taken inside the send call, so this subtracts the end of that call; a NIC
+  usually transmits after the call returned, so with NIC timestamps this adds
+  the send path through the stack, driver and NIC queue.
 
 Each part's two terms are measured in one clock; xylem subtracts durations,
 never times from different clocks. `host_stack_us` and `network_server_us`

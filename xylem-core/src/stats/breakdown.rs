@@ -10,8 +10,10 @@
 //!   time from the request leaving the kernel (or the NIC) to the response
 //!   reaching it: network, server and the NICs.
 //! - `host_stack`: the user-space round trip (cycles read when the send and
-//!   receive calls completed) minus `network_server`, saturating at zero:
-//!   the client's own stack, syscalls and wakeup on both paths.
+//!   receive calls returned) minus `network_server`, saturating at zero:
+//!   the time from the kernel RX timestamp to the receive call's return,
+//!   minus the time from the kernel TX timestamp to the send call's return
+//!   (negative when the NIC transmits after the call returned).
 //!
 //! Only durations are subtracted, each measured in one clock; times from
 //! different clocks are never compared.
