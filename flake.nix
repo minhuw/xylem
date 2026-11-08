@@ -11,7 +11,7 @@
     # The DPDK SDK of the `ntcp-dpdk` feature, from the ntcp commit that
     # xylem-transport/Cargo.toml pins; built from this flake's nixpkgs
     ntcp = {
-      url = "github:minhuw/ntcp/5d2b0f0723acf2295cd992c521c7398a1c6197e2";
+      url = "github:minhuw/ntcp/dca47b54535bef6e9513e4e53ba1b491e7c47328";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
@@ -94,7 +94,7 @@
       in
       {
         # Development shell
-        devShells.default = pkgs.mkShell {
+        devShells.default = pkgs.mkShell ({
           buildInputs = buildInputs ++ [
             rustToolchain
 
@@ -127,7 +127,10 @@
           ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
             # Profiling, for flamegraph
             pkgs.perf
-          ] ++ dpdkInputs;
+          ] ++ dpdkInputs ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+            # The `ntcp-af-xdp` feature links libbpf
+            pkgs.libbpf
+          ];
 
           inherit nativeBuildInputs;
 
@@ -162,7 +165,13 @@
               pre-commit install
             fi
           '';
-        };
+        } // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          # The `ntcp-af-xdp` feature compiles its XDP program for the BPF
+          # target, with a clang that adds no host-target flags (not
+          # cc-wrapper's) and the Linux UAPI headers
+          NTCP_BPF_CLANG = "${pkgs.llvmPackages.clang-unwrapped}/bin/clang";
+          NTCP_BPF_CFLAGS = "-isystem ${pkgs.linuxHeaders}/include";
+        });
 
         # Package definition
         packages.default = rustPlatform.buildRustPackage {
@@ -175,7 +184,7 @@
             lockFile = ./Cargo.lock;
             # One hash covers every crate of a git repository at its pinned rev
             outputHashes = {
-              "ntcp-native-0.0.1" = "sha256-++eB7lPbPiv1GhpRrooV9CFKXZ5nqql8QqBcMICXFl8=";
+              "ntcp-native-0.0.1" = "sha256-YdWfMoTGX08babetTNAFSfQYQsXMb9Ra0OliRrOfark=";
             };
           };
 

@@ -53,6 +53,9 @@ evalsync = ["dep:evalsync"]
 ntcp = ["xylem-transport/ntcp"]
 # ntcp over DPDK ports (Linux only; needs the DPDK SDK of the nix dev shell)
 ntcp-dpdk = ["ntcp", "xylem-transport/ntcp-dpdk"]
+# ntcp over AF_XDP sockets (Linux only; needs the nix dev shell's libbpf and
+# BPF clang)
+ntcp-af-xdp = ["ntcp", "xylem-transport/ntcp-af-xdp"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
