@@ -11,7 +11,7 @@
     # The DPDK SDK of the `ntcp-dpdk` feature, from the ntcp commit that
     # xylem-transport/Cargo.toml pins; built from this flake's nixpkgs
     ntcp = {
-      url = "github:minhuw/ntcp/d281f43db1eecf98e54bb6e3320d05993f4308d1";
+      url = "github:minhuw/ntcp/147169a8b6b675ccdcee063a6634338580c09d50";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
@@ -184,7 +184,7 @@
             lockFile = ./Cargo.lock;
             # One hash covers every crate of a git repository at its pinned rev
             outputHashes = {
-              "ntcp-native-0.0.1" = "sha256-X5+3OZoKYDjNycXrAq/JD7lXcZFxCMWu+hdNQhISaFY=";
+              "ntcp-native-0.0.1" = "sha256-3vKFBYmBJpQuoOlnZDDc5JSQ/R60harYXK+hwQmilWg=";
             };
           };
 
