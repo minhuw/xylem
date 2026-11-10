@@ -642,7 +642,7 @@ fn assert_json_results(path: &Path, target: &str) -> String {
         (Some(start), Some(end)) => {
             let start = start.as_u64().expect("load-loop start must be Unix microseconds");
             let end = end.as_u64().expect("load-loop end must be Unix microseconds");
-            assert!(start > 0 && start <= end && end <= (1 << 53) - 1);
+            assert!(start > 0 && start <= end && end < (1 << 53));
             expected = expected.replace(
                 "    \"measured_duration_secs\": #,\n",
                 "    \"measured_duration_secs\": #,\n    \"actual_load_loop_start_unix_us\": #,\n    \"actual_load_loop_end_unix_us\": #,\n",
