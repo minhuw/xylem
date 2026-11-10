@@ -1272,85 +1272,88 @@ mod tests {
         ];
         for fail_send in [true, false] {
             for (start_sample, end_sample, expected) in samples_and_expected {
-                let factory = FakeFactory::default();
-                {
-                    let mut io = factory.0.lock().unwrap();
-                    if fail_send {
-                        io.fail_send = true;
-                    } else {
-                        // Complete one request before the next receive fails.
-                        io.responses.push_back(Ok(0u64.to_le_bytes().to_vec()));
-                        io.responses.push_back(Err(xylem_transport::Error::Io(
-                            std::io::Error::new(
-                                std::io::ErrorKind::PermissionDenied,
-                                "receive failed",
-                            ),
-                        )));
-                    }
-                    // A drain would consume this response after the receive error.
-                    io.responses.push_back(Ok(1u64.to_le_bytes().to_vec()));
-                }
-                let mut worker = fake_worker(
-                    &factory,
-                    1,
-                    Box::new(UniformPolicyScheduler::fixed_rate(10_000.0)),
-                );
-                worker.config.duration = Duration::from_secs(5);
-                // A first event makes an erroneous end_measurement visible.
-                worker.stats.record_tx_bytes(0, 0, 0);
-                let mut samples = [start_sample, end_sample].into_iter();
-                let mut clock_calls = 0;
-                let result = worker.run_at_with_clock(timing::time_ns(), || {
-                    let io = factory.0.lock().unwrap();
-                    assert!(!io.closed);
-                    if clock_calls == 0 {
-                        assert!(io.sent.is_empty());
-                    } else if !fail_send {
-                        assert_eq!(io.sent.len(), 2, "the end sample follows the error");
-                        assert_eq!(io.responses.len(), 1, "the end sample precedes draining");
-                    }
-                    clock_calls += 1;
-                    samples.next().expect("the wall clock is sampled exactly twice")
-                });
-                assert!(samples.next().is_none());
-                match result.unwrap_err() {
-                    crate::Error::Io(error) => {
-                        let (kind, message) = if fail_send {
-                            (std::io::ErrorKind::Other, "send failed")
-                        } else {
-                            (std::io::ErrorKind::PermissionDenied, "receive failed")
-                        };
-                        assert_eq!((error.kind(), error.to_string().as_str()), (kind, message));
-                    }
-                    error => panic!("unexpected error: {error:?}"),
-                }
-
-                assert_eq!(worker.stats.measurement_window_ns(), None);
-                let counts = worker.stats.request_counts_global();
-                assert_eq!((counts.unsent, counts.timed_out, counts.failed), (0, 0, 0));
-                let completed = u64::from(!fail_send);
-                assert_eq!((counts.sent, counts.completed), (completed * 2, completed));
-                assert_eq!(global(&worker).total_requests, completed);
-                assert_eq!(worker.pool.get_state(0).unwrap().pending_count(), completed as usize);
-                {
-                    let io = factory.0.lock().unwrap();
-                    assert!(!io.closed);
-                    assert_eq!(io.responses.len(), 1, "the loop error must not drain responses");
-                }
-
-                let failed = worker.into_stats();
-                assert_eq!(failed.actual_load_loop_unix_us(), expected);
-                let mut peer = TupleStatsCollector::default();
-                peer.record_actual_load_loop(120, 140);
-                let merged =
-                    TupleStatsCollector::merge(vec![peer, failed, TupleStatsCollector::default()]);
-                assert_eq!(
-                    merged.actual_load_loop_unix_us(),
-                    expected,
-                    "fail_send={fail_send}, samples=({start_sample:?}, {end_sample:?})"
-                );
+                assert_actual_load_loop_error_case(fail_send, start_sample, end_sample, expected);
             }
         }
+    }
+
+    fn assert_actual_load_loop_error_case(
+        fail_send: bool,
+        start_sample: Option<u64>,
+        end_sample: Option<u64>,
+        expected: Option<(u64, u64)>,
+    ) {
+        let factory = FakeFactory::default();
+        {
+            let mut io = factory.0.lock().unwrap();
+            if fail_send {
+                io.fail_send = true;
+            } else {
+                // Complete one request before the next receive fails.
+                io.responses.push_back(Ok(0u64.to_le_bytes().to_vec()));
+                io.responses.push_back(Err(xylem_transport::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "receive failed",
+                ))));
+            }
+            // A drain would consume this response after the receive error.
+            io.responses.push_back(Ok(1u64.to_le_bytes().to_vec()));
+        }
+        let mut worker =
+            fake_worker(&factory, 1, Box::new(UniformPolicyScheduler::fixed_rate(10_000.0)));
+        worker.config.duration = Duration::from_secs(5);
+        // A first event makes an erroneous end_measurement visible.
+        worker.stats.record_tx_bytes(0, 0, 0);
+        let mut samples = [start_sample, end_sample].into_iter();
+        let mut clock_calls = 0;
+        let result = worker.run_at_with_clock(timing::time_ns(), || {
+            let io = factory.0.lock().unwrap();
+            assert!(!io.closed);
+            if clock_calls == 0 {
+                assert!(io.sent.is_empty());
+            } else if !fail_send {
+                assert_eq!(io.sent.len(), 2, "the end sample follows the error");
+                assert_eq!(io.responses.len(), 1, "the end sample precedes draining");
+            }
+            clock_calls += 1;
+            samples.next().expect("the wall clock is sampled exactly twice")
+        });
+        assert!(samples.next().is_none());
+        match result.unwrap_err() {
+            crate::Error::Io(error) => {
+                let (kind, message) = if fail_send {
+                    (std::io::ErrorKind::Other, "send failed")
+                } else {
+                    (std::io::ErrorKind::PermissionDenied, "receive failed")
+                };
+                assert_eq!((error.kind(), error.to_string().as_str()), (kind, message));
+            }
+            error => panic!("unexpected error: {error:?}"),
+        }
+
+        assert_eq!(worker.stats.measurement_window_ns(), None);
+        let counts = worker.stats.request_counts_global();
+        assert_eq!((counts.unsent, counts.timed_out, counts.failed), (0, 0, 0));
+        let completed = u64::from(!fail_send);
+        assert_eq!((counts.sent, counts.completed), (completed * 2, completed));
+        assert_eq!(global(&worker).total_requests, completed);
+        assert_eq!(worker.pool.get_state(0).unwrap().pending_count(), completed as usize);
+        {
+            let io = factory.0.lock().unwrap();
+            assert!(!io.closed);
+            assert_eq!(io.responses.len(), 1, "the loop error must not drain responses");
+        }
+
+        let failed = worker.into_stats();
+        assert_eq!(failed.actual_load_loop_unix_us(), expected);
+        let mut peer = TupleStatsCollector::default();
+        peer.record_actual_load_loop(120, 140);
+        let merged = TupleStatsCollector::merge(vec![peer, failed, TupleStatsCollector::default()]);
+        assert_eq!(
+            merged.actual_load_loop_unix_us(),
+            expected,
+            "fail_send={fail_send}, samples=({start_sample:?}, {end_sample:?})"
+        );
     }
 
     #[test]
