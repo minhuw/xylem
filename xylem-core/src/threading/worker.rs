@@ -16,9 +16,13 @@ use crate::Result;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use xylem_common::Protocol;
 use xylem_transport::{ConnectionGroup, TransportFactory};
+
+fn unix_time_us() -> Option<u64> {
+    SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_micros().try_into().ok()
+}
 
 /// Configuration for worker
 pub struct WorkerConfig {
@@ -206,6 +210,15 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
     /// buckets. Nothing is sent before it. A connection still setting up
     /// starts its schedule once setup is done.
     pub fn run_at(&mut self, start_ns: u64) -> Result<()> {
+        self.run_at_with_clock(start_ns, unix_time_us)
+    }
+
+    // A supplied wall clock lets tests exercise unusable samples at loop exit.
+    fn run_at_with_clock(
+        &mut self,
+        start_ns: u64,
+        mut wall_clock_us: impl FnMut() -> Option<u64>,
+    ) -> Result<()> {
         self.stats.start_measurement(start_ns);
         self.anchor_schedules(start_ns);
         let now_ns = timing::time_ns();
@@ -214,30 +227,38 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             std::thread::sleep(Duration::from_nanos(start_ns - now_ns - 1_000_000));
         }
         timing::busy_wait_until(start_ns);
+        let actual_start_us = wall_clock_us();
 
         let duration_ns = self.config.duration.as_nanos().min(u64::MAX as u128) as u64;
         let end_ns = start_ns.saturating_add(duration_ns);
 
-        loop {
+        let loop_result = loop {
             let now_ns = timing::time_ns();
 
             // Check if duration exceeded
             if now_ns >= end_ns {
-                self.stats.end_measurement(end_ns);
-                self.record_unsent(end_ns);
-                break;
+                break Ok(());
             }
 
-            self.send_requests()?;
+            if let Err(error) = self.send_requests() {
+                break Err(error);
+            }
 
             // RECEIVE PHASE: Poll all connections for responses (single syscall)
             // Derive sleep duration from the ready heap (when next connection will be ready)
             let now_ns = timing::time_ns();
 
             let poll_timeout = self.poll_timeout(now_ns, end_ns);
-            self.process_responses(poll_timeout)?;
+            if let Err(error) = self.process_responses(poll_timeout) {
+                break Err(error);
+            }
             self.expire_requests(timing::time_ns());
-        }
+        };
+        let actual_end_us = wall_clock_us();
+        self.stats.record_actual_load_loop_samples(actual_start_us, actual_end_us);
+        loop_result?;
+        self.stats.end_measurement(end_ns);
+        self.record_unsent(end_ns);
 
         // Stop sending and wait for the responses still pending
         self.drain_responses()?;
@@ -1188,6 +1209,161 @@ mod tests {
         assert!(first_send >= start, "nothing is sent before the start");
         assert_eq!(end, start + 10_000_000);
         assert_eq!(worker.stats.request_counts_global().sent, 1);
+    }
+
+    #[test]
+    fn actual_load_loop_starts_after_the_shared_wait() {
+        let factory = FakeFactory::default();
+        let mut worker = fake_worker(&factory, 1, Box::new(UniformPolicyScheduler::closed_loop()));
+        worker.config.duration = Duration::ZERO;
+        let start = timing::time_ns() + 1_000_000;
+        let mut samples = [Some(100), Some(200)].into_iter();
+        worker
+            .run_at_with_clock(start, || {
+                assert!(timing::time_ns() >= start, "the shared wait completed");
+                assert!(factory.0.lock().unwrap().sent.is_empty());
+                samples.next().expect("the wall clock is sampled exactly twice")
+            })
+            .unwrap();
+        assert!(samples.next().is_none());
+        assert_eq!(worker.stats.actual_load_loop_unix_us(), Some((100, 200)));
+    }
+
+    #[test]
+    fn actual_load_loop_excludes_pending_response_drain() {
+        let factory = FakeFactory::default();
+        let mut worker = fake_worker(&factory, 1, Box::new(UniformPolicyScheduler::closed_loop()));
+        // A response is waiting when the zero-duration loop exits.
+        worker.send_requests().unwrap();
+        factory.0.lock().unwrap().responses.push_back(Ok(0u64.to_le_bytes().to_vec()));
+        worker.config.duration = Duration::ZERO;
+        worker.config.drain_timeout = Duration::from_secs(1);
+        let mut samples = [Some(100), Some(200)].into_iter();
+        worker
+            .run_at_with_clock(timing::time_ns(), || {
+                let io = factory.0.lock().unwrap();
+                assert!(io.timeouts.is_empty(), "the drain has not polled yet");
+                assert_eq!(io.responses.len(), 1, "the response is still pending");
+                samples.next().expect("the wall clock is sampled exactly twice")
+            })
+            .unwrap();
+        assert!(samples.next().is_none());
+        assert_eq!(worker.stats.actual_load_loop_unix_us(), Some((100, 200)));
+        {
+            let io = factory.0.lock().unwrap();
+            assert_eq!(io.timeouts.len(), 1, "the pending response was drained");
+            assert!(io.responses.is_empty());
+        }
+        assert_eq!(worker.stats.request_counts_global().completed, 1);
+        assert_eq!(worker.stats.request_counts_global().timed_out, 0);
+        assert_eq!(global(&worker).total_requests, 0);
+        assert_eq!(global(&worker).latency_sample_count, 1);
+    }
+
+    #[test]
+    fn actual_load_loop_records_errors_and_invalid_clock_samples() {
+        let samples_and_expected = [
+            (Some(100), Some(200), Some((100, 200))),
+            (None, Some(200), None),
+            (Some(100), None, None),
+            (None, None, None),
+            (Some(200), Some(100), None),
+            (Some(100), Some(1 << 53), None),
+        ];
+        for fail_send in [true, false] {
+            for (start_sample, end_sample, expected) in samples_and_expected {
+                let factory = FakeFactory::default();
+                {
+                    let mut io = factory.0.lock().unwrap();
+                    if fail_send {
+                        io.fail_send = true;
+                    } else {
+                        // Complete one request before the next receive fails.
+                        io.responses.push_back(Ok(0u64.to_le_bytes().to_vec()));
+                        io.responses.push_back(Err(xylem_transport::Error::Io(
+                            std::io::Error::new(
+                                std::io::ErrorKind::PermissionDenied,
+                                "receive failed",
+                            ),
+                        )));
+                    }
+                    // A drain would consume this response after the receive error.
+                    io.responses.push_back(Ok(1u64.to_le_bytes().to_vec()));
+                }
+                let mut worker = fake_worker(
+                    &factory,
+                    1,
+                    Box::new(UniformPolicyScheduler::fixed_rate(10_000.0)),
+                );
+                worker.config.duration = Duration::from_secs(5);
+                // A first event makes an erroneous end_measurement visible.
+                worker.stats.record_tx_bytes(0, 0, 0);
+                let mut samples = [start_sample, end_sample].into_iter();
+                let mut clock_calls = 0;
+                let result = worker.run_at_with_clock(timing::time_ns(), || {
+                    let io = factory.0.lock().unwrap();
+                    assert!(!io.closed);
+                    if clock_calls == 0 {
+                        assert!(io.sent.is_empty());
+                    } else if !fail_send {
+                        assert_eq!(io.sent.len(), 2, "the end sample follows the error");
+                        assert_eq!(io.responses.len(), 1, "the end sample precedes draining");
+                    }
+                    clock_calls += 1;
+                    samples.next().expect("the wall clock is sampled exactly twice")
+                });
+                assert!(samples.next().is_none());
+                match result.unwrap_err() {
+                    crate::Error::Io(error) => {
+                        let (kind, message) = if fail_send {
+                            (std::io::ErrorKind::Other, "send failed")
+                        } else {
+                            (std::io::ErrorKind::PermissionDenied, "receive failed")
+                        };
+                        assert_eq!((error.kind(), error.to_string().as_str()), (kind, message));
+                    }
+                    error => panic!("unexpected error: {error:?}"),
+                }
+
+                assert_eq!(worker.stats.measurement_window_ns(), None);
+                let counts = worker.stats.request_counts_global();
+                assert_eq!((counts.unsent, counts.timed_out, counts.failed), (0, 0, 0));
+                let completed = u64::from(!fail_send);
+                assert_eq!((counts.sent, counts.completed), (completed * 2, completed));
+                assert_eq!(global(&worker).total_requests, completed);
+                assert_eq!(worker.pool.get_state(0).unwrap().pending_count(), completed as usize);
+                {
+                    let io = factory.0.lock().unwrap();
+                    assert!(!io.closed);
+                    assert_eq!(io.responses.len(), 1, "the loop error must not drain responses");
+                }
+
+                let failed = worker.into_stats();
+                assert_eq!(failed.actual_load_loop_unix_us(), expected);
+                let mut peer = TupleStatsCollector::default();
+                peer.record_actual_load_loop(120, 140);
+                let merged =
+                    TupleStatsCollector::merge(vec![peer, failed, TupleStatsCollector::default()]);
+                assert_eq!(
+                    merged.actual_load_loop_unix_us(),
+                    expected,
+                    "fail_send={fail_send}, samples=({start_sample:?}, {end_sample:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn actual_load_loop_records_error_through_public_run() {
+        let factory = FakeFactory::default();
+        factory.0.lock().unwrap().fail_send = true;
+        let mut worker = fake_worker(&factory, 1, Box::new(UniformPolicyScheduler::closed_loop()));
+        let before = unix_time_us().unwrap();
+        let error = worker.run().unwrap_err();
+        let after = unix_time_us().unwrap();
+        assert!(matches!(error, crate::Error::Io(ref e) if e.to_string() == "send failed"));
+        let (start, end) = worker.into_stats().actual_load_loop_unix_us().unwrap();
+        assert!(before <= start && start <= end && end <= after);
     }
 
     #[test]

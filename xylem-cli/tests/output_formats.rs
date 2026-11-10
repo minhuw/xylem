@@ -407,8 +407,10 @@ fn summary_values(json_text: &str) -> Vec<String> {
 }
 
 /// JSON fields whose values are measured.
-const MEASURED_KEYS: [&str; 22] = [
+const MEASURED_KEYS: [&str; 24] = [
     "measured_duration_secs",
+    "actual_load_loop_start_unix_us",
+    "actual_load_loop_end_unix_us",
     "total_requests",
     "min_us",
     "max_us",
@@ -630,8 +632,26 @@ fn sorted_keys(value: &serde_json::Value) -> Vec<&str> {
 /// Check the JSON results file and return its text.
 fn assert_json_results(path: &Path, target: &str) -> String {
     let text = std::fs::read_to_string(path).unwrap();
-    assert_eq!(mask_json(&text), MASKED_JSON.replace("TARGET", target));
     let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let experiment = &json["experiment"];
+    let mut expected = MASKED_JSON.replace("TARGET", target);
+    match (
+        experiment.get("actual_load_loop_start_unix_us"),
+        experiment.get("actual_load_loop_end_unix_us"),
+    ) {
+        (Some(start), Some(end)) => {
+            let start = start.as_u64().expect("load-loop start must be Unix microseconds");
+            let end = end.as_u64().expect("load-loop end must be Unix microseconds");
+            assert!(start > 0 && start <= end && end <= (1 << 53) - 1);
+            expected = expected.replace(
+                "    \"measured_duration_secs\": #,\n",
+                "    \"measured_duration_secs\": #,\n    \"actual_load_loop_start_unix_us\": #,\n    \"actual_load_loop_end_unix_us\": #,\n",
+            );
+        }
+        (None, None) => {} // Wall-clock samples may be unavailable.
+        _ => panic!("load-loop timestamps must be present or absent together"),
+    }
+    assert_eq!(mask_json(&text), expected);
     assert_eq!(
         sorted_keys(&json),
         [

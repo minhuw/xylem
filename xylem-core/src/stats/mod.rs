@@ -79,6 +79,9 @@ pub trait StatsRecorder: Send {
     /// Responses drained after it still count toward latency, not throughput.
     fn end_measurement(&mut self, _end_ns: u64) {}
 
+    /// Record a worker load-loop interval in Unix microseconds, including missing samples.
+    fn record_actual_load_loop_samples(&mut self, _start_us: Option<u64>, _end_us: Option<u64>) {}
+
     /// Record a measurement request that was sent, with its lag behind its
     /// intended send time (`None` for a closed-loop request)
     fn record_sent(&mut self, _group_id: usize, _connection_id: usize, _lag: Option<Duration>) {}
@@ -144,6 +147,10 @@ impl StatsRecorder for TupleStatsCollector {
 
     fn end_measurement(&mut self, end_ns: u64) {
         TupleStatsCollector::end_measurement(self, end_ns);
+    }
+
+    fn record_actual_load_loop_samples(&mut self, start_us: Option<u64>, end_us: Option<u64>) {
+        TupleStatsCollector::record_actual_load_loop_samples(self, start_us, end_us);
     }
 
     fn record_sent(&mut self, group_id: usize, _connection_id: usize, lag: Option<Duration>) {

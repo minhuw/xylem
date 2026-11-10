@@ -504,6 +504,25 @@ pub struct ConnectionStats {
     pub latency: AggregatedStats,
 }
 
+// Empty collectors are neutral; an unusable worker interval poisons any aggregate.
+#[derive(Clone, Copy, Default)]
+enum ActualLoadLoop {
+    #[default]
+    Empty,
+    Valid(u64, u64),
+    Invalid,
+}
+
+impl ActualLoadLoop {
+    fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Invalid, _) | (_, Self::Invalid) => Self::Invalid,
+            (Self::Empty, value) | (value, Self::Empty) => value,
+            (Self::Valid(a, b), Self::Valid(c, d)) => Self::Valid(a.min(c), b.max(d)),
+        }
+    }
+}
+
 /// Tuple-keyed statistics collector
 ///
 /// Stores statistics keyed by (time_bucket, group_id, thread_id, connection_id) for flexible
@@ -535,6 +554,9 @@ pub struct TupleStatsCollector {
     ///
     /// [`StatsRecorder::end_measurement`]: super::StatsRecorder::end_measurement
     measurement_end_ns: Option<u64>,
+    /// Aggregate of worker loop intervals in Unix microseconds. Unusable
+    /// samples invalidate the aggregate; empty collectors remain neutral.
+    actual_load_loop: ActualLoadLoop,
     /// Request counts per group
     request_counts: HashMap<usize, RequestCounts>,
     /// Send lags of open-loop requests per group
@@ -563,6 +585,7 @@ impl TupleStatsCollector {
             experiment_start_ns: crate::timing::time_ns(),
             first_record_ns: None,
             measurement_end_ns: None,
+            actual_load_loop: ActualLoadLoop::Empty,
             request_counts: HashMap::new(),
             send_lags: HashMap::new(),
             error_latencies: HashMap::new(),
@@ -588,6 +611,7 @@ impl TupleStatsCollector {
             experiment_start_ns: start_time_ns,
             first_record_ns: None,
             measurement_end_ns: None,
+            actual_load_loop: ActualLoadLoop::Empty,
             request_counts: HashMap::new(),
             send_lags: HashMap::new(),
             error_latencies: HashMap::new(),
@@ -1089,6 +1113,9 @@ impl TupleStatsCollector {
             experiment_start_ns: first.experiment_start_ns,
             first_record_ns: collectors.iter().filter_map(|c| c.first_record_ns).min(),
             measurement_end_ns: collectors.iter().filter_map(|c| c.measurement_end_ns).max(),
+            actual_load_loop: collectors
+                .iter()
+                .fold(ActualLoadLoop::Empty, |combined, c| combined.merge(c.actual_load_loop)),
             request_counts: HashMap::new(),
             send_lags: HashMap::new(),
             error_latencies: HashMap::new(),
@@ -1176,6 +1203,39 @@ impl TupleStatsCollector {
     /// Record the end of the measurement loop; a merge keeps the latest end.
     pub fn end_measurement(&mut self, end_ns: u64) {
         self.measurement_end_ns = Some(self.measurement_end_ns.map_or(end_ns, |e| e.max(end_ns)));
+    }
+
+    /// Record an actual load-loop interval in Unix microseconds.
+    /// Reversed values or values above `2^53 - 1` invalidate this interval and
+    /// any merged interval containing it.
+    pub fn record_actual_load_loop(&mut self, start_us: u64, end_us: u64) {
+        self.record_actual_load_loop_samples(Some(start_us), Some(end_us));
+    }
+
+    /// Record a worker's start and end wall-clock samples in Unix microseconds.
+    /// A missing sample, a start after the end, or a sample above `2^53 - 1`
+    /// invalidates this interval and every merged interval containing it.
+    /// Collectors with no recorded interval remain neutral when merged.
+    pub fn record_actual_load_loop_samples(&mut self, start_us: Option<u64>, end_us: Option<u64>) {
+        const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
+        let sample = match (start_us, end_us) {
+            (Some(start), Some(end)) if start <= end && end <= MAX_SAFE_INTEGER => {
+                ActualLoadLoop::Valid(start, end)
+            }
+            _ => ActualLoadLoop::Invalid,
+        };
+        self.actual_load_loop = self.actual_load_loop.merge(sample);
+    }
+
+    /// Earliest worker loop start and latest worker loop end, in Unix microseconds.
+    /// The merged interval includes gaps between worker loops. Returns `None`
+    /// if no interval was recorded or any worker's samples are unusable. These
+    /// readings do not imply alignment with any other host's clock.
+    pub fn actual_load_loop_unix_us(&self) -> Option<(u64, u64)> {
+        match self.actual_load_loop {
+            ActualLoadLoop::Valid(start, end) => Some((start, end)),
+            ActualLoadLoop::Empty | ActualLoadLoop::Invalid => None,
+        }
     }
 
     /// The measurement window in nanoseconds: from the first recorded event
@@ -1838,6 +1898,72 @@ mod tests {
         assert_eq!(collector.group_ids(), vec![0, 1]);
         assert_eq!(collector.connection_ids(0), vec![(0, 0), (0, 1)]);
         assert_eq!(collector.connection_ids(1), vec![(0, 0)]);
+    }
+
+    #[test]
+    fn actual_load_loop_merge_uses_valid_intervals_and_empty_collectors_are_neutral() {
+        use crate::stats::StatsRecorder;
+
+        // An existing recorder need not implement the new hook, even if it has
+        // an unrelated method named `record_actual_load_loop`.
+        struct DefaultRecorder;
+        impl DefaultRecorder {
+            fn record_actual_load_loop(&mut self, _: &str) {}
+        }
+        impl StatsRecorder for DefaultRecorder {
+            fn record_latency(&mut self, _: usize, _: usize, _: Duration) {}
+            fn record_tx_bytes(&mut self, _: usize, _: usize, _: usize) {}
+            fn record_rx_bytes(&mut self, _: usize, _: usize, _: usize) {}
+        }
+        let mut recorder = DefaultRecorder;
+        recorder.record_actual_load_loop("unrelated");
+        StatsRecorder::record_actual_load_loop_samples(&mut recorder, None, Some(1));
+
+        let mut a = TupleStatsCollector::default();
+        a.record_actual_load_loop(200, 400);
+        let mut b = TupleStatsCollector::default();
+        StatsRecorder::record_actual_load_loop_samples(&mut b, Some(100), Some(150));
+        let merged = TupleStatsCollector::merge(vec![a, TupleStatsCollector::default(), b]);
+        assert_eq!(merged.actual_load_loop_unix_us(), Some((100, 400)), "gaps are included");
+        assert_eq!(TupleStatsCollector::merge(vec![]).actual_load_loop_unix_us(), None);
+
+        let mut boundary = TupleStatsCollector::default();
+        boundary.record_actual_load_loop((1 << 53) - 1, (1 << 53) - 1);
+        assert_eq!(boundary.actual_load_loop_unix_us(), Some(((1 << 53) - 1, (1 << 53) - 1)));
+    }
+
+    #[test]
+    fn actual_load_loop_invalid_samples_invalidate_both_boundaries_across_merges() {
+        for (start, end) in [
+            (Some(100), Some(90)),
+            (None, Some(120)),
+            (Some(100), None),
+            (None, None),
+            (Some(1), Some(1 << 53)),
+            (Some(1 << 53), Some(1 << 53)),
+        ] {
+            for invalid_first in [false, true] {
+                let mut valid = TupleStatsCollector::default();
+                valid.record_actual_load_loop(110, 120);
+                let mut invalid = TupleStatsCollector::default();
+                invalid.record_actual_load_loop_samples(start, end);
+                // Once invalid, another sample in the same collector cannot restore it.
+                invalid.record_actual_load_loop(100, 200);
+                let workers = if invalid_first {
+                    vec![invalid, valid]
+                } else {
+                    vec![valid, invalid]
+                };
+                let merged = TupleStatsCollector::merge(workers);
+                assert_eq!(merged.actual_load_loop_unix_us(), None, "{start:?} {end:?}");
+                let mut later = TupleStatsCollector::default();
+                later.record_actual_load_loop(130, 140);
+                assert_eq!(
+                    TupleStatsCollector::merge(vec![merged, later]).actual_load_loop_unix_us(),
+                    None
+                );
+            }
+        }
     }
 
     #[test]

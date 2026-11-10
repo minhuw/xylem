@@ -54,6 +54,16 @@ the part of its time bucket inside the measured window, so the first and last
 buckets are not understated. All threads' time buckets count from the
 shared start.
 
+The JSON `experiment` object may also contain
+`actual_load_loop_start_unix_us` and `actual_load_loop_end_unix_us`: wall-clock
+microseconds since the Unix epoch on the machine running xylem. They give the
+earliest worker load-loop start and latest end, including any gaps between
+workers. Each loop starts after the shared start wait, ends before drain, and
+may include connection setup or warmup. These readings do not imply
+synchronization between guest and host clocks. Both fields are omitted if no
+interval was recorded or any worker's boundary is missing, reversed, or above
+`2^53 - 1`.
+
 ## Request accounting
 
 Each `requests` object in JSON (global and per group) counts measurement

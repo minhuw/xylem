@@ -302,6 +302,12 @@ pub struct ExperimentMetadata {
     /// throughput is computed over. Excludes connection setup and warmup.
     #[serde(default)]
     pub measured_duration_secs: f64,
+    /// Earliest actual worker load-loop start, as Unix microseconds on this host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_load_loop_start_unix_us: Option<u64>,
+    /// Latest actual worker load-loop end, before drain, as Unix microseconds on this host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_load_loop_end_unix_us: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
 }
@@ -403,6 +409,8 @@ impl DetailedExperimentResults {
         // warmup; collectors that never ran a worker fall back to `duration`.
         let measured = tuple_stats.measured_duration().unwrap_or(duration);
 
+        let actual_load_loop = tuple_stats.actual_load_loop_unix_us();
+
         // Aggregate global stats
         let global_aggregated = tuple_stats.aggregate_global(measured);
 
@@ -500,6 +508,8 @@ impl DetailedExperimentResults {
                 description: experiment_description,
                 duration_secs,
                 measured_duration_secs: measured.as_secs_f64(),
+                actual_load_loop_start_unix_us: actual_load_loop.map(|(start, _)| start),
+                actual_load_loop_end_unix_us: actual_load_loop.map(|(_, end)| end),
                 seed,
             },
             target: TargetMetadata {
