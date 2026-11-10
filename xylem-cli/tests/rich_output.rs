@@ -220,17 +220,18 @@ fn test_html_report_generation() {
         false, // include_records - not needed for HTML
     );
 
-    // Generate HTML to temp file
-    let temp_path = "/tmp/xylem_test_report.html";
-    let result = html::generate_html_report(&results, temp_path);
+    // Generate HTML to a temporary file owned by this test
+    let temp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
+    let temp_path = temp_dir.path().join("xylem_test_report.html");
+    let result = html::generate_html_report(&results, temp_path.to_str().unwrap());
 
     assert!(result.is_ok(), "HTML generation failed: {:?}", result.err());
 
     // Verify file was created
-    assert!(std::path::Path::new(temp_path).exists(), "HTML file was not created");
+    assert!(temp_path.exists(), "HTML file was not created");
 
     // Read and verify HTML content
-    let html_content = std::fs::read_to_string(temp_path).expect("Failed to read generated HTML");
+    let html_content = std::fs::read_to_string(&temp_path).expect("Failed to read generated HTML");
 
     // Verify essential HTML elements
     assert!(html_content.contains("<!DOCTYPE html>"));
@@ -241,9 +242,6 @@ fn test_html_report_generation() {
     assert!(html_content.contains("test-group"));
     assert!(html_content.contains("chart.js")); // Chart library included
     assert!(html_content.contains("canvas")); // Chart canvases present
-
-    // Clean up
-    std::fs::remove_file(temp_path).ok();
 }
 
 #[test]
