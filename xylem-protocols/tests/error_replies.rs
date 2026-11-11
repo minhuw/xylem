@@ -210,14 +210,17 @@ fn binary_response(opcode: u8, status: u16, key: &[u8], value: &[u8]) -> Vec<u8>
 }
 
 #[test]
-fn memcached_binary_statuses_are_error_replies_except_a_get_miss() {
+fn memcached_binary_statuses_are_error_replies_except_misses_and_conditions() {
     const GETK: u8 = 0x0c;
     const SET: u8 = 0x01;
     let replies = [
         binary_response(GETK, 0x0000, b"key:0", b"value"),
-        // A GET miss is not an error; a SET's missing key is
+        // A miss or a failed condition is a result, for any command
         binary_response(GETK, 0x0001, b"", b"Not found"),
         binary_response(SET, 0x0001, b"", b"Not found"),
+        binary_response(SET, 0x0002, b"", b"Data exists for key."),
+        binary_response(SET, 0x0005, b"", b"Not stored."),
+        binary_response(SET, 0x0004, b"", b"Invalid arguments"),
         binary_response(SET, 0x0003, b"", b"Too large."),
         binary_response(SET, 0x0082, b"", b"Out of memory"),
         binary_response(SET, 0x0000, b"", b""),
@@ -228,7 +231,10 @@ fn memcached_binary_statuses_are_error_replies_except_a_get_miss() {
     let errors = [
         None,
         None,
-        Some(("KEY_ENOENT", "Not found")),
+        None,
+        None,
+        None,
+        Some(("EINVAL", "Invalid arguments")),
         Some(("E2BIG", "Too large.")),
         Some(("ENOMEM", "Out of memory")),
         None,
@@ -243,7 +249,7 @@ fn memcached_binary_statuses_are_error_replies_except_a_get_miss() {
         MemcachedBinaryProtocol::with_workload(MemcachedOp::Set, KeyGeneration::sequential(0), 4)
             .with_udp_framing();
     protocol.next_request(0);
-    let response = datagram(0, 0, 1, &replies[3]);
+    let response = datagram(0, 0, 1, &replies[6]);
     let error = ErrorReply::new("E2BIG", "Too large.");
     assert_eq!(
         protocol.parse_response(0, &response).unwrap(),

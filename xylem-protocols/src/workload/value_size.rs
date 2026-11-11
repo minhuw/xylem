@@ -1,5 +1,6 @@
 //! Value size generation strategies
 
+use super::selector::{CommandSelector, WeightedCommandSelector};
 use rand::{
     distr::{Distribution as RandDistribution, Uniform},
     rngs::SmallRng,
@@ -97,6 +98,29 @@ impl ValueSizeGenerator for NormalSize {
         let sample = self.dist.sample();
         let clamped = sample.max(self.min as f64).min(self.max as f64);
         clamped as usize
+    }
+}
+
+/// Weighted size generator - draws each size from a weighted list, such as
+/// an empirical size histogram
+pub struct WeightedSize(WeightedCommandSelector<usize>);
+
+impl WeightedSize {
+    /// Create a weighted size generator over `(size, weight)` pairs; weights
+    /// must be finite and non-negative, and not all zero
+    pub fn with_seed(sizes: Vec<(usize, f64)>, seed: Option<u64>) -> anyhow::Result<Self> {
+        anyhow::ensure!(!sizes.is_empty(), "Weighted value sizes need at least one size");
+        anyhow::ensure!(
+            sizes.iter().all(|(_, weight)| weight.is_finite() && *weight >= 0.0),
+            "Weighted value size weights must be finite and >= 0"
+        );
+        Ok(Self(WeightedCommandSelector::with_seed(sizes, seed)?))
+    }
+}
+
+impl ValueSizeGenerator for WeightedSize {
+    fn next_size(&mut self) -> usize {
+        self.0.next_command()
     }
 }
 
@@ -200,6 +224,49 @@ mod tests {
         assert_eq!(gen.next_size_for_command("set"), 256);
         assert_eq!(gen.next_size_for_command("incr"), 128); // Uses default
         assert_eq!(gen.next_size(), 128); // Uses default
+    }
+}
+
+#[cfg(test)]
+mod weighted_tests {
+    use super::*;
+
+    #[test]
+    fn weighted_sizes_follow_their_weights_and_seed() {
+        let sizes = vec![(16, 0.7), (1024, 0.2), (65536, 0.1)];
+        let mut gen = WeightedSize::with_seed(sizes.clone(), Some(7)).unwrap();
+        let mut again = WeightedSize::with_seed(sizes, Some(7)).unwrap();
+        let mut counts = HashMap::new();
+        let samples = 20_000;
+        for _ in 0..samples {
+            let size = gen.next_size();
+            assert_eq!(size, again.next_size());
+            *counts.entry(size).or_insert(0usize) += 1;
+        }
+        assert_eq!(counts.len(), 3);
+        for (size, weight) in [(16, 0.7), (1024, 0.2), (65536, 0.1)] {
+            let share = counts[&size] as f64 / samples as f64;
+            assert!((share - weight).abs() < 0.02, "size {size}: {share}");
+        }
+    }
+
+    #[test]
+    fn a_zero_weight_size_never_appears() {
+        let mut gen = WeightedSize::with_seed(vec![(1, 0.0), (2, 3.0)], None).unwrap();
+        assert!((0..1000).all(|_| gen.next_size() == 2));
+    }
+
+    #[test]
+    fn invalid_weighted_sizes_are_rejected() {
+        for sizes in [
+            vec![],
+            vec![(1, 0.0)],
+            vec![(1, -1.0), (2, 2.0)],
+            vec![(1, f64::NAN)],
+            vec![(1, f64::INFINITY)],
+        ] {
+            assert!(WeightedSize::with_seed(sizes.clone(), None).is_err(), "{sizes:?}");
+        }
     }
 }
 

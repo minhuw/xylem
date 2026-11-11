@@ -835,6 +835,6 @@ mod config_parsing {
         assert!(config.random_data);
         assert!(config.value_size.is_some());
         assert_eq!(config.keys.prefix(), "mt:");
-        assert_eq!(config.operation, "set");
+        assert_eq!(config.operation.as_deref(), Some("set"));
     }
 }

@@ -26,15 +26,19 @@ That's an array with three elements:
 
 The server responds with:
 ```rust
-[0, 15, true, 42, "Masstree-0.1"]
+[0, 15, true, 0, "Bag"]
 ```
 
 That's:
 1. Sequence number 0
 2. Response code 15 (CMD_HANDSHAKE + 1)
 3. Success boolean
-4. Maximum sequence number (server tells you when to wrap around)
-5. Server version string
+4. Index of the server thread that serves the connection
+5. The server's row type (`Bag` by default)
+
+A failed handshake (a `maxkeylen` above the server's) is answered with
+`[0, 15, false, "bad maxkeylen"]` and the connection is closed; xylem stops
+the run with the server's reason.
 
 Xylem handles this automatically for each connection. You never see the handshake—it just works.
 
@@ -45,8 +49,9 @@ Every Masstree message is a MessagePack array. The structure depends on the comm
 **GET request**: `[seq, 2, key_string]`
 - Three elements: sequence number, command 2, the key
 
-**GET response**: `[seq, 3, value_string]`
-- Three elements: sequence number, response 3, the value (or error)
+**GET response**: `[seq, 3, column...]`
+- A hit carries every column of the row (one for a value stored by SET); a
+  miss echoes the request, `[seq, 3, key_string]`
 
 **SET (REPLACE) request**: `[seq, 8, key_string, value_string]`
 - Four elements: sequence, command 8, key, value
@@ -64,7 +69,15 @@ Every Masstree message is a MessagePack array. The structure depends on the comm
 - Variable length: sequence, command 4, starting key, count, optional field indices
 
 **SCAN response**: `[seq, 5, key1, value1, key2, value2, ...]`
-- Variable length: sequence, response 5, then alternating keys and values
+- Variable length: sequence, response 5, then alternating keys and values;
+  a value is a string for a one-column row and an array of columns otherwise
+
+**PUT, REMOVE and CHECKPOINT responses**: `[seq, 7, result_code]`,
+`[seq, 11, removed_bool]` and `[seq, 13]`
+
+A request the server does not run is answered `[seq, -1]`. Stackbench's `mtd`
+answers CHECKPOINT so on backends without blocking calls and keeps the
+connection; xylem counts it as an `Unsupported` error reply.
 
 MessagePack handles the binary encoding. Strings are length-prefixed (so they're binary-safe like RESP bulk strings), integers use the most compact representation (1-5 bytes depending on size), and arrays/maps have efficient headers. This makes the wire format more compact than RESP for numeric-heavy workloads.
 
@@ -72,15 +85,13 @@ MessagePack handles the binary encoding. Strings are length-prefixed (so they're
 
 Each request has a 16-bit sequence number. The client picks the sequence, the server echoes it back. This enables pipelining—send multiple requests without waiting, then match responses by sequence number.
 
-Xylem manages sequences per-connection automatically. It starts at 1 (0 is reserved for handshake), increments on each request, and wraps around at the server's max (typically 2^16-1).
-
-Unlike Redis where responses come back in FIFO order, Masstree can reorder responses since they're tagged by sequence. Single-connection operations usually preserve order, but the protocol allows out-of-order completion for high concurrency scenarios.
+Xylem manages sequences per-connection automatically: the handshake uses 0, and the requests after it count from 0 again, wrapping at 2^16. The server answers a connection's requests in order.
 
 ## The Operations
 
 Each operation serves specific benchmarking purposes.
 
-**GET** retrieves a value by key. It's your basic read operation. Benchmark GET to measure read latency, snapshot isolation behavior, and how Masstree handles concurrent readers. If the key doesn't exist, you get a NotFound result code (-2).
+**GET** retrieves a value by key. It's your basic read operation. Benchmark GET to measure read latency, snapshot isolation behavior, and how Masstree handles concurrent readers. If the key doesn't exist, the server echoes the key instead of the row's columns.
 
 **SET (REPLACE)** stores or updates a value. Masstree calls it REPLACE because it replaces any existing value atomically. This isn't an upsert in the SQL sense—it's a blind write that doesn't check the old value. Benchmark SET to test write throughput, MVCC overhead, and how concurrent writes interact with readers.
 
@@ -88,9 +99,9 @@ Each operation serves specific benchmarking purposes.
 
 **REMOVE** deletes a key. Unlike some systems, Masstree removal is immediate (within the current snapshot)—it doesn't wait for garbage collection. Benchmark this to test deletion throughput and how removed keys affect memory and performance.
 
-**SCAN** performs range queries. You specify a starting key ("user:1000"), a count, and optionally which fields to retrieve. The response alternates keys and values: `[seq, 5, "user:1000", {data}, "user:1001", {data}, ...]`. This tests ordered access patterns like leaderboards, time-series queries, and scenarios where sorted iteration matters.
+**SCAN** performs range queries. Each scan starts at a key drawn from the key distribution (inclusive), and returns up to `count` rows with the listed fields. The response alternates keys and values: `[seq, 5, "user:1000", value, "user:1001", value, ...]`. This tests ordered access patterns like leaderboards, time-series queries, and scenarios where sorted iteration matters.
 
-**CHECKPOINT** triggers a database snapshot. Masstree persists state by checkpointing to disk periodically. Calling CHECKPOINT explicitly forces this, which is useful for testing recovery time, checkpoint overhead, and consistency guarantees. The response is immediate, but the actual checkpoint happens asynchronously.
+**CHECKPOINT** triggers a database snapshot. Masstree persists state by checkpointing to disk periodically. Calling CHECKPOINT explicitly forces this, which is useful for testing recovery time, checkpoint overhead, and consistency guarantees. The response is immediate, but the actual checkpoint happens asynchronously. A server started without logging (`mtd -n`) has nothing to checkpoint.
 
 ### Result Codes
 
@@ -121,38 +132,21 @@ Start with pure operations. A GET-only workload tests read performance under sna
 operation = "get"
 ```
 
-But production databases handle mixed workloads. A Masstree traffic group runs a single operation, so model a mix with one group per operation and split the rate between them. A typical application with 60% reads, 30% updates, 10% deletes:
+But production databases handle mixed workloads. `operations` takes the shape of [Redis's](redis.md): a fixed operation, or a weighted random mix. A typical application with 60% reads, 30% updates, 10% deletes:
 
 ```toml
-[[traffic_groups]]
-name = "reads"
-protocol = "masstree"
-target = "127.0.0.1:2117"
-threads = [0, 1, 2, 3]
-connections_per_thread = 6
-traffic_policy = { type = "fixed-rate", rate = 60000.0 }
-protocol_config = { operation = "get" }
-
-[[traffic_groups]]
-name = "updates"
-protocol = "masstree"
-target = "127.0.0.1:2117"
-threads = [0, 1, 2, 3]
-connections_per_thread = 3
-traffic_policy = { type = "fixed-rate", rate = 30000.0 }
-protocol_config = { operation = "set" }
-
-[[traffic_groups]]
-name = "deletes"
-protocol = "masstree"
-target = "127.0.0.1:2117"
-threads = [0, 1, 2, 3]
-connections_per_thread = 1
-traffic_policy = { type = "fixed-rate", rate = 10000.0 }
-protocol_config = { operation = "remove" }
+[traffic_groups.protocol_config.operations]
+strategy = "weighted"
+commands = [
+    { name = "get", weight = 0.6 },
+    { name = "set", weight = 0.3 },
+    { name = "remove", weight = 0.1 },
+]
 ```
 
-Add column-based updates to model partial record modifications. `put_columns` sets how many columns each PUT writes, starting at column 0; Xylem sends each column an empty value:
+Set `operation` or `operations`, not both. In a mix, `scan` takes the parameters `count` and `fields` (column indices) and `put` takes `columns`; without them a command uses the top-level `scan` and `put_columns`. A command may also draw its keys from its own `keys` distribution, with the group's prefix and value size.
+
+Add column-based updates to model partial record modifications. `put_columns` sets how many columns each PUT writes, starting at column 0; each column is a value of the value size:
 
 ```toml
 [traffic_groups.protocol_config]
@@ -160,7 +154,7 @@ operation = "put"
 put_columns = 2  # Update columns 0 and 1 (e.g., timestamp and counter)
 ```
 
-Include range queries for analytics workloads. Each SCAN starts at the first key and returns up to `count` records with the listed fields, or every field if `fields` is empty:
+Include range queries for analytics workloads. Each SCAN starts at a key drawn from the key distribution and returns up to `count` records with the listed column indices, or every column if `fields` is empty:
 
 ```toml
 [traffic_groups.protocol_config]
@@ -253,7 +247,15 @@ min = 512
 max = 4096
 ```
 
-This models caching patterns where reads are metadata lookups and writes are full document stores.
+Or a weighted list of sizes, such as a measured histogram:
+
+```toml
+[traffic_groups.protocol_config.value_size]
+strategy = "weighted"
+sizes = [{ size = 64, weight = 0.9 }, { size = 4096, weight = 0.1 }]
+```
+
+Each SET value and each PUT column draws its own size; `per_command` gives `set` and `put` different sizes. This models caching patterns where reads are metadata lookups and writes are full document stores.
 
 ## MVCC and Snapshot Isolation
 

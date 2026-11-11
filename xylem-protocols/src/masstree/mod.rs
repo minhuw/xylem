@@ -1,36 +1,48 @@
 //! Masstree protocol implementation
 //!
-//! Masstree uses MessagePack (msgpack) for serialization.
+//! Masstree (`mtd`, `kvproto.hh`) speaks MessagePack: every request and
+//! response is one array that starts with the sequence number and the
+//! command; a response's command is the request's plus one, and its
+//! sequence number is the request's.
 //!
-//! Request format:
-//! - GET: [seq, 2, key_str]
-//! - SET/REPLACE: [seq, 8, key_str, value_str]
-//! - HANDSHAKE: [0, 14, {"core": -1, "maxkeylen": 255}]
+//! Requests:
+//! - HANDSHAKE: `[0, 14, {"core": -1, "maxkeylen": 255}]`
+//! - GET: `[seq, 2, key]`
+//! - SCAN: `[seq, 4, firstkey, count, column...]`, the `count` keys from
+//!   `firstkey` on (inclusive), with the listed columns (all if none)
+//! - PUT: `[seq, 6, key, column, value, column, value, ...]`
+//! - REPLACE (Xylem's SET): `[seq, 8, key, value]`
+//! - REMOVE: `[seq, 10, key]`
+//! - CHECKPOINT: `[seq, 12]`
 //!
-//! Response format:
-//! - GET response: [seq, 3, value_str]
-//! - SET response: [seq, 9, result_u8]
-//! - HANDSHAKE response: [0, 15, success_bool, max_seq_u32, version_str]
-//!
-//! Command codes:
-//! - Cmd_Get = 2 (response: Cmd_Get + 1 = 3)
-//! - Cmd_Replace = 8 (response: Cmd_Replace + 1 = 9)
-//! - Cmd_Handshake = 14 (response: Cmd_Handshake + 1 = 15)
+//! Responses:
+//! - HANDSHAKE: `[0, 15, true, thread_index, row_type]`, or
+//!   `[0, 15, false, reason]` when it fails, after which the server closes
+//!   the connection
+//! - GET: `[seq, 3, column...]` with every column of a hit, or the request
+//!   echoed (`[seq, 3, key]`) for a miss
+//! - SCAN: `[seq, 5, key, value, ...]`, each value a string for a
+//!   one-column row and an array of columns otherwise
+//! - PUT, REPLACE: `[seq, 7 or 9, result]`, a [`ResultCode`]
+//! - REMOVE: `[seq, 11, removed]`
+//! - CHECKPOINT: `[seq, 13]`
+//! - a command the server does not run: `[seq, -1]`
 //!
 //! A PUT or REPLACE response whose result code is Retry or OutOfDate, or a
-//! code outside [`ResultCode`], is an error reply named by the code. A
-//! missing key is not an error: the server answers a GET miss with the key
-//! itself, and NotFound is a successful result. A failed handshake fails
-//! the run.
+//! code outside [`ResultCode`], is an error reply named by the code, and so
+//! is `[seq, -1]` (`Unsupported`; a Stackbench `mtd` without blocking calls
+//! answers CHECKPOINT so). A missing key is not an error: the server
+//! answers a GET miss with the key itself, and NotFound is a successful
+//! result. A failed handshake fails the run.
 
 mod config;
 
+use crate::workload::{CommandSelector, FixedCommandSelector, ValueSizeGenerator};
 use crate::{ErrorReply, Parsed, Protocol};
-use anyhow::{anyhow, Result};
-use rmp::decode;
+use anyhow::{anyhow, bail, ensure, Result};
 use rmp::encode;
 use std::collections::HashMap;
-use std::io::{Cursor, Write};
+use std::io::Write;
 
 // Masstree command codes
 const CMD_GET: u8 = 2;
@@ -40,6 +52,8 @@ const CMD_REPLACE: u8 = 8;
 const CMD_REMOVE: u8 = 10;
 const CMD_CHECKPOINT: u8 = 12;
 const CMD_HANDSHAKE: u8 = 14;
+/// Command of the response to a request the server does not run
+const CMD_UNSUPPORTED: i64 = -1;
 
 /// Masstree result codes
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,14 +69,14 @@ pub enum ResultCode {
 }
 
 /// The error reply of a PUT or REPLACE result code, `None` for a success
-fn result_error(code: i8) -> Option<ErrorReply<'static>> {
-    const RETRY: i8 = ResultCode::Retry as i8;
-    const OUT_OF_DATE: i8 = ResultCode::OutOfDate as i8;
+fn result_error(code: i64) -> Option<ErrorReply<'static>> {
+    const RETRY: i64 = ResultCode::Retry as i64;
+    const OUT_OF_DATE: i64 = ResultCode::OutOfDate as i64;
     let kind = match code {
         RETRY => "Retry",
         OUT_OF_DATE => "OutOfDate",
         // NotFound, Inserted, Updated, Found, ScanDone
-        code if (ResultCode::NotFound as i8..=ResultCode::ScanDone as i8).contains(&code) => {
+        code if (ResultCode::NotFound as i64..=ResultCode::ScanDone as i64).contains(&code) => {
             return None
         }
         _ => "UnknownResult",
@@ -70,23 +84,37 @@ fn result_error(code: i8) -> Option<ErrorReply<'static>> {
     Some(ErrorReply::new(kind, kind))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MasstreeOp {
     Get,
+    /// Replace the whole row with one value
     Set,
-    /// Put with column-based update: [(col_idx, value), ...]
+    /// Write columns `0..columns`, each a value of the value size
     Put {
-        columns: Vec<(u32, Vec<u8>)>,
+        columns: u32,
     },
     Remove,
-    /// Scan from firstkey, return up to count key-value pairs
-    /// Optional field indices to return specific fields
+    /// Scan `count` rows from the key on, returning the `fields` columns
+    /// (all if empty)
     Scan {
-        firstkey: String,
         count: u32,
         fields: Vec<u32>,
     },
     Checkpoint,
+}
+
+impl MasstreeOp {
+    /// Command name, as `value_size.per_command` keys sizes
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Set => "SET",
+            Self::Put { .. } => "PUT",
+            Self::Remove => "REMOVE",
+            Self::Scan { .. } => "SCAN",
+            Self::Checkpoint => "CHECKPOINT",
+        }
+    }
 }
 
 /// Insert phase state for data population before measurement
@@ -143,15 +171,18 @@ enum HandshakeState {
 }
 
 pub struct MasstreeProtocol {
-    operation: MasstreeOp,
+    /// Operation of each measurement request
+    selector: Box<dyn CommandSelector<MasstreeOp>>,
     /// Per-connection sequence numbers
     conn_send_seq: HashMap<usize, u16>,
     /// Per-connection handshake state
     conn_handshake_state: HashMap<usize, HandshakeState>,
     /// Key generator for next_request()
     key_gen: Option<crate::workload::KeyGeneration>,
-    /// Value size for next_request()
+    /// Value size for next_request() without a size generator
     value_size: usize,
+    /// Value sizes of SET and PUT columns, by command name
+    value_sizes: Option<Box<dyn ValueSizeGenerator>>,
     /// Key prefix for generated keys (default: "key:")
     key_prefix: String,
     /// Whether to use random data for values instead of repeated 'x'
@@ -165,11 +196,12 @@ pub struct MasstreeProtocol {
 impl MasstreeProtocol {
     pub fn new(operation: MasstreeOp) -> Self {
         Self {
-            operation,
+            selector: Box::new(FixedCommandSelector::new(operation)),
             conn_send_seq: HashMap::new(),
             conn_handshake_state: HashMap::new(),
             key_gen: None,
             value_size: 64,
+            value_sizes: None,
             key_prefix: "key:".to_string(),
             random_data: false,
             rng: None,
@@ -216,16 +248,31 @@ impl MasstreeProtocol {
         };
 
         Self {
-            operation,
+            selector: Box::new(FixedCommandSelector::new(operation)),
             conn_send_seq: HashMap::new(),
             conn_handshake_state: HashMap::new(),
             key_gen: Some(key_gen),
             value_size,
+            value_sizes: None,
             key_prefix,
             random_data,
             rng,
             insert_phase,
         }
+    }
+
+    /// Select each measurement operation with `selector` instead of the one
+    /// operation
+    pub fn with_operations(mut self, selector: Box<dyn CommandSelector<MasstreeOp>>) -> Self {
+        self.selector = selector;
+        self
+    }
+
+    /// Draw the size of every SET value and PUT column from `sizes`, by
+    /// command name
+    pub fn with_value_size_generator(mut self, sizes: Box<dyn ValueSizeGenerator>) -> Self {
+        self.value_sizes = Some(sizes);
+        self
     }
 
     /// Set the insert phase configuration
@@ -280,6 +327,14 @@ impl MasstreeProtocol {
         }
     }
 
+    /// The size of the next value of `op`
+    fn next_value_size(&mut self, op: &MasstreeOp) -> usize {
+        match &mut self.value_sizes {
+            Some(sizes) => sizes.next_size_for_command(op.name()),
+            None => self.value_size,
+        }
+    }
+
     /// Build a handshake request: [0, 14, {"core": -1, "maxkeylen": 255}]
     fn build_handshake(&self) -> Result<Vec<u8>> {
         let mut buf = Vec::with_capacity(128);
@@ -307,102 +362,60 @@ impl MasstreeProtocol {
         Ok(buf)
     }
 
+    /// Start a request array of `len` elements: [seq, cmd, ...]
+    fn start_request(buf: &mut Vec<u8>, len: u32, seq: u16, cmd: u8) -> Result<()> {
+        encode::write_array_len(buf, len)?;
+        encode::write_u32(buf, seq as u32)?;
+        encode::write_u8(buf, cmd)?;
+        Ok(())
+    }
+
+    /// Write `value` as a msgpack string, as mtclient sends values
+    fn write_value(buf: &mut Vec<u8>, value: &[u8]) -> Result<()> {
+        encode::write_str_len(buf, value.len() as u32)?;
+        buf.write_all(value)?;
+        Ok(())
+    }
+
     /// Build a GET request: [seq, 2, key_str]
     fn build_get_request(&self, seq: u16, key: &str) -> Result<Vec<u8>> {
-        let mut buf = Vec::with_capacity(256);
-
-        // Array of 3 elements: [seq, cmd, key]
-        encode::write_array_len(&mut buf, 3)?;
-
-        // seq (u32)
-        encode::write_u32(&mut buf, seq as u32)?;
-
-        // cmd = 2 (Cmd_Get)
-        encode::write_u8(&mut buf, CMD_GET)?;
-
-        // key as string
+        let mut buf = Vec::with_capacity(32 + key.len());
+        Self::start_request(&mut buf, 3, seq, CMD_GET)?;
         encode::write_str(&mut buf, key)?;
-
         Ok(buf)
     }
 
     /// Build a SET/REPLACE request: [seq, 8, key_str, value_str]
     fn build_set_request(&self, seq: u16, key: &str, value: &[u8]) -> Result<Vec<u8>> {
-        let mut buf = Vec::with_capacity(256 + value.len());
-
-        // Array of 4 elements: [seq, cmd, key, value]
-        encode::write_array_len(&mut buf, 4)?;
-
-        // seq (u32)
-        encode::write_u32(&mut buf, seq as u32)?;
-
-        // cmd = 8 (Cmd_Replace)
-        encode::write_u8(&mut buf, CMD_REPLACE)?;
-
-        // key as string
+        let mut buf = Vec::with_capacity(32 + key.len() + value.len());
+        Self::start_request(&mut buf, 4, seq, CMD_REPLACE)?;
         encode::write_str(&mut buf, key)?;
-
-        // value as string (not binary, to match lancet implementation)
-        encode::write_str_len(&mut buf, value.len() as u32)?;
-        buf.write_all(value)?;
-
+        Self::write_value(&mut buf, value)?;
         Ok(buf)
     }
 
     /// Build a PUT request: [seq, 6, key_str, col_idx, value, col_idx, value, ...]
-    fn build_put_request(
-        &self,
-        seq: u16,
-        key: &str,
-        columns: &[(u32, Vec<u8>)],
-    ) -> Result<Vec<u8>> {
-        // Estimate size: header + key + column data
-        let total_value_size: usize = columns.iter().map(|(_, v)| v.len()).sum();
-        let mut buf = Vec::with_capacity(256 + total_value_size);
-
-        // Array size: seq, cmd, key, + (col_idx, value) pairs
-        let array_len = 3 + (columns.len() * 2);
-        encode::write_array_len(&mut buf, array_len as u32)?;
-
-        // seq (u32)
-        encode::write_u32(&mut buf, seq as u32)?;
-
-        // cmd = 6 (Cmd_Put)
-        encode::write_u8(&mut buf, CMD_PUT)?;
-
-        // key as string
+    fn build_put_request(&self, seq: u16, key: &str, columns: &[Vec<u8>]) -> Result<Vec<u8>> {
+        let total_value_size: usize = columns.iter().map(Vec::len).sum();
+        let mut buf = Vec::with_capacity(32 + key.len() + total_value_size + columns.len() * 10);
+        Self::start_request(&mut buf, 3 + 2 * columns.len() as u32, seq, CMD_PUT)?;
         encode::write_str(&mut buf, key)?;
-
-        // Write column index and value pairs
-        for (col_idx, value) in columns {
-            encode::write_u32(&mut buf, *col_idx)?;
-            encode::write_str_len(&mut buf, value.len() as u32)?;
-            buf.write_all(value)?;
+        for (col_idx, value) in columns.iter().enumerate() {
+            encode::write_u32(&mut buf, col_idx as u32)?;
+            Self::write_value(&mut buf, value)?;
         }
-
         Ok(buf)
     }
 
     /// Build a REMOVE request: [seq, 10, key_str]
     fn build_remove_request(&self, seq: u16, key: &str) -> Result<Vec<u8>> {
-        let mut buf = Vec::with_capacity(256);
-
-        // Array of 3 elements: [seq, cmd, key]
-        encode::write_array_len(&mut buf, 3)?;
-
-        // seq (u32)
-        encode::write_u32(&mut buf, seq as u32)?;
-
-        // cmd = 10 (Cmd_Remove)
-        encode::write_u8(&mut buf, CMD_REMOVE)?;
-
-        // key as string
+        let mut buf = Vec::with_capacity(32 + key.len());
+        Self::start_request(&mut buf, 3, seq, CMD_REMOVE)?;
         encode::write_str(&mut buf, key)?;
-
         Ok(buf)
     }
 
-    /// Build a SCAN request: [seq, 4, firstkey_str, count_i32, field1_idx, field2_idx, ...]
+    /// Build a SCAN request: [seq, 4, firstkey_str, count, field1_idx, field2_idx, ...]
     fn build_scan_request(
         &self,
         seq: u16,
@@ -410,45 +423,21 @@ impl MasstreeProtocol {
         count: u32,
         fields: &[u32],
     ) -> Result<Vec<u8>> {
-        let mut buf = Vec::with_capacity(256 + (fields.len() * 4));
-
-        // Array size: seq, cmd, firstkey, count, + field indices
-        let array_len = 4 + fields.len();
-        encode::write_array_len(&mut buf, array_len as u32)?;
-
-        // seq (u32)
-        encode::write_u32(&mut buf, seq as u32)?;
-
-        // cmd = 4 (Cmd_Scan)
-        encode::write_u8(&mut buf, CMD_SCAN)?;
-
-        // firstkey as string
+        let mut buf = Vec::with_capacity(32 + firstkey.len() + fields.len() * 5);
+        Self::start_request(&mut buf, 4 + fields.len() as u32, seq, CMD_SCAN)?;
         encode::write_str(&mut buf, firstkey)?;
-
-        // count (must be > 0)
+        // count (must be > 0: mtd asserts it)
         encode::write_u32(&mut buf, count)?;
-
-        // Optional field indices
         for field_idx in fields {
             encode::write_u32(&mut buf, *field_idx)?;
         }
-
         Ok(buf)
     }
 
     /// Build a CHECKPOINT request: [seq, 12]
     fn build_checkpoint_request(&self, seq: u16) -> Result<Vec<u8>> {
-        let mut buf = Vec::with_capacity(64);
-
-        // Array of 2 elements: [seq, cmd]
-        encode::write_array_len(&mut buf, 2)?;
-
-        // seq (u32)
-        encode::write_u32(&mut buf, seq as u32)?;
-
-        // cmd = 12 (Cmd_Checkpoint)
-        encode::write_u8(&mut buf, CMD_CHECKPOINT)?;
-
+        let mut buf = Vec::with_capacity(8);
+        Self::start_request(&mut buf, 2, seq, CMD_CHECKPOINT)?;
         Ok(buf)
     }
 }
@@ -460,43 +449,33 @@ impl Default for MasstreeProtocol {
 }
 
 impl MasstreeProtocol {
-    /// Internal method to generate a request with specific key and value size
+    /// Encode the request of `op` on `key`
     /// Note: Caller should check handshake state before calling this
-    fn generate_request_internal(
-        &mut self,
-        conn_id: usize,
-        key: u64,
-        value_size: usize,
-    ) -> crate::Request<(usize, u16)> {
-        let seq = self.next_send_seq(conn_id);
+    fn encode(&mut self, op: &MasstreeOp, seq: u16, key: u64) -> Result<Vec<u8>> {
         // Format key with configurable prefix
         let key_str = self.format_key(key);
-
-        let request = match &self.operation {
-            MasstreeOp::Get => {
-                self.build_get_request(seq, &key_str).expect("Failed to build GET request")
-            }
+        match op {
+            MasstreeOp::Get => self.build_get_request(seq, &key_str),
             MasstreeOp::Set => {
-                // Generate value using configurable data generation
-                let value = self.generate_value(value_size);
+                let size = self.next_value_size(op);
+                let value = self.generate_value(size);
                 self.build_set_request(seq, &key_str, &value)
-                    .expect("Failed to build SET request")
             }
-            MasstreeOp::Put { columns } => self
-                .build_put_request(seq, &key_str, columns)
-                .expect("Failed to build PUT request"),
-            MasstreeOp::Remove => self
-                .build_remove_request(seq, &key_str)
-                .expect("Failed to build REMOVE request"),
-            MasstreeOp::Scan { firstkey, count, fields } => self
-                .build_scan_request(seq, firstkey, *count, fields)
-                .expect("Failed to build SCAN request"),
-            MasstreeOp::Checkpoint => {
-                self.build_checkpoint_request(seq).expect("Failed to build CHECKPOINT request")
+            MasstreeOp::Put { columns } => {
+                let values: Vec<_> = (0..*columns)
+                    .map(|_| {
+                        let size = self.next_value_size(op);
+                        self.generate_value(size)
+                    })
+                    .collect();
+                self.build_put_request(seq, &key_str, &values)
             }
-        };
-
-        crate::Request::measurement(request, (conn_id, seq))
+            MasstreeOp::Remove => self.build_remove_request(seq, &key_str),
+            MasstreeOp::Scan { count, fields } => {
+                self.build_scan_request(seq, &key_str, *count, fields)
+            }
+            MasstreeOp::Checkpoint => self.build_checkpoint_request(seq),
+        }
     }
 }
 
@@ -527,8 +506,19 @@ impl Protocol for MasstreeProtocol {
         }
 
         // Phase 3: Normal measurement phase
-        let key = self.key_gen.as_mut().map(|g| g.next_key()).unwrap_or(0);
-        self.generate_request_internal(conn_id, key, self.value_size)
+        let op = self.selector.next_command();
+        let key = if self.selector.has_per_command_keys() {
+            self.selector
+                .generate_key_for_command(&op)
+                .expect("a selector with per-command keys generates them")
+        } else {
+            self.key_gen.as_mut().map(|g| g.next_key()).unwrap_or(0)
+        };
+        let seq = self.next_send_seq(conn_id);
+        let request = self
+            .encode(&op, seq, key)
+            .unwrap_or_else(|e| panic!("Failed to build {} request: {e}", op.name()));
+        crate::Request::measurement(request, (conn_id, seq))
     }
 
     fn parse_response<'a>(
@@ -536,103 +526,23 @@ impl Protocol for MasstreeProtocol {
         conn_id: usize,
         data: &'a [u8],
     ) -> Result<Parsed<'a, (usize, u16)>> {
-        if data.is_empty() {
+        let Some(response) = Response::parse(data)? else {
             return Ok(Parsed::Incomplete);
-        }
-
-        let mut cursor = Cursor::new(data);
-        let start_position = cursor.position();
-
-        // Try to parse MessagePack array header
-        let array_len = match decode::read_array_len(&mut cursor) {
-            Ok(len) if len >= 2 => len,
-            Ok(_) => return Err(anyhow!("Invalid Masstree response: array too short")),
-            Err(_) => return Ok(Parsed::Incomplete), // Incomplete data
         };
-
-        // Read sequence number (u32)
-        let seq = match decode::read_int::<u32, _>(&mut cursor) {
-            Ok(s) => s,
-            Err(_) => return Ok(Parsed::Incomplete), // Incomplete data
+        let id = (conn_id, response.seq as u16);
+        let error = match response.body {
+            Body::Done => None,
+            Body::Result(code) => result_error(code),
+            Body::Unsupported => Some(ErrorReply::new("Unsupported", "Unsupported command")),
+            Body::Handshake(Ok(())) => {
+                self.mark_handshake_done(conn_id);
+                None
+            }
+            Body::Handshake(Err(reason)) => {
+                bail!("Masstree handshake failed on connection {conn_id}: {reason}")
+            }
         };
-
-        // Read command (u8)
-        let cmd = match decode::read_int::<u8, _>(&mut cursor) {
-            Ok(c) => c,
-            Err(_) => return Ok(Parsed::Incomplete), // Incomplete data
-        };
-
-        // Parse based on command type (response = request + 1)
-        match cmd {
-            // GET response: [seq, 3, value_str]
-            3 => {
-                if array_len != 3 {
-                    return Err(anyhow!(
-                        "Invalid GET response: expected 3 elements, got {}",
-                        array_len
-                    ));
-                }
-                self.parse_get_response(conn_id, seq, &mut cursor, data, start_position)
-            }
-            // SCAN response: [seq, 5, key1_str, value1, key2_str, value2, ...]
-            5 => {
-                // SCAN response has variable length (2 + 2*count)
-                self.parse_scan_response(conn_id, seq, &mut cursor, data, start_position, array_len)
-            }
-            // PUT response: [seq, 7, result_u8]
-            7 => {
-                if array_len != 3 {
-                    return Err(anyhow!(
-                        "Invalid PUT response: expected 3 elements, got {}",
-                        array_len
-                    ));
-                }
-                self.parse_put_response(conn_id, seq, &mut cursor)
-            }
-            // REPLACE response: [seq, 9, result_u8]
-            9 => {
-                if array_len != 3 {
-                    return Err(anyhow!(
-                        "Invalid REPLACE response: expected 3 elements, got {}",
-                        array_len
-                    ));
-                }
-                self.parse_replace_response(conn_id, seq, &mut cursor)
-            }
-            // REMOVE response: [seq, 11, removed_bool]
-            11 => {
-                if array_len != 3 {
-                    return Err(anyhow!(
-                        "Invalid REMOVE response: expected 3 elements, got {}",
-                        array_len
-                    ));
-                }
-                self.parse_remove_response(conn_id, seq, &mut cursor)
-            }
-            // CHECKPOINT response: [seq, 13]
-            13 => {
-                if array_len != 2 {
-                    return Err(anyhow!(
-                        "Invalid CHECKPOINT response: expected 2 elements, got {}",
-                        array_len
-                    ));
-                }
-                // Checkpoint response is just [seq, cmd], no additional data
-                let bytes_consumed = cursor.position() as usize;
-                Ok(Parsed::ok(bytes_consumed, (conn_id, seq as u16)))
-            }
-            // HANDSHAKE response: [0, 15, success_bool, thread_id_u32, version_str]
-            15 => {
-                if array_len != 5 {
-                    return Err(anyhow!(
-                        "Invalid HANDSHAKE response: expected 5 elements, got {}",
-                        array_len
-                    ));
-                }
-                self.parse_handshake_response(conn_id, &mut cursor, data, start_position)
-            }
-            _ => Err(anyhow!("Unknown Masstree response command: {}", cmd)),
-        }
+        Ok(Parsed::Complete { consumed: response.len, id, error })
     }
 
     fn name(&self) -> &'static str {
@@ -642,8 +552,12 @@ impl Protocol for MasstreeProtocol {
     fn reset(&mut self) {
         self.conn_send_seq.clear();
         self.conn_handshake_state.clear();
+        self.selector.reset();
         if let Some(ref mut key_gen) = self.key_gen {
             key_gen.reset();
+        }
+        if let Some(sizes) = &mut self.value_sizes {
+            sizes.reset();
         }
     }
 
@@ -667,180 +581,338 @@ impl Protocol for MasstreeProtocol {
     }
 }
 
-// Helper methods for parsing different response types
-impl MasstreeProtocol {
-    fn parse_get_response(
-        &mut self,
-        conn_id: usize,
-        seq: u32,
-        cursor: &mut Cursor<&[u8]>,
-        data: &[u8],
-        _start_position: u64,
-    ) -> Result<Parsed<'static, (usize, u16)>> {
-        // Read value string length
-        let str_len = match decode::read_str_len(cursor) {
-            Ok(len) => len as usize,
-            Err(_) => return Ok(Parsed::Incomplete), // Incomplete data
+/// One complete response
+#[derive(Debug, PartialEq)]
+struct Response {
+    /// Its length in bytes
+    len: usize,
+    seq: u32,
+    body: Body,
+}
+
+/// What a response says
+#[derive(Debug, PartialEq)]
+enum Body {
+    /// GET, SCAN, REMOVE and CHECKPOINT: done, whatever they found
+    Done,
+    /// PUT and REPLACE: a result code
+    Result(i64),
+    /// `[seq, -1]`: the server did not run the command
+    Unsupported,
+    /// HANDSHAKE: success, or the server's reason for failing
+    Handshake(std::result::Result<(), String>),
+}
+
+impl Response {
+    /// The response at the start of `data`, `None` while it is incomplete
+    fn parse(data: &[u8]) -> Result<Option<Self>> {
+        let mut reader = Reader { data, pos: 0, read: 0 };
+        let Some(array_len) = reader.array_len()? else {
+            return Ok(None);
         };
-
-        let position = cursor.position() as usize;
-        // Check if we have the full string data
-        if position + str_len <= data.len() {
-            // Advance cursor past the string data
-            cursor.set_position((position + str_len) as u64);
-            let total_consumed = cursor.position() as usize;
-            Ok(Parsed::ok(total_consumed, (conn_id, seq as u16)))
-        } else {
-            Ok(Parsed::Incomplete) // Incomplete data
-        }
-    }
-
-    fn parse_replace_response(
-        &mut self,
-        conn_id: usize,
-        seq: u32,
-        cursor: &mut Cursor<&[u8]>,
-    ) -> Result<Parsed<'static, (usize, u16)>> {
-        // Read result byte (ResultCode enum)
-        match decode::read_int::<i8, _>(cursor) {
-            Ok(result) => {
-                let bytes_consumed = cursor.position() as usize;
-                let id = (conn_id, seq as u16);
-                Ok(Parsed::Complete {
-                    consumed: bytes_consumed,
-                    id,
-                    error: result_error(result),
-                })
-            }
-            Err(_) => Ok(Parsed::Incomplete), // Incomplete data
-        }
-    }
-
-    fn parse_put_response(
-        &mut self,
-        conn_id: usize,
-        seq: u32,
-        cursor: &mut Cursor<&[u8]>,
-    ) -> Result<Parsed<'static, (usize, u16)>> {
-        // Read result byte (ResultCode enum)
-        match decode::read_int::<i8, _>(cursor) {
-            Ok(result) => {
-                let bytes_consumed = cursor.position() as usize;
-                let id = (conn_id, seq as u16);
-                Ok(Parsed::Complete {
-                    consumed: bytes_consumed,
-                    id,
-                    error: result_error(result),
-                })
-            }
-            Err(_) => Ok(Parsed::Incomplete), // Incomplete data
-        }
-    }
-
-    fn parse_remove_response(
-        &mut self,
-        conn_id: usize,
-        seq: u32,
-        cursor: &mut Cursor<&[u8]>,
-    ) -> Result<Parsed<'static, (usize, u16)>> {
-        // Read removed boolean
-        match decode::read_bool(cursor) {
-            Ok(_removed) => {
-                let bytes_consumed = cursor.position() as usize;
-                Ok(Parsed::ok(bytes_consumed, (conn_id, seq as u16)))
-            }
-            Err(_) => Ok(Parsed::Incomplete), // Incomplete data
-        }
-    }
-
-    fn parse_scan_response(
-        &mut self,
-        conn_id: usize,
-        seq: u32,
-        cursor: &mut Cursor<&[u8]>,
-        data: &[u8],
-        _start_position: u64,
-        array_len: u32,
-    ) -> Result<Parsed<'static, (usize, u16)>> {
-        // SCAN response: [seq, 5, key1_str, value1, key2_str, value2, ...]
-        // Array length = 2 + 2*count (seq, cmd, then key-value pairs)
-
-        if array_len < 2 {
-            return Err(anyhow!("Invalid SCAN response: array too short"));
-        }
-
-        // We already read seq and cmd, now read key-value pairs
-        let num_pairs = (array_len - 2) / 2;
-
-        for _ in 0..num_pairs {
-            // Read key string
-            let key_len = match decode::read_str_len(cursor) {
-                Ok(len) => len as usize,
-                Err(_) => return Ok(Parsed::Incomplete), // Incomplete data
-            };
-
-            let position = cursor.position() as usize;
-            if position + key_len > data.len() {
-                return Ok(Parsed::Incomplete); // Incomplete data
-            }
-            cursor.set_position((position + key_len) as u64);
-
-            // Read value string
-            let value_len = match decode::read_str_len(cursor) {
-                Ok(len) => len as usize,
-                Err(_) => return Ok(Parsed::Incomplete), // Incomplete data
-            };
-
-            let position = cursor.position() as usize;
-            if position + value_len > data.len() {
-                return Ok(Parsed::Incomplete); // Incomplete data
-            }
-            cursor.set_position((position + value_len) as u64);
-        }
-
-        let total_consumed = cursor.position() as usize;
-        Ok(Parsed::ok(total_consumed, (conn_id, seq as u16)))
-    }
-
-    fn parse_handshake_response(
-        &mut self,
-        conn_id: usize,
-        cursor: &mut Cursor<&[u8]>,
-        data: &[u8],
-        _start_position: u64,
-    ) -> Result<Parsed<'static, (usize, u16)>> {
-        // Read success boolean
-        let success = match decode::read_bool(cursor) {
-            Ok(s) => s,
-            Err(_) => return Ok(Parsed::Incomplete), // Incomplete data
+        ensure!(array_len >= 2, "Invalid Masstree response: array of {array_len} elements");
+        let Some(seq) = reader.int()? else {
+            return Ok(None);
         };
-        if !success {
-            return Err(anyhow!("Masstree handshake failed on connection {conn_id}"));
+        let seq = u32::try_from(seq)
+            .map_err(|_| anyhow!("Invalid Masstree response sequence number {seq}"))?;
+        let Some(cmd) = reader.int()? else {
+            return Ok(None);
+        };
+        let expect_len = |expected: u32, what: &str| {
+            ensure!(
+                array_len == expected,
+                "Invalid {what} response: expected {expected} elements, got {array_len}"
+            );
+            Ok(())
+        };
+        let body = match cmd {
+            // [seq, 3, column...] for a hit, the request echoed for a miss
+            3 => {
+                ensure!(array_len >= 3, "Invalid GET response: {array_len} elements");
+                Body::Done
+            }
+            // [seq, 5, key, value, ...]
+            5 => {
+                ensure!(array_len % 2 == 0, "Invalid SCAN response: {array_len} elements");
+                Body::Done
+            }
+            7 | 9 => {
+                expect_len(3, if cmd == 7 { "PUT" } else { "REPLACE" })?;
+                match reader.int()? {
+                    Some(code) => Body::Result(code),
+                    None => return Ok(None),
+                }
+            }
+            11 => {
+                expect_len(3, "REMOVE")?;
+                match reader.bool()? {
+                    Some(_removed) => Body::Done,
+                    None => return Ok(None),
+                }
+            }
+            13 => {
+                expect_len(2, "CHECKPOINT")?;
+                Body::Done
+            }
+            CMD_UNSUPPORTED => {
+                expect_len(2, "unsupported command")?;
+                Body::Unsupported
+            }
+            15 => match reader.bool()? {
+                None => return Ok(None),
+                // [0, 15, true, thread_index, row_type]
+                Some(true) => {
+                    expect_len(5, "HANDSHAKE")?;
+                    Body::Handshake(Ok(()))
+                }
+                // [0, 15, false, reason]; the reason is the first string
+                Some(false) => match reader.first_str_of_rest(array_len)? {
+                    Some(reason) => Body::Handshake(Err(
+                        reason.unwrap_or_else(|| "no reason given".to_string())
+                    )),
+                    None => return Ok(None),
+                },
+            },
+            _ => bail!("Unknown Masstree response command: {cmd}"),
+        };
+        // Skip the elements the body does not read
+        while reader.read < array_len {
+            if reader.skip()?.is_none() {
+                return Ok(None);
+            }
         }
+        Ok(Some(Self { len: reader.pos, seq, body }))
+    }
+}
 
-        // Read max_seq (u32)
-        let _max_seq = match decode::read_int::<u32, _>(cursor) {
-            Ok(s) => s,
-            Err(_) => return Ok(Parsed::Incomplete), // Incomplete data
+/// Reads the elements of one response array from a buffer that may end
+/// early: every read returns `None` when the data ends first
+struct Reader<'a> {
+    data: &'a [u8],
+    pos: usize,
+    /// Array elements read so far
+    read: u32,
+}
+
+impl<'a> Reader<'a> {
+    /// The `n` bytes at `at`, `None` if the data ends first
+    fn bytes(&self, at: usize, n: usize) -> Option<&'a [u8]> {
+        self.data.get(at..at.checked_add(n)?)
+    }
+
+    /// The big-endian unsigned integer of `n` bytes at `at`
+    fn uint(&self, at: usize, n: usize) -> Option<u64> {
+        Some(self.bytes(at, n)?.iter().fold(0, |value, &byte| value << 8 | u64::from(byte)))
+    }
+
+    /// The length of the array that starts the response
+    fn array_len(&mut self) -> Result<Option<u32>> {
+        use rmp::Marker;
+        let Some(&byte) = self.data.first() else {
+            return Ok(None);
         };
-
-        // Read version string length
-        let str_len = match decode::read_str_len(cursor) {
-            Ok(len) => len as usize,
-            Err(_) => return Ok(Parsed::Incomplete), // Incomplete data
+        let (len, header) = match Marker::from_u8(byte) {
+            Marker::FixArray(n) => (u64::from(n), 1),
+            Marker::Array16 => match self.uint(1, 2) {
+                Some(n) => (n, 3),
+                None => return Ok(None),
+            },
+            Marker::Array32 => match self.uint(1, 4) {
+                Some(n) => (n, 5),
+                None => return Ok(None),
+            },
+            marker => bail!("Invalid Masstree response: {marker:?} instead of an array"),
         };
+        self.pos = header;
+        Ok(Some(len as u32))
+    }
 
-        let position = cursor.position() as usize;
-        // Check if we have the full string data
-        if position + str_len <= data.len() {
-            self.mark_handshake_done(conn_id);
-            // Advance cursor past the string data
-            let total_consumed = position + str_len;
-            Ok(Parsed::ok(total_consumed, (conn_id, 0)))
-        } else {
-            Ok(Parsed::Incomplete) // Incomplete data
+    /// The next element, an integer
+    fn int(&mut self) -> Result<Option<i64>> {
+        use rmp::Marker;
+        let Some(&byte) = self.data.get(self.pos) else {
+            return Ok(None);
+        };
+        let (value, len) = match Marker::from_u8(byte) {
+            Marker::FixPos(n) => (i64::from(n), 1),
+            Marker::FixNeg(n) => (i64::from(n), 1),
+            marker @ (Marker::U8 | Marker::U16 | Marker::U32 | Marker::U64) => {
+                let n = match marker {
+                    Marker::U8 => 1,
+                    Marker::U16 => 2,
+                    Marker::U32 => 4,
+                    _ => 8,
+                };
+                let Some(value) = self.uint(self.pos + 1, n) else {
+                    return Ok(None);
+                };
+                let value = i64::try_from(value)
+                    .map_err(|_| anyhow!("Masstree response integer {value} out of range"))?;
+                (value, 1 + n)
+            }
+            marker @ (Marker::I8 | Marker::I16 | Marker::I32 | Marker::I64) => {
+                let n = match marker {
+                    Marker::I8 => 1,
+                    Marker::I16 => 2,
+                    Marker::I32 => 4,
+                    _ => 8,
+                };
+                let Some(value) = self.uint(self.pos + 1, n) else {
+                    return Ok(None);
+                };
+                // Sign-extend the n-byte two's complement value
+                let shift = 64 - 8 * n as u32;
+                (((value << shift) as i64) >> shift, 1 + n)
+            }
+            marker => bail!("Invalid Masstree response: {marker:?} instead of an integer"),
+        };
+        self.pos += len;
+        self.read += 1;
+        Ok(Some(value))
+    }
+
+    /// The next element, a boolean
+    fn bool(&mut self) -> Result<Option<bool>> {
+        use rmp::Marker;
+        let Some(&byte) = self.data.get(self.pos) else {
+            return Ok(None);
+        };
+        let value = match Marker::from_u8(byte) {
+            Marker::True => true,
+            Marker::False => false,
+            marker => bail!("Invalid Masstree response: {marker:?} instead of a boolean"),
+        };
+        self.pos += 1;
+        self.read += 1;
+        Ok(Some(value))
+    }
+
+    /// The next element, a string
+    fn str(&mut self) -> Result<Option<&'a [u8]>> {
+        let start = self.pos;
+        match skip_value(self.data, start)? {
+            Some(end) if matches!(self.data[start], 0xa0..=0xbf | 0xd9..=0xdb) => {
+                let header = match self.data[start] {
+                    0xa0..=0xbf => 1,
+                    0xd9 => 2,
+                    0xda => 3,
+                    _ => 5,
+                };
+                self.pos = end;
+                self.read += 1;
+                Ok(Some(&self.data[start + header..end]))
+            }
+            Some(_) => {
+                bail!("Invalid Masstree response: 0x{:02x} instead of a string", self.data[start])
+            }
+            None => Ok(None),
         }
     }
+
+    /// The first string among the rest of the `array_len` elements, which
+    /// it skips; `None` while they are incomplete
+    fn first_str_of_rest(&mut self, array_len: u32) -> Result<Option<Option<String>>> {
+        let mut found = None;
+        while self.read < array_len {
+            let is_str = matches!(self.data.get(self.pos), Some(0xa0..=0xbf | 0xd9..=0xdb));
+            if is_str && found.is_none() {
+                let Some(text) = self.str()? else {
+                    return Ok(None);
+                };
+                found = Some(String::from_utf8_lossy(text).into_owned());
+            } else if self.skip()?.is_none() {
+                return Ok(None);
+            }
+        }
+        Ok(Some(found))
+    }
+
+    /// Skip the next element, whatever it is
+    fn skip(&mut self) -> Result<Option<()>> {
+        let Some(end) = skip_value(self.data, self.pos)? else {
+            return Ok(None);
+        };
+        self.pos = end;
+        self.read += 1;
+        Ok(Some(()))
+    }
+}
+
+/// The end of the msgpack value at `pos` in `data`, `None` if the data ends
+/// first
+fn skip_value(data: &[u8], pos: usize) -> Result<Option<usize>> {
+    use rmp::Marker;
+    let reader = Reader { data, pos, read: 0 };
+    let Some(&byte) = data.get(pos) else {
+        return Ok(None);
+    };
+    // Bytes after the marker: a length field of `len_bytes` bytes, then
+    // `fixed` bytes plus `len` bytes, then `len * items_per_len + items` values
+    let (len_bytes, fixed, len_is_bytes, items): (usize, usize, bool, u64) =
+        match Marker::from_u8(byte) {
+            Marker::FixPos(_) | Marker::FixNeg(_) | Marker::Null | Marker::True | Marker::False => {
+                (0, 0, false, 0)
+            }
+            Marker::U8 | Marker::I8 => (0, 1, false, 0),
+            Marker::U16 | Marker::I16 => (0, 2, false, 0),
+            Marker::U32 | Marker::I32 | Marker::F32 => (0, 4, false, 0),
+            Marker::U64 | Marker::I64 | Marker::F64 => (0, 8, false, 0),
+            Marker::FixStr(n) => (0, usize::from(n), false, 0),
+            Marker::Str8 | Marker::Bin8 => (1, 0, true, 0),
+            Marker::Str16 | Marker::Bin16 => (2, 0, true, 0),
+            Marker::Str32 | Marker::Bin32 => (4, 0, true, 0),
+            Marker::FixArray(n) => (0, 0, false, u64::from(n)),
+            Marker::FixMap(n) => (0, 0, false, 2 * u64::from(n)),
+            Marker::Array16 | Marker::Map16 | Marker::Array32 | Marker::Map32 => {
+                let len_bytes = if matches!(Marker::from_u8(byte), Marker::Array16 | Marker::Map16)
+                {
+                    2
+                } else {
+                    4
+                };
+                let Some(n) = reader.uint(pos + 1, len_bytes) else {
+                    return Ok(None);
+                };
+                let per = if matches!(Marker::from_u8(byte), Marker::Map16 | Marker::Map32) {
+                    2
+                } else {
+                    1
+                };
+                (len_bytes, 0, false, per * n)
+            }
+            Marker::FixExt1 => (0, 2, false, 0),
+            Marker::FixExt2 => (0, 3, false, 0),
+            Marker::FixExt4 => (0, 5, false, 0),
+            Marker::FixExt8 => (0, 9, false, 0),
+            Marker::FixExt16 => (0, 17, false, 0),
+            Marker::Ext8 => (1, 1, true, 0),
+            Marker::Ext16 => (2, 1, true, 0),
+            Marker::Ext32 => (4, 1, true, 0),
+            Marker::Reserved => bail!("Invalid Masstree response: reserved msgpack marker 0xc1"),
+        };
+    let mut end = pos + 1;
+    let mut payload = fixed;
+    if len_is_bytes {
+        let Some(len) = reader.uint(end, len_bytes) else {
+            return Ok(None);
+        };
+        payload += usize::try_from(len)?;
+    }
+    end += len_bytes;
+    end = end
+        .checked_add(payload)
+        .ok_or_else(|| anyhow!("Masstree value length overflow"))?;
+    if data.len() < end {
+        return Ok(None);
+    }
+    for _ in 0..items {
+        match skip_value(data, end)? {
+            Some(next) => end = next,
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(end))
 }
 
 #[cfg(test)]
@@ -952,42 +1024,41 @@ mod tests {
     }
 
     #[test]
-    fn test_put_request() {
-        let columns = vec![(0, b"value0".to_vec()), (1, b"value1".to_vec())];
-        let mut proto = MasstreeProtocol::new(MasstreeOp::Put { columns });
+    fn put_writes_every_column_with_a_value() {
+        use crate::workload::KeyGeneration;
+        let mut proto = MasstreeProtocol::with_workload(
+            MasstreeOp::Put { columns: 2 },
+            KeyGeneration::sequential(5),
+            3,
+        );
         proto.mark_handshake_done(0);
-
         let request = proto.next_request(0);
-        let (conn_id, seq) = request.request_id;
-
-        assert_eq!(conn_id, 0);
-        assert_eq!(seq, 0);
-
-        // PUT requests have seq, cmd, key, + column pairs
-        assert!(!request.data.is_empty());
-        assert!(request.data.len() > 20); // Should have reasonable size
+        // [0, 6, "key:5", 0, "xxx", 1, "xxx"]
+        let mut expected = vec![0x97, 0xce, 0, 0, 0, 0, 0xcc, CMD_PUT, 0xa5];
+        expected.extend_from_slice(b"key:5");
+        expected.extend_from_slice(&[0xce, 0, 0, 0, 0, 0xa3, b'x', b'x', b'x']);
+        expected.extend_from_slice(&[0xce, 0, 0, 0, 1, 0xa3, b'x', b'x', b'x']);
+        assert_eq!(request.data, expected);
     }
 
     #[test]
-    fn test_scan_request() {
-        let scan_op = MasstreeOp::Scan {
-            firstkey: "start_key".to_string(),
-            count: 10,
-            fields: vec![0, 1, 2],
-        };
-        let mut proto = MasstreeProtocol::new(scan_op);
+    fn scan_starts_at_the_generated_key() {
+        use crate::workload::KeyGeneration;
+        let scan_op = MasstreeOp::Scan { count: 10, fields: vec![0, 1, 2] };
+        let mut proto = MasstreeProtocol::with_workload(scan_op, KeyGeneration::sequential(42), 8);
         proto.mark_handshake_done(0);
 
-        let request = proto.next_request(0);
-        let (conn_id, seq) = request.request_id;
-
-        assert_eq!(conn_id, 0);
-        assert_eq!(seq, 0);
-
-        // SCAN requests have seq, cmd, firstkey, count, field indices
-        assert!(!request.data.is_empty());
-        let req_str = String::from_utf8_lossy(&request.data);
-        assert!(req_str.contains("start_key"));
+        for key in [42, 43] {
+            let request = proto.next_request(0);
+            // [seq, 4, "key:N", 10, 0, 1, 2]
+            let mut expected = vec![0x97, 0xce, 0, 0, 0, (key - 42) as u8, 0xcc, CMD_SCAN, 0xa6];
+            expected.extend_from_slice(format!("key:{key}").as_bytes());
+            expected.extend_from_slice(&[0xce, 0, 0, 0, 10]);
+            for field in 0..3 {
+                expected.extend_from_slice(&[0xce, 0, 0, 0, field]);
+            }
+            assert_eq!(request.data, expected);
+        }
     }
 
     #[test]
@@ -1187,5 +1258,168 @@ mod tests {
         let mut proto2 = MasstreeProtocol::new(MasstreeOp::Get);
         proto2.mark_handshake_done(0);
         assert!(!proto2.next_request(0).metadata.is_warmup);
+    }
+
+    /// Responses as Stackbench's mtd sends them (captured from it)
+    #[test]
+    fn responses_of_every_command_are_framed() {
+        fn parse(data: &[u8]) -> Result<Parsed<'_, (usize, u16)>> {
+            MasstreeProtocol::new(MasstreeOp::Get).parse_response(3, data)
+        }
+        for (response, seq) in [
+            // Handshake: [0, 15, true, 0, "Bag"]
+            (&b"\x95\x00\x0f\xc3\x00\xa3Bag"[..], 0),
+            // PUT Inserted, REPLACE Updated
+            (b"\x93\x01\x07\x01", 1),
+            (b"\x93\x01\x09\x02", 1),
+            // GET hit of a two-column row, and of a one-column row
+            (b"\x94\x02\x03\xa2aa\xa2bb", 2),
+            (b"\x93\x02\x03\xa2aa", 2),
+            // GET miss: the request echoed
+            (b"\x93\x03\x03\xa1z", 3),
+            // SCAN: a multi-column row's value is an array, none found
+            (b"\x94\x04\x05\xa1k\x92\xa2aa\xa2bb", 4),
+            (b"\x96\x04\x05\xa1k\xa2aa\xa1l\xa2bb", 4),
+            (b"\x92\x04\x05", 4),
+            // REMOVE, CHECKPOINT
+            (b"\x93\x06\x0b\xc3", 6),
+            (b"\x92\x05\x0d", 5),
+            // A sequence number past 127 is a msgpack uint
+            (b"\x93\xcd\x01\x2c\x0b\xc2", 300),
+        ] {
+            assert_eq!(
+                parse(response).unwrap(),
+                Parsed::ok(response.len(), (3, seq)),
+                "{response:?}"
+            );
+            let mut two = response.to_vec();
+            two.extend_from_slice(b"\x92\x05\x0d");
+            assert_eq!(parse(&two).unwrap(), Parsed::ok(response.len(), (3, seq)));
+            for len in 0..response.len() {
+                assert_eq!(parse(&response[..len]).unwrap(), Parsed::Incomplete, "{response:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_commands_and_failed_results_are_error_replies() {
+        let mut proto = MasstreeProtocol::new(MasstreeOp::Get);
+        // [5, -1]: mtd did not run the command (a checkpoint on a backend
+        // without blocking calls)
+        assert_eq!(
+            proto.parse_response(0, b"\x92\x05\xff").unwrap(),
+            Parsed::error(3, (0, 5), ErrorReply::new("Unsupported", "Unsupported command"))
+        );
+        for (code, kind) in [(0xff, "Retry"), (0x00, "OutOfDate"), (0x09, "UnknownResult")] {
+            let response = [0x93, 0x01, 0x09, code];
+            assert_eq!(
+                proto.parse_response(0, &response).unwrap(),
+                Parsed::error(4, (0, 1), ErrorReply::new(kind, kind))
+            );
+        }
+        // NotFound is a result
+        assert_eq!(proto.parse_response(0, b"\x93\x01\x07\xfe").unwrap(), Parsed::ok(4, (0, 1)));
+    }
+
+    #[test]
+    fn a_failed_handshake_fails_with_the_servers_reason() {
+        let mut proto = MasstreeProtocol::new(MasstreeOp::Get);
+        proto.next_request(0);
+        let error = proto
+            .parse_response(0, b"\x94\x00\x0f\xc2\xadbad maxkeylen")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "Masstree handshake failed on connection 0: bad maxkeylen");
+        assert!(proto.setup_pending(0));
+        let error = proto.parse_response(0, b"\x93\x00\x0f\xc2").unwrap_err().to_string();
+        assert_eq!(error, "Masstree handshake failed on connection 0: no reason given");
+        assert!(proto.parse_response(0, b"\x95\x00\x0f\xc3\x00\xa3Bag").is_ok());
+        assert!(!proto.setup_pending(0));
+    }
+
+    #[test]
+    fn malformed_responses_are_errors() {
+        for response in [
+            &b"\x93\x01\x2a\x00"[..], // unknown command 42
+            b"\x91\x01",              // array too short
+            b"\xa1x",                 // not an array
+            b"\x92\x01\x03",          // GET without a column or key
+            b"\x93\x01\x05\xa1k",     // SCAN key without a value
+            b"\x94\x01\x07\x01\x01",  // PUT with an extra element
+            b"\x93\x01\x07\xa1x",     // PUT result not an integer
+            b"\x93\x01\x0b\x01",      // REMOVE result not a boolean
+            b"\x93\xff\x03\xa1k",     // negative sequence number
+            b"\x93\x01\x03\xc1",      // reserved marker
+        ] {
+            let mut proto = MasstreeProtocol::new(MasstreeOp::Get);
+            assert!(proto.parse_response(0, response).is_err(), "{response:?}");
+        }
+    }
+
+    #[test]
+    fn skip_value_crosses_every_msgpack_type() {
+        let mut values: Vec<Vec<u8>> = Vec::new();
+        let mut buf = Vec::new();
+        encode::write_nil(&mut buf).unwrap();
+        values.push(std::mem::take(&mut buf));
+        for value in [0u64, 200, 70_000, 5_000_000_000] {
+            encode::write_uint(&mut buf, value).unwrap();
+            values.push(std::mem::take(&mut buf));
+        }
+        for value in [-1i64, -100, -40_000, -3_000_000_000] {
+            encode::write_sint(&mut buf, value).unwrap();
+            values.push(std::mem::take(&mut buf));
+        }
+        encode::write_f64(&mut buf, 1.5).unwrap();
+        values.push(std::mem::take(&mut buf));
+        for len in [3, 40, 300, 70_000] {
+            encode::write_str_len(&mut buf, len as u32).unwrap();
+            buf.resize(buf.len() + len, b'v');
+            values.push(std::mem::take(&mut buf));
+            encode::write_bin(&mut buf, &vec![1; len]).unwrap();
+            values.push(std::mem::take(&mut buf));
+        }
+        encode::write_ext_meta(&mut buf, 4, 7).unwrap();
+        buf.extend_from_slice(&[0; 4]);
+        values.push(std::mem::take(&mut buf));
+        encode::write_ext_meta(&mut buf, 5, 7).unwrap();
+        buf.extend_from_slice(&[0; 5]);
+        values.push(std::mem::take(&mut buf));
+        // An array of 20 and a map of every value so far
+        encode::write_array_len(&mut buf, 20).unwrap();
+        for _ in 0..20 {
+            buf.extend_from_slice(&values[1]);
+        }
+        values.push(std::mem::take(&mut buf));
+        encode::write_map_len(&mut buf, values.len() as u32).unwrap();
+        for value in values.clone() {
+            buf.extend_from_slice(&values[0]);
+            buf.extend_from_slice(&value);
+        }
+        values.push(std::mem::take(&mut buf));
+        for value in values {
+            assert_eq!(skip_value(&value, 0).unwrap(), Some(value.len()), "{value:?}");
+            for len in 0..value.len() {
+                assert_eq!(skip_value(&value[..len], 0).unwrap(), None);
+            }
+        }
+    }
+
+    #[test]
+    fn value_sizes_follow_the_generator_per_command() {
+        use crate::workload::{FixedSize, KeyGeneration, PerCommandSize, ValueSizeGenerator};
+        let mut sizes: HashMap<String, Box<dyn ValueSizeGenerator>> = HashMap::new();
+        sizes.insert("put".to_string(), Box::new(FixedSize::new(2)));
+        let mut proto =
+            MasstreeProtocol::with_workload(MasstreeOp::Set, KeyGeneration::sequential(0), 9)
+                .with_value_size_generator(Box::new(PerCommandSize::new(
+                    sizes,
+                    Box::new(FixedSize::new(4)),
+                )));
+        proto.mark_handshake_done(0);
+        assert!(proto.next_request(0).data.ends_with(b"\xa4xxxx"));
+        let mut proto = proto
+            .with_operations(Box::new(FixedCommandSelector::new(MasstreeOp::Put { columns: 1 })));
+        assert!(proto.next_request(0).data.ends_with(b"\xa2xx"));
     }
 }

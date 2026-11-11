@@ -163,6 +163,26 @@ min = 64
 max = 4096
 ```
 
+Or draw sizes from a weighted list, such as a measured size histogram; weights
+are relative and need not sum to 1:
+
+```toml
+[traffic_groups.protocol_config.value_size]
+strategy = "weighted"
+sizes = [
+    { size = 32, weight = 0.6 },
+    { size = 512, weight = 0.3 },
+    { size = 8192, weight = 0.1 },
+]
+```
+
+`strategy = "per_command"` gives commands their own size (`distribution` is
+`fixed`, `uniform`, `normal` or `weighted`) and the others `default`. The sizes
+apply to the values a request sends: Redis SET (and the other writing
+commands), Memcached SET, ADD and REPLACE, and Masstree SET and each PUT
+column. Without a `value_size` section, every value has `keys.value_size`
+bytes.
+
 ## Redis Connection Setup
 
 Redis groups can authenticate, select a database and switch to RESP3 on every connection before the workload starts:

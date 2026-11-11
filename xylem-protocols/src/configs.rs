@@ -319,6 +319,9 @@ pub enum ValueSizeConfig {
         min: usize,
         max: usize,
     },
+    /// Sizes drawn from a weighted list, such as an empirical size
+    /// histogram; weights need not sum to 1
+    Weighted { sizes: Vec<SizeWeight> },
     /// Per-command size configuration
     #[serde(rename = "per_command")]
     PerCommand {
@@ -327,6 +330,22 @@ pub enum ValueSizeConfig {
         /// Default strategy for unspecified commands
         default: Box<ValueSizeConfig>,
     },
+}
+
+/// One size of a weighted size list
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct SizeWeight {
+    /// Value size in bytes
+    pub size: usize,
+    /// Relative weight (probability) of this size
+    pub weight: f64,
+}
+
+/// The `(size, weight)` pairs of a weighted size list
+fn size_weights(sizes: &[SizeWeight]) -> Vec<(usize, f64)> {
+    sizes.iter().map(|s| (s.size, s.weight)).collect()
 }
 
 /// Value size configuration for a specific command
@@ -347,6 +366,10 @@ pub enum CommandValueSizeConfig {
         min: usize,
         max: usize,
     },
+    /// Sizes drawn from a weighted list
+    Weighted {
+        sizes: Vec<SizeWeight>,
+    },
 }
 
 impl CommandValueSizeConfig {
@@ -355,7 +378,7 @@ impl CommandValueSizeConfig {
         &self,
         master_seed: Option<u64>,
     ) -> anyhow::Result<Box<dyn crate::workload::ValueSizeGenerator>> {
-        use crate::workload::{FixedSize, NormalSize, UniformSize};
+        use crate::workload::{FixedSize, NormalSize, UniformSize, WeightedSize};
         use xylem_core::seed::derive_seed;
 
         match self {
@@ -368,6 +391,19 @@ impl CommandValueSizeConfig {
                 let seed = master_seed.map(|s| derive_seed(s, "normal_cmd_size"));
                 Ok(Box::new(NormalSize::with_seed(*mean, *std_dev, *min, *max, seed)?))
             }
+            Self::Weighted { sizes } => {
+                let seed = master_seed.map(|s| derive_seed(s, "weighted_cmd_size"));
+                Ok(Box::new(WeightedSize::with_seed(size_weights(sizes), seed)?))
+            }
+        }
+    }
+
+    /// The largest size this config can produce
+    pub fn max_size(&self) -> usize {
+        match self {
+            Self::Fixed { size } => *size,
+            Self::Uniform { max, .. } | Self::Normal { max, .. } => *max,
+            Self::Weighted { sizes } => sizes.iter().map(|s| s.size).max().unwrap_or(0),
         }
     }
 }
@@ -381,7 +417,25 @@ impl ValueSizeConfig {
             Self::Fixed { size } => *size,
             Self::Uniform { min, max } => min / 2 + max / 2 + (min % 2 + max % 2) / 2,
             Self::Normal { mean, .. } => *mean as usize,
+            Self::Weighted { sizes } => {
+                let total: f64 = sizes.iter().map(|s| s.weight).sum();
+                let mean: f64 = sizes.iter().map(|s| s.size as f64 * s.weight).sum::<f64>() / total;
+                mean.round() as usize
+            }
             Self::PerCommand { default, .. } => default.fixed_size(),
+        }
+    }
+
+    /// The largest size this config can produce, for any command
+    pub fn max_size(&self) -> usize {
+        match self {
+            Self::Fixed { size } => *size,
+            Self::Uniform { max, .. } | Self::Normal { max, .. } => *max,
+            Self::Weighted { sizes } => sizes.iter().map(|s| s.size).max().unwrap_or(0),
+            Self::PerCommand { commands, default } => commands
+                .values()
+                .map(CommandValueSizeConfig::max_size)
+                .fold(default.max_size(), usize::max),
         }
     }
 
@@ -390,7 +444,7 @@ impl ValueSizeConfig {
         &self,
         master_seed: Option<u64>,
     ) -> anyhow::Result<Box<dyn crate::workload::ValueSizeGenerator>> {
-        use crate::workload::{FixedSize, NormalSize, PerCommandSize, UniformSize};
+        use crate::workload::{FixedSize, NormalSize, PerCommandSize, UniformSize, WeightedSize};
         use xylem_core::seed::derive_seed;
 
         match self {
@@ -402,6 +456,10 @@ impl ValueSizeConfig {
             Self::Normal { mean, std_dev, min, max } => {
                 let seed = master_seed.map(|s| derive_seed(s, "normal_value_size"));
                 Ok(Box::new(NormalSize::with_seed(*mean, *std_dev, *min, *max, seed)?))
+            }
+            Self::Weighted { sizes } => {
+                let seed = master_seed.map(|s| derive_seed(s, "weighted_value_size"));
+                Ok(Box::new(WeightedSize::with_seed(size_weights(sizes), seed)?))
             }
             Self::PerCommand { commands, default } => {
                 let mut command_generators = std::collections::HashMap::new();
@@ -484,17 +542,125 @@ impl RedisCommandParams {
     }
 }
 
-/// Memcached protocol configuration
+/// Operation selection of a key-value protocol, in the shape of Redis's
+/// `operations`: one operation, or a weighted random mix of commands. `P`
+/// are the protocol's per-command parameters.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "strategy", rename_all = "lowercase", deny_unknown_fields)]
+pub enum OperationsConfig<P> {
+    /// Fixed operation (single command, default parameters)
+    Fixed { operation: String },
+    /// Weighted random selection
+    Weighted { commands: Vec<OperationWeight<P>> },
+}
+
+/// One command of a weighted operation mix
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields, bound(deserialize = "P: Deserialize<'de>"))]
+pub struct OperationWeight<P> {
+    /// Command name
+    pub name: String,
+    /// Weight (probability) for this command; weights need not sum to 1
+    pub weight: f64,
+    /// Parameters of the command
+    #[serde(default)]
+    pub params: Option<P>,
+    /// Optional per-command key distribution, with the protocol's prefix and
+    /// value size
+    #[serde(default)]
+    pub keys: Option<KeysConfig>,
+}
+
+impl<P> OperationsConfig<P> {
+    /// The operation mix of a config that takes either one `operation` or an
+    /// `operations` mix: `default` when it sets neither, an error when both
+    pub fn resolve<'a>(
+        operation: Option<&str>,
+        operations: Option<&'a Self>,
+        default: &str,
+    ) -> anyhow::Result<std::borrow::Cow<'a, Self>>
+    where
+        P: Clone,
+    {
+        use std::borrow::Cow;
+        let fixed = |operation: &str| Cow::Owned(Self::Fixed { operation: operation.to_string() });
+        match (operation, operations) {
+            (Some(_), Some(_)) => anyhow::bail!("Set either operation or operations, not both"),
+            (Some(operation), None) => Ok(fixed(operation)),
+            (None, Some(operations)) => Ok(Cow::Borrowed(operations)),
+            (None, None) => Ok(fixed(default)),
+        }
+    }
+
+    /// Build the command selector of this mix: `parse` turns a command name
+    /// and its params into an operation; per-command `keys` must keep the
+    /// prefix and value size of `keys`
+    pub fn selector<T: Clone + Send + 'static>(
+        &self,
+        keys: &KeysConfig,
+        seed: Option<u64>,
+        mut parse: impl FnMut(&str, Option<&P>) -> anyhow::Result<T>,
+    ) -> anyhow::Result<Box<dyn crate::CommandSelector<T>>> {
+        match self {
+            Self::Fixed { operation } => {
+                Ok(Box::new(crate::FixedCommandSelector::new(parse(operation, None)?)))
+            }
+            Self::Weighted { commands } => {
+                let commands = commands
+                    .iter()
+                    .map(|cmd| {
+                        let op = parse(&cmd.name, cmd.params.as_ref())?;
+                        Ok((op, cmd.weight, cmd.keys.as_ref()))
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                crate::workload::selector::weighted_selector(commands, keys, seed)
+            }
+        }
+    }
+}
+
+/// Memcached operation mix
+pub type MemcachedOperationsConfig = OperationsConfig<MemcachedCommandParams>;
+
+/// Parameters of a Memcached command in an operation mix; each command
+/// takes only its own
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct MemcachedCommandParams {
+    /// Keys per multi-get (`mget`, default 10)
+    #[serde(default)]
+    pub count: Option<usize>,
+    /// Amount to add or subtract (`incr` and `decr`, default 1)
+    #[serde(default)]
+    pub delta: Option<u64>,
+    /// New expiration time in seconds, 0 for none (`touch`, default 0)
+    #[serde(default)]
+    pub exptime: Option<u32>,
+}
+
+/// Memcached protocol configuration
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct MemcachedConfig {
     /// Key generation strategy
     #[serde(default)]
     pub keys: KeysConfig,
-    /// Operation to execute (default: GET)
-    #[serde(default = "default_memcached_operation")]
-    pub operation: String,
+    /// Operation every request executes (default: GET): get, set, add,
+    /// replace, delete, incr, decr, touch or mget. Set this or `operations`.
+    #[serde(default)]
+    pub operation: Option<String>,
+    /// Operation mix, a fixed operation or weighted commands. Set this or
+    /// `operation`.
+    #[serde(default)]
+    pub operations: Option<MemcachedOperationsConfig>,
+    /// Value size of set, add and replace, also per command (overrides
+    /// keys.value_size)
+    #[serde(default)]
+    pub value_size: Option<ValueSizeConfig>,
     /// Insert phase configuration (populate keys before measurement)
     ///
     /// When configured, the protocol will first insert all keys using SET
@@ -502,20 +668,6 @@ pub struct MemcachedConfig {
     /// that need pre-populated data (e.g., GET workloads).
     #[serde(default)]
     pub insert_phase: Option<InsertPhaseConfig>,
-}
-
-fn default_memcached_operation() -> String {
-    "GET".to_string()
-}
-
-impl Default for MemcachedConfig {
-    fn default() -> Self {
-        Self {
-            keys: KeysConfig::default(),
-            operation: default_memcached_operation(),
-            insert_phase: None,
-        }
-    }
 }
 
 /// HTTP protocol configuration
@@ -569,23 +721,29 @@ impl Default for HttpConfig {
 pub struct XylemEchoConfig {}
 
 /// Masstree protocol configuration
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct MasstreeConfig {
     /// Key generation configuration
     #[serde(default)]
     pub keys: KeysConfig,
-    /// Operation to perform (get, set, put, remove, scan, checkpoint)
-    #[serde(default = "default_masstree_operation")]
-    pub operation: String,
-    /// Number of columns for PUT operation
+    /// Operation every request performs (default: get): get, set, put,
+    /// remove, scan or checkpoint. Set this or `operations`.
+    #[serde(default)]
+    pub operation: Option<String>,
+    /// Operation mix, a fixed operation or weighted commands. Set this or
+    /// `operation`.
+    #[serde(default)]
+    pub operations: Option<MasstreeOperationsConfig>,
+    /// Number of columns for PUT operation (default 1)
     #[serde(default)]
     pub put_columns: Option<usize>,
     /// Scan configuration
     #[serde(default)]
     pub scan: Option<MasstreeScanConfig>,
-    /// Value size configuration (overrides keys.value_size for variable sizes)
+    /// Value size of set and of each put column, also per command
+    /// (overrides keys.value_size)
     #[serde(default)]
     pub value_size: Option<ValueSizeConfig>,
     /// Use random data for values instead of repeated 'x' characters
@@ -654,31 +812,33 @@ pub struct MasstreeScanConfig {
     /// Number of records to scan
     #[serde(default = "default_scan_count")]
     pub count: usize,
-    /// Fields to return (empty = all fields)
+    /// Column indices to return, as decimal strings (empty = all columns)
     #[serde(default)]
     pub fields: Vec<String>,
 }
 
-fn default_masstree_operation() -> String {
-    "get".to_string()
+/// Masstree operation mix
+pub type MasstreeOperationsConfig = OperationsConfig<MasstreeCommandParams>;
+
+/// Parameters of a Masstree command in an operation mix; each command takes
+/// only its own, and defaults to the top-level `scan` and `put_columns`
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct MasstreeCommandParams {
+    /// Records per scan (`scan`)
+    #[serde(default)]
+    pub count: Option<usize>,
+    /// Column indices a scan returns, empty for all (`scan`)
+    #[serde(default)]
+    pub fields: Option<Vec<u32>>,
+    /// Columns a put writes (`put`)
+    #[serde(default)]
+    pub columns: Option<usize>,
 }
 
 fn default_scan_count() -> usize {
     10
-}
-
-impl Default for MasstreeConfig {
-    fn default() -> Self {
-        Self {
-            keys: KeysConfig::default(),
-            operation: default_masstree_operation(),
-            put_columns: None,
-            scan: None,
-            value_size: None,
-            random_data: false,
-            insert_phase: None,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -849,6 +1009,7 @@ mod tests {
             json!({ "strategy": "fixed", "size": 8 }),
             json!({ "strategy": "uniform", "min": 1, "max": 8 }),
             json!({ "strategy": "normal", "mean": 4.0, "std_dev": 1.0, "min": 1, "max": 8 }),
+            json!({ "strategy": "weighted", "sizes": [] }),
             json!({
                 "strategy": "per_command", "commands": {},
                 "default": { "strategy": "fixed", "size": 8 }
@@ -860,9 +1021,23 @@ mod tests {
             json!({ "distribution": "fixed", "size": 8 }),
             json!({ "distribution": "uniform", "min": 1, "max": 8 }),
             json!({ "distribution": "normal", "mean": 4.0, "std_dev": 1.0, "min": 1, "max": 8 }),
+            json!({ "distribution": "weighted", "sizes": [] }),
         ] {
             rejects_unknown_keys::<CommandValueSizeConfig>(size);
         }
+        rejects_unknown_keys::<SizeWeight>(json!({ "size": 8, "weight": 1.0 }));
+        rejects_unknown_keys::<MemcachedCommandParams>(json!({}));
+        rejects_unknown_keys::<MasstreeCommandParams>(json!({}));
+        for operations in [
+            json!({ "strategy": "fixed", "operation": "get" }),
+            json!({ "strategy": "weighted", "commands": [] }),
+        ] {
+            rejects_unknown_keys::<MemcachedOperationsConfig>(operations.clone());
+            rejects_unknown_keys::<MasstreeOperationsConfig>(operations);
+        }
+        rejects_unknown_keys::<OperationWeight<MemcachedCommandParams>>(
+            json!({ "name": "get", "weight": 1.0 }),
+        );
         for operations in [
             json!({ "strategy": "fixed", "operation": "get" }),
             json!({ "strategy": "weighted", "commands": [] }),
@@ -892,5 +1067,54 @@ mod tests {
         // Keys of two shapes match neither
         let mixed = json!({ "template": "GET __key__", "count": 1 });
         assert!(serde_json::from_value::<RedisCommandParams>(mixed).is_err());
+    }
+
+    #[test]
+    fn weighted_value_sizes_parse_and_bound_their_sizes() {
+        let sizes: ValueSizeConfig = serde_json::from_value(serde_json::json!({
+            "strategy": "weighted",
+            "sizes": [{ "size": 10, "weight": 3.0 }, { "size": 50, "weight": 1.0 }],
+        }))
+        .unwrap();
+        assert_eq!(sizes.fixed_size(), 20);
+        assert_eq!(sizes.max_size(), 50);
+        let mut generator = sizes.to_generator(Some(1)).unwrap();
+        let drawn: std::collections::HashSet<_> = (0..200).map(|_| generator.next_size()).collect();
+        assert_eq!(drawn, [10, 50].into());
+
+        let per_command: ValueSizeConfig = serde_json::from_value(serde_json::json!({
+            "strategy": "per_command",
+            "commands": { "set": { "distribution": "weighted", "sizes": [{ "size": 99, "weight": 1.0 }] } },
+            "default": { "strategy": "uniform", "min": 1, "max": 70 },
+        }))
+        .unwrap();
+        assert_eq!(per_command.max_size(), 99);
+        let mut generator = per_command.to_generator(None).unwrap();
+        assert_eq!(generator.next_size_for_command("SET"), 99);
+
+        let empty: ValueSizeConfig =
+            serde_json::from_value(serde_json::json!({ "strategy": "weighted", "sizes": [] }))
+                .unwrap();
+        assert!(empty.to_generator(None).is_err());
+    }
+
+    /// Redis SETs take their value sizes from the weighted list
+    #[test]
+    fn redis_sets_draw_weighted_value_sizes() {
+        use crate::Protocol;
+        let config: RedisConfig = serde_json::from_value(serde_json::json!({
+            "operations": { "strategy": "fixed", "operation": "set" },
+            "value_size": { "strategy": "weighted",
+                "sizes": [{ "size": 2, "weight": 1.0 }, { "size": 12, "weight": 1.0 }] },
+        }))
+        .unwrap();
+        let mut protocol = crate::RedisProtocol::from_config(&config, Some(4)).unwrap();
+        let mut lengths = std::collections::HashSet::new();
+        for _ in 0..100 {
+            let data = String::from_utf8(protocol.next_request(0).data).unwrap();
+            // *3 $3 SET $<key len> <key> $<value len> <value>
+            lengths.insert(data.split("\r\n").nth(5).unwrap().to_string());
+        }
+        assert_eq!(lengths, ["$2", "$12"].map(String::from).into());
     }
 }

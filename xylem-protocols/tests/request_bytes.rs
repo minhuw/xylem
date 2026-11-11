@@ -60,7 +60,9 @@ fn seeded_random_get_config() -> MemcachedConfig {
             value_size: 8,
             prefix: "r:".into(),
         },
-        operation: "GET".into(),
+        operation: Some("GET".into()),
+        operations: None,
+        value_size: None,
         insert_phase: Some(InsertPhaseConfig { key_count: Some(3), value_size: Some(5) }),
     }
 }
@@ -73,7 +75,9 @@ fn seeded_zipfian_set_config() -> MemcachedConfig {
             value_size: 4,
             prefix: "z:".into(),
         },
-        operation: "SET".into(),
+        operation: Some("SET".into()),
+        operations: None,
+        value_size: None,
         insert_phase: Some(InsertPhaseConfig { key_count: Some(2), value_size: Some(2) }),
     }
 }
@@ -87,7 +91,9 @@ fn round_robin_empty_insert_phase_config() -> MemcachedConfig {
             value_size: 2,
             prefix: "rr:".into(),
         },
-        operation: "get".into(),
+        operation: Some("get".into()),
+        operations: None,
+        value_size: None,
         insert_phase: Some(InsertPhaseConfig::default()),
     }
 }
@@ -1014,18 +1020,24 @@ fn masstree_new_set_uses_key_zero_and_64_byte_value() {
 
 #[test]
 fn masstree_new_put_writes_each_column() {
-    let columns = vec![(0, b"ab".to_vec()), (3, b"xyz".to_vec())];
+    // Columns 0 and 1, each a value of the default 64 bytes
+    let columns = vec![(0, vec![b'x'; 64]), (1, vec![b'x'; 64])];
     #[rustfmt::skip]
-    let first_put = vec![
-        0x97, // array of 7
-        0xce, 0x00, 0x00, 0x00, 0x00, // u32 seq 0
-        0xcc, 0x06, // u8 command 6 (put)
-        0xa5, b'k', b'e', b'y', b':', b'0',
-        0xce, 0x00, 0x00, 0x00, 0x00, 0xa2, b'a', b'b', // column 0
-        0xce, 0x00, 0x00, 0x00, 0x03, 0xa3, b'x', b'y', b'z', // column 3
-    ];
+    let first_put = [
+        vec![
+            0x97, // array of 7
+            0xce, 0x00, 0x00, 0x00, 0x00, // u32 seq 0
+            0xcc, 0x06, // u8 command 6 (put)
+            0xa5, b'k', b'e', b'y', b':', b'0',
+            0xce, 0x00, 0x00, 0x00, 0x00, 0xd9, 64, // column 0, str8 of 64
+        ],
+        vec![b'x'; 64],
+        vec![0xce, 0x00, 0x00, 0x00, 0x01, 0xd9, 64], // column 1
+        vec![b'x'; 64],
+    ]
+    .concat();
     assert_eq!(masstree_put(0, "key:0", &columns), first_put);
-    let mut protocol = MasstreeProtocol::new(MasstreeOp::Put { columns: columns.clone() });
+    let mut protocol = MasstreeProtocol::new(MasstreeOp::Put { columns: 2 });
     complete_masstree_handshake(&mut protocol, 0);
     complete_masstree_handshake(&mut protocol, 1);
     assert_requests(
@@ -1034,21 +1046,6 @@ fn masstree_new_put_writes_each_column() {
             (0, Request::measurement(first_put.clone(), (0, 0))),
             (1, Request::measurement(first_put.clone(), (1, 0))),
             (0, Request::measurement(masstree_put(1, "key:0", &columns), (0, 1))),
-        ],
-    );
-
-    let mut protocol = MasstreeProtocol::new(MasstreeOp::Put { columns: vec![] });
-    complete_masstree_handshake(&mut protocol, 0);
-    complete_masstree_handshake(&mut protocol, 1);
-    #[rustfmt::skip]
-    let no_columns = vec![
-        0x93, 0xce, 0x00, 0x00, 0x00, 0x00, 0xcc, 0x06, 0xa5, b'k', b'e', b'y', b':', b'0',
-    ];
-    assert_requests(
-        &mut protocol,
-        vec![
-            (1, Request::measurement(no_columns.clone(), (1, 0))),
-            (0, Request::measurement(no_columns.clone(), (0, 0))),
         ],
     );
 }
@@ -1089,22 +1086,19 @@ fn masstree_new_remove_and_checkpoint() {
 
 #[test]
 fn masstree_new_scan_sends_first_key_count_and_fields() {
+    // Without a key generator, every scan starts at key 0
     #[rustfmt::skip]
     let first_scan = vec![
         0x96, // array of 6
         0xce, 0x00, 0x00, 0x00, 0x00, // u32 seq 0
         0xcc, 0x04, // u8 command 4 (scan)
-        0xa5, b'k', b'e', b'y', b':', b'5', // first key
+        0xa5, b'k', b'e', b'y', b':', b'0', // first key
         0xce, 0x00, 0x00, 0x00, 0x0a, // count 10
         0xce, 0x00, 0x00, 0x00, 0x01, // field 1
         0xce, 0x00, 0x00, 0x00, 0x02, // field 2
     ];
-    assert_eq!(masstree_scan(0, "key:5", 10, &[1, 2]), first_scan);
-    let mut protocol = MasstreeProtocol::new(MasstreeOp::Scan {
-        firstkey: "key:5".to_string(),
-        count: 10,
-        fields: vec![1, 2],
-    });
+    assert_eq!(masstree_scan(0, "key:0", 10, &[1, 2]), first_scan);
+    let mut protocol = MasstreeProtocol::new(MasstreeOp::Scan { count: 10, fields: vec![1, 2] });
     complete_masstree_handshake(&mut protocol, 0);
     complete_masstree_handshake(&mut protocol, 1);
     assert_requests(
@@ -1112,26 +1106,23 @@ fn masstree_new_scan_sends_first_key_count_and_fields() {
         vec![
             (0, Request::measurement(first_scan.clone(), (0, 0))),
             (1, Request::measurement(first_scan.clone(), (1, 0))),
-            (0, Request::measurement(masstree_scan(1, "key:5", 10, &[1, 2]), (0, 1))),
+            (0, Request::measurement(masstree_scan(1, "key:0", 10, &[1, 2]), (0, 1))),
         ],
     );
 
-    let mut protocol = MasstreeProtocol::new(MasstreeOp::Scan {
-        firstkey: "a".to_string(),
-        count: 1,
-        fields: vec![],
-    });
+    // With one, each scan starts at the next generated key
+    let mut protocol = MasstreeProtocol::with_workload(
+        MasstreeOp::Scan { count: 1, fields: vec![] },
+        KeyGeneration::sequential(8),
+        3,
+    );
     complete_masstree_handshake(&mut protocol, 0);
     complete_masstree_handshake(&mut protocol, 1);
-    #[rustfmt::skip]
-    let no_fields = vec![
-        0x94, 0xce, 0x00, 0x00, 0x00, 0x00, 0xcc, 0x04, 0xa1, b'a', 0xce, 0x00, 0x00, 0x00, 0x01,
-    ];
     assert_requests(
         &mut protocol,
         vec![
-            (1, Request::measurement(no_fields.clone(), (1, 0))),
-            (0, Request::measurement(no_fields.clone(), (0, 0))),
+            (1, Request::measurement(masstree_scan(0, "key:8", 1, &[]), (1, 0))),
+            (0, Request::measurement(masstree_scan(0, "key:9", 1, &[]), (0, 0))),
         ],
     );
 }
@@ -1168,9 +1159,9 @@ fn masstree_with_workload_set_put_and_remove_use_generated_keys() {
         ],
     );
 
-    let columns = vec![(2, b"v".to_vec())];
+    let columns = vec![(0, b"xxx".to_vec())];
     let mut protocol = MasstreeProtocol::with_workload(
-        MasstreeOp::Put { columns: columns.clone() },
+        MasstreeOp::Put { columns: 1 },
         KeyGeneration::sequential(4),
         3,
     );

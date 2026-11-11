@@ -345,7 +345,9 @@ fn memcached_set_config() -> MemcachedConfig {
             value_size: 5,
             prefix: "mc:".into(),
         },
-        operation: "set".into(),
+        operation: Some("set".into()),
+        operations: None,
+        value_size: None,
         insert_phase: Some(InsertPhaseConfig { key_count: Some(2), value_size: Some(3) }),
     }
 }
@@ -359,7 +361,9 @@ fn memcached_get_config() -> MemcachedConfig {
             value_size: 4,
             prefix: "z:".into(),
         },
-        operation: "GET".into(),
+        operation: Some("GET".into()),
+        operations: None,
+        value_size: None,
         insert_phase: Some(InsertPhaseConfig { key_count: None, value_size: None }),
     }
 }
@@ -379,10 +383,11 @@ fn memcached_config_errors() -> Vec<(MemcachedConfig, &'static str)> {
     vec![
         (
             MemcachedConfig {
-                operation: "DELETE".into(),
+                operation: Some("CAS".into()),
                 ..Default::default()
             },
-            "Unknown Memcached operation: DELETE. Supported: GET, SET",
+            "Unknown Memcached operation: CAS. Supported: GET, SET, ADD, REPLACE, DELETE, INCR, \
+             DECR, TOUCH, MGET",
         ),
         (memcached_prefix_config("bad key:".into()), prefix_error),
         (memcached_prefix_config("bad\x01key:".into()), prefix_error),
@@ -609,9 +614,9 @@ fn masstree_requests(
     requests
 }
 
-/// SET over seeded random keys with a custom prefix, a uniform value size (the
-/// CLI path sends its fixed representative size), random value bytes, and an
-/// insert phase taking its value size from the keys.
+/// SET over seeded random keys with a custom prefix, a uniform value size
+/// drawn per request, random value bytes, and an insert phase taking its
+/// value size from the keys.
 fn masstree_set_config() -> MasstreeConfig {
     MasstreeConfig {
         keys: KeysConfig::Random {
@@ -619,7 +624,7 @@ fn masstree_set_config() -> MasstreeConfig {
             value_size: 9,
             prefix: "mt:".into(),
         },
-        operation: "set".into(),
+        operation: Some("set".into()),
         value_size: Some(ValueSizeConfig::Uniform { min: 3, max: 8 }),
         random_data: true,
         insert_phase: Some(InsertPhaseConfig { key_count: Some(2), value_size: None }),
@@ -652,41 +657,42 @@ fn masstree_set_with_value_size_random_data_and_insert_phase() {
                 (0, 1)
             ),
             Request::measurement(
-                b"\x94\xce\x00\x00\x00\x02\xcc\x08\xa5mt:70\xa5Rr(\\d".to_vec(),
+                b"\x94\xce\x00\x00\x00\x02\xcc\x08\xa5mt:70\xa3Rr(".to_vec(),
                 (0, 2)
             ),
             Request::measurement(
-                b"\x94\xce\x00\x00\x00\x02\xcc\x08\xa5mt:39\xa5;}dkG".to_vec(),
+                b"\x94\xce\x00\x00\x00\x02\xcc\x08\xa5mt:39\xa7\\d;}dkG".to_vec(),
                 (1, 2)
             ),
             Request::measurement(
-                b"\x94\xce\x00\x00\x00\x03\xcc\x08\xa5mt:77\xa5Slq0L".to_vec(),
+                b"\x94\xce\x00\x00\x00\x03\xcc\x08\xa5mt:77\xa4Slq0".to_vec(),
                 (0, 3)
             ),
             Request::measurement(
-                b"\x94\xce\x00\x00\x00\x03\xcc\x08\xa5mt:46\xa5X%G]W".to_vec(),
+                b"\x94\xce\x00\x00\x00\x03\xcc\x08\xa5mt:46\xa7LX%G]Wh".to_vec(),
                 (1, 3)
             ),
         ]
     );
 }
 
-/// Each remaining operation, with PUT columns and SCAN settings that the
-/// constructor turns into the operation (non-numeric scan fields are dropped).
+/// Each remaining operation, with PUT columns of the value size and SCAN
+/// settings that the constructor turns into the operation; a scan starts at
+/// the generated key.
 #[test]
 fn masstree_operations_from_config() {
     let cases: [(&str, &[u8], &[u8]); 5] = [
         ("get", b"\x93\xce\x00\x00\x00\x00\xcc\x02\xa4op:0", b"\x93\xce\x00\x00\x00\x00\xcc\x02\xa4op:1"),
         (
             "PUT",
-            b"\x97\xce\x00\x00\x00\x00\xcc\x06\xa4op:0\xce\x00\x00\x00\x00\xa0\xce\x00\x00\x00\x01\xa0",
-            b"\x97\xce\x00\x00\x00\x00\xcc\x06\xa4op:1\xce\x00\x00\x00\x00\xa0\xce\x00\x00\x00\x01\xa0",
+            b"\x97\xce\x00\x00\x00\x00\xcc\x06\xa4op:0\xce\x00\x00\x00\x00\xa3xxx\xce\x00\x00\x00\x01\xa3xxx",
+            b"\x97\xce\x00\x00\x00\x00\xcc\x06\xa4op:1\xce\x00\x00\x00\x00\xa3xxx\xce\x00\x00\x00\x01\xa3xxx",
         ),
         ("remove", b"\x93\xce\x00\x00\x00\x00\xcc\n\xa4op:0", b"\x93\xce\x00\x00\x00\x00\xcc\n\xa4op:1"),
         (
             "scan",
-            b"\x96\xce\x00\x00\x00\x00\xcc\x04\xa0\xce\x00\x00\x00\x04\xce\x00\x00\x00\x01\xce\x00\x00\x00\x03",
-            b"\x96\xce\x00\x00\x00\x00\xcc\x04\xa0\xce\x00\x00\x00\x04\xce\x00\x00\x00\x01\xce\x00\x00\x00\x03",
+            b"\x96\xce\x00\x00\x00\x00\xcc\x04\xa4op:0\xce\x00\x00\x00\x04\xce\x00\x00\x00\x01\xce\x00\x00\x00\x03",
+            b"\x96\xce\x00\x00\x00\x00\xcc\x04\xa4op:1\xce\x00\x00\x00\x04\xce\x00\x00\x00\x01\xce\x00\x00\x00\x03",
         ),
         ("checkpoint", b"\x92\xce\x00\x00\x00\x00\xcc\x0c", b"\x92\xce\x00\x00\x00\x00\xcc\x0c"),
     ];
@@ -697,11 +703,11 @@ fn masstree_operations_from_config() {
                 value_size: 3,
                 prefix: "op:".into(),
             },
-            operation: operation.into(),
+            operation: Some(operation.into()),
             put_columns: Some(2),
             scan: Some(MasstreeScanConfig {
                 count: 4,
-                fields: vec!["1".into(), "name".into(), "3".into()],
+                fields: vec!["1".into(), "3".into()],
             }),
             ..Default::default()
         };

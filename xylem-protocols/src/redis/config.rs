@@ -1,7 +1,7 @@
 //! Config-aware Redis construction.
 use crate::configs::{RedisConfig, RedisOperationsConfig};
 use crate::redis::{ConnectionSetup, RedisOp, RedisProtocol};
-use crate::{CommandSelector, FixedCommandSelector, WeightedCommandSelector};
+use crate::{CommandSelector, FixedCommandSelector};
 use anyhow::Result;
 
 impl RedisConfig {
@@ -15,35 +15,14 @@ impl RedisConfig {
                 Ok(Box::new(FixedCommandSelector::new(parse_redis_operation(operation, None)?)))
             }
             Some(RedisOperationsConfig::Weighted { commands }) => {
-                let mut weighted = Vec::new();
-                let mut keys = Vec::new();
-                let per_command = commands.iter().any(|cmd| cmd.keys.is_some());
-                for cmd in commands {
-                    weighted
-                        .push((parse_redis_operation(&cmd.name, cmd.params.as_ref())?, cmd.weight));
-                    let config = cmd.keys.as_ref().unwrap_or(&self.keys);
-                    config.validate()?;
-                    anyhow::ensure!(
-                        config.prefix() == self.keys.prefix(),
-                        "Per-command key prefixes are unsupported"
-                    );
-                    anyhow::ensure!(
-                        config.value_size() == self.keys.value_size(),
-                        "Use value_size.per_command for per-command value sizes"
-                    );
-                    if per_command {
-                        keys.push(
-                            Box::new(config.to_key_gen(seed)?) as Box<dyn crate::KeyGenerator>
-                        );
-                    }
-                }
-                if per_command {
-                    Ok(Box::new(WeightedCommandSelector::with_per_command_keys(
-                        weighted, keys, seed,
-                    )?))
-                } else {
-                    Ok(Box::new(WeightedCommandSelector::with_seed(weighted, seed)?))
-                }
+                let commands = commands
+                    .iter()
+                    .map(|cmd| {
+                        let op = parse_redis_operation(&cmd.name, cmd.params.as_ref())?;
+                        Ok((op, cmd.weight, cmd.keys.as_ref()))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                crate::workload::selector::weighted_selector(commands, &self.keys, seed)
             }
         }
     }

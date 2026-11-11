@@ -737,7 +737,8 @@ fn validate_udp_request_size(config: &ProtocolConfig, index: usize, name: &str) 
     };
     let max = xylem_protocols::memcached::MAX_UDP_VALUE_SIZE;
     let insert_size = config.insert_phase.as_ref().and_then(|insert| insert.value_size);
-    for size in [Some(config.keys.value_size()), insert_size].into_iter().flatten() {
+    let sizes = config.value_size.as_ref().map(|sizes| sizes.max_size());
+    for size in [Some(config.keys.value_size()), insert_size, sizes].into_iter().flatten() {
         if size > max {
             bail!(
                 "Traffic group {} '{}': value size {} does not fit one memcached UDP \
@@ -748,6 +749,22 @@ fn validate_udp_request_size(config: &ProtocolConfig, index: usize, name: &str) 
                 max
             );
         }
+    }
+    // memcached answers a multi-get over UDP with a datagram per value, each
+    // marked as a whole response, so where the response ends is unknown
+    let operations = config.operations_used().with_context(|| {
+        format!("Traffic group {} '{}' has invalid Memcached protocol_config", index, name)
+    })?;
+    if operations
+        .iter()
+        .any(|op| matches!(op, xylem_protocols::memcached::MemcachedOp::MultiGet { .. }))
+    {
+        bail!(
+            "Traffic group {} '{}': mget is not supported over UDP, where memcached sends \
+             each value of a multi-get as a response of its own",
+            index,
+            name
+        );
     }
     Ok(())
 }
@@ -1776,6 +1793,31 @@ file = "results/test.json"
         at(max).unwrap();
         let error = at(max + 1).unwrap_err().to_string();
         assert!(error.contains("does not fit one memcached UDP datagram"), "{error}");
+
+        // Every size a value_size distribution can draw, and multi-gets
+        let with = |protocol_config: serde_json::Value| {
+            let config = udp_profile("memcached-binary", "udp", "").unwrap();
+            let mut value = toml::Value::try_from(&config).unwrap();
+            let extra: toml::Value = serde_json::from_value(protocol_config).unwrap();
+            let pc = value["traffic_groups"][0]["protocol_config"].as_table_mut().unwrap();
+            pc.extend(extra.as_table().unwrap().clone());
+            let mut config: ProfileConfig = value.try_into().unwrap();
+            config.validate()
+        };
+        let weighted = |size: usize| {
+            serde_json::json!({ "value_size": { "strategy": "weighted",
+                "sizes": [{ "size": 1, "weight": 1.0 }, { "size": size, "weight": 0.001 }] } })
+        };
+        with(weighted(max)).unwrap();
+        let error = with(weighted(max + 1)).unwrap_err().to_string();
+        assert!(error.contains(&format!("value size {} does not fit", max + 1)), "{error}");
+        let mix = |name: &str| {
+            serde_json::json!({ "operations": { "strategy": "weighted", "commands": [
+                { "name": "get", "weight": 1.0 }, { "name": name, "weight": 1.0 }] } })
+        };
+        with(mix("delete")).unwrap();
+        let error = with(mix("mget")).unwrap_err().to_string();
+        assert!(error.contains("mget is not supported over UDP"), "{error}");
     }
 
     #[test]
@@ -2487,7 +2529,18 @@ threads = [0]
 connections_per_thread = 1
 traffic_policy = { type = "closed-loop" }
 sampling_policy = { type = "unlimited" }
-protocol_config = { keys = { strategy = "round-robin", max = 10, value_size = 8 }, insert_phase = {} }
+
+[traffic_groups.protocol_config]
+keys = { strategy = "round-robin", max = 10, value_size = 8 }
+insert_phase = {}
+
+[traffic_groups.protocol_config.operations]
+strategy = "weighted"
+commands = [{ name = "mget", weight = 1.0, params = { count = 2 } }, { name = "set", weight = 1.0 }]
+
+[traffic_groups.protocol_config.value_size]
+strategy = "weighted"
+sizes = [{ size = 8, weight = 0.9 }, { size = 64, weight = 0.1 }]
 
 [[traffic_groups]]
 name = "http"
@@ -2505,7 +2558,7 @@ target = "127.0.0.1:2117"
 threads = [0]
 connections_per_thread = 1
 traffic_policy = { type = "closed-loop" }
-protocol_config = { operation = "scan", scan = { count = 5 } }
+protocol_config = { scan = { count = 5 }, operations = { strategy = "weighted", commands = [{ name = "scan", weight = 1.0, params = { count = 2 } }] } }
 
 [[traffic_groups]]
 name = "echo"
@@ -2607,11 +2660,35 @@ protocol_config = {}
                 "traffic_groups.1.protocol_config.insert_phase",
                 "in traffic_groups[1].protocol_config.insert_phase",
             ),
+            (
+                "traffic_groups.1.protocol_config.operations",
+                "in traffic_groups[1].protocol_config.operations",
+            ),
+            (
+                "traffic_groups.1.protocol_config.operations.commands.0",
+                "in traffic_groups[1].protocol_config.operations.commands[0]",
+            ),
+            (
+                "traffic_groups.1.protocol_config.operations.commands.0.params",
+                "in traffic_groups[1].protocol_config.operations.commands[0].params",
+            ),
+            (
+                "traffic_groups.1.protocol_config.value_size",
+                "in traffic_groups[1].protocol_config.value_size",
+            ),
+            (
+                "traffic_groups.1.protocol_config.value_size.sizes.0",
+                "in traffic_groups[1].protocol_config.value_size.sizes[0]",
+            ),
             ("traffic_groups.2.protocol_config", "in traffic_groups[2].protocol_config"),
             ("traffic_groups.3.protocol_config", "in traffic_groups[3].protocol_config"),
             (
                 "traffic_groups.3.protocol_config.scan",
                 "in traffic_groups[3].protocol_config.scan",
+            ),
+            (
+                "traffic_groups.3.protocol_config.operations.commands.0.params",
+                "in traffic_groups[3].protocol_config.operations.commands[0].params",
             ),
             ("traffic_groups.4.protocol_config", "in traffic_groups[4].protocol_config"),
         ] {
@@ -2998,7 +3075,9 @@ file = "/tmp/test.json"
         let mut config = profile("operation = \"set\"");
         config.validate().expect("valid masstree protocol_config");
         match &config.protocol_configs[..] {
-            [ProtocolConfig::Masstree(masstree)] => assert_eq!(masstree.operation, "set"),
+            [ProtocolConfig::Masstree(masstree)] => {
+                assert_eq!(masstree.operation.as_deref(), Some("set"))
+            }
             other => panic!("Expected one Masstree protocol config, got {:?}", other),
         }
     }

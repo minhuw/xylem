@@ -7,6 +7,7 @@
 //! Key types:
 //! - `KeyGeneration` - Key distribution strategies (sequential, random, zipfian, etc.)
 //! - `ValueSizeGenerator` - Value size generation strategies
+//! - `CommandSelector` - Operation selection: one operation or a weighted mix
 //!
 //! # Design Philosophy
 //!
@@ -15,8 +16,12 @@
 //! (request content, key distribution, value sizes).
 
 pub mod keys;
+pub mod selector;
 pub mod value_size;
 
 // Re-export main types
 pub use keys::{KeyGeneration, KeyGeneratorTrait};
-pub use value_size::{FixedSize, NormalSize, PerCommandSize, UniformSize, ValueSizeGenerator};
+pub use selector::{CommandSelector, FixedCommandSelector, WeightedCommandSelector};
+pub use value_size::{
+    FixedSize, NormalSize, PerCommandSize, UniformSize, ValueSizeGenerator, WeightedSize,
+};

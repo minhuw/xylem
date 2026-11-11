@@ -68,7 +68,7 @@ fn memcached_malformed_lengths_do_not_succeed() {
     for response in [
         b"VALUE k 0 nope\r\n".as_slice(),
         b"VALUE k 0 1\r\nx!!END\r\n",
-        b"NOT_STORED\r\n",
+        b"NOT_A_REPLY\r\n",
     ] {
         let mut protocol = MemcachedAsciiProtocol::default();
         assert!(protocol.parse_response(0, response).is_err());
@@ -255,7 +255,9 @@ fn normal_set_sizes_and_round_robin_keys_reach_both_memcached_formats() {
             value_size: 3,
             prefix: "p:".into(),
         },
-        operation: "SET".into(),
+        operation: Some("SET".into()),
+        operations: None,
+        value_size: None,
         insert_phase: None,
     };
     let mut ascii = MemcachedAsciiProtocol::from_config(&config, None).unwrap();

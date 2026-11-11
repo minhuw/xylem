@@ -8,10 +8,19 @@
 //! datagram carries memcached's frame header (see [`udp`]), and responses
 //! match requests by its request id, so loss and reordering are tolerated.
 //!
+//! The measurement phase sends one operation or a weighted mix of them
+//! (see [`MemcachedOp`]); both codecs frame every reply without knowing
+//! which request it answers, as replies are self-describing: ASCII by their
+//! first line, binary by their opcode.
+//!
 //! Error replies are counted by kind: the ASCII `ERROR`, `CLIENT_ERROR` and
 //! `SERVER_ERROR` lines by keyword, and binary responses with a non-zero
-//! status by the status name, except a GET miss (`KEY_ENOENT`).
+//! status by the status name. A miss or a failed condition is a result, not
+//! an error: the ASCII `NOT_FOUND`, `NOT_STORED` and `EXISTS` and a GET's
+//! `END` without a value, and their binary statuses `KEY_ENOENT`,
+//! `NOT_STORED` and `KEY_EEXISTS`.
 
+use crate::workload::{CommandSelector, FixedCommandSelector, KeyGeneration, ValueSizeGenerator};
 use crate::{ErrorReply, Parsed};
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -26,10 +35,123 @@ pub use binary::MemcachedBinaryProtocol;
 pub use udp::MAX_UDP_VALUE_SIZE;
 
 /// Operation sent in the measurement phase, shared by the ASCII and binary codecs
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemcachedOp {
     Get,
     Set,
+    /// Store only if the key is absent
+    Add,
+    /// Store only if the key is present
+    Replace,
+    Delete,
+    /// Add `delta` to a numeric value; a missing key is not created
+    Incr {
+        delta: u64,
+    },
+    /// Subtract `delta` from a numeric value, saturating at 0; a missing key
+    /// is not created
+    Decr {
+        delta: u64,
+    },
+    /// Set a key's expiration time in seconds (0: never expires)
+    Touch {
+        exptime: u32,
+    },
+    /// Get `count` keys, each drawn from the key distribution, in one request
+    MultiGet {
+        count: usize,
+    },
+}
+
+impl MemcachedOp {
+    /// Command name, as `value_size.per_command` keys sizes
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Set => "SET",
+            Self::Add => "ADD",
+            Self::Replace => "REPLACE",
+            Self::Delete => "DELETE",
+            Self::Incr { .. } => "INCR",
+            Self::Decr { .. } => "DECR",
+            Self::Touch { .. } => "TOUCH",
+            Self::MultiGet { .. } => "MGET",
+        }
+    }
+
+    /// Whether the operation sends a value
+    fn stores(&self) -> bool {
+        matches!(self, Self::Set | Self::Add | Self::Replace)
+    }
+
+    /// Number of keys per request
+    fn key_count(&self) -> usize {
+        match self {
+            Self::MultiGet { count } => *count,
+            _ => 1,
+        }
+    }
+}
+
+/// What the measurement phase sends: the operation mix, the keys and the
+/// value sizes, shared by the ASCII and binary codecs
+pub(crate) struct Workload {
+    selector: Box<dyn CommandSelector<MemcachedOp>>,
+    /// Keys of operations without per-command keys
+    key_gen: Option<KeyGeneration>,
+    /// Value size without a size generator
+    value_size: usize,
+    value_sizes: Option<Box<dyn ValueSizeGenerator>>,
+}
+
+/// One measurement request to encode
+pub(crate) struct NextOp {
+    op: MemcachedOp,
+    keys: Vec<u64>,
+    /// Value size of a storage operation, 0 for others
+    value_size: usize,
+}
+
+impl Workload {
+    fn new(op: MemcachedOp, key_gen: Option<KeyGeneration>, value_size: usize) -> Self {
+        Self {
+            selector: Box::new(FixedCommandSelector::new(op)),
+            key_gen,
+            value_size,
+            value_sizes: None,
+        }
+    }
+
+    fn next(&mut self) -> NextOp {
+        let op = self.selector.next_command();
+        let keys = (0..op.key_count()).map(|_| self.next_key(&op)).collect();
+        let value_size = match &mut self.value_sizes {
+            _ if !op.stores() => 0,
+            Some(sizes) => sizes.next_size_for_command(op.name()),
+            None => self.value_size,
+        };
+        NextOp { op, keys, value_size }
+    }
+
+    fn next_key(&mut self, op: &MemcachedOp) -> u64 {
+        if self.selector.has_per_command_keys() {
+            self.selector
+                .generate_key_for_command(op)
+                .expect("a selector with per-command keys generates them")
+        } else {
+            self.key_gen.as_mut().map(|g| g.next_key()).unwrap_or(0)
+        }
+    }
+
+    fn reset(&mut self) {
+        self.selector.reset();
+        if let Some(key_gen) = &mut self.key_gen {
+            key_gen.reset();
+        }
+        if let Some(sizes) = &mut self.value_sizes {
+            sizes.reset();
+        }
+    }
 }
 
 /// Insert phase state for data population before measurement
