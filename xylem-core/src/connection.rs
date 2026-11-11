@@ -16,8 +16,8 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use xylem_common::{ConnectionRole, ErrorReply, Parsed, Protocol};
 use xylem_transport::{
-    ConnectionGroup, KernelTimestamp, RecvOutcome, Timestamp, TransportFactory, TxRange,
-    TxTimestampInfo,
+    ConnectionGroup, KernelTimestamp, RecvOutcome, SendProgress, Timestamp, TransportFactory,
+    TxRange, TxTimestampInfo,
 };
 
 /// Wrapping less-than-or-equal comparison for u32 counters
@@ -146,6 +146,34 @@ impl ErrorReplies {
     }
 }
 
+/// A request the transport took the last byte of; see
+/// [`ConnectionPool::take_sent`]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SentRequest {
+    pub group_id: usize,
+    pub connection_id: usize,
+    /// The request's bytes
+    pub bytes: usize,
+    /// Time from its intended send time to its send; `None` without a
+    /// schedule (closed loop)
+    pub lag: Option<Duration>,
+    /// Whether it is a measurement request: no warmup or setup request
+    pub measured: bool,
+}
+
+/// A request queued on a connection whose last byte the transport has not
+/// taken yet
+#[derive(Debug)]
+struct QueuedRequest<ReqId> {
+    /// Stream offset past its last byte, counted in [`ConnectionState::queued_bytes`]
+    end: u64,
+    len: usize,
+    req_id: ReqId,
+    intended_ns: Option<u64>,
+    is_warmup: bool,
+    is_setup: bool,
+}
+
 /// Pending request tracking
 #[derive(Debug)]
 struct PendingRequest {
@@ -184,6 +212,16 @@ struct PendingRequest {
 ///
 /// Queue cleanup: When a response arrives before its TX timestamp, or its stamp was lost,
 /// the queue entry is removed when the response completes the request.
+///
+/// # Send Queue
+///
+/// Requests and protocol-driven bytes go into `out` in order and reach the
+/// transport through non-blocking writes: a send round's requests on the
+/// connection leave in one write at the pool's flush, and bytes the
+/// transport does not take wait for the connection to become writable,
+/// ahead of anything queued later. A request enters `pending_map`, with
+/// the timestamp of the write that took its last byte, only then; until
+/// then it waits in `unsent` and holds its pipeline slot.
 ///
 /// # Scheduling Invariant
 ///
@@ -249,6 +287,19 @@ pub struct ConnectionState<ReqId: Eq + Hash + Clone> {
     /// Opened for the protocol's own use ([`ConnectionRole::Control`]): it
     /// has no traffic policy of its own and sends only setup requests
     control: bool,
+    /// Bytes queued to send; the transport took those before `out_head`
+    out: Vec<u8>,
+    out_head: usize,
+    /// Bytes ever queued, and ever taken by the transport: stream offsets
+    queued_bytes: u64,
+    sent_bytes: u64,
+    /// Queued requests whose last byte the transport has not taken, in order
+    unsent: VecDeque<QueuedRequest<ReqId>>,
+    /// On the pool's list of connections to write at its next flush
+    staged: bool,
+    /// The transport took fewer bytes than queued: the rest waits for the
+    /// connection to become writable, with write interest set
+    write_blocked: bool,
 }
 
 impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
@@ -282,12 +333,19 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
             absorbed_bytes: 0,
             error_replies: ErrorReplies::default(),
             control: false,
+            out: Vec::new(),
+            out_head: 0,
+            queued_bytes: 0,
+            sent_bytes: 0,
+            unsent: VecDeque::new(),
+            staged: false,
+            write_blocked: false,
         }
     }
 
     /// Check if this connection can accept more requests
     pub fn can_send(&self) -> bool {
-        !self.closed && self.pending_map.len() < self.max_pending_requests
+        !self.closed && self.pending_count() < self.max_pending_requests
     }
 
     /// Get connection ID
@@ -300,9 +358,15 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         self.target
     }
 
-    /// Get pending request count
+    /// Get pending request count: requests sent and waiting for their
+    /// responses, and requests queued but not yet taken by the transport
     pub fn pending_count(&self) -> usize {
-        self.pending_map.len()
+        self.pending_map.len() + self.unsent.len()
+    }
+
+    /// Whether queued bytes wait for the connection to become writable
+    pub fn is_write_blocked(&self) -> bool {
+        self.write_blocked
     }
 
     /// Get maximum pending requests allowed
@@ -336,7 +400,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         self.policy.intended_send_time()
     }
 
-    /// Number of pending measurement (non-warmup) requests
+    /// Number of pending measurement (non-warmup) requests the transport took
     pub fn measured_pending_count(&self) -> usize {
         self.pending_map.values().filter(|pending| !pending.is_warmup).count()
     }
@@ -366,9 +430,92 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         self.on_heap = on_heap;
     }
 
+    /// Queue `data` after the bytes queued before it; `request` is the
+    /// request it carries, if any
+    fn queue(&mut self, data: &[u8], request: Option<(ReqId, Option<u64>, bool, bool)>) {
+        self.out.extend_from_slice(data);
+        self.queued_bytes += data.len() as u64;
+        if let Some((req_id, intended_ns, is_warmup, is_setup)) = request {
+            self.unsent.push_back(QueuedRequest {
+                end: self.queued_bytes,
+                len: data.len(),
+                req_id,
+                intended_ns,
+                is_warmup,
+                is_setup,
+            });
+        }
+    }
+
+    /// Mark the connection closed and drop its pending and queued requests
+    fn close(&mut self) {
+        self.closed = true;
+        self.pending_map.clear();
+        self.unsent.clear();
+        self.out.clear();
+        self.out_head = 0;
+    }
+
+    /// Queued bytes the transport has not taken
+    fn unsent_bytes(&self) -> &[u8] {
+        &self.out[self.out_head..]
+    }
+
+    /// The transport took the next `progress.accepted` queued bytes: record
+    /// every request whose last byte it took as sent, with the write's
+    /// timestamp, and push it to `sent`
+    ///
+    /// A request's lag runs from its intended send time to that timestamp.
+    /// The TX range of the write is given to its last request; one ending
+    /// earlier in it ends that many bytes into the range. Datagram
+    /// transports count datagrams, but write one request at a time.
+    fn on_progress(&mut self, progress: SendProgress, sent: &mut Vec<SentRequest>) {
+        let before = self.sent_bytes;
+        self.sent_bytes += progress.accepted as u64;
+        self.out_head += progress.accepted;
+        if self.out_head == self.out.len() {
+            self.out.clear();
+            self.out_head = 0;
+        } else if self.out_head > self.out.len() / 2 {
+            self.out.drain(..self.out_head);
+            self.out_head = 0;
+        }
+        let receipt = progress.receipt;
+        while self.unsent.front().is_some_and(|request| request.end <= self.sent_bytes) {
+            let request = self.unsent.pop_front().expect("checked the front");
+            let tx = receipt.tx.map(|range| {
+                if request.end == self.sent_bytes {
+                    range
+                } else {
+                    let end = range.start.wrapping_add((request.end - before) as u32);
+                    TxRange { start: range.start, end }
+                }
+            });
+            let lag = request.intended_ns.map(|intended| {
+                Duration::from_nanos(receipt.timestamp.clock_ns().saturating_sub(intended))
+            });
+            self.record_request(
+                request.req_id,
+                receipt.timestamp,
+                lag.unwrap_or_default(),
+                tx,
+                request.is_warmup,
+                request.is_setup,
+            );
+            sent.push(SentRequest {
+                group_id: self.group_id,
+                connection_id: self.connection_id,
+                bytes: request.len,
+                lag,
+                measured: !request.is_warmup && !request.is_setup,
+            });
+        }
+    }
+
     /// Record a sent request, with its TX range when the transport reports TX timestamps
     ///
     /// Only `tx.end` is needed to determine which TX timestamp covers this request.
+    #[cfg(test)]
     fn record_send(
         &mut self,
         req_id: ReqId,
@@ -419,7 +566,8 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
     /// spent waiting for setup replies into send lag and a burst of overdue
     /// sends. The schedule restarts at its first intended time from then on.
     fn finish_setup_request(&mut self) {
-        if !self.pending_map.values().any(|pending| pending.is_setup) {
+        let unsent_setup = self.unsent.iter().any(|request| request.is_setup);
+        if !unsent_setup && !self.pending_map.values().any(|pending| pending.is_setup) {
             self.policy.reset();
         }
     }
@@ -824,6 +972,10 @@ pub struct ConnectionPool<G: ConnectionGroup, ReqId: Eq + Hash + Clone> {
     /// No pending request times out before this (a `timing::time_ns` value);
     /// `None` when none can. May be earlier than the true next deadline.
     next_deadline_ns: Option<u64>,
+    /// Connections with bytes queued since the last flush, which writes them
+    staged: Vec<usize>,
+    /// Requests the transport took since the last [`Self::take_sent`]
+    sent: Vec<SentRequest>,
 }
 
 impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionPool<G, ReqId> {
@@ -995,6 +1147,8 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
             dispatchers,
             tx_timestamps: Vec::new(),
             next_deadline_ns: None,
+            staged: Vec::new(),
+            sent: Vec::new(),
         })
     }
 
@@ -1084,10 +1238,98 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
             .map_or(0, |state| std::mem::take(&mut state.late_responses))
     }
 
-    /// Put the requests sent since the last flush or poll on the wire (see
-    /// [`ConnectionGroup::flush`])
+    /// Write the bytes queued since the last flush, one write per
+    /// connection, and put them on the wire (see [`ConnectionGroup::flush`])
+    ///
+    /// A connection waiting to become writable is left for
+    /// [`Self::write_queued`] once it is.
     pub fn flush(&mut self) -> Result<()> {
+        let mut staged = std::mem::take(&mut self.staged);
+        let mut result = Ok(());
+        for &connection_id in &staged {
+            let Some(state) = self.connection_states.get_mut(&connection_id) else {
+                continue;
+            };
+            state.staged = false;
+            if result.is_ok() && !state.write_blocked {
+                result = self.write_queued(connection_id);
+            }
+        }
+        staged.clear();
+        self.staged = staged;
+        result?;
         self.group.flush()?;
+        Ok(())
+    }
+
+    /// Hand the bytes queued on `connection_id` to the transport, as many as
+    /// it takes now
+    ///
+    /// Requests whose last byte it took count as sent (see
+    /// [`Self::take_sent`]). If bytes are left, the connection gets write
+    /// interest, so a poll reports it once it can take more; call this
+    /// again then. Does nothing on a closed connection.
+    pub fn write_queued(&mut self, connection_id: usize) -> Result<()> {
+        let state = self
+            .connection_states
+            .get_mut(&connection_id)
+            .ok_or_else(|| crate::Error::Connection("Connection not found".to_string()))?;
+        if state.closed {
+            return Ok(());
+        }
+        let data = state.unsent_bytes();
+        if !data.is_empty() {
+            let progress = self.group.try_send(connection_id, data)?;
+            let deadlines = state.deadlines.len();
+            state.on_progress(progress, &mut self.sent);
+            if state.deadlines.len() > deadlines {
+                // Deadlines grow in send order, so the first new one is the earliest
+                let deadline_ns = state.deadlines[deadlines].0;
+                self.next_deadline_ns =
+                    Some(self.next_deadline_ns.map_or(deadline_ns, |next| next.min(deadline_ns)));
+            }
+        }
+        let blocked = !state.unsent_bytes().is_empty();
+        if blocked != state.write_blocked {
+            state.write_blocked = blocked;
+            self.group.set_write_interest(connection_id, blocked)?;
+        }
+        Ok(())
+    }
+
+    /// Take the requests the transport took the last byte of since the last
+    /// call, in the order it took them
+    pub fn take_sent(&mut self, sent: &mut Vec<SentRequest>) {
+        sent.clear();
+        std::mem::swap(sent, &mut self.sent);
+    }
+
+    /// Queue `data` on `connection_id` to write at the next flush, before
+    /// anything queued later; a datagram is written at once
+    fn queue(
+        &mut self,
+        connection_id: usize,
+        data: &[u8],
+        request: Option<(ReqId, Option<u64>, bool, bool)>,
+    ) -> Result<()> {
+        let state = self
+            .connection_states
+            .get_mut(&connection_id)
+            .ok_or_else(|| crate::Error::Connection("Connection not found".to_string()))?;
+        if request.is_some() && !state.can_send() {
+            return Err(crate::Error::Connection(
+                "Connection cannot accept more requests".to_string(),
+            ));
+        }
+        state.queue(data, request);
+        // Datagrams keep their boundaries: one write each
+        if self.datagram {
+            return self.write_queued(connection_id);
+        }
+        if !state.staged {
+            state.staged = true;
+            self.staged.push(connection_id);
+        }
         Ok(())
     }
 
@@ -1102,7 +1344,8 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         Ok(())
     }
 
-    /// Send data on a connection
+    /// Send a request on a connection now: queue it and write the
+    /// connection's queue (see [`Self::write_queued`])
     ///
     /// # Arguments
     /// * `connection_id` - The connection to send on
@@ -1116,73 +1359,64 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         req_id: ReqId,
         is_warmup: bool,
     ) -> Result<()> {
-        self.send_scheduled(connection_id, data, req_id, is_warmup, None).map(|_| ())
+        self.queue_request(connection_id, data, req_id, is_warmup, None)?;
+        self.write_queued(connection_id)
     }
 
-    /// Send a request that was intended to go out at `intended_ns`
+    /// Queue a request that was intended to go out at `intended_ns`, to
+    /// write at the next flush
     ///
-    /// The send lag is the time from `intended_ns` to the cycles the transport
-    /// read when the send completed, on the [`crate::timing::time_ns`] clock.
-    /// It is added to the request's latency. Returns the lag, or `None` for a
-    /// request without an intended time (closed loop), whose lag is zero.
-    pub fn send_scheduled(
+    /// Once the transport takes its last byte it is sent (see
+    /// [`Self::take_sent`]): its send lag is the time from `intended_ns` to
+    /// the cycles the transport read when that write completed, on the
+    /// [`crate::timing::time_ns`] clock, and is added to its latency. A
+    /// request without an intended time (closed loop) has no lag. It holds
+    /// a pipeline slot from now on.
+    pub fn queue_request(
         &mut self,
         connection_id: usize,
         data: &[u8],
         req_id: ReqId,
         is_warmup: bool,
         intended_ns: Option<u64>,
-    ) -> Result<Option<Duration>> {
-        let state = self
-            .connection_states
-            .get_mut(&connection_id)
-            .ok_or_else(|| crate::Error::Connection("Connection not found".to_string()))?;
-
-        if !state.can_send() {
-            return Err(crate::Error::Connection(
-                "Connection cannot accept more requests".to_string(),
-            ));
-        }
-
-        let receipt = self.group.send(connection_id, data)?;
-
-        let send_lag = intended_ns.map(|intended| {
-            Duration::from_nanos(receipt.timestamp.clock_ns().saturating_sub(intended))
-        });
-
-        let state = self.connection_states.get_mut(&connection_id).unwrap();
-        state.record_send(
-            req_id,
-            receipt.timestamp,
-            send_lag.unwrap_or_default(),
-            receipt.tx,
-            is_warmup,
-        );
-        if state.request_timeout.is_some() {
-            if let Some(&(deadline_ns, _)) = state.deadlines.back() {
-                self.next_deadline_ns =
-                    Some(self.next_deadline_ns.map_or(deadline_ns, |next| next.min(deadline_ns)));
-            }
-        }
-
-        Ok(send_lag)
+    ) -> Result<()> {
+        self.queue(connection_id, data, Some((req_id, intended_ns, is_warmup, false)))
     }
 
     /// Send protocol-driven data (see [`xylem_common::Outbox::data`]) on a
     /// connection: no request, so nothing is tracked and the pipeline limit
     /// does not apply
+    ///
+    /// It goes out after the bytes queued before it and before those queued
+    /// later. With nothing queued, the transport takes what it can of it at
+    /// once, without a copy; the rest is queued for the connection to become
+    /// writable (see [`Self::write_queued`]).
     pub fn send_driven(&mut self, connection_id: usize, data: &[u8]) -> Result<()> {
-        if !self.connection_states.contains_key(&connection_id) {
-            return Err(crate::Error::Connection("Connection not found".to_string()));
+        let state = self
+            .connection_states
+            .get_mut(&connection_id)
+            .ok_or_else(|| crate::Error::Connection("Connection not found".to_string()))?;
+        if state.closed {
+            return Err(crate::Error::Connection("Connection closed".to_string()));
+        }
+        if !state.unsent_bytes().is_empty() {
+            return self.queue(connection_id, data, None);
         }
         // The transport counts these bytes in its TX ranges too, so later
         // requests' ranges stay right. This send's own TX timestamp ends past
         // every earlier request, whose own timestamps came first.
-        self.group.send(connection_id, data)?;
+        let accepted = self.group.try_send(connection_id, data)?.accepted;
+        state.queued_bytes += accepted as u64;
+        state.sent_bytes += accepted as u64;
+        if accepted < data.len() {
+            state.queue(&data[accepted..], None);
+            state.write_blocked = true;
+            self.group.set_write_interest(connection_id, true)?;
+        }
         Ok(())
     }
 
-    /// Send a connection setup request (a handshake, AUTH, ...)
+    /// Queue a connection setup request (a handshake, AUTH, ...)
     ///
     /// The request is tracked like a warmup request, but has no intended send
     /// time and does not advance the policy's schedule, which restarts: while
@@ -1190,20 +1424,11 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
     /// none as unsent. When the reply to the connection's last pending setup
     /// request arrives, the schedule starts afresh the next time the
     /// connection is scheduled.
-    pub fn send_setup(&mut self, connection_id: usize, data: &[u8], req_id: ReqId) -> Result<()> {
-        let state = self
-            .connection_states
-            .get_mut(&connection_id)
-            .ok_or_else(|| crate::Error::Connection("Connection not found".to_string()))?;
-        if !state.can_send() {
-            return Err(crate::Error::Connection(
-                "Connection cannot accept more requests".to_string(),
-            ));
+    pub fn queue_setup(&mut self, connection_id: usize, data: &[u8], req_id: ReqId) -> Result<()> {
+        self.queue(connection_id, data, Some((req_id, None, true, true)))?;
+        if let Some(state) = self.connection_states.get_mut(&connection_id) {
+            state.policy.reset();
         }
-        let receipt = self.group.send(connection_id, data)?;
-        let state = self.connection_states.get_mut(&connection_id).unwrap();
-        state.record_request(req_id, receipt.timestamp, Duration::ZERO, receipt.tx, true, true);
-        state.policy.reset();
         Ok(())
     }
 
@@ -1575,8 +1800,7 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
     /// it from the connection pool to prevent drain_iteration from hanging.
     pub fn close(&mut self, connection_id: usize) -> Result<()> {
         if let Some(state) = self.connection_states.get_mut(&connection_id) {
-            state.closed = true;
-            state.pending_map.clear();
+            state.close();
         }
         // Remove from connection_ids to prevent drain_iteration from waiting on it
         self.connection_ids.retain(|&id| id != connection_id);
@@ -1587,8 +1811,7 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
     /// Close all connections
     pub fn close_all(&mut self) -> Result<()> {
         for state in self.connection_states.values_mut() {
-            state.closed = true;
-            state.pending_map.clear();
+            state.close();
         }
         self.connection_ids.clear();
         self.group.close_all()?;
@@ -2129,12 +2352,114 @@ mod tests {
         )
         .unwrap();
         let intended = crate::timing::time_ns().saturating_sub(5_000_000);
-        let lag = pool.send_scheduled(0, &[0], 1u64, false, Some(intended)).unwrap().unwrap();
-        assert!(lag >= Duration::from_millis(5) && lag < Duration::from_secs(1), "{lag:?}");
+        pool.queue_request(0, &[1], 1u64, false, Some(intended)).unwrap();
         // A request without an intended time has no lag
-        assert_eq!(pool.send_scheduled(0, &[0], 2u64, true, None).unwrap(), None);
-        assert_eq!(pool.get_state(0).unwrap().measured_pending_count(), 1);
+        pool.queue_request(0, &[2, 2], 2u64, true, None).unwrap();
+        // Queued requests hold their slots, but are sent only by the flush
         assert_eq!(pool.get_state(0).unwrap().pending_count(), 2);
+        assert_eq!(pool.get_state(0).unwrap().measured_pending_count(), 0);
+        assert!(factory.0.lock().unwrap().sent.is_empty());
+        pool.flush().unwrap();
+
+        // Both went out in one write, which timed them both
+        assert_eq!(factory.0.lock().unwrap().sent, [vec![1, 2, 2]]);
+        let mut sent = Vec::new();
+        pool.take_sent(&mut sent);
+        let lag = sent[0].lag.unwrap();
+        assert!(lag >= Duration::from_millis(5) && lag < Duration::from_secs(1), "{lag:?}");
+        let second = SentRequest {
+            connection_id: 0,
+            group_id: 0,
+            bytes: 2,
+            lag: None,
+            measured: false,
+        };
+        assert_eq!(sent[1], second);
+        assert_eq!((sent.len(), sent[0].bytes, sent[0].measured), (2, 1, true));
+        let state = pool.get_state(0).unwrap();
+        assert_eq!((state.measured_pending_count(), state.pending_count()), (1, 2));
+        let send_ns = |id: u64| state.pending_map[&id].send_ts.clock_ns();
+        assert_eq!(send_ns(1), send_ns(2), "one send timestamp");
+    }
+
+    #[test]
+    fn a_partial_write_keeps_the_rest_queued_in_order_until_writable() {
+        let factory = test_support::FakeFactory::default();
+        let mut pool = ConnectionPool::new(
+            &factory,
+            "127.0.0.1:1".parse().unwrap(),
+            1,
+            4,
+            Box::new(crate::scheduler::UniformPolicyScheduler::closed_loop()),
+            0,
+        )
+        .unwrap();
+        factory.0.lock().unwrap().accept_limit = Some(4);
+        let written = |factory: &test_support::FakeFactory| factory.0.lock().unwrap().sent.concat();
+
+        // The transport takes 4 bytes of the driven data; the rest waits
+        // for the connection to become writable
+        pool.send_driven(0, b"0123456789").unwrap();
+        assert!(pool.get_state(0).unwrap().is_write_blocked());
+        assert_eq!(factory.0.lock().unwrap().write_interest, [0]);
+        assert_eq!(written(&factory), b"0123");
+
+        // A request queued later waits behind it, holding its slot, and a
+        // flush leaves the blocked connection alone; more driven data goes
+        // after the request
+        pool.queue_request(0, b"REQ", 7u64, false, None).unwrap();
+        pool.flush().unwrap();
+        pool.send_driven(0, b"ab").unwrap();
+        assert_eq!(written(&factory), b"0123");
+        assert_eq!(pool.get_state(0).unwrap().pending_count(), 1);
+
+        // Once it is writable, each write takes 4 more bytes. The request is
+        // sent once the transport takes its last byte, not before.
+        factory.0.lock().unwrap().writable = true;
+        let mut sent = Vec::new();
+        for expected in [&b"01234567"[..], b"0123456789RE"] {
+            pool.write_queued(0).unwrap();
+            pool.take_sent(&mut sent);
+            assert_eq!(written(&factory), expected);
+            assert!(sent.is_empty());
+            assert!(pool.get_state(0).unwrap().pending_map.is_empty());
+        }
+        pool.write_queued(0).unwrap();
+        pool.take_sent(&mut sent);
+        assert_eq!(written(&factory), b"0123456789REQab");
+        let request = SentRequest {
+            group_id: 0,
+            connection_id: 0,
+            bytes: 3,
+            lag: None,
+            measured: true,
+        };
+        assert_eq!(sent, [request]);
+        let state = pool.get_state(0).unwrap();
+        assert!(state.pending_map.contains_key(&7));
+        assert_eq!(state.pending_count(), 1);
+
+        // Everything went out: no more write interest, and a write is a no-op
+        assert!(!state.is_write_blocked());
+        assert!(factory.0.lock().unwrap().write_interest.is_empty());
+        let writes = factory.0.lock().unwrap().sent.len();
+        pool.write_queued(0).unwrap();
+        assert_eq!(factory.0.lock().unwrap().sent.len(), writes);
+    }
+
+    #[test]
+    fn requests_sharing_a_write_end_at_their_own_bytes_of_its_tx_range() {
+        let mut state = state();
+        state.queue(&[0; 3], Some((1, None, false, false)));
+        state.queue(&[0; 5], Some((2, None, true, false)));
+        let tx = Some(TxRange { start: 100, end: 108 });
+        let receipt = xylem_transport::SendReceipt { timestamp: Timestamp::now(), tx };
+        let mut sent = Vec::new();
+        state.on_progress(SendProgress { accepted: 8, receipt }, &mut sent);
+        let ends: Vec<_> = state.tx_pending_queue.iter().map(|&(end, id, _)| (id, end)).collect();
+        assert_eq!(ends, [(1, 103), (2, 108)]);
+        // The warmup request is sent, but not measured
+        assert_eq!(sent.iter().map(|sent| sent.measured).collect::<Vec<_>>(), [true, false]);
     }
 
     fn fake_pool(
@@ -2526,6 +2851,12 @@ pub(crate) mod test_support {
         pub datagram: bool,
         /// The number of sends made when each `flush` was called
         pub flushes: Vec<usize>,
+        /// Most bytes each `try_send` takes; `None` takes all
+        pub accept_limit: Option<usize>,
+        /// Connections with write interest: `poll` reports them, and
+        /// `try_send` takes bytes on them, only while `writable` is set
+        pub write_interest: Vec<usize>,
+        pub writable: bool,
     }
 
     impl Default for FakeIo {
@@ -2545,6 +2876,9 @@ pub(crate) mod test_support {
                 live_timestamps: false,
                 datagram: false,
                 flushes: Vec::new(),
+                accept_limit: None,
+                write_interest: Vec::new(),
+                writable: false,
             }
         }
     }
@@ -2603,6 +2937,41 @@ pub(crate) mod test_support {
             })
         }
 
+        fn try_send(
+            &mut self,
+            conn_id: usize,
+            data: &[u8],
+        ) -> xylem_transport::Result<SendProgress> {
+            let io = self.io.lock().unwrap();
+            // A connection waiting to become writable takes nothing until it is
+            let blocked = io.write_interest.contains(&conn_id) && !io.writable;
+            let limit = if blocked { Some(0) } else { io.accept_limit };
+            drop(io);
+            let accepted = limit.map_or(data.len(), |limit| limit.min(data.len()));
+            if accepted == 0 && !data.is_empty() {
+                self.check(conn_id)?;
+                let timestamp = self.io.lock().unwrap().now();
+                let receipt = xylem_transport::SendReceipt { timestamp, tx: None };
+                return Ok(SendProgress { accepted, receipt });
+            }
+            let receipt = self.send(conn_id, &data[..accepted])?;
+            Ok(SendProgress { accepted, receipt })
+        }
+
+        fn set_write_interest(
+            &mut self,
+            conn_id: usize,
+            interested: bool,
+        ) -> xylem_transport::Result<()> {
+            self.check(conn_id)?;
+            let mut io = self.io.lock().unwrap();
+            io.write_interest.retain(|&id| id != conn_id);
+            if interested {
+                io.write_interest.push(conn_id);
+            }
+            Ok(())
+        }
+
         // An empty queued response stands for "no data right now"
         fn recv(&mut self, conn_id: usize, buf: &mut [u8]) -> xylem_transport::Result<RecvOutcome> {
             self.check(conn_id)?;
@@ -2639,6 +3008,11 @@ pub(crate) mod test_support {
             ready.clear();
             if !io.responses.is_empty() {
                 ready.push(io.response_connection_id);
+            }
+            if io.writable {
+                let writable: Vec<usize> =
+                    io.write_interest.iter().copied().filter(|id| !ready.contains(id)).collect();
+                ready.extend(writable);
             }
             Ok(())
         }

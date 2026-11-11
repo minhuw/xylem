@@ -7,8 +7,9 @@ The transport layer (`xylem-transport`) provides network I/O for Xylem: TCP, UDP
 A worker thread owns one `ConnectionGroup`, created by a `TransportFactory` (`TcpTransportFactory`, `UdpTransportFactory` or `UnixTransportFactory`). All I/O goes through the group by connection ID:
 
 - `add_connection(target)` opens a connection and returns its ID (`add_connection_path` for Unix sockets).
-- `send(conn, data)` writes every byte and returns a `SendReceipt`: the send timestamp and, when TX timestamps are on, the TX range of the send.
-- `poll(timeout, &mut ready)` waits once for all connections and fills `ready` with readable connection IDs (level-triggered).
+- `send(conn, data)` writes every byte, waiting while the socket is full, and returns a `SendReceipt`: the send timestamp and, when TX timestamps are on, the TX range of the send.
+- `try_send(conn, data)` writes what the socket takes now, possibly nothing, and returns how many bytes with their `SendReceipt`. The worker sends this way: it keeps the rest queued and sets `set_write_interest(conn, true)` until the connection can take more.
+- `poll(timeout, &mut ready)` waits once for all connections and fills `ready` with readable connection IDs, and those with write interest that can take more bytes (level-triggered).
 - `recv(conn, buf)` reads what is available and returns a `RecvOutcome`: `Data` with its receive timestamp, `WouldBlock` or `Eof`.
 - `poll_tx_timestamps(&mut out)` collects kernel TX timestamps that arrived since the last call.
 

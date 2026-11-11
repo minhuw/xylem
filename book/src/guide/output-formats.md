@@ -173,6 +173,13 @@ latency (from the send, or its kernel TX timestamp, to the response). Each
 Closed-loop requests have no intended time: their values are `null` and their
 latency is the service latency alone.
 
+Either way a request counts as sent when the transport takes its last byte.
+The requests a worker's send round queues on one connection go out together,
+in one write when the round ends (the round's first request alone, at once),
+and share that write's timestamp.
+A connection whose socket takes only part of its bytes sends the rest once it
+becomes writable, and its later requests wait behind them.
+
 ## Latency breakdown
 
 Each `latency_breakdown` object in JSON (global and per group) says where the

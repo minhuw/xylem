@@ -7,7 +7,7 @@
 //! - Single connection, single pending request: Simple closed-loop latency measurement
 //! - Multiple connections with pipelining: High-throughput load testing
 
-use crate::connection::{ConnectionPool, TrafficGroupConfig};
+use crate::connection::{ConnectionPool, SentRequest, TrafficGroupConfig};
 use crate::request_dump::RequestDumper;
 use crate::stats::{StatsRecorder, TupleStatsCollector, UNSENT_WALK_CAP};
 use crate::timing;
@@ -65,6 +65,8 @@ pub struct Worker<G: ConnectionGroup, P: Protocol, S: StatsRecorder = TupleStats
     ready_ids: Vec<usize>,
     /// Reused buffer the protocols drain their driven sends and wakeups into
     outbox: Outbox,
+    /// Reused buffer for the requests the transport took
+    sent: Vec<SentRequest>,
 }
 
 impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
@@ -156,6 +158,7 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             next_tx_cleanup_ns: timing::time_ns().saturating_add(1_000_000_000),
             ready_ids: Vec::new(),
             outbox: Outbox::default(),
+            sent: Vec::new(),
         }
     }
 
@@ -328,7 +331,7 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             if request.metadata.is_setup {
                 // Connection setup (a handshake, AUTH, ...) may carry
                 // credentials: it is never dumped, measured or scheduled.
-                self.pool.send_setup(connection_id, &request.data, request.request_id)?;
+                self.pool.queue_setup(connection_id, &request.data, request.request_id)?;
             } else {
                 // Record request to dump file if enabled
                 if let Some(ref dumper) = self.request_dumper {
@@ -342,10 +345,12 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
                     );
                 }
 
-                // Send request (track warmup status for response handling). An
-                // open-loop request's latency starts at its intended send time.
+                // Queue the request (track warmup status for response
+                // handling); it is sent, and its stats recorded, when the
+                // transport takes it. An open-loop request's latency starts
+                // at its intended send time.
                 let intended_ns = self.pool.intended_send_time(pick);
-                let lag = self.pool.send_scheduled(
+                self.pool.queue_request(
                     connection_id,
                     &request.data,
                     request.request_id,
@@ -353,13 +358,8 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
                     intended_ns,
                 )?;
 
-                // Advance the policy's schedule and record stats (skip stats for
-                // warmup requests)
+                // Advance the policy's schedule
                 self.pool.on_request_sent(pick, timing::time_ns());
-                if !request.metadata.is_warmup {
-                    self.stats.record_tx_bytes(group_id, connection_id, request.data.len());
-                    self.stats.record_sent(group_id, connection_id, lag);
-                }
             }
 
             // Try to re-add connection to heap if it still has capacity
@@ -374,9 +374,9 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
 
             sends_this_iteration += 1;
             // The round's first request goes out at once, as on a kernel
-            // socket; the rest wait for one transmit pass after the loop
+            // socket; the rest wait for one write per connection after the loop
             if sends_this_iteration == 1 {
-                self.pool.flush()?;
+                self.flush()?;
             }
             if sends_this_iteration >= max_sends_per_iteration {
                 eprintln!(
@@ -386,13 +386,47 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
                 break;
             }
         }
-        // One transmit pass for the rest of the round: a user-space stack's
-        // pass costs time per connection, so one per send would grow with
-        // the square of the connections that send together
+        // One write per connection and one transmit pass for the rest of
+        // the round: requests pipelined on a connection share a write and
+        // its packets, and a user-space stack's pass costs time per
+        // connection, so one per send would grow with the square of the
+        // connections that send together
         if sends_this_iteration > 1 {
-            self.pool.flush()?;
+            self.flush()?;
         }
         Ok(())
+    }
+
+    /// Write what was queued since the last flush and put it on the wire,
+    /// recording the requests the transport took
+    fn flush(&mut self) -> Result<()> {
+        let flushed = self.pool.flush();
+        self.record_sent();
+        flushed
+    }
+
+    /// Record the stats of the measurement requests the transport took
+    fn record_sent(&mut self) {
+        self.pool.take_sent(&mut self.sent);
+        for sent in &self.sent {
+            if sent.measured {
+                self.stats.record_tx_bytes(sent.group_id, sent.connection_id, sent.bytes);
+                self.stats.record_sent(sent.group_id, sent.connection_id, sent.lag);
+            }
+        }
+    }
+
+    /// Write the bytes queued on `connection_id` that the transport takes
+    /// now; on a connection error, close the connection
+    fn write_queued(&mut self, connection_id: usize, group_id: usize) -> Result<()> {
+        match self.pool.write_queued(connection_id) {
+            Err(e @ crate::Error::Connection(_)) => {
+                self.close_failed(connection_id, group_id);
+                tracing::warn!(connection_id, "Connection disconnected: {}", e);
+                Ok(())
+            }
+            result => result,
+        }
     }
 
     /// Bound every receive wait by the experiment deadline and the next
@@ -435,6 +469,16 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             let state = match self.pool.get_state(connection_id) {
                 Some(s) => s,
                 None => continue,
+            };
+
+            // Queued bytes waited for the connection to become writable
+            if state.is_write_blocked() {
+                let group_id = state.group_id();
+                self.write_queued(connection_id, group_id)?;
+            }
+            let state = match self.pool.get_state(connection_id) {
+                Some(s) if !s.is_closed() => s,
+                _ => continue,
             };
 
             // Skip connections with no pending requests. A datagram connection
@@ -512,14 +556,18 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         if driven_sends {
             self.pool.flush()?;
         }
+        // Requests written once their connections became writable
+        self.record_sent();
 
         Ok(())
     }
 
     /// Take what the protocol asks for after parsing data received on
     /// `connection_id`: reschedule the connections it woke, and send its
-    /// driven bytes on the connection before its next request. Returns
-    /// whether it sent any; on a load connection they count as sent bytes.
+    /// driven bytes on the connection before its next request. What the
+    /// transport does not take now waits in the connection's send queue for
+    /// the connection to become writable, while reads go on. Returns whether
+    /// it sent any; on a load connection they count as sent bytes.
     fn drain_outbox(&mut self, connection_id: usize, group_id: usize) -> Result<bool> {
         let protocol = self.protocols.get_mut(&group_id).expect("Protocol not found for group_id");
         protocol.drain_outbox(connection_id, &mut self.outbox);
@@ -706,7 +754,7 @@ mod tests {
     use xylem_common::{ErrorReply, Parsed, Request, RequestMeta};
     use xylem_transport::TcpTransportFactory;
 
-    use crate::connection::test_support::{FakeFactory, FakeGroup};
+    use crate::connection::test_support::{FakeFactory, FakeGroup, FakeIo};
     use crate::scheduler::{PolicyScheduler, UniformPolicyScheduler};
     use crate::stats::SamplingPolicy;
 
@@ -806,18 +854,26 @@ mod tests {
         .unwrap()
     }
 
+    /// Requests the fake transport took: the fake protocol's are 8 bytes
+    fn sent_requests(factory: &FakeFactory) -> usize {
+        factory.0.lock().unwrap().sent.iter().map(Vec::len).sum::<usize>() / 8
+    }
+
     #[test]
     fn a_round_flushes_its_first_send_at_once_and_the_rest_together() {
         let factory = FakeFactory::default();
-        // Closed loop with 4 requests in flight: one round sends 4
+        // Closed loop with 4 requests in flight: one round sends 4, the
+        // first alone and the other 3 in one write
         let mut worker = fake_worker(&factory, 4, Box::new(UniformPolicyScheduler::closed_loop()));
         worker.send_requests().unwrap();
-        assert_eq!(factory.0.lock().unwrap().sent.len(), 4);
-        assert_eq!(factory.0.lock().unwrap().flushes, [1, 4]);
+        let sizes: Vec<usize> = factory.0.lock().unwrap().sent.iter().map(Vec::len).collect();
+        assert_eq!(sizes, [8, 24]);
+        assert_eq!(factory.0.lock().unwrap().flushes, [1, 2]);
+        assert_eq!(worker.stats.request_counts_global().sent, 4);
 
         // A round that sends nothing flushes nothing
         worker.send_requests().unwrap();
-        assert_eq!(factory.0.lock().unwrap().flushes, [1, 4]);
+        assert_eq!(factory.0.lock().unwrap().flushes, [1, 2]);
     }
 
     #[test]
@@ -951,7 +1007,7 @@ mod tests {
         let factory = FakeFactory::default();
         let mut worker = fake_worker(&factory, 32, Box::new(UniformPolicyScheduler::closed_loop()));
         worker.send_requests().unwrap();
-        assert_eq!(factory.0.lock().unwrap().sent.len(), 16);
+        assert_eq!(sent_requests(&factory), 16);
         assert_eq!(worker.pool.peek_next_ready_time(), None);
         let timeout = worker.poll_timeout(100, 100_000_100);
         assert_eq!(timeout, Duration::ZERO);
@@ -1390,7 +1446,8 @@ mod tests {
             if clock_calls == 0 {
                 assert!(io.sent.is_empty());
             } else if !fail_send {
-                assert_eq!(io.sent.len(), 2, "the end sample follows the error");
+                let sent = io.sent.iter().map(Vec::len).sum::<usize>() / 8;
+                assert_eq!(sent, 2, "the end sample follows the error");
                 assert_eq!(io.responses.len(), 1, "the end sample precedes draining");
             }
             clock_calls += 1;
@@ -1415,7 +1472,9 @@ mod tests {
         let completed = u64::from(!fail_send);
         assert_eq!((counts.sent, counts.completed), (completed * 2, completed));
         assert_eq!(global(&worker).total_requests, completed);
-        assert_eq!(worker.pool.get_state(0).unwrap().pending_count(), completed as usize);
+        // A request whose write failed was never sent, so nothing waits for it
+        let measured_pending = worker.pool.get_state(0).unwrap().measured_pending_count();
+        assert_eq!(measured_pending, completed as usize);
         {
             let io = factory.0.lock().unwrap();
             assert!(!io.closed);
@@ -1537,7 +1596,7 @@ mod tests {
         while worker.pool.has_ready(timing::time_ns()) {
             worker.send_requests().unwrap();
         }
-        let sent = factory.0.lock().unwrap().sent.len() as u64;
+        let sent = sent_requests(&factory) as u64;
         assert!(sent >= 101, "the overdue requests go out: {sent}");
         assert_eq!(
             worker.pool.get_state(0).unwrap().intended_send_time(),
@@ -2113,6 +2172,8 @@ mod tests {
         /// Send a measurement request on the control connection
         misbehave: bool,
         driven: HashMap<usize, Vec<u8>>,
+        /// What a PULL frame makes it send; `DATA` when empty
+        pull_data: Vec<u8>,
         wake: Vec<usize>,
     }
 
@@ -2146,7 +2207,12 @@ mod tests {
             data: &'a [u8],
         ) -> anyhow::Result<Parsed<'a, u64>> {
             if data.starts_with(b"PULL") {
-                self.driven.entry(conn_id).or_default().extend_from_slice(b"DATA");
+                let pull: &[u8] = if self.pull_data.is_empty() {
+                    b"DATA"
+                } else {
+                    &self.pull_data
+                };
+                self.driven.entry(conn_id).or_default().extend_from_slice(pull);
                 return Ok(Parsed::Absorbed(4));
             }
             if data.len() < 8 {
@@ -2274,6 +2340,60 @@ mod tests {
         let entries = worker.stats.entries();
         assert_eq!(entries.values().map(|entry| entry.rx_bytes).sum::<u64>(), 12);
         assert_eq!(entries.values().map(|entry| entry.tx_bytes).sum::<u64>(), 3 * 8 + 4);
+    }
+
+    #[test]
+    fn driven_data_on_a_slow_link_waits_for_writability_while_reads_go_on() {
+        let factory = FakeFactory::default();
+        let pull_data: Vec<u8> = (0..20).collect();
+        let protocol = SessionProtocol {
+            pull_data: pull_data.clone(),
+            ..Default::default()
+        };
+        let mut worker = session_worker(&factory, protocol);
+        let io = factory.0.clone();
+        worker.send_requests().unwrap();
+        io.lock().unwrap().responses.push_back(Ok(SESSION_SETUP.to_le_bytes().to_vec()));
+        worker.process_responses(Duration::ZERO).unwrap();
+        worker.send_requests().unwrap();
+        let on_connection_1 = |io: &FakeIo| -> Vec<u8> {
+            let writes = io.sent.iter().zip(&io.sent_on).skip(3);
+            writes.filter(|&(_, &on)| on == 1).flat_map(|(data, _)| data.clone()).collect()
+        };
+
+        // From now on the transport takes at most 8 bytes per write. A PULL
+        // makes connection 1 send 20 bytes: 8 go out, 12 wait
+        io.lock().unwrap().accept_limit = Some(8);
+        io.lock().unwrap().response_connection_id = 1;
+        io.lock().unwrap().responses.push_back(Ok(b"PULL".to_vec()));
+        worker.process_responses(Duration::ZERO).unwrap();
+        assert_eq!(on_connection_1(&io.lock().unwrap()), pull_data[..8]);
+        assert!(worker.pool.get_state(1).unwrap().is_write_blocked());
+
+        // While it waits, the reply to request 0 is still read, and the next
+        // request queues behind the rest of the data instead of going out
+        io.lock().unwrap().responses.push_back(Ok(0u64.to_le_bytes().to_vec()));
+        worker.process_responses(Duration::ZERO).unwrap();
+        assert_eq!(worker.stats.request_counts_global().completed, 1);
+        worker.send_requests().unwrap();
+        assert_eq!(on_connection_1(&io.lock().unwrap()), pull_data[..8]);
+        assert_eq!(worker.stats.request_counts_global().sent, 2);
+
+        // Once the connection is writable, each poll reports it and its
+        // queue drains in order: the data, then request 2
+        io.lock().unwrap().writable = true;
+        for _ in 0..3 {
+            worker.process_responses(Duration::ZERO).unwrap();
+        }
+        let mut expected = pull_data.clone();
+        expected.extend_from_slice(&2u64.to_le_bytes());
+        assert_eq!(on_connection_1(&io.lock().unwrap()), expected);
+        assert!(!worker.pool.get_state(1).unwrap().is_write_blocked());
+        assert!(io.lock().unwrap().write_interest.is_empty());
+        let counts = worker.stats.request_counts_global();
+        assert_eq!((counts.sent, counts.completed), (3, 1));
+        let tx_bytes: u64 = worker.stats.entries().values().map(|entry| entry.tx_bytes).sum();
+        assert_eq!(tx_bytes, 3 * 8 + 20);
     }
 
     #[test]

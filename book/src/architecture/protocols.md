@@ -76,7 +76,9 @@ pub trait Protocol: Send {
   protocol puts in `Outbox::data` bytes to send on that connection that are
   no requests (an NVMe/TCP H2CData PDU answering an R2T, an HTTP/2 SETTINGS
   acknowledgement); the worker sends them before the connection's next
-  request, counts them as sent bytes, and gives them no latency. In
+  request, counts them as sent bytes, and gives them no latency. Bytes the
+  socket does not take at once wait in the connection's send queue until it
+  is writable, ahead of later requests, while the worker keeps reading. In
   `Outbox::wake` it names connections that data on this one unblocked, such
   as I/O queues waiting for their admin queue; the worker reschedules just
   those.
