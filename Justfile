@@ -74,6 +74,11 @@ test-masstree:
     @echo "🌲 Running Masstree integration tests..."
     cargo nextest run --profile integration -E 'binary(masstree_integration)'
 
+# Run DNS integration tests (Knot DNS)
+test-dns:
+    @echo "🌐 Running DNS integration tests..."
+    cargo nextest run --profile integration -E 'binary(dns_integration)'
+
 # Build debug version
 build:
     @echo "🔨 Building debug version..."

@@ -8,6 +8,7 @@
 mod compose;
 
 // Docker-based service guards
+pub mod knot;
 pub mod masstree;
 pub mod memcached;
 pub mod multi_protocol;

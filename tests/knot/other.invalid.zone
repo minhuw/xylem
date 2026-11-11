@@ -1,0 +1,6 @@
+$ORIGIN other.invalid.
+$TTL 90
+@ IN SOA ns.other.invalid. hostmaster.other.invalid. ( 1 3600 600 86400 90 )
+@ IN NS ns.other.invalid.
+ns IN A 198.51.100.53
+www IN A 198.51.100.80
