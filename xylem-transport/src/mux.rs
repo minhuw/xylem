@@ -54,6 +54,27 @@ pub(crate) struct Multiplexer {
 const EVENT_CAPACITY: usize = 64;
 
 #[cfg(target_os = "linux")]
+fn epoll_flags(interest: Interest) -> EpollFlags {
+    let mut flags = EpollFlags::empty();
+    if interest.readable {
+        flags |= EpollFlags::EPOLLIN;
+    }
+    if interest.writable {
+        flags |= EpollFlags::EPOLLOUT;
+    }
+    flags
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mio_interest(interest: Interest) -> MioInterest {
+    match (interest.readable, interest.writable) {
+        (true, true) => MioInterest::READABLE | MioInterest::WRITABLE,
+        (false, true) => MioInterest::WRITABLE,
+        _ => MioInterest::READABLE,
+    }
+}
+
+#[cfg(target_os = "linux")]
 impl Multiplexer {
     pub fn new() -> Result<Self> {
         Ok(Self {
@@ -64,22 +85,23 @@ impl Multiplexer {
 
     /// Register `fd`; `id` is returned in its events
     pub fn register(&mut self, fd: RawFd, id: usize, interest: Interest) -> Result<()> {
-        let mut flags = EpollFlags::empty();
-        if interest.readable {
-            flags |= EpollFlags::EPOLLIN;
-        }
-        if interest.writable {
-            flags |= EpollFlags::EPOLLOUT;
-        }
         // SAFETY: the caller keeps `fd` open while it is registered.
         let fd = unsafe { BorrowedFd::borrow_raw(fd) };
-        self.epoll.add(fd, EpollEvent::new(flags, id as u64))?;
+        self.epoll.add(fd, EpollEvent::new(epoll_flags(interest), id as u64))?;
         Ok(())
     }
 
     pub fn deregister(&mut self, fd: RawFd) -> Result<()> {
         // SAFETY: `fd` is still open; it is being removed from the set.
         self.epoll.delete(unsafe { BorrowedFd::borrow_raw(fd) })?;
+        Ok(())
+    }
+
+    /// Change the interest of the registered `fd`
+    pub fn modify(&mut self, fd: RawFd, id: usize, interest: Interest) -> Result<()> {
+        let mut event = EpollEvent::new(epoll_flags(interest), id as u64);
+        // SAFETY: the caller keeps `fd` open while it is registered.
+        self.epoll.modify(unsafe { BorrowedFd::borrow_raw(fd) }, &mut event)?;
         Ok(())
     }
 
@@ -124,18 +146,22 @@ impl Multiplexer {
 
     /// Register `fd`; `id` is returned in its events
     pub fn register(&mut self, fd: RawFd, id: usize, interest: Interest) -> Result<()> {
-        let interest = match (interest.readable, interest.writable) {
-            (true, true) => MioInterest::READABLE | MioInterest::WRITABLE,
-            (false, true) => MioInterest::WRITABLE,
-            _ => MioInterest::READABLE,
-        };
         let mut source = mio::unix::SourceFd(&fd);
-        self.poll.registry().register(&mut source, Token(id), interest)?;
+        self.poll.registry().register(&mut source, Token(id), mio_interest(interest))?;
         Ok(())
     }
 
     pub fn deregister(&mut self, fd: RawFd) -> Result<()> {
         self.poll.registry().deregister(&mut mio::unix::SourceFd(&fd))?;
+        Ok(())
+    }
+
+    /// Change the interest of the registered `fd`
+    pub fn modify(&mut self, fd: RawFd, id: usize, interest: Interest) -> Result<()> {
+        let mut source = mio::unix::SourceFd(&fd);
+        self.poll
+            .registry()
+            .reregister(&mut source, Token(id), mio_interest(interest))?;
         Ok(())
     }
 

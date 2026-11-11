@@ -24,7 +24,7 @@
 
 use crate::{
     ClockCalibrationReport, ConnectionGroup, Error, KernelClock, KernelTimestamp, RecvOutcome,
-    Result, SendReceipt, Timestamp, TransportFactory, TxRange, TxTimestampInfo,
+    Result, SendProgress, SendReceipt, Timestamp, TransportFactory, TxRange, TxTimestampInfo,
 };
 use ntcp_io::{ClockDescriptor, PacketIo};
 use ntcp_io_dpdk::{bracketed_reading, ClockCalibration};
@@ -174,11 +174,16 @@ struct SlotState {
     /// The connection ended (`Closed` event or network stopped); a receive
     /// reports what is left and then the error
     closed: bool,
+    /// The caller waits to send more (`set_write_interest`)
+    write_interest: bool,
+    /// Writes may be accepted: cleared by a write that would block, set by
+    /// the `Writable` event ntcp latches after one
+    writable: bool,
 }
 
 impl SlotState {
     fn ready(&self) -> bool {
-        self.readable || self.eof || self.closed
+        self.readable || self.eof || self.closed || (self.write_interest && self.writable)
     }
 }
 
@@ -295,6 +300,28 @@ impl<H: Copy + Eq + Hash> SlotTable<H> {
     fn on_readable(&mut self, handle: H) {
         if let Some(&id) = self.by_handle.get(&handle) {
             self.set_readable(id, true);
+        }
+    }
+
+    /// Whether writes on `id` may be accepted
+    fn set_writable(&mut self, id: usize, writable: bool) {
+        self.slots[id].state.writable = writable;
+        if writable && self.slots[id].state.write_interest {
+            self.enqueue(id);
+        }
+    }
+
+    /// Whether `id` is reported while writes may be accepted
+    fn set_write_interest(&mut self, id: usize, interested: bool) {
+        self.slots[id].state.write_interest = interested;
+        if interested && self.slots[id].state.writable {
+            self.enqueue(id);
+        }
+    }
+
+    fn on_writable(&mut self, handle: H) {
+        if let Some(&id) = self.by_handle.get(&handle) {
+            self.set_writable(id, true);
         }
     }
 
@@ -640,6 +667,78 @@ impl<P: NtcpBackend> NtcpConnectionGroup<P> {
         Ok(())
     }
 
+    /// Write `data` to `conn_id`'s stack buffer. If `spin`, drive the stack
+    /// while it takes no more, until every byte is accepted or the send
+    /// timeout passes; else stop there and wait for its `Writable` event.
+    fn write(&mut self, conn_id: usize, data: &[u8], spin: bool) -> Result<SendProgress> {
+        let conn = self.slots.handle(conn_id)?;
+        let stamped = self.nic.is_some();
+        let options = WriteOptions {
+            timestamps: TxTimestampRequest {
+                scheduled: stamped,
+                ..TxTimestampRequest::default()
+            },
+        };
+        let mut sent = 0;
+        // Stream positions of the first and past the last byte written
+        let mut range: Option<(u64, u64)> = None;
+        let mut deadline = None;
+        while sent < data.len() {
+            // Whether ntcp refused the write, so it latches a Writable event
+            // once it takes more
+            let refused = match self.network.try_write(conn, &data[sent..], options) {
+                Ok(receipt) => {
+                    sent += receipt.accepted;
+                    let start = range.map_or(receipt.range.start, |(start, _)| start);
+                    range = Some((start, receipt.range.end));
+                    if receipt.accepted > 0 {
+                        continue;
+                    }
+                    false
+                }
+                Err(e) if e.is_would_block() => true,
+                Err(e) => return Err(network_error("ntcp send", e)),
+            };
+            // A full buffer or used-up TX timestamp records
+            if !spin {
+                // Without a Writable event to come, stay reported as writable
+                // so the caller tries again
+                self.slots.set_writable(conn_id, !refused);
+                break;
+            }
+            // Let the stack transmit and take ACKs, within the send timeout
+            let deadline = match deadline {
+                Some(deadline) => deadline,
+                None => *deadline.insert(self.deadline_after(self.send_timeout)),
+            };
+            if self.now() >= deadline {
+                return Err(Error::Connection(format!(
+                    "Send timeout: {} of {} bytes accepted",
+                    sent,
+                    data.len()
+                )));
+            }
+            // A full drive: send space frees only as received ACKs are
+            // processed, TX timestamp records as they are drained
+            self.drive()?;
+            if stamped {
+                self.drain_stamps();
+            }
+        }
+        // The bytes are in the stack; they go on the wire at the next flush
+        // or poll, which the worker calls after its round of sends
+        let timestamp = Timestamp::now();
+        self.unflushed |= sent > 0;
+        let tx = match range {
+            Some((start, end)) if stamped => Some(TxRange { start: start as u32, end: end as u32 }),
+            _ => None,
+        };
+        Ok(SendProgress {
+            accepted: sent,
+            receipt: SendReceipt { timestamp, tx },
+        })
+    }
+
     /// Drive the network once with `budget`
     fn drive_with(&mut self, budget: WorkBudget) -> Result<DriveReport> {
         let now = self.now();
@@ -668,7 +767,8 @@ impl<P: NtcpBackend> NtcpConnectionGroup<P> {
                     Event::Readable(id) => self.slots.on_readable(id),
                     Event::Closed { connection, .. } => self.slots.on_closed(connection),
                     Event::NetworkStopped => self.slots.on_stopped(),
-                    // Writable: send drives until its bytes are accepted
+                    // Latched after a write would block
+                    Event::Writable(id) => self.slots.on_writable(id),
                     _ => {}
                 }
             }
@@ -882,60 +982,17 @@ impl<P: NtcpBackend> ConnectionGroup for NtcpConnectionGroup<P> {
     }
 
     fn send(&mut self, conn_id: usize, data: &[u8]) -> Result<SendReceipt> {
-        let conn = self.slots.handle(conn_id)?;
-        let stamped = self.nic.is_some();
-        let options = WriteOptions {
-            timestamps: TxTimestampRequest {
-                scheduled: stamped,
-                ..TxTimestampRequest::default()
-            },
-        };
-        let mut sent = 0;
-        // Stream positions of the first and past the last byte written
-        let mut range: Option<(u64, u64)> = None;
-        let mut deadline = None;
-        while sent < data.len() {
-            match self.network.try_write(conn, &data[sent..], options) {
-                Ok(receipt) => {
-                    sent += receipt.accepted;
-                    let start = range.map_or(receipt.range.start, |(start, _)| start);
-                    range = Some((start, receipt.range.end));
-                }
-                Err(e) if e.is_would_block() => {}
-                Err(e) => return Err(network_error("ntcp send", e)),
-            }
-            if sent < data.len() {
-                // Only a partial write, a full buffer or used-up TX
-                // timestamp records get here: let the stack transmit and
-                // take ACKs, within the send timeout
-                let deadline = match deadline {
-                    Some(deadline) => deadline,
-                    None => *deadline.insert(self.deadline_after(self.send_timeout)),
-                };
-                if self.now() >= deadline {
-                    return Err(Error::Connection(format!(
-                        "Send timeout: {} of {} bytes accepted",
-                        sent,
-                        data.len()
-                    )));
-                }
-                // A full drive: send space frees only as received ACKs are
-                // processed, TX timestamp records as they are drained
-                self.drive()?;
-                if stamped {
-                    self.drain_stamps();
-                }
-            }
-        }
-        // The bytes are in the stack; they go on the wire at the next flush
-        // or poll, which the worker calls after its round of sends
-        let timestamp = Timestamp::now();
-        self.unflushed |= !data.is_empty();
-        let tx = match range {
-            Some((start, end)) if stamped => Some(TxRange { start: start as u32, end: end as u32 }),
-            _ => None,
-        };
-        Ok(SendReceipt { timestamp, tx })
+        Ok(self.write(conn_id, data, true)?.receipt)
+    }
+
+    fn try_send(&mut self, conn_id: usize, data: &[u8]) -> Result<SendProgress> {
+        self.write(conn_id, data, false)
+    }
+
+    fn set_write_interest(&mut self, conn_id: usize, interested: bool) -> Result<()> {
+        self.slots.handle(conn_id)?;
+        self.slots.set_write_interest(conn_id, interested);
+        Ok(())
     }
 
     fn flush(&mut self) -> Result<()> {

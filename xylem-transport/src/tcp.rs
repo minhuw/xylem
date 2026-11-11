@@ -10,7 +10,8 @@
 
 use crate::group::{GroupCore, GroupSocket, TimestampConfig, TxCounter};
 use crate::{
-    ConnectionGroup, Error, RecvOutcome, Result, SendReceipt, Timestamp, TransportFactory,
+    ConnectionGroup, Error, RecvOutcome, Result, SendProgress, SendReceipt, Timestamp,
+    TransportFactory,
 };
 use socket2::{Domain, Protocol, Socket, Type};
 use std::io::{self, Read, Write};
@@ -63,7 +64,9 @@ impl GroupSocket for TcpConn {
 }
 
 impl TcpConn {
-    fn send(&mut self, data: &[u8]) -> Result<SendReceipt> {
+    /// Write `data`, spinning while the socket would block if `spin`, else
+    /// stopping there
+    fn write(&mut self, data: &[u8], spin: bool) -> Result<SendProgress> {
         if !self.connected {
             return Err(Error::Connection("Connection closed".to_string()));
         }
@@ -72,10 +75,11 @@ impl TcpConn {
         while total_written < data.len() {
             match self.stream.write(&data[total_written..]) {
                 Ok(n) => total_written += n,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock && spin => {
                     std::hint::spin_loop();
                     continue;
                 }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => return Err(e.into()),
             }
         }
@@ -83,8 +87,14 @@ impl TcpConn {
         let timestamp = Timestamp::now();
         // Byte range [start, end) of this send; its kernel TX timestamp
         // arrives later with a cumulative tx_end >= end
-        let tx = self.tx.as_mut().map(|counter| counter.advance(data.len() as u32));
-        Ok(SendReceipt { timestamp, tx })
+        let tx = match total_written {
+            0 if !data.is_empty() => None,
+            n => self.tx.as_mut().map(|counter| counter.advance(n as u32)),
+        };
+        Ok(SendProgress {
+            accepted: total_written,
+            receipt: SendReceipt { timestamp, tx },
+        })
     }
 
     fn recv(&mut self, buf: &mut [u8]) -> Result<RecvOutcome> {
@@ -239,7 +249,15 @@ impl ConnectionGroup for TcpConnectionGroup {
     }
 
     fn send(&mut self, conn_id: usize, data: &[u8]) -> Result<SendReceipt> {
-        self.core.conn_mut(conn_id)?.send(data)
+        Ok(self.core.conn_mut(conn_id)?.write(data, true)?.receipt)
+    }
+
+    fn try_send(&mut self, conn_id: usize, data: &[u8]) -> Result<SendProgress> {
+        self.core.conn_mut(conn_id)?.write(data, false)
+    }
+
+    fn set_write_interest(&mut self, conn_id: usize, interested: bool) -> Result<()> {
+        self.core.set_write_interest(conn_id, interested)
     }
 
     fn recv(&mut self, conn_id: usize, buf: &mut [u8]) -> Result<RecvOutcome> {
@@ -338,6 +356,50 @@ mod tests {
         for id in ids {
             assert!(group.core.conn_mut(id).unwrap().stream.nodelay().unwrap(), "connection {id}");
         }
+    }
+
+    #[test]
+    fn try_send_takes_what_fits_and_write_interest_reports_room() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut group = TcpConnectionGroup::new().unwrap();
+        let conn_id = group.add_connection(&addr).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+
+        // The peer reads nothing, so the socket buffers fill: a non-blocking
+        // send takes a part, then nothing
+        let data = vec![7u8; 64 << 20];
+        let first = group.try_send(conn_id, &data).unwrap();
+        assert!(first.accepted > 0 && first.accepted < data.len(), "{}", first.accepted);
+        let full = group.try_send(conn_id, &data[first.accepted..]).unwrap();
+        assert_eq!(full.accepted, 0);
+
+        // With write interest, a poll reports the connection only once the
+        // peer made room
+        group.set_write_interest(conn_id, true).unwrap();
+        let mut ready = Vec::new();
+        group.poll(Duration::ZERO, &mut ready).unwrap();
+        assert!(ready.is_empty());
+        // The peer reads everything sent so far, so the client's buffer empties
+        let sent = first.accepted;
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let reader = thread::spawn(move || {
+            let mut buf = vec![0; 1 << 20];
+            let mut total = 0;
+            while total < sent {
+                total += peer.read(&mut buf).unwrap();
+            }
+            peer
+        });
+        let _peer = reader.join().unwrap();
+        group.poll(Duration::from_secs(5), &mut ready).unwrap();
+        assert_eq!(ready, [conn_id]);
+        assert!(group.try_send(conn_id, &data[first.accepted..]).unwrap().accepted > 0);
+
+        // Without it, a writable connection is not reported
+        group.set_write_interest(conn_id, false).unwrap();
+        group.poll(Duration::ZERO, &mut ready).unwrap();
+        assert!(ready.is_empty());
     }
 
     #[test]

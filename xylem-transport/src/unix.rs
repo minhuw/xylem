@@ -9,7 +9,8 @@
 
 use crate::group::{GroupCore, GroupSocket};
 use crate::{
-    ConnectionGroup, Error, RecvOutcome, Result, SendReceipt, Timestamp, TransportFactory,
+    ConnectionGroup, Error, RecvOutcome, Result, SendProgress, SendReceipt, Timestamp,
+    TransportFactory,
 };
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
@@ -41,7 +42,9 @@ impl GroupSocket for UnixConn {
 }
 
 impl UnixConn {
-    fn send(&mut self, data: &[u8]) -> Result<SendReceipt> {
+    /// Write `data`, spinning while the socket would block if `spin`, else
+    /// stopping there
+    fn write(&mut self, data: &[u8], spin: bool) -> Result<SendProgress> {
         if !self.connected {
             return Err(Error::Connection("Connection closed".to_string()));
         }
@@ -50,16 +53,18 @@ impl UnixConn {
         while total_written < data.len() {
             match self.stream.write(&data[total_written..]) {
                 Ok(n) => total_written += n,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock && spin => {
                     std::hint::spin_loop();
                     continue;
                 }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => return Err(e.into()),
             }
         }
 
         // Unix sockets report no TX timestamps
-        Ok(SendReceipt { timestamp: Timestamp::now(), tx: None })
+        let receipt = SendReceipt { timestamp: Timestamp::now(), tx: None };
+        Ok(SendProgress { accepted: total_written, receipt })
     }
 
     fn recv(&mut self, buf: &mut [u8]) -> Result<RecvOutcome> {
@@ -122,7 +127,15 @@ impl ConnectionGroup for UnixConnectionGroup {
     }
 
     fn send(&mut self, conn_id: usize, data: &[u8]) -> Result<SendReceipt> {
-        self.core.conn_mut(conn_id)?.send(data)
+        Ok(self.core.conn_mut(conn_id)?.write(data, true)?.receipt)
+    }
+
+    fn try_send(&mut self, conn_id: usize, data: &[u8]) -> Result<SendProgress> {
+        self.core.conn_mut(conn_id)?.write(data, false)
+    }
+
+    fn set_write_interest(&mut self, conn_id: usize, interested: bool) -> Result<()> {
+        self.core.set_write_interest(conn_id, interested)
     }
 
     fn recv(&mut self, conn_id: usize, buf: &mut [u8]) -> Result<RecvOutcome> {

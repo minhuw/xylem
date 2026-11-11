@@ -385,18 +385,31 @@ impl<C: GroupSocket> GroupCore<C> {
             .ok_or_else(|| Error::Connection("Connection not found".to_string()))
     }
 
-    /// Wait for readable sockets and collect the ids of live connections into `ready`
+    /// Wait for readable sockets, and writable ones registered for writes
+    /// (see [`Self::set_write_interest`]), and collect the ids of live
+    /// connections into `ready`
     pub(crate) fn poll(&mut self, timeout: Duration, ready: &mut Vec<usize>) -> Result<()> {
         ready.clear();
         let events = self.mux.wait(Some(timeout))?;
         ready.extend(
             events
                 .iter()
-                .filter(|e| e.readable)
+                .filter(|e| e.readable || e.writable)
                 .map(|e| e.id)
                 .filter(|id| self.connections.contains_key(id)),
         );
         Ok(())
+    }
+
+    /// Whether `poll` also reports `conn_id` when its socket is writable
+    pub(crate) fn set_write_interest(&mut self, conn_id: usize, interested: bool) -> Result<()> {
+        let fd = self.conn_mut(conn_id)?.socket_fd();
+        let interest = if interested {
+            Interest::BOTH
+        } else {
+            Interest::READABLE
+        };
+        self.mux.modify(fd, conn_id, interest)
     }
 
     /// Drain TX timestamps from the error queue of every connection with

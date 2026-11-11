@@ -184,6 +184,17 @@ pub struct SendReceipt {
     pub tx: Option<TxRange>,
 }
 
+/// What a non-blocking send handed to the transport; see
+/// [`ConnectionGroup::try_send`]
+#[derive(Debug, Clone, Copy)]
+pub struct SendProgress {
+    /// Leading bytes of the data the transport accepted, possibly none
+    pub accepted: usize,
+    /// Timestamp taken once the transport accepted them, and their TX
+    /// counter range (`None` when none was accepted)
+    pub receipt: SendReceipt,
+}
+
 /// How a group converted NIC timestamps to the [`time_ns`] clock
 ///
 /// The group fits the NIC clock to `time_ns` from paired readings of both,
@@ -249,6 +260,32 @@ pub trait ConnectionGroup {
     /// Unknown connection IDs return `Error::Connection`.
     fn send(&mut self, conn_id: usize, data: &[u8]) -> Result<SendReceipt>;
 
+    /// Send a leading part of `data` on `conn_id` without waiting
+    ///
+    /// Hands the transport as many bytes as it takes now, possibly none,
+    /// and reports how many, with the timestamp taken once it accepted them
+    /// and their TX range. The caller keeps the rest, asks for
+    /// [`Self::set_write_interest`], and sends it once `poll` reports the
+    /// connection, so it can keep reading meanwhile. Bytes go on the wire as
+    /// with `send`, at the next `flush` or `poll` on a user-space stack.
+    ///
+    /// The default sends all of `data` with `send`, which suits datagram
+    /// transports: a datagram is sent whole or not at all.
+    fn try_send(&mut self, conn_id: usize, data: &[u8]) -> Result<SendProgress> {
+        let receipt = self.send(conn_id, data)?;
+        Ok(SendProgress { accepted: data.len(), receipt })
+    }
+
+    /// Whether `poll` also reports `conn_id` while it can take more bytes
+    ///
+    /// Set it while a [`Self::try_send`] left bytes unsent, and clear it
+    /// once they are sent: a writable connection would otherwise be reported
+    /// by every `poll`. The default does nothing, for groups whose
+    /// `try_send` takes every byte.
+    fn set_write_interest(&mut self, _conn_id: usize, _interested: bool) -> Result<()> {
+        Ok(())
+    }
+
     /// Put everything sent since the last `flush` or `poll` on the wire
     ///
     /// Groups whose `send` transmits at once (kernel sockets) need nothing.
@@ -282,11 +319,13 @@ pub trait ConnectionGroup {
     ///
     /// Clears `ready`, waits up to `timeout` (zero means do not wait), and
     /// fills it with the IDs of connections that are readable: data, EOF, or
-    /// an error to report. This is the key efficiency gain: one syscall
-    /// checks all connections.
+    /// an error to report, and of connections with write interest (see
+    /// [`Self::set_write_interest`]) that can take more bytes. This is the
+    /// key efficiency gain: one syscall checks all connections.
     ///
     /// Level-triggered: a connection keeps being reported until a `recv`
-    /// returns `RecvOutcome::WouldBlock`.
+    /// returns `RecvOutcome::WouldBlock`, or while it has write interest and
+    /// can take more bytes.
     fn poll(&mut self, timeout: Duration, ready: &mut Vec<usize>) -> Result<()>;
 
     /// Poll for TX timestamps from all connections
