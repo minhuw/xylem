@@ -14,7 +14,7 @@ use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
 use std::net::SocketAddr;
 use std::time::Duration;
-use xylem_common::{ErrorReply, Parsed, Protocol};
+use xylem_common::{ConnectionRole, ErrorReply, Parsed, Protocol};
 use xylem_transport::{
     ConnectionGroup, KernelTimestamp, RecvOutcome, Timestamp, TransportFactory, TxRange,
     TxTimestampInfo,
@@ -88,8 +88,8 @@ pub struct Completion<ReqId> {
     /// Whether the request was a warmup (or setup) request, whose stats are
     /// not collected
     pub is_warmup: bool,
-    /// Bytes the response took: those the protocol consumed, plus on a
-    /// datagram connection the absorbed datagrams before it
+    /// Bytes the response took: those the protocol consumed, plus those it
+    /// absorbed before it ([`Parsed::Absorbed`])
     pub bytes_consumed: usize,
     /// Set for an error reply; see [`ConnectionPool::error_kind`]
     pub error: Option<ErrorKindId>,
@@ -241,11 +241,14 @@ pub struct ConnectionState<ReqId: Eq + Hash + Clone> {
     timed_out_order: VecDeque<ReqId>,
     /// Late responses to timed-out measurement requests, not yet taken by the worker
     late_responses: u64,
-    /// Datagram bytes the protocol absorbed without completing a request;
-    /// they are attributed to the next completed response
+    /// Bytes the protocol absorbed without completing a request; they are
+    /// attributed to the next completed response
     absorbed_bytes: usize,
     /// Error reply handling and kinds
     error_replies: ErrorReplies,
+    /// Opened for the protocol's own use ([`ConnectionRole::Control`]): it
+    /// has no traffic policy of its own and sends only setup requests
+    control: bool,
 }
 
 impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
@@ -278,6 +281,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
             late_responses: 0,
             absorbed_bytes: 0,
             error_replies: ErrorReplies::default(),
+            control: false,
         }
     }
 
@@ -314,6 +318,12 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
     /// Get the traffic group ID
     pub fn group_id(&self) -> usize {
         self.group_id
+    }
+
+    /// Whether the connection was opened for the protocol's own use
+    /// ([`ConnectionRole::Control`]) rather than to carry load
+    pub fn is_control(&self) -> bool {
+        self.control
     }
 
     /// Get the next send or policy-refresh wakeup time (in nanoseconds)
@@ -657,7 +667,8 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
     /// Process `len` bytes the transport read into `recv_spare()`
     ///
     /// Returns a [`Completion`] for each completed response; its error kind
-    /// is set for an error reply. The latency is the request's send lag plus
+    /// is set for an error reply. Bytes the parser absorbs count toward the
+    /// next completed response. The latency is the request's send lag plus
     /// its service latency, from the send to the receive timestamp. With
     /// `on_error = "abort"`, an error reply is an error.
     fn process_received<F>(
@@ -695,10 +706,10 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
             if consumed == 0 {
                 break;
             }
+            cursor += consumed;
+            self.absorbed_bytes += consumed;
             let Parsed::Complete { id: req_id, error, .. } = parsed else {
-                return Err(crate::Error::Protocol(format!(
-                    "Protocol consumed {consumed} bytes but returned no request ID"
-                )));
+                continue;
             };
             let error = error
                 .map(|error| self.error_replies.report(self.group_id, self.connection_id, &error))
@@ -708,12 +719,11 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
                     id: req_id,
                     latency,
                     is_warmup,
-                    bytes_consumed: consumed,
+                    bytes_consumed: std::mem::take(&mut self.absorbed_bytes),
                     error,
                     breakdown,
                 });
             }
-            cursor += consumed;
         }
         // Compact the remaining partial frame once, regardless of response count.
         self.recv_buffer.copy_within(cursor..self.recv_len, 0);
@@ -867,7 +877,19 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         factory: &F,
         groups: Vec<TrafficGroupConfig>,
     ) -> Result<Self> {
-        Self::build(factory.create_group()?, groups, |group, target| {
+        Self::new_multi_group_with_roles(factory, groups, &HashMap::new())
+    }
+
+    /// Create a pool like [`Self::new_multi_group_with_targets`], opening
+    /// each group's connections in the order and with the roles `roles` maps
+    /// its group ID to (see [`Protocol::connection_roles`]); a group without
+    /// an entry gets only load connections
+    pub fn new_multi_group_with_roles<F: TransportFactory<Group = G>>(
+        factory: &F,
+        groups: Vec<TrafficGroupConfig>,
+        roles: &HashMap<usize, Vec<ConnectionRole>>,
+    ) -> Result<Self> {
+        Self::build(factory.create_group()?, groups, roles, |group, target| {
             let connection_id = group.add_connection(target)?;
             Ok((connection_id, *target))
         })
@@ -877,13 +899,19 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
     ///
     /// `add_connection` opens one connection to a group's target and returns its
     /// connection ID and the address recorded in its state. Each group's
-    /// scheduler assigns policies by the connection's index within that group.
+    /// scheduler assigns policies by the load connection's index within that
+    /// group; a control connection gets a closed-loop policy and sends only
+    /// while its protocol is setting it up.
     fn build<T>(
         mut group: G,
         groups: Vec<GroupConfig<T>>,
+        roles: &HashMap<usize, Vec<ConnectionRole>>,
         mut add_connection: impl FnMut(&mut G, &T) -> Result<(usize, SocketAddr)>,
     ) -> Result<Self> {
-        let total_connections: usize = groups.iter().map(|(_, _, count, _, _)| count).sum();
+        let total_connections: usize = groups
+            .iter()
+            .map(|(group_id, _, count, _, _)| roles.get(group_id).map_or(*count, Vec::len))
+            .sum();
         let mut connection_states = HashMap::with_capacity(total_connections);
         let mut connection_ids = Vec::with_capacity(total_connections);
         let mut ready_heap = ReadyHeap::new();
@@ -897,13 +925,40 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
             mut policy_scheduler,
         ) in groups
         {
-            let dispatcher = policy_scheduler.dispatch_policy().map(|policy| {
+            let group_dispatcher = policy_scheduler.dispatch_policy().map(|policy| {
                 dispatchers.push(GroupDispatcher::new(group_id, policy));
                 dispatchers.len() - 1
             });
-            for index in 0..connection_count {
+            let load_roles;
+            let group_roles = match roles.get(&group_id) {
+                Some(group_roles) => group_roles.as_slice(),
+                None => {
+                    load_roles = vec![ConnectionRole::Load; connection_count];
+                    &load_roles
+                }
+            };
+            let load = group_roles.iter().filter(|&&role| role == ConnectionRole::Load).count();
+            if load != connection_count {
+                return Err(crate::Error::Config(format!(
+                    "Traffic group {group_id}: the protocol asked for {load} load connections, \
+                     not the {connection_count} configured"
+                )));
+            }
+            let mut load_index = 0;
+            for &role in group_roles {
                 let (connection_id, address) = add_connection(&mut group, &target)?;
-                let mut policy = policy_scheduler.assign_policy(index);
+                // A control connection takes no arrivals of the group's
+                // dispatcher: it sends its setup requests off the heap
+                let (mut policy, dispatcher) = match role {
+                    ConnectionRole::Load => {
+                        load_index += 1;
+                        (policy_scheduler.assign_policy(load_index - 1), group_dispatcher)
+                    }
+                    ConnectionRole::Control => {
+                        let policy: Box<dyn Policy> = Box::new(crate::scheduler::ClosedLoopPolicy);
+                        (policy, None)
+                    }
+                };
 
                 // The first call starts the connection's intended schedule once
                 // it is connected, or for a group-dispatched connection, the
@@ -924,6 +979,7 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
                 );
 
                 state.dispatcher = dispatcher;
+                state.control = role == ConnectionRole::Control;
                 state.set_on_heap(true);
                 connection_states.insert(connection_id, state);
                 connection_ids.push(connection_id);
@@ -1110,6 +1166,20 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         }
 
         Ok(send_lag)
+    }
+
+    /// Send protocol-driven data (see [`xylem_common::Outbox::data`]) on a
+    /// connection: no request, so nothing is tracked and the pipeline limit
+    /// does not apply
+    pub fn send_driven(&mut self, connection_id: usize, data: &[u8]) -> Result<()> {
+        if !self.connection_states.contains_key(&connection_id) {
+            return Err(crate::Error::Connection("Connection not found".to_string()));
+        }
+        // The transport counts these bytes in its TX ranges too, so later
+        // requests' ranges stay right. This send's own TX timestamp ends past
+        // every earlier request, whose own timestamps came first.
+        self.group.send(connection_id, data)?;
+        Ok(())
     }
 
     /// Send a connection setup request (a handshake, AUTH, ...)
@@ -1466,6 +1536,16 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         &self.connection_ids
     }
 
+    /// IDs of the connections of traffic group `group_id`, in the order they
+    /// were opened
+    pub fn group_connection_ids(&self, group_id: usize) -> Vec<usize> {
+        self.connection_ids
+            .iter()
+            .copied()
+            .filter(|id| self.connection_states.get(id).is_some_and(|s| s.group_id == group_id))
+            .collect()
+    }
+
     /// Get the number of connections in the pool
     pub fn connection_count(&self) -> usize {
         self.connection_ids.len()
@@ -1527,10 +1607,21 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug>
         factory: &xylem_transport::UnixTransportFactory,
         groups: Vec<UnixTrafficGroupConfig>,
     ) -> Result<Self> {
+        Self::new_multi_group_unix_with_roles(factory, groups, &HashMap::new())
+    }
+
+    /// Create a Unix socket pool whose groups open connections with the
+    /// roles `roles` maps their group IDs to; see
+    /// [`ConnectionPool::new_multi_group_with_roles`]
+    pub fn new_multi_group_unix_with_roles(
+        factory: &xylem_transport::UnixTransportFactory,
+        groups: Vec<UnixTrafficGroupConfig>,
+        roles: &HashMap<usize, Vec<ConnectionRole>>,
+    ) -> Result<Self> {
         // Placeholder address for Unix sockets (not used for actual connections)
         let placeholder_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
 
-        Self::build(factory.create_group()?, groups, |group, path| {
+        Self::build(factory.create_group()?, groups, roles, |group, path| {
             let connection_id = group.add_connection_path(path)?;
             // Unix sockets don't have a SocketAddr
             Ok((connection_id, placeholder_addr))
@@ -1575,6 +1666,14 @@ mod tests {
         } else {
             Parsed::ok(size, id)
         })
+    }
+
+    /// Give a test parser closure the signature the receive path takes
+    fn parser<F>(parse: F) -> F
+    where
+        F: for<'a> FnMut(&'a [u8]) -> Result<Parsed<'a, u64>>,
+    {
+        parse
     }
 
     #[test]
@@ -1640,16 +1739,30 @@ mod tests {
     }
 
     #[test]
-    fn consumed_bytes_without_request_id_is_an_error() {
+    fn absorbed_stream_bytes_count_toward_the_next_response() {
         let mut state = state();
         let ts = Timestamp::now();
         state.record_send(1, ts, Duration::ZERO, tx(0, 1), false);
-        let error = state.process_recv(b"hello", ts, |_| Ok(Parsed::Absorbed(5))).unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "Protocol error: Protocol consumed 5 bytes but returned no request ID"
-        );
+        // A 3-byte frame that completes nothing, then the 5-byte response
+        // split across reads: the parser streams its first 2 bytes
+        let mut calls = 0;
+        let mut parse = parser(|data| {
+            calls += 1;
+            Ok(match calls {
+                1 => Parsed::Absorbed(3),
+                2 => Parsed::Absorbed(2),
+                _ if data.len() < 3 => Parsed::Incomplete,
+                _ => Parsed::ok(3, 1),
+            })
+        });
+        assert!(state.process_recv(b"r2tab", ts, &mut parse).unwrap().is_empty());
         assert_eq!(state.pending_count(), 1);
+        let responses = state.process_recv(b"cde", ts, &mut parse).unwrap();
+        assert_eq!(
+            responses.iter().map(|r| (r.id, r.bytes_consumed)).collect::<Vec<_>>(),
+            [(1, 8)]
+        );
+        assert!(state.buffered().is_empty());
 
         // Consuming nothing is an incomplete response, with or without an ID
         for parsed in [Parsed::Incomplete, Parsed::ok(0, 1)] {
@@ -1660,6 +1773,37 @@ mod tests {
             assert_eq!(state.buffered(), b"hel");
             assert_eq!(state.pending_count(), 1);
         }
+    }
+
+    #[test]
+    fn roles_must_hold_the_configured_load_connections() {
+        let factory = test_support::FakeFactory::default();
+        let groups = || {
+            vec![(
+                0,
+                "127.0.0.1:1".parse().unwrap(),
+                2,
+                1,
+                Box::new(crate::scheduler::UniformPolicyScheduler::closed_loop())
+                    as Box<dyn crate::scheduler::PolicyScheduler>,
+            )]
+        };
+        let roles = HashMap::from([(0, vec![ConnectionRole::Control, ConnectionRole::Load])]);
+        let error =
+            ConnectionPool::<_, u64>::new_multi_group_with_roles(&factory, groups(), &roles)
+                .err()
+                .unwrap();
+        assert!(error.to_string().contains("asked for 1 load connections, not the 2"));
+
+        let roles = HashMap::from([(
+            0,
+            vec![ConnectionRole::Load, ConnectionRole::Control, ConnectionRole::Load],
+        )]);
+        let pool = ConnectionPool::<_, u64>::new_multi_group_with_roles(&factory, groups(), &roles)
+            .unwrap();
+        assert_eq!(pool.group_connection_ids(0).len(), 3);
+        let control: Vec<_> = (0..3).map(|id| pool.get_state(id).unwrap().is_control()).collect();
+        assert_eq!(control, [false, true, false]);
     }
 
     #[test]
@@ -2365,6 +2509,8 @@ pub(crate) mod test_support {
     pub struct FakeIo {
         pub responses: VecDeque<xylem_transport::Result<Vec<u8>>>,
         pub sent: Vec<Vec<u8>>,
+        /// The connection of each of `sent`
+        pub sent_on: Vec<usize>,
         pub fail_send: bool,
         pub timeouts: Vec<Duration>,
         pub tx_polls: usize,
@@ -2387,6 +2533,7 @@ pub(crate) mod test_support {
             Self {
                 responses: VecDeque::new(),
                 sent: Vec::new(),
+                sent_on: Vec::new(),
                 fail_send: false,
                 timeouts: Vec::new(),
                 tx_polls: 0,
@@ -2448,6 +2595,7 @@ pub(crate) mod test_support {
                 return Err(xylem_transport::Error::Io(std::io::Error::other("send failed")));
             }
             io.sent.push(data.to_vec());
+            io.sent_on.push(conn_id);
             let end = io.sent.len() as u32;
             Ok(xylem_transport::SendReceipt {
                 timestamp: io.now(),

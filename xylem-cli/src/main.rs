@@ -473,17 +473,26 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
             ));
         }
 
-        // Calculate total connections for worker config
+        // Calculate total connections for worker config, including those a
+        // protocol opens for its own use (Protocol::connection_roles)
+        let opened = |group_id: &usize, load: usize| {
+            protocols.get(group_id).map_or(load, |protocol| {
+                xylem_core::threading::Protocol::connection_roles(protocol, load).len()
+            })
+        };
         // For Unix transport, groups_config is empty - we'll compute from groups_for_thread instead
         let (total_conn_count, default_target): (usize, std::net::SocketAddr) = if is_unix_transport
         {
             // Unix transport: compute from groups_for_thread, use placeholder address
-            let count: usize =
-                groups_for_thread.iter().map(|(_, meta)| meta.connections_per_thread).sum();
+            let count: usize = groups_for_thread
+                .iter()
+                .map(|(group_id, meta)| opened(group_id, meta.connections_per_thread))
+                .sum();
             (count, "0.0.0.0:0".parse().unwrap())
         } else {
             // TCP/UDP: compute from groups_config
-            let count = groups_config.iter().map(|(_, _, c, _, _)| c).sum();
+            let count =
+                groups_config.iter().map(|(group_id, _, c, _, _)| opened(group_id, *c)).sum();
             let target = groups_config
                 .first()
                 .map(|(_, addr, _, _, _)| *addr)

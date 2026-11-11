@@ -1,6 +1,6 @@
 use crate::config::ProtocolConfig;
 use anyhow::Result;
-use xylem_common::{Parsed, Request};
+use xylem_common::{ConnectionRole, Outbox, Parsed, Request};
 use xylem_protocols::Protocol;
 
 /// Multi-protocol wrapper that can dispatch to any supported protocol
@@ -168,6 +168,42 @@ impl Protocol for MultiProtocol {
             MultiProtocol::XylemEcho(p) => p.setup_pending(conn_id),
             MultiProtocol::Masstree(p) => p.setup_pending(conn_id),
             MultiProtocol::Dns(p) => p.setup_pending(conn_id),
+        }
+    }
+
+    fn connection_roles(&self, load: usize) -> Vec<ConnectionRole> {
+        match self {
+            MultiProtocol::Redis(p) => p.connection_roles(load),
+            MultiProtocol::MemcachedBinary(p) => p.connection_roles(load),
+            MultiProtocol::MemcachedAscii(p) => p.connection_roles(load),
+            MultiProtocol::Http(p) => p.connection_roles(load),
+            MultiProtocol::XylemEcho(p) => p.connection_roles(load),
+            MultiProtocol::Masstree(p) => p.connection_roles(load),
+            MultiProtocol::Dns(p) => p.connection_roles(load),
+        }
+    }
+
+    fn bind_connections(&mut self, conn_ids: &[usize]) {
+        match self {
+            MultiProtocol::Redis(p) => p.bind_connections(conn_ids),
+            MultiProtocol::MemcachedBinary(p) => p.bind_connections(conn_ids),
+            MultiProtocol::MemcachedAscii(p) => p.bind_connections(conn_ids),
+            MultiProtocol::Http(p) => p.bind_connections(conn_ids),
+            MultiProtocol::XylemEcho(p) => p.bind_connections(conn_ids),
+            MultiProtocol::Masstree(p) => p.bind_connections(conn_ids),
+            MultiProtocol::Dns(p) => p.bind_connections(conn_ids),
+        }
+    }
+
+    fn drain_outbox(&mut self, conn_id: usize, outbox: &mut Outbox) {
+        match self {
+            MultiProtocol::Redis(p) => p.drain_outbox(conn_id, outbox),
+            MultiProtocol::MemcachedBinary(p) => p.drain_outbox(conn_id, outbox),
+            MultiProtocol::MemcachedAscii(p) => p.drain_outbox(conn_id, outbox),
+            MultiProtocol::Http(p) => p.drain_outbox(conn_id, outbox),
+            MultiProtocol::XylemEcho(p) => p.drain_outbox(conn_id, outbox),
+            MultiProtocol::Masstree(p) => p.drain_outbox(conn_id, outbox),
+            MultiProtocol::Dns(p) => p.drain_outbox(conn_id, outbox),
         }
     }
 }

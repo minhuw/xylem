@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use xylem_common::Protocol;
+use xylem_common::{ConnectionRole, Outbox, Protocol};
 use xylem_transport::{ConnectionGroup, TransportFactory};
 
 fn unix_time_us() -> Option<u64> {
@@ -63,6 +63,8 @@ pub struct Worker<G: ConnectionGroup, P: Protocol, S: StatsRecorder = TupleStats
     next_tx_cleanup_ns: u64,
     /// Reused buffer for the connection IDs each poll reports ready.
     ready_ids: Vec<usize>,
+    /// Reused buffer the protocols drain their driven sends and wakeups into
+    outbox: Outbox,
 }
 
 impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
@@ -74,17 +76,18 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         config: WorkerConfig,
         policy_scheduler: Box<dyn crate::scheduler::PolicyScheduler>,
     ) -> Result<Self> {
-        let pool = ConnectionPool::new(
-            factory,
+        let mut protocols = HashMap::new();
+        protocols.insert(0, protocol);
+        // Default group_id 0 for legacy single-pool workers
+        let groups = vec![(
+            0,
             config.target,
             config.conn_count,
             config.max_pending_per_conn,
             policy_scheduler,
-            0, // Default group_id for legacy single-pool workers
-        )?;
-
-        let mut protocols = HashMap::new();
-        protocols.insert(0, protocol);
+        )];
+        let roles = connection_roles(&protocols, groups.iter().map(|g| (g.0, g.2)));
+        let pool = ConnectionPool::new_multi_group_with_roles(factory, groups, &roles)?;
 
         Ok(Self::from_pool(pool, protocols, stats, config))
     }
@@ -108,9 +111,14 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         config: WorkerConfig,
         groups: Vec<(usize, usize, usize, Box<dyn crate::scheduler::PolicyScheduler>)>,
     ) -> Result<Self> {
-        let pool = ConnectionPool::new_multi_group(factory, config.target, groups)?;
-
-        Ok(Self::from_pool(pool, protocols, stats, config))
+        let target = config.target;
+        let groups = groups
+            .into_iter()
+            .map(|(group_id, count, max_pending, scheduler)| {
+                (group_id, target, count, max_pending, scheduler)
+            })
+            .collect();
+        Self::new_multi_group_with_targets(factory, protocols, stats, config, groups)
     }
 
     /// Create a new pipelined worker with multiple traffic groups, each with its own target
@@ -121,18 +129,23 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         config: WorkerConfig,
         groups: Vec<TrafficGroupConfig>,
     ) -> Result<Self> {
-        let pool = ConnectionPool::new_multi_group_with_targets(factory, groups)?;
+        let roles = connection_roles(&protocols, groups.iter().map(|g| (g.0, g.2)));
+        let pool = ConnectionPool::new_multi_group_with_roles(factory, groups, &roles)?;
 
         Ok(Self::from_pool(pool, protocols, stats, config))
     }
 
-    /// Create a worker around an already built connection pool
+    /// Create a worker around an already built connection pool, telling each
+    /// group's protocol the connections it got
     fn from_pool(
         pool: ConnectionPool<G, P::RequestId>,
-        protocols: HashMap<usize, P>,
+        mut protocols: HashMap<usize, P>,
         stats: S,
         config: WorkerConfig,
     ) -> Self {
+        for (&group_id, protocol) in protocols.iter_mut() {
+            protocol.bind_connections(&pool.group_connection_ids(group_id));
+        }
         Self {
             pool,
             protocols,
@@ -142,6 +155,7 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             thread_id: 0,
             next_tx_cleanup_ns: timing::time_ns().saturating_add(1_000_000_000),
             ready_ids: Vec::new(),
+            outbox: Outbox::default(),
         }
     }
 
@@ -304,6 +318,12 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
                     self.protocols.get_mut(&group_id).expect("Protocol not found for group_id");
                 protocol.next_request(connection_id)
             };
+            if state.is_control() && !request.metadata.is_setup {
+                return Err(crate::Error::Protocol(format!(
+                    "Traffic group {group_id}, connection {connection_id}: the protocol sent a \
+                     request that is no setup request on a control connection"
+                )));
+            }
 
             if request.metadata.is_setup {
                 // Connection setup (a handshake, AUTH, ...) may carry
@@ -410,6 +430,7 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         // This prevents memory leaks when TX timestamps are never received
         self.maintain_tx_queues(timing::time_ns());
 
+        let mut driven_sends = false;
         for &connection_id in &ready_ids {
             let state = match self.pool.get_state(connection_id) {
                 Some(s) => s,
@@ -468,6 +489,17 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
                 self.stats.record_late_responses(group_id, connection_id, late);
             }
 
+            // What the parsed data made the protocol send or unblock
+            match self.drain_outbox(connection_id, group_id) {
+                Ok(sent) => driven_sends |= sent,
+                Err(e @ crate::Error::Connection(_)) => {
+                    self.close_failed(connection_id, group_id);
+                    tracing::warn!(connection_id, "Connection disconnected: {}", e);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+
             // Reschedule connection if it can send but isn't on heap
             // This handles two cases:
             // 1. Pipeline transitioned from full to available
@@ -476,8 +508,39 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             self.pool.try_schedule_connection(connection_id, protocol);
         }
         self.ready_ids = ready_ids;
+        // Driven sends answer the peer at once, like the first send of a round
+        if driven_sends {
+            self.pool.flush()?;
+        }
 
         Ok(())
+    }
+
+    /// Take what the protocol asks for after parsing data received on
+    /// `connection_id`: reschedule the connections it woke, and send its
+    /// driven bytes on the connection before its next request. Returns
+    /// whether it sent any; on a load connection they count as sent bytes.
+    fn drain_outbox(&mut self, connection_id: usize, group_id: usize) -> Result<bool> {
+        let protocol = self.protocols.get_mut(&group_id).expect("Protocol not found for group_id");
+        protocol.drain_outbox(connection_id, &mut self.outbox);
+        if self.outbox.is_empty() {
+            return Ok(false);
+        }
+        let protocol = self.protocols.get(&group_id).expect("Protocol not found for group_id");
+        for woken in self.outbox.wake.drain(..) {
+            self.pool.try_schedule_connection(woken, protocol);
+        }
+        if self.outbox.data.is_empty() {
+            return Ok(false);
+        }
+        let sent = self.pool.send_driven(connection_id, &self.outbox.data);
+        let len = self.outbox.data.len();
+        self.outbox.data.clear();
+        sent?;
+        if self.pool.get_state(connection_id).is_some_and(|state| !state.is_control()) {
+            self.stats.record_tx_bytes(group_id, connection_id, len);
+        }
+        Ok(true)
     }
 
     /// Time out the requests whose request timeout passed by `now_ns`, count
@@ -613,10 +676,25 @@ impl<P: Protocol, S: StatsRecorder> Worker<xylem_transport::UnixConnectionGroup,
         config: WorkerConfig,
         groups: Vec<crate::connection::UnixTrafficGroupConfig>,
     ) -> Result<Self> {
-        let pool = ConnectionPool::new_multi_group_unix(factory, groups)?;
+        let roles = connection_roles(&protocols, groups.iter().map(|g| (g.0, g.2)));
+        let pool = ConnectionPool::new_multi_group_unix_with_roles(factory, groups, &roles)?;
 
         Ok(Self::from_pool(pool, protocols, stats, config))
     }
+}
+
+/// The connection roles each group's protocol asks for, by group ID, given
+/// `(group_id, load connections)` for every group of the worker
+fn connection_roles<P: Protocol>(
+    protocols: &HashMap<usize, P>,
+    groups: impl Iterator<Item = (usize, usize)>,
+) -> HashMap<usize, Vec<ConnectionRole>> {
+    groups
+        .filter_map(|(group_id, load)| {
+            let protocol = protocols.get(&group_id)?;
+            Some((group_id, protocol.connection_roles(load)))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -2016,5 +2094,241 @@ mod tests {
         );
 
         println!("✓ Fixed-rate policy sent {} requests in {:?}", actual, elapsed);
+    }
+
+    /// Setup request ID of the session protocol's control connection
+    const SESSION_SETUP: u64 = u64::MAX;
+
+    /// A protocol whose session spans connections: a control connection
+    /// sets up first and unblocks the load connections. A load request's
+    /// reply may follow a 4-byte PULL frame, which completes nothing and
+    /// makes the protocol send DATA on the connection.
+    #[derive(Default)]
+    struct SessionProtocol {
+        control: Option<usize>,
+        load: Vec<usize>,
+        setup_sent: bool,
+        ready: bool,
+        next_id: u64,
+        /// Send a measurement request on the control connection
+        misbehave: bool,
+        driven: HashMap<usize, Vec<u8>>,
+        wake: Vec<usize>,
+    }
+
+    impl Protocol for SessionProtocol {
+        type RequestId = u64;
+
+        fn connection_roles(&self, load: usize) -> Vec<ConnectionRole> {
+            let mut roles = vec![ConnectionRole::Control];
+            roles.extend(std::iter::repeat_n(ConnectionRole::Load, load));
+            roles
+        }
+
+        fn bind_connections(&mut self, conn_ids: &[usize]) {
+            self.control = Some(conn_ids[0]);
+            self.load = conn_ids[1..].to_vec();
+        }
+
+        fn next_request(&mut self, conn_id: usize) -> Request<u64> {
+            if Some(conn_id) == self.control && !self.misbehave {
+                self.setup_sent = true;
+                return Request::setup(SESSION_SETUP.to_le_bytes().to_vec(), SESSION_SETUP);
+            }
+            let id = self.next_id;
+            self.next_id += 1;
+            Request::measurement(id.to_le_bytes().to_vec(), id)
+        }
+
+        fn parse_response<'a>(
+            &mut self,
+            conn_id: usize,
+            data: &'a [u8],
+        ) -> anyhow::Result<Parsed<'a, u64>> {
+            if data.starts_with(b"PULL") {
+                self.driven.entry(conn_id).or_default().extend_from_slice(b"DATA");
+                return Ok(Parsed::Absorbed(4));
+            }
+            if data.len() < 8 {
+                return Ok(Parsed::Incomplete);
+            }
+            let id = u64::from_le_bytes(data[..8].try_into().unwrap());
+            if id == SESSION_SETUP {
+                self.ready = true;
+                self.wake.extend_from_slice(&self.load);
+            }
+            Ok(Parsed::ok(8, id))
+        }
+
+        fn can_send(&self, conn_id: usize) -> bool {
+            if Some(conn_id) == self.control {
+                !self.setup_sent
+            } else {
+                self.ready
+            }
+        }
+
+        fn setup_pending(&self, conn_id: usize) -> bool {
+            Some(conn_id) == self.control && !self.ready
+        }
+
+        fn drain_outbox(&mut self, conn_id: usize, outbox: &mut Outbox) {
+            if let Some(data) = self.driven.remove(&conn_id) {
+                outbox.data.extend_from_slice(&data);
+            }
+            outbox.wake.append(&mut self.wake);
+        }
+
+        fn name(&self) -> &'static str {
+            "Session"
+        }
+        fn reset(&mut self) {}
+    }
+
+    fn session_worker(
+        factory: &FakeFactory,
+        protocol: SessionProtocol,
+    ) -> Worker<FakeGroup, SessionProtocol> {
+        session_worker_with(factory, protocol, Box::new(UniformPolicyScheduler::closed_loop()))
+    }
+
+    fn session_worker_with(
+        factory: &FakeFactory,
+        protocol: SessionProtocol,
+        scheduler: Box<dyn PolicyScheduler>,
+    ) -> Worker<FakeGroup, SessionProtocol> {
+        let mut stats = TupleStatsCollector::default();
+        stats.register_group_policy(0, SamplingPolicy::Limited { max_samples: 1000, rate: 1.0 });
+        let config = WorkerConfig {
+            target: "127.0.0.1:1".parse().unwrap(),
+            duration: Duration::from_millis(100),
+            conn_count: 2,
+            max_pending_per_conn: 1,
+            drain_timeout: FAKE_DRAIN_TIMEOUT,
+        };
+        let mut worker = Worker::new(factory, protocol, stats, config, scheduler).unwrap();
+        worker.anchor_schedules(timing::time_ns());
+        worker
+    }
+
+    #[test]
+    fn control_connection_sets_up_first_and_wakes_the_load_connections() {
+        let factory = FakeFactory::default();
+        let mut worker = session_worker(&factory, SessionProtocol::default());
+        let io = factory.0.clone();
+        // Opened first, the control connection sends only its setup request
+        let protocol = &worker.protocols[&0];
+        assert_eq!((protocol.control, protocol.load.clone()), (Some(0), vec![1, 2]));
+        assert!(worker.pool.get_state(0).unwrap().is_control());
+        assert!(!worker.pool.get_state(1).unwrap().is_control());
+        worker.send_requests().unwrap();
+        assert_eq!(io.lock().unwrap().sent_on, [0]);
+
+        // Its reply unblocks the load connections at once
+        io.lock().unwrap().responses.push_back(Ok(SESSION_SETUP.to_le_bytes().to_vec()));
+        worker.process_responses(Duration::ZERO).unwrap();
+        worker.send_requests().unwrap();
+        assert_eq!(io.lock().unwrap().sent_on, [0, 1, 2]);
+
+        // Only the load connections' requests are measured
+        let counts = worker.stats.request_counts_global();
+        assert_eq!(counts.sent, 2);
+        assert!(worker.stats.entries().keys().all(|key| key.connection_id != 0));
+    }
+
+    #[test]
+    fn driven_data_goes_out_before_the_next_request_and_is_no_request() {
+        let factory = FakeFactory::default();
+        let mut worker = session_worker(&factory, SessionProtocol::default());
+        let io = factory.0.clone();
+        worker.send_requests().unwrap();
+        io.lock().unwrap().responses.push_back(Ok(SESSION_SETUP.to_le_bytes().to_vec()));
+        worker.process_responses(Duration::ZERO).unwrap();
+        worker.send_requests().unwrap();
+        let flushes_before = io.lock().unwrap().flushes.len();
+
+        // Request 0 on connection 1: a PULL frame, then its reply in a later read
+        io.lock().unwrap().response_connection_id = 1;
+        io.lock().unwrap().responses.push_back(Ok(b"PULL".to_vec()));
+        worker.process_responses(Duration::ZERO).unwrap();
+        {
+            let io = io.lock().unwrap();
+            assert_eq!(io.sent.last().unwrap(), b"DATA");
+            assert_eq!(io.sent_on, [0, 1, 2, 1]);
+            // The driven send is flushed at once
+            assert_eq!(io.flushes.len(), flushes_before + 1);
+        }
+        assert_eq!(worker.pool.get_state(1).unwrap().pending_count(), 1);
+
+        io.lock().unwrap().responses.push_back(Ok(0u64.to_le_bytes().to_vec()));
+        worker.process_responses(Duration::ZERO).unwrap();
+        worker.send_requests().unwrap();
+        assert_eq!(io.lock().unwrap().sent_on, [0, 1, 2, 1, 1]);
+
+        // One request completed with one latency; its reply's bytes include
+        // the PULL frame, and the DATA bytes count as sent bytes
+        let counts = worker.stats.request_counts_global();
+        assert_eq!((counts.sent, counts.completed), (3, 1));
+        let global = worker.stats.aggregate_global(Duration::from_secs(1));
+        assert_eq!(global.latency_sample_count, 1);
+        let entries = worker.stats.entries();
+        assert_eq!(entries.values().map(|entry| entry.rx_bytes).sum::<u64>(), 12);
+        assert_eq!(entries.values().map(|entry| entry.tx_bytes).sum::<u64>(), 3 * 8 + 4);
+    }
+
+    #[test]
+    fn a_request_on_a_control_connection_fails_the_run() {
+        let factory = FakeFactory::default();
+        let protocol = SessionProtocol { misbehave: true, ..Default::default() };
+        let mut worker = session_worker(&factory, protocol);
+        let error = worker.send_requests().unwrap_err();
+        assert!(error.to_string().contains("no setup request on a control connection"));
+        assert!(factory.0.lock().unwrap().sent.is_empty());
+    }
+
+    #[test]
+    fn group_dispatch_never_sends_arrivals_on_a_control_connection() {
+        use crate::scheduler::{FixedRatePolicy, GroupDispatchScheduler};
+        let factory = FakeFactory::default();
+        factory.0.lock().unwrap().live_timestamps = true;
+        let scheduler =
+            Box::new(GroupDispatchScheduler::new(Box::new(FixedRatePolicy::new(10_000.0))));
+        let mut worker = session_worker_with(&factory, SessionProtocol::default(), scheduler);
+        let io = factory.0.clone();
+
+        // The control connection sets up off the arrivals; the load
+        // connections wait for it
+        worker.send_requests().unwrap();
+        assert_eq!(io.lock().unwrap().sent_on, [0]);
+        io.lock().unwrap().responses.push_back(Ok(SESSION_SETUP.to_le_bytes().to_vec()));
+        worker.process_responses(Duration::ZERO).unwrap();
+
+        // Arrivals go to the idle load connections only, one each, while
+        // the control connection stays idle
+        let deadline = timing::time_ns() + 50_000_000;
+        while io.lock().unwrap().sent.len() < 3 && timing::time_ns() < deadline {
+            worker.send_requests().unwrap();
+        }
+        thread::sleep(Duration::from_millis(1));
+        worker.send_requests().unwrap();
+        let mut sent_on = io.lock().unwrap().sent_on.clone();
+        sent_on[1..].sort_unstable();
+        assert_eq!(sent_on, [0, 1, 2]);
+
+        // A driven send goes out on a dispatched connection too, and its
+        // reply frees the connection for the next arrival
+        {
+            let mut io = io.lock().unwrap();
+            io.response_connection_id = 2;
+            io.responses.push_back(Ok([&b"PULL"[..], &1u64.to_le_bytes()].concat()));
+        }
+        worker.process_responses(Duration::ZERO).unwrap();
+        assert_eq!(io.lock().unwrap().sent.last().unwrap(), b"DATA");
+        let deadline = timing::time_ns() + 50_000_000;
+        while io.lock().unwrap().sent.len() < 5 && timing::time_ns() < deadline {
+            worker.send_requests().unwrap();
+        }
+        assert_eq!(io.lock().unwrap().sent_on[3..], [2, 2]);
+        assert_eq!(worker.stats.request_counts_global().completed, 1);
     }
 }

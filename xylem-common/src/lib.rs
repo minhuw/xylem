@@ -14,5 +14,5 @@ pub use distributions::{
     ZipfianDistribution,
 };
 
-pub use protocol::{ErrorReply, Parsed, Protocol};
+pub use protocol::{ConnectionRole, ErrorReply, Outbox, Parsed, Protocol};
 pub use request::{Request, RequestMeta};

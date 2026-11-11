@@ -12,8 +12,7 @@ use std::hash::Hash;
 pub enum Parsed<'a, Id> {
     /// The response at the start is incomplete; nothing is consumed
     Incomplete,
-    /// The first `n` bytes complete no request (datagram transports only;
-    /// see [`Protocol::parse_response`])
+    /// The first `n` bytes complete no request (see [`Protocol::parse_response`])
     Absorbed(usize),
     /// The first `consumed` bytes complete the request `id`
     Complete {
@@ -91,6 +90,43 @@ fn utf8_prefix(bytes: &[u8]) -> &str {
     }
 }
 
+/// Role of a connection the worker opens for a traffic group; see
+/// [`Protocol::connection_roles`]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionRole {
+    /// Carries the group's load: one of its configured connections, with a
+    /// traffic policy and statistics
+    Load,
+    /// Opened for the protocol's own use, such as an NVMe/TCP admin queue.
+    /// It has no traffic policy and sends only setup requests
+    /// ([`crate::RequestMeta::is_setup`]) and protocol-driven data
+    /// ([`Outbox::data`]), so nothing on it is measured. A request that is no
+    /// setup request fails the run.
+    Control,
+}
+
+/// What a protocol asks the worker to do after it parsed received data; see
+/// [`Protocol::drain_outbox`]
+#[derive(Debug, Default)]
+pub struct Outbox {
+    /// Bytes to send on the connection the data arrived on, in order, before
+    /// its next request: an NVMe/TCP H2CData PDU answering an R2T, an HTTP/2
+    /// SETTINGS acknowledgement or WINDOW_UPDATE, ... They are no requests:
+    /// nothing waits for a reply to them and they carry no latency.
+    pub data: Vec<u8>,
+    /// Connections of the same traffic group whose [`Protocol::can_send`] may
+    /// have turned true because of the parsed data, such as I/O queues whose
+    /// admin queue just connected. The worker reschedules them.
+    pub wake: Vec<usize>,
+}
+
+impl Outbox {
+    /// Whether the protocol asked for nothing
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty() && self.wake.is_empty()
+    }
+}
+
 /// Application protocol trait for generating requests and parsing responses
 /// with request ID tracking
 pub trait Protocol: Send {
@@ -133,8 +169,12 @@ pub trait Protocol: Send {
     /// # Byte streams
     ///
     /// On a stream transport (TCP, Unix, ntcp), `data` holds every byte not
-    /// yet consumed, across reads. Consuming bytes without a request ID
-    /// ([`Parsed::Absorbed`]) is an error.
+    /// yet consumed, across reads. `Absorbed(n)` consumes `n` bytes that
+    /// complete no request: a PDU that is no response (an NVMe/TCP R2T) or a
+    /// leading part of one, which lets a parser stream a response longer than
+    /// the receive buffer. They count toward the next completed response's
+    /// bytes. A stateful parser must not change its state when it returns
+    /// `Incomplete`: the same bytes come again with more after them.
     ///
     /// # Datagrams
     ///
@@ -189,6 +229,38 @@ pub trait Protocol: Send {
     fn setup_pending(&self, _conn_id: usize) -> bool {
         false
     }
+
+    /// The roles of the connections to open for a traffic group whose
+    /// threads each have `load` connections (`connections_per_thread`), in
+    /// the order to open them
+    ///
+    /// It must hold exactly `load` [`ConnectionRole::Load`] entries. A
+    /// protocol whose sessions span connections adds
+    /// [`ConnectionRole::Control`] ones: NVMe/TCP opens an admin queue before
+    /// each controller's I/O queues. The worker passes the IDs it opened to
+    /// [`Self::bind_connections`] before the run.
+    ///
+    /// Default implementation returns `load` load connections.
+    fn connection_roles(&self, load: usize) -> Vec<ConnectionRole> {
+        vec![ConnectionRole::Load; load]
+    }
+
+    /// The IDs of the connections the worker opened for this protocol, in
+    /// the order of [`Self::connection_roles`]; called once, before the run
+    ///
+    /// Default implementation does nothing.
+    fn bind_connections(&mut self, _conn_ids: &[usize]) {}
+
+    /// Move what the protocol asks of the worker after parsing data received
+    /// on `conn_id` into `outbox`, which the worker passes empty
+    ///
+    /// The worker calls it after each read it parsed on `conn_id`, sends
+    /// [`Outbox::data`] on `conn_id` through the transport before any further
+    /// request, and reschedules the connections in [`Outbox::wake`]. The
+    /// bytes count as sent bytes on a load connection, never as a request.
+    ///
+    /// Default implementation leaves `outbox` empty.
+    fn drain_outbox(&mut self, _conn_id: usize, _outbox: &mut Outbox) {}
 
     /// Protocol name
     fn name(&self) -> &'static str;
