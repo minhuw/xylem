@@ -12,6 +12,7 @@ pub mod dns;
 pub mod http;
 pub mod masstree;
 pub mod memcached;
+pub mod nvme_tcp;
 pub mod redis;
 pub mod workload;
 pub mod xylem_echo;
@@ -29,6 +30,7 @@ pub use http::HttpMethod;
 pub use http::HttpProtocol;
 pub use masstree::{MasstreeOp, MasstreeProtocol, ResultCode};
 pub use memcached::{MemcachedAsciiProtocol, MemcachedBinaryProtocol};
+pub use nvme_tcp::{NvmeAccess, NvmeTcpConfig, NvmeTcpProtocol};
 pub use redis::command_template::CommandTemplate;
 pub use redis::{RedisOp, RedisProtocol};
 pub use workload::selector::{

@@ -209,6 +209,11 @@ pub trait Protocol: Send {
     /// # Returns
     /// true if the protocol is ready to generate a request for this connection
     ///
+    /// The worker asks when it schedules the connection, and may ask for its
+    /// next request any time later. So once true, it must stay true until
+    /// that request: only the connection's own requests and received data may
+    /// turn it false, not data received on another connection.
+    ///
     /// Default implementation always returns true (no protocol-level constraints).
     fn can_send(&self, _conn_id: usize) -> bool {
         true

@@ -190,18 +190,20 @@ enum ProtocolKind {
     Http,
     Masstree,
     Dns,
+    NvmeTcp,
     XylemEcho,
 }
 
 /// Every accepted traffic group protocol name. The invalid-protocol error lists
 /// the names in this order.
-const PROTOCOLS: [(&str, ProtocolKind); 7] = [
+const PROTOCOLS: [(&str, ProtocolKind); 8] = [
     ("redis", ProtocolKind::Redis),
     ("memcached-binary", ProtocolKind::MemcachedBinary),
     ("memcached-ascii", ProtocolKind::MemcachedAscii),
     ("http", ProtocolKind::Http),
     ("masstree", ProtocolKind::Masstree),
     ("dns", ProtocolKind::Dns),
+    ("nvme-tcp", ProtocolKind::NvmeTcp),
     ("xylem-echo", ProtocolKind::XylemEcho), // Test protocol
 ];
 
@@ -215,6 +217,7 @@ pub enum ProtocolConfig {
     Http(xylem_protocols::HttpConfig),
     Masstree(xylem_protocols::MasstreeConfig),
     Dns(xylem_protocols::DnsConfig),
+    NvmeTcp(xylem_protocols::NvmeTcpConfig),
     XylemEcho(xylem_protocols::XylemEchoConfig),
 }
 
@@ -493,6 +496,18 @@ impl ProfileConfig {
                     group.name,
                     group.max_pending_per_connection,
                     xylem_protocols::dns::ID_COUNT
+                ));
+            }
+            if protocol == ProtocolKind::NvmeTcp
+                && group.max_pending_per_connection > xylem_protocols::nvme_tcp::MAX_QUEUE_DEPTH
+            {
+                errors.push(anyhow!(
+                    "Traffic group {} '{}' max_pending_per_connection {} exceeds the {} \
+                     commands an NVMe/TCP I/O queue can have in flight",
+                    i,
+                    group.name,
+                    group.max_pending_per_connection,
+                    xylem_protocols::nvme_tcp::MAX_QUEUE_DEPTH
                 ));
             }
 
@@ -835,6 +850,19 @@ fn parse_protocol_config(
             })?;
             Ok(ProtocolConfig::Dns(config))
         }
+        ProtocolKind::NvmeTcp => {
+            // subnqn has no default: an omitted protocol_config lacks it
+            let empty = serde_json::Value::Object(Default::default());
+            let config: xylem_protocols::NvmeTcpConfig =
+                parse_config_value(pc.unwrap_or(&empty), "NVMe/TCP", group_idx, group_name)?;
+            config.validate().with_context(|| {
+                format!(
+                    "Traffic group {} '{}' has invalid NVMe/TCP protocol_config",
+                    group_idx, group_name
+                )
+            })?;
+            Ok(ProtocolConfig::NvmeTcp(config))
+        }
         ProtocolKind::XylemEcho => {
             let config = parse_typed_config(pc, "XylemEcho", group_idx, group_name)?;
             Ok(ProtocolConfig::XylemEcho(config))
@@ -909,6 +937,19 @@ where
     let Some(pc) = pc else {
         return Ok(T::default());
     };
+    parse_config_value(pc, label, group_idx, group_name)
+}
+
+/// Parse protocol_config as `T`, which has no defaults for everything
+fn parse_config_value<T>(
+    pc: &serde_json::Value,
+    label: &str,
+    group_idx: usize,
+    group_name: &str,
+) -> Result<T>
+where
+    T: serde::de::DeserializeOwned,
+{
     serde_json::from_value(pc.clone()).map_err(|e| {
         anyhow::anyhow!(
             "Traffic group {} '{}' has invalid {} protocol_config: {}",
@@ -1567,6 +1608,70 @@ file = "results/test.json"
         // Stream transports have no request timeout
         let config = udp_profile("memcached-ascii", "tcp", "").unwrap();
         assert_eq!(config.traffic_groups[0].effective_request_timeout(), None);
+    }
+
+    #[test]
+    fn nvme_tcp_protocol_config_is_checked() {
+        let profile = |transport: &str, extra: &str| {
+            let profile = format!(
+                r#"
+[experiment]
+name = "nvme"
+duration = "1s"
+
+[[traffic_groups]]
+name = "main"
+protocol = "nvme-tcp"
+target = "127.0.0.1:4420"
+transport = "{transport}"
+threads = [0]
+connections_per_thread = 2
+{extra}
+
+[traffic_groups.traffic_policy]
+type = "closed-loop"
+
+[output]
+format = "json"
+file = "results/test.json"
+"#
+            );
+            let mut config: ProfileConfig = toml::from_str(&profile).unwrap();
+            config.validate().map(|()| config).map_err(|error| format!("{error:#}"))
+        };
+        let config = profile(
+            "tcp",
+            r#"max_pending_per_connection = 32
+protocol_config = { subnqn = "nqn.test", block_size = 65536, read_percent = 70 }"#,
+        )
+        .unwrap();
+        let [ProtocolConfig::NvmeTcp(nvme)] = &config.protocol_configs[..] else {
+            panic!("{:?}", config.protocol_configs);
+        };
+        assert_eq!((nvme.block_size, nvme.read_percent), (65536, 70));
+
+        for (transport, extra, expected) in [
+            ("tcp", "", "missing field `subnqn`"),
+            (
+                "tcp",
+                r#"protocol_config = { subnqn = "n", read_percent = 101 }"#,
+                "read_percent",
+            ),
+            ("tcp", r#"protocol_config = { subnqn = "n", queue_depth = 4 }"#, "queue_depth"),
+            (
+                "tcp",
+                "max_pending_per_connection = 65536\nprotocol_config = { subnqn = \"n\" }",
+                "exceeds the 65535 commands an NVMe/TCP I/O queue",
+            ),
+            (
+                "udp",
+                r#"protocol_config = { subnqn = "n" }"#,
+                "protocol 'nvme-tcp' does not support transport 'udp'",
+            ),
+        ] {
+            let error = profile(transport, extra).unwrap_err();
+            assert!(error.contains(expected), "{extra}: {error}");
+        }
     }
 
     #[test]
@@ -2988,7 +3093,7 @@ protocol_config = {}
         assert!(
             format!("{err:#}").contains(
                 "Invalid protocol 'redis-cluster' for traffic group 0 'main'. Valid options: \
-                 redis, memcached-binary, memcached-ascii, http, masstree, dns, xylem-echo. \
+                 redis, memcached-binary, memcached-ascii, http, masstree, dns, nvme-tcp, xylem-echo. \
                  Redis Cluster support was removed"
             ),
             "{err:#}"

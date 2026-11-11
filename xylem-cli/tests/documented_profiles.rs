@@ -100,6 +100,7 @@ fn check_workloads(config: &ProfileConfig, path: &Path) {
             protocol_config,
             &group.target,
             &group.transport,
+            group.max_pending_per_connection,
             config.experiment.seed,
         )
         .unwrap_or_else(|e| panic!("{} group {}: {e}", path.display(), group.name));

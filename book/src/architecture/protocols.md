@@ -28,6 +28,14 @@ pub trait Protocol: Send {
         false
     }
 
+    fn connection_roles(&self, load: usize) -> Vec<ConnectionRole> {
+        vec![ConnectionRole::Load; load]
+    }
+
+    fn bind_connections(&mut self, _conn_ids: &[usize]) {}
+
+    fn drain_outbox(&mut self, _conn_id: usize, _outbox: &mut Outbox) {}
+
     fn name(&self) -> &'static str;
 
     fn reset(&mut self);
@@ -45,18 +53,37 @@ pub trait Protocol: Send {
   static, so reporting one allocates nothing. An error reply completes its
   request; `Err` is for bytes that cannot be framed and for failed connection
   setup, and fails the run. `Parsed::Absorbed(n)` consumes bytes that
-  complete no request, such as one datagram of a multi-datagram UDP response;
-  on a byte stream that is an error.
+  complete no request, such as one datagram of a multi-datagram UDP response,
+  an NVMe/TCP R2T, or the leading part of a response longer than the receive
+  buffer; they count toward the next completed response's bytes.
 - `can_send` lets a protocol hold back requests on a connection, for example
-  until the Masstree handshake completes.
+  until the Masstree handshake completes. The worker asks when it schedules
+  the connection, so once true it must stay true until that connection's
+  next request.
 - `setup_pending` reports a connection that is still in connection setup
   (Redis AUTH, SELECT and HELLO, the Masstree handshake). Its requests go out
   as soon as `can_send` allows, off the connection's intended send schedule,
   which starts once setup is done.
+- `connection_roles` lets a session span connections. For a group with
+  `load` connections per thread it returns the connections to open, in
+  order: exactly `load` `Load` connections, which carry the traffic policy
+  and statistics, and any `Control` connections the protocol needs for
+  itself, such as an NVMe/TCP admin queue per controller. A control
+  connection has no policy, takes no group-dispatched arrivals, and may send
+  only setup requests. `bind_connections` receives the opened IDs in the same
+  order before the run.
+- `drain_outbox` runs after each read the worker parsed on a connection. The
+  protocol puts in `Outbox::data` bytes to send on that connection that are
+  no requests (an NVMe/TCP H2CData PDU answering an R2T, an HTTP/2 SETTINGS
+  acknowledgement); the worker sends them before the connection's next
+  request, counts them as sent bytes, and gives them no latency. In
+  `Outbox::wake` it names connections that data on this one unblocked, such
+  as I/O queues waiting for their admin queue; the worker reschedules just
+  those.
 - `name` returns the protocol name, and `reset` clears per-connection state.
 
 The core engine decides when to send; the protocol decides what to send. The
-Redis, Memcached, HTTP, Masstree and DNS protocols have a `from_config` constructor
+Redis, Memcached, HTTP, Masstree, DNS and NVMe/TCP protocols have a `from_config` constructor
 that builds them from their `protocol_config` section.
 
 ## Protocol Design
@@ -73,6 +100,8 @@ The following protocol implementations are available:
 - **Masstree** - MessagePack-based protocol for the Masstree key-value store
 - **DNS** - Standard queries with one question, length-prefixed on byte
   streams and bare in UDP datagrams
+- **NVMe/TCP** - NVM reads and writes on the I/O queues of NVMe over Fabrics
+  controllers
 - **Xylem Echo** - Echo protocol for testing xylem itself
 
 Detailed documentation for each protocol is available in the [Protocols](../guide/protocols.md) section of the User Guide.

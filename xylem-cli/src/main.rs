@@ -387,7 +387,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
         // Build protocol map: one per group_id
         let mut protocols = std::collections::HashMap::new();
 
-        for (group_id, _group_meta) in groups_for_thread.iter() {
+        for (group_id, group_meta) in groups_for_thread.iter() {
             let group_config = &config_for_worker.traffic_groups[*group_id];
 
             // Each thread's protocol gets its own seed, so threads do not
@@ -402,6 +402,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
                 &config_for_worker.protocol_configs[*group_id],
                 &group_config.target,
                 &group_config.transport,
+                group_meta.max_pending_per_connection,
                 protocol_seed,
             )?;
 

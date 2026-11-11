@@ -13,6 +13,7 @@ pub enum MultiProtocol {
     XylemEcho(xylem_protocols::xylem_echo::XylemEchoProtocol),
     Masstree(xylem_protocols::MasstreeProtocol),
     Dns(xylem_protocols::DnsProtocol),
+    NvmeTcp(xylem_protocols::NvmeTcpProtocol),
 }
 
 impl MultiProtocol {
@@ -20,11 +21,13 @@ impl MultiProtocol {
     /// `ProfileConfig::validate` parsed. HTTP sends `target` as the Host header
     /// unless the config sets `host`. Memcached frames its datagrams, and
     /// DNS sends bare messages instead of length-prefixed ones, when the
-    /// group's `transport` is "udp".
+    /// group's `transport` is "udp". NVMe/TCP sizes its I/O queues to
+    /// `max_pending`, the group's `max_pending_per_connection`.
     pub fn from_config(
         config: &ProtocolConfig,
         target: &str,
         transport: &str,
+        max_pending: usize,
         seed: Option<u64>,
     ) -> Result<Self> {
         let udp = transport == "udp";
@@ -71,6 +74,9 @@ impl MultiProtocol {
                         .with_framing(framing),
                 )
             }
+            ProtocolConfig::NvmeTcp(nvme_config) => Self::NvmeTcp(
+                xylem_protocols::NvmeTcpProtocol::from_config(nvme_config, max_pending, seed)?,
+            ),
             ProtocolConfig::XylemEcho(_echo_config) => create_xylem_echo_protocol(),
         };
         Ok(protocol)
@@ -100,6 +106,11 @@ impl Protocol for MultiProtocol {
                 let (conn, id) = request.request_id;
                 Request::new(request.data, (conn, u64::from(id)), request.metadata)
             }
+            MultiProtocol::NvmeTcp(p) => {
+                let request = p.next_request(conn_id);
+                let (conn, tag) = request.request_id;
+                Request::new(request.data, (conn, u64::from(tag)), request.metadata)
+            }
         }
     }
 
@@ -120,6 +131,9 @@ impl Protocol for MultiProtocol {
             MultiProtocol::Dns(p) => {
                 Ok(p.parse_response(conn_id, data)?.map_id(|(conn, id)| (conn, u64::from(id))))
             }
+            MultiProtocol::NvmeTcp(p) => {
+                Ok(p.parse_response(conn_id, data)?.map_id(|(conn, tag)| (conn, u64::from(tag))))
+            }
         }
     }
 
@@ -132,6 +146,7 @@ impl Protocol for MultiProtocol {
             MultiProtocol::XylemEcho(p) => p.name(),
             MultiProtocol::Masstree(p) => p.name(),
             MultiProtocol::Dns(p) => p.name(),
+            MultiProtocol::NvmeTcp(p) => p.name(),
         }
     }
 
@@ -144,6 +159,7 @@ impl Protocol for MultiProtocol {
             MultiProtocol::XylemEcho(p) => p.reset(),
             MultiProtocol::Masstree(p) => p.reset(),
             MultiProtocol::Dns(p) => p.reset(),
+            MultiProtocol::NvmeTcp(p) => p.reset(),
         }
     }
 
@@ -156,6 +172,7 @@ impl Protocol for MultiProtocol {
             MultiProtocol::XylemEcho(p) => p.can_send(conn_id),
             MultiProtocol::Masstree(p) => p.can_send(conn_id),
             MultiProtocol::Dns(p) => p.can_send(conn_id),
+            MultiProtocol::NvmeTcp(p) => p.can_send(conn_id),
         }
     }
 
@@ -168,6 +185,7 @@ impl Protocol for MultiProtocol {
             MultiProtocol::XylemEcho(p) => p.setup_pending(conn_id),
             MultiProtocol::Masstree(p) => p.setup_pending(conn_id),
             MultiProtocol::Dns(p) => p.setup_pending(conn_id),
+            MultiProtocol::NvmeTcp(p) => p.setup_pending(conn_id),
         }
     }
 
@@ -180,6 +198,7 @@ impl Protocol for MultiProtocol {
             MultiProtocol::XylemEcho(p) => p.connection_roles(load),
             MultiProtocol::Masstree(p) => p.connection_roles(load),
             MultiProtocol::Dns(p) => p.connection_roles(load),
+            MultiProtocol::NvmeTcp(p) => p.connection_roles(load),
         }
     }
 
@@ -192,6 +211,7 @@ impl Protocol for MultiProtocol {
             MultiProtocol::XylemEcho(p) => p.bind_connections(conn_ids),
             MultiProtocol::Masstree(p) => p.bind_connections(conn_ids),
             MultiProtocol::Dns(p) => p.bind_connections(conn_ids),
+            MultiProtocol::NvmeTcp(p) => p.bind_connections(conn_ids),
         }
     }
 
@@ -204,6 +224,7 @@ impl Protocol for MultiProtocol {
             MultiProtocol::XylemEcho(p) => p.drain_outbox(conn_id, outbox),
             MultiProtocol::Masstree(p) => p.drain_outbox(conn_id, outbox),
             MultiProtocol::Dns(p) => p.drain_outbox(conn_id, outbox),
+            MultiProtocol::NvmeTcp(p) => p.drain_outbox(conn_id, outbox),
         }
     }
 }
@@ -241,7 +262,7 @@ mod tests {
             ("unix", xylem_protocols::DnsFraming::Stream),
             ("udp", xylem_protocols::DnsFraming::Datagram),
         ] {
-            let protocol = MultiProtocol::from_config(&config, "127.0.0.1:53", transport, None);
+            let protocol = MultiProtocol::from_config(&config, "127.0.0.1:53", transport, 1, None);
             let Ok(MultiProtocol::Dns(dns)) = protocol else {
                 panic!("not a DNS protocol");
             };

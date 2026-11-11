@@ -79,6 +79,12 @@ test-dns:
     @echo "🌐 Running DNS integration tests..."
     cargo nextest run --profile integration -E 'binary(dns_integration)'
 
+# Run NVMe/TCP integration tests against SPDK's nvmf_tgt (no Docker, no
+# root; XYLEM_NVMF_TGT picks the binary, else nixpkgs#spdk is built)
+test-nvme:
+    @echo "💾 Running NVMe/TCP integration tests..."
+    cargo nextest run --profile integration -E 'binary(nvme_tcp_integration)'
+
 # Build debug version
 build:
     @echo "🔨 Building debug version..."

@@ -196,6 +196,7 @@ fn protocol_schema(protocol: ProtocolKind) -> Schema {
         ProtocolKind::Http => Schema::of::<xylem_protocols::HttpConfig>(),
         ProtocolKind::Masstree => Schema::of::<xylem_protocols::MasstreeConfig>(),
         ProtocolKind::Dns => Schema::of::<xylem_protocols::DnsConfig>(),
+        ProtocolKind::NvmeTcp => Schema::of::<xylem_protocols::NvmeTcpConfig>(),
         ProtocolKind::XylemEcho => Schema::of::<xylem_protocols::XylemEchoConfig>(),
     }
 }

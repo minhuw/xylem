@@ -1015,7 +1015,7 @@
           "default": "count"
         },
         "protocol": {
-          "description": "Protocol for this group (redis, memcached-binary, memcached-ascii, http, masstree, dns, xylem-echo)",
+          "description": "Protocol for this group (redis, memcached-binary, memcached-ascii, http, masstree, dns, nvme-tcp, xylem-echo)",
           "type": "string"
         },
         "protocol_config": {
