@@ -3,7 +3,7 @@
 use std::time::Duration;
 use xylem_cli::output::{html, DetailedExperimentResults};
 use xylem_core::stats::{SamplingPolicy, TupleStatsCollector};
-use xylem_core::traffic_group::{OnError, PolicyConfig, TrafficGroupConfig};
+use xylem_core::traffic_group::{Dispatch, OnError, PolicyConfig, TrafficGroupConfig};
 
 #[test]
 fn test_detailed_json_output_generation() {
@@ -56,7 +56,10 @@ fn test_detailed_json_output_generation() {
             protocol: "memcached-binary".to_string(),
             target: "127.0.0.1:6380".to_string(),
             transport: "tcp".to_string(),
-            traffic_policy: PolicyConfig::FixedRate { rate: 1000.0 },
+            traffic_policy: PolicyConfig::FixedRate {
+                rate: 1000.0,
+                dispatch: Dispatch::Connection,
+            },
             sampling_policy: policy.clone(),
             protocol_config: protocol_config.clone(),
         },

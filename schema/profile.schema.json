@@ -106,6 +106,21 @@
         }
       ]
     },
+    "Dispatch": {
+      "description": "How a rate-driven traffic group's arrivals reach its connections",
+      "oneOf": [
+        {
+          "description": "Every connection runs its own share of the group's arrivals and sends\nthem itself; an arrival due while its connection's pipeline is full\nwaits for that connection (default)",
+          "type": "string",
+          "const": "connection"
+        },
+        {
+          "description": "Every thread runs one arrival process, its share of the group's rate,\nand sends each arrival on the connection idle longest; an arrival due\nwhile no connection is idle waits for the first to free up and counts\nas a late send",
+          "type": "string",
+          "const": "group"
+        }
+      ]
+    },
     "DumpConfig": {
       "description": "Configuration for request dumping",
       "type": "object",
@@ -490,6 +505,10 @@
           "description": "Fixed-rate policy",
           "type": "object",
           "properties": {
+            "dispatch": {
+              "description": "How arrivals reach the connections: \"connection\" (default) or \"group\"",
+              "$ref": "#/$defs/Dispatch"
+            },
             "rate": {
               "description": "Rate in requests per second",
               "type": "number",
@@ -510,6 +529,10 @@
           "description": "Poisson policy",
           "type": "object",
           "properties": {
+            "dispatch": {
+              "description": "How arrivals reach the connections: \"connection\" (default) or \"group\"",
+              "$ref": "#/$defs/Dispatch"
+            },
             "rate": {
               "description": "Average rate in requests per second",
               "type": "number",
@@ -530,6 +553,10 @@
           "description": "Adaptive policy",
           "type": "object",
           "properties": {
+            "dispatch": {
+              "description": "How arrivals reach the connections: \"connection\" (default) or \"group\"",
+              "$ref": "#/$defs/Dispatch"
+            },
             "initial_rate": {
               "description": "Initial rate in requests per second",
               "type": "number",
@@ -579,6 +606,10 @@
               "type": "number",
               "format": "double"
             },
+            "dispatch": {
+              "description": "How arrivals reach the connections: \"connection\" (default) or \"group\"",
+              "$ref": "#/$defs/Dispatch"
+            },
             "period": {
               "description": "Period duration (e.g., \"60s\", \"24h\")",
               "type": "string"
@@ -608,6 +639,10 @@
           "description": "Ramp pattern - linearly increase/decrease rate over time",
           "type": "object",
           "properties": {
+            "dispatch": {
+              "description": "How arrivals reach the connections: \"connection\" (default) or \"group\"",
+              "$ref": "#/$defs/Dispatch"
+            },
             "duration": {
               "description": "Ramp duration",
               "type": "string"
@@ -639,6 +674,10 @@
           "description": "Spike pattern - sudden burst of traffic",
           "type": "object",
           "properties": {
+            "dispatch": {
+              "description": "How arrivals reach the connections: \"connection\" (default) or \"group\"",
+              "$ref": "#/$defs/Dispatch"
+            },
             "normal_rate": {
               "description": "Normal baseline rate in requests per second",
               "type": "number",
@@ -675,6 +714,10 @@
           "description": "Sawtooth pattern - repeated ramps (ramp up, instant drop, repeat)",
           "type": "object",
           "properties": {
+            "dispatch": {
+              "description": "How arrivals reach the connections: \"connection\" (default) or \"group\"",
+              "$ref": "#/$defs/Dispatch"
+            },
             "max_rate": {
               "description": "Maximum rate (end of ramp)",
               "type": "number",

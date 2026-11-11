@@ -405,7 +405,7 @@ impl ProfileConfig {
             // Rate-based policies need a positive rate. Pattern policies accept
             // zero, which pauses sending by design.
             let rates: &[(f64, &str)] = match &group.traffic_policy {
-                PolicyConfig::FixedRate { rate } | PolicyConfig::Poisson { rate } => {
+                PolicyConfig::FixedRate { rate, .. } | PolicyConfig::Poisson { rate, .. } => {
                     &[(*rate, "rate")]
                 }
                 PolicyConfig::Adaptive { initial_rate, min_rate, max_rate, .. } => &[
@@ -2413,7 +2413,7 @@ duration = "10s""#,
             SamplingPolicy::DdSketch { .. }
         ));
         assert!(
-            matches!(config.traffic_groups[0].traffic_policy, PolicyConfig::FixedRate { rate } if rate == 1000.0)
+            matches!(config.traffic_groups[0].traffic_policy, PolicyConfig::FixedRate { rate, .. } if rate == 1000.0)
         );
     }
 

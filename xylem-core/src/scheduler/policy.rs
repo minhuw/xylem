@@ -766,6 +766,13 @@ pub trait PolicyScheduler: Send {
     /// A boxed Policy instance for this connection
     fn assign_policy(&mut self, conn_id: usize) -> Box<dyn Policy>;
 
+    /// The arrival process the scheduler's connections share under group
+    /// dispatch (see [`super::dispatch`]), taken once when the pool is built;
+    /// `None` (the default) gives each connection its own schedule
+    fn dispatch_policy(&mut self) -> Option<Box<dyn Policy>> {
+        None
+    }
+
     /// Get the scheduler name for debugging
     fn name(&self) -> &'static str;
 }

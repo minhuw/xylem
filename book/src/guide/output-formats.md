@@ -99,6 +99,12 @@ requests; warmup requests are excluded:
 - `unsent_capped`: whether that walk stopped at its cap on some connection, so
   `unsent` is a lower bound.
 
+Under [group dispatch](../reference/schema.md#group-dispatch) a thread's
+connections share one schedule: an arrival that waits for an idle connection
+counts in `late_sends`, and `unsent` counts the thread's schedule, not each
+connection's. Each entry of `traffic_groups` reports its mode in `dispatch`:
+`"connection"` or `"group"`.
+
 After a run, `sent = completed + timed_out + failed`.
 
 ## Error replies

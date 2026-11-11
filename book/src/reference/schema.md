@@ -204,6 +204,9 @@ Setup requests are not measured, counted or dumped, and an error reply to one fa
   - `"poisson"`: Poisson arrival process (open-loop)
 - `rate` (float, required for fixed-rate/poisson): Requests per second of the
   whole group, across all its threads and connections
+- `dispatch` (string, rate-driven policies only): how the arrivals reach the
+  connections, `"connection"` (default) or `"group"`; see
+  [group dispatch](#group-dispatch)
 
 Every policy except `closed-loop` is rate-driven, including `adaptive` and the
 time-varying `sinusoidal`, `ramp`, `spike` and `sawtooth` patterns. Each
@@ -257,6 +260,35 @@ rate = 100.0  # 100 req/s for the group, evenly spaced
 [traffic_groups.traffic_policy]
 type = "poisson"
 rate = 50.0  # Mean 50 req/s for the group
+```
+
+#### Group dispatch
+
+By default every connection runs its own schedule, so a request due on a
+connection whose pipeline is full waits for that connection even while others
+are idle. With `max_pending_per_connection = 1`, which protocols without
+pipelining such as HTTP/1.1 need, the arrivals then wait for responses: their
+sends go out late, and the load is no longer open-loop.
+
+With `dispatch = "group"`, each thread of the group runs one schedule, its
+`1/T` share of the group's rates for `T` threads, by the rules above with
+thread `t` (its position in `threads`) in place of connection `c`:
+`fixed-rate` threads interleave into one evenly spaced stream, and each
+`poisson` thread is a Poisson process at `rate/T`, seeded per thread from
+`experiment.seed`. Each arrival goes to the thread's connection of the group
+that has been idle longest: set up, its protocol ready, and its pipeline not
+full. An arrival due while none is idle waits for the first to free up, with
+its send lag and latency counted from its intended time, so it counts in
+`late_sends`; arrivals still waiting at the end of the window count in
+`unsent`. The schedule starts when the first connection is set up. Give the
+group enough connections to cover the rate times the latency, plus bursts.
+`closed-loop` takes no `dispatch`.
+
+```toml
+[traffic_groups.traffic_policy]
+type = "poisson"
+rate = 20000.0
+dispatch = "group"  # one arrival process per thread, sent on idle connections
 ```
 
 ### Sampling Policy

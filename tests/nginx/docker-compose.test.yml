@@ -7,3 +7,4 @@ services:
       - "127.0.0.1::80"
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./delay.js:/etc/nginx/njs/delay.js:ro

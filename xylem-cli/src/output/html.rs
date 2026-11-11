@@ -669,6 +669,7 @@ mod optional_latency_display_tests {
             threads: vec![0],
             connections: 1,
             policy: "closed-loop".into(),
+            dispatch: Default::default(),
             stats: GroupStats {
                 total_requests: 0,
                 throughput_rps: 0.0,

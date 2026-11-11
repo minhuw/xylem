@@ -9,8 +9,8 @@
 //! - Per-group protocol configuration (keys, operations, etc.)
 
 use crate::scheduler::{
-    AdaptivePolicy, FixedRatePolicy, GroupPolicyScheduler, PatternAwarePolicy, PoissonPolicy,
-    PolicyScheduler, UniformPolicyScheduler,
+    AdaptivePolicy, FixedRatePolicy, GroupDispatchScheduler, GroupPolicyScheduler,
+    PatternAwarePolicy, PoissonPolicy, Policy, PolicyScheduler, UniformPolicyScheduler,
 };
 use crate::stats::SamplingPolicy;
 use crate::workload::LoadPattern;
@@ -162,11 +162,17 @@ pub enum PolicyConfig {
     FixedRate {
         /// Rate in requests per second
         rate: f64,
+        /// How arrivals reach the connections: "connection" (default) or "group"
+        #[serde(default, skip_serializing_if = "Dispatch::is_connection")]
+        dispatch: Dispatch,
     },
     /// Poisson policy
     Poisson {
         /// Average rate in requests per second
         rate: f64,
+        /// How arrivals reach the connections: "connection" (default) or "group"
+        #[serde(default, skip_serializing_if = "Dispatch::is_connection")]
+        dispatch: Dispatch,
     },
     /// Adaptive policy
     Adaptive {
@@ -180,6 +186,9 @@ pub enum PolicyConfig {
         /// Maximum rate (cap)
         #[serde(default = "default_max_rate")]
         max_rate: f64,
+        /// How arrivals reach the connections: "connection" (default) or "group"
+        #[serde(default, skip_serializing_if = "Dispatch::is_connection")]
+        dispatch: Dispatch,
     },
     /// Sinusoidal pattern - varies rate following a sine wave (e.g., diurnal patterns)
     Sinusoidal {
@@ -195,6 +204,9 @@ pub enum PolicyConfig {
         #[serde(default, with = "humantime_serde")]
         #[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
         phase_shift: Option<std::time::Duration>,
+        /// How arrivals reach the connections: "connection" (default) or "group"
+        #[serde(default, skip_serializing_if = "Dispatch::is_connection")]
+        dispatch: Dispatch,
     },
     /// Ramp pattern - linearly increase/decrease rate over time
     Ramp {
@@ -206,6 +218,9 @@ pub enum PolicyConfig {
         #[serde(with = "humantime_serde")]
         #[cfg_attr(feature = "schema", schemars(with = "String"))]
         duration: std::time::Duration,
+        /// How arrivals reach the connections: "connection" (default) or "group"
+        #[serde(default, skip_serializing_if = "Dispatch::is_connection")]
+        dispatch: Dispatch,
     },
     /// Spike pattern - sudden burst of traffic
     Spike {
@@ -221,6 +236,9 @@ pub enum PolicyConfig {
         #[serde(with = "humantime_serde")]
         #[cfg_attr(feature = "schema", schemars(with = "String"))]
         spike_duration: std::time::Duration,
+        /// How arrivals reach the connections: "connection" (default) or "group"
+        #[serde(default, skip_serializing_if = "Dispatch::is_connection")]
+        dispatch: Dispatch,
     },
     /// Sawtooth pattern - repeated ramps (ramp up, instant drop, repeat)
     Sawtooth {
@@ -232,7 +250,43 @@ pub enum PolicyConfig {
         #[serde(with = "humantime_serde")]
         #[cfg_attr(feature = "schema", schemars(with = "String"))]
         period: std::time::Duration,
+        /// How arrivals reach the connections: "connection" (default) or "group"
+        #[serde(default, skip_serializing_if = "Dispatch::is_connection")]
+        dispatch: Dispatch,
     },
+}
+
+/// How a rate-driven traffic group's arrivals reach its connections
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum Dispatch {
+    /// Every connection runs its own share of the group's arrivals and sends
+    /// them itself; an arrival due while its connection's pipeline is full
+    /// waits for that connection (default)
+    #[default]
+    Connection,
+    /// Every thread runs one arrival process, its share of the group's rate,
+    /// and sends each arrival on the connection idle longest; an arrival due
+    /// while no connection is idle waits for the first to free up and counts
+    /// as a late send
+    Group,
+}
+
+impl Dispatch {
+    /// Whether this is the default, per-connection dispatch
+    pub fn is_connection(&self) -> bool {
+        *self == Dispatch::Connection
+    }
+}
+
+impl std::fmt::Display for Dispatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Dispatch::Connection => "connection",
+            Dispatch::Group => "group",
+        })
+    }
 }
 
 fn default_min_rate() -> f64 {
@@ -244,6 +298,21 @@ fn default_max_rate() -> f64 {
 }
 
 impl PolicyConfig {
+    /// How arrivals reach the connections; closed loop has no arrivals and
+    /// dispatches per connection
+    pub fn dispatch(&self) -> Dispatch {
+        match self {
+            PolicyConfig::ClosedLoop => Dispatch::Connection,
+            PolicyConfig::FixedRate { dispatch, .. }
+            | PolicyConfig::Poisson { dispatch, .. }
+            | PolicyConfig::Adaptive { dispatch, .. }
+            | PolicyConfig::Sinusoidal { dispatch, .. }
+            | PolicyConfig::Ramp { dispatch, .. }
+            | PolicyConfig::Spike { dispatch, .. }
+            | PolicyConfig::Sawtooth { dispatch, .. } => *dispatch,
+        }
+    }
+
     /// Create the policy scheduler of one thread entry's connections of `group`
     ///
     /// The group's connections are numbered across its threads, this entry's
@@ -256,24 +325,36 @@ impl PolicyConfig {
     ///   [`crate::seed::poisson_seed`]`(seed, g, c)`; without one, from OS entropy.
     /// - Adaptive and the patterns: each connection runs at `1/N` of the
     ///   configured rates and starts `c/N` of a request into its schedule.
+    ///
+    /// With group dispatch, the thread entries instead play the role of the
+    /// connections: entry `t` of `T` (its position in the group's threads)
+    /// runs one arrival process by the same rules with `t` of `T`, which its
+    /// connections share (see [`crate::scheduler::dispatch`]). Its Poisson
+    /// seed is [`crate::seed::poisson_dispatch_seed`]`(seed, g, t)`.
     pub fn create_scheduler(
         &self,
         group: &TrafficGroup,
         seed: Option<u64>,
     ) -> Result<Box<dyn PolicyScheduler>> {
+        if self.dispatch() == Dispatch::Group {
+            let threads = group.threads.len().max(1);
+            let thread = group.first_connection / group.connections_per_thread.max(1);
+            let policy = self.arrival_policy(group.id, thread, threads, seed)?;
+            return Ok(Box::new(GroupDispatchScheduler::new(policy)));
+        }
         let connections = group.total_connections().max(1);
         let num_connections = connections as f64;
         let first = group.first_connection;
 
         match self {
             PolicyConfig::ClosedLoop => Ok(Box::new(UniformPolicyScheduler::closed_loop())),
-            PolicyConfig::FixedRate { rate } => {
+            PolicyConfig::FixedRate { rate, .. } => {
                 let rate = *rate;
                 Ok(Box::new(GroupPolicyScheduler::new(first, move |c| {
                     Box::new(FixedRatePolicy::striped(rate, c, connections))
                 })))
             }
-            PolicyConfig::Poisson { rate } => {
+            PolicyConfig::Poisson { rate, .. } => {
                 let per_conn_rate = *rate / num_connections;
                 // Validate the rate once, not on every connection
                 PoissonPolicy::with_seed(per_conn_rate, Some(0))?;
@@ -291,6 +372,7 @@ impl PolicyConfig {
                 target_latency_us,
                 min_rate,
                 max_rate,
+                ..
             } => {
                 let target_latency = Duration::from_micros(*target_latency_us);
                 let per_conn_initial = *initial_rate / num_connections;
@@ -313,6 +395,7 @@ impl PolicyConfig {
                 amplitude,
                 period,
                 phase_shift,
+                ..
             } => {
                 let per_conn_base = *base_rate / num_connections;
                 let per_conn_amplitude = *amplitude / num_connections;
@@ -328,7 +411,7 @@ impl PolicyConfig {
                 };
                 Ok(pattern_scheduler(Arc::new(pattern), first, connections))
             }
-            PolicyConfig::Ramp { start_rate, end_rate, duration } => {
+            PolicyConfig::Ramp { start_rate, end_rate, duration, .. } => {
                 let per_conn_start = *start_rate / num_connections;
                 let per_conn_end = *end_rate / num_connections;
                 let pattern =
@@ -340,6 +423,7 @@ impl PolicyConfig {
                 spike_rate,
                 spike_start,
                 spike_duration,
+                ..
             } => {
                 let per_conn_normal = *normal_rate / num_connections;
                 let per_conn_spike = *spike_rate / num_connections;
@@ -351,7 +435,7 @@ impl PolicyConfig {
                 );
                 Ok(pattern_scheduler(Arc::new(pattern), first, connections))
             }
-            PolicyConfig::Sawtooth { min_rate, max_rate, period } => {
+            PolicyConfig::Sawtooth { min_rate, max_rate, period, .. } => {
                 let per_conn_min = *min_rate / num_connections;
                 let per_conn_max = *max_rate / num_connections;
                 let pattern =
@@ -359,6 +443,97 @@ impl PolicyConfig {
                 Ok(pattern_scheduler(Arc::new(pattern), first, connections))
             }
         }
+    }
+
+    /// The arrival process of thread entry `thread` of the `threads` of
+    /// traffic group `group_id` under group dispatch: its share of the
+    /// configured rates, by the rules a connection's share follows under
+    /// per-connection dispatch
+    fn arrival_policy(
+        &self,
+        group_id: usize,
+        thread: usize,
+        threads: usize,
+        seed: Option<u64>,
+    ) -> Result<Box<dyn Policy>> {
+        let share = threads as f64;
+        let pattern = |pattern: Arc<dyn LoadPattern>| -> Box<dyn Policy> {
+            let start_ns = crate::timing::time_ns();
+            Box::new(PatternAwarePolicy::new(pattern, start_ns).with_phase(thread, threads))
+        };
+        Ok(match self {
+            PolicyConfig::ClosedLoop => {
+                return Err(crate::Error::Config(
+                    "closed-loop traffic has no arrivals to dispatch".to_string(),
+                ))
+            }
+            PolicyConfig::FixedRate { rate, .. } => {
+                Box::new(FixedRatePolicy::striped(*rate, thread, threads))
+            }
+            PolicyConfig::Poisson { rate, .. } => {
+                let seed =
+                    seed.map(|seed| crate::seed::poisson_dispatch_seed(seed, group_id, thread));
+                Box::new(PoissonPolicy::with_seed(*rate / share, seed)?)
+            }
+            PolicyConfig::Adaptive {
+                initial_rate,
+                target_latency_us,
+                min_rate,
+                max_rate,
+                ..
+            } => Box::new(
+                AdaptivePolicy::new(
+                    *initial_rate / share,
+                    Duration::from_micros(*target_latency_us),
+                    *min_rate / share,
+                    *max_rate / share,
+                )
+                .with_phase(thread, threads),
+            ),
+            PolicyConfig::Sinusoidal {
+                base_rate,
+                amplitude,
+                period,
+                phase_shift,
+                ..
+            } => {
+                let sine = crate::workload::SinusoidalPattern::new(
+                    *base_rate / share,
+                    *amplitude / share,
+                    *period,
+                );
+                pattern(Arc::new(match phase_shift {
+                    Some(shift) => sine.with_phase_shift(*shift),
+                    None => sine,
+                }))
+            }
+            PolicyConfig::Ramp { start_rate, end_rate, duration, .. } => {
+                pattern(Arc::new(crate::workload::RampPattern::new(
+                    *start_rate / share,
+                    *end_rate / share,
+                    *duration,
+                )))
+            }
+            PolicyConfig::Spike {
+                normal_rate,
+                spike_rate,
+                spike_start,
+                spike_duration,
+                ..
+            } => pattern(Arc::new(crate::workload::SpikePattern::new(
+                *normal_rate / share,
+                *spike_rate / share,
+                *spike_start,
+                *spike_duration,
+            ))),
+            PolicyConfig::Sawtooth { min_rate, max_rate, period, .. } => {
+                pattern(Arc::new(crate::workload::SawtoothPattern::new(
+                    *min_rate / share,
+                    *max_rate / share,
+                    *period,
+                )))
+            }
+        })
     }
 }
 
@@ -534,7 +709,10 @@ mod tests {
                 request_timeout: None,
                 on_error: OnError::Count,
                 timestamps: TimestampSourceConfig::User,
-                traffic_policy: PolicyConfig::Poisson { rate: 1000.0 },
+                traffic_policy: PolicyConfig::Poisson {
+                    rate: 1000.0,
+                    dispatch: Dispatch::Connection,
+                },
                 sampling_policy: SamplingPolicy::Unlimited,
                 protocol_config: Some(serde_json::json!({
                     "keys": {"strategy": "zipfian", "n": 1000000, "theta": 0.99, "value_size": 64}
@@ -726,8 +904,24 @@ mod tests {
         let start = 1_000_000_000;
         // Thread 1 carries both groups, and group 1 lists it twice
         let configs = vec![
-            group("a", vec![0, 1, 2], 3, PolicyConfig::FixedRate { rate: 90_000.0 }),
-            group("b", vec![1, 3, 1], 2, PolicyConfig::FixedRate { rate: 12_345.5 }),
+            group(
+                "a",
+                vec![0, 1, 2],
+                3,
+                PolicyConfig::FixedRate {
+                    rate: 90_000.0,
+                    dispatch: Dispatch::Connection,
+                },
+            ),
+            group(
+                "b",
+                vec![1, 3, 1],
+                2,
+                PolicyConfig::FixedRate {
+                    rate: 12_345.5,
+                    dispatch: Dispatch::Connection,
+                },
+            ),
         ];
         let assignment = ThreadGroupAssignment::from_configs(&configs);
         let firsts: Vec<_> = assignment
@@ -760,8 +954,24 @@ mod tests {
     fn seeded_poisson_groups_repeat_and_every_connection_has_its_own_stream() {
         let start = 1_000_000_000;
         let configs = vec![
-            group("a", vec![0, 1], 2, PolicyConfig::Poisson { rate: 4_000.0 }),
-            group("b", vec![1], 2, PolicyConfig::Poisson { rate: 4_000.0 }),
+            group(
+                "a",
+                vec![0, 1],
+                2,
+                PolicyConfig::Poisson {
+                    rate: 4_000.0,
+                    dispatch: Dispatch::Connection,
+                },
+            ),
+            group(
+                "b",
+                vec![1],
+                2,
+                PolicyConfig::Poisson {
+                    rate: 4_000.0,
+                    dispatch: Dispatch::Connection,
+                },
+            ),
         ];
         let schedules = group_schedules(&configs, Some(7), start, 100);
         assert_eq!(schedules, group_schedules(&configs, Some(7), start, 100));
@@ -804,6 +1014,96 @@ mod tests {
             with_unknown["bogus"] = 1.into();
             let error = serde_json::from_value::<PolicyConfig>(with_unknown).unwrap_err();
             assert!(error.to_string().contains("unknown field `bogus`"), "{policy}: {error}");
+        }
+    }
+
+    #[test]
+    fn every_rate_policy_takes_a_dispatch_mode_and_closed_loop_none() {
+        for policy in [
+            serde_json::json!({ "type": "fixed-rate", "rate": 1.0 }),
+            serde_json::json!({ "type": "poisson", "rate": 1.0 }),
+            serde_json::json!({ "type": "adaptive", "initial_rate": 1.0, "target_latency_us": 10 }),
+            serde_json::json!({
+                "type": "sinusoidal", "base_rate": 1.0, "amplitude": 1.0, "period": "1s"
+            }),
+            serde_json::json!({
+                "type": "ramp", "start_rate": 1.0, "end_rate": 2.0, "duration": "1s"
+            }),
+            serde_json::json!({
+                "type": "spike", "normal_rate": 1.0, "spike_rate": 2.0,
+                "spike_start": "1s", "spike_duration": "1s"
+            }),
+            serde_json::json!({
+                "type": "sawtooth", "min_rate": 1.0, "max_rate": 2.0, "period": "1s"
+            }),
+        ] {
+            // The default is per-connection dispatch, and it is not written out
+            let config: PolicyConfig = serde_json::from_value(policy.clone()).unwrap();
+            assert_eq!(config.dispatch(), Dispatch::Connection);
+            assert_eq!(serde_json::to_value(&config).unwrap().get("dispatch"), None);
+            let mut group = policy.clone();
+            group["dispatch"] = "group".into();
+            let config: PolicyConfig = serde_json::from_value(group.clone()).unwrap();
+            assert_eq!(config.dispatch(), Dispatch::Group, "{policy}");
+            assert_eq!(serde_json::to_value(&config).unwrap()["dispatch"], "group");
+            group["dispatch"] = "thread".into();
+            assert!(serde_json::from_value::<PolicyConfig>(group).is_err());
+        }
+        let closed = serde_json::json!({ "type": "closed-loop", "dispatch": "group" });
+        let error = serde_json::from_value::<PolicyConfig>(closed).unwrap_err();
+        assert!(error.to_string().contains("unknown field `dispatch`"), "{error}");
+    }
+
+    /// Every thread entry's group-dispatch arrival process, built the way the
+    /// CLI builds them, with its first `sends` intended times anchored at `start`
+    fn dispatch_schedules(
+        config: &TrafficGroupConfig,
+        seed: Option<u64>,
+        start: u64,
+        sends: usize,
+    ) -> Vec<Vec<u64>> {
+        let configs = [config.clone()];
+        let assignment = ThreadGroupAssignment::from_configs(&configs);
+        let mut schedules = Vec::new();
+        for thread_id in assignment.thread_ids() {
+            for (_, entry) in assignment.get_groups_for_thread(thread_id).unwrap() {
+                let mut scheduler = config.traffic_policy.create_scheduler(entry, seed).unwrap();
+                assert_eq!(scheduler.assign_policy(0).name(), "ClosedLoop");
+                let mut policy = scheduler.dispatch_policy().expect("group dispatch");
+                schedules.push(intended_times(&mut *policy, start, sends));
+            }
+        }
+        schedules
+    }
+
+    #[test]
+    fn group_dispatch_runs_one_arrival_process_per_thread_sharing_the_rate() {
+        let start = 1_000_000_000;
+        let fixed = PolicyConfig::FixedRate { rate: 4_000.0, dispatch: Dispatch::Group };
+        // Each thread's arrivals take every other slot of the 4000 req/s
+        // stream, however many connections the thread has
+        let schedules = dispatch_schedules(&group("a", vec![0, 1], 8, fixed), None, start, 3);
+        assert_eq!(
+            schedules,
+            [
+                [start, start + 500_000, start + 1_000_000],
+                [start + 250_000, start + 750_000, start + 1_250_000]
+            ]
+        );
+
+        let poisson = group(
+            "a",
+            vec![0, 1],
+            8,
+            PolicyConfig::Poisson { rate: 4_000.0, dispatch: Dispatch::Group },
+        );
+        let schedules = dispatch_schedules(&poisson, Some(7), start, 20_000);
+        assert_eq!(schedules, dispatch_schedules(&poisson, Some(7), start, 20_000));
+        assert_ne!(schedules[0], schedules[1], "every thread has its own stream");
+        for times in &schedules {
+            // 2000 req/s per thread: 20,000 arrivals take about 10 s
+            let span = (times[times.len() - 1] - start) as f64 / 1e9;
+            assert!((9.7..10.3).contains(&span), "{span} s");
         }
     }
 

@@ -82,6 +82,13 @@ pub fn poisson_seed(master_seed: u64, group: usize, connection: usize) -> u64 {
     derive_seed(master_seed, &format!("{}/{group}/{connection}", components::POISSON_POLICY))
 }
 
+/// Seed of the Poisson arrivals that thread entry `thread` (its position in
+/// the group's threads) of traffic group `group` dispatches to its
+/// connections under group dispatch
+pub fn poisson_dispatch_seed(master_seed: u64, group: usize, thread: usize) -> u64 {
+    derive_seed(master_seed, &format!("{}/{group}/{thread}", components::POISSON_DISPATCH))
+}
+
 /// Standard component names for seed derivation
 ///
 /// Using constants ensures consistent naming across the codebase
@@ -94,6 +101,8 @@ pub mod components {
     /// Seed component for protocol-specific random generation (e.g., key generation)
     pub const RANDOM_KEYS: &str = "random_key_generation";
     pub const POISSON_POLICY: &str = "poisson_policy";
+    /// Seed component for a traffic group's group-dispatched Poisson arrivals
+    pub const POISSON_DISPATCH: &str = "poisson_dispatch";
     /// Seed component for a traffic group's protocol on one thread
     pub const PROTOCOL: &str = "protocol";
 }

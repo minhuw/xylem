@@ -6,7 +6,7 @@
 //! Uses `ConnectionGroup` internally for efficient I/O multiplexing - a single
 //! poll syscall checks all connections in the pool.
 
-use crate::scheduler::{Policy, ReadyHeap};
+use crate::scheduler::{GroupDispatcher, Policy, ReadyHeap};
 use crate::stats::{LatencyBreakdown, MAX_ERROR_KINDS, MAX_ERROR_KIND_LEN, OTHER_ERROR_KIND};
 use crate::traffic_group::OnError;
 use crate::Result;
@@ -193,6 +193,9 @@ struct PendingRequest {
 /// The heap stores ALL connections that can send, including rate-limited connections
 /// with future send times. This allows efficient timeout calculation by peeking at the
 /// earliest ready time (needed for epoll_wait timeout).
+///
+/// A connection of a group-dispatched traffic group is on the heap only while
+/// it sets up; once set up, it waits on its dispatcher's idle list instead.
 pub struct ConnectionState<ReqId: Eq + Hash + Clone> {
     /// Connection ID in the ConnectionGroup
     connection_id: usize,
@@ -216,9 +219,13 @@ pub struct ConnectionState<ReqId: Eq + Hash + Clone> {
     policy: Box<dyn Policy>,
     /// Traffic group ID this connection belongs to
     group_id: usize,
-    /// Whether this connection is currently in the ready heap
+    /// Whether this connection is currently in the ready heap, or on its
+    /// dispatcher's idle list
     /// Invariant: on_heap == true ⟺ connection can accept more requests
     on_heap: bool,
+    /// Index of the pool's group dispatcher that sends on this connection;
+    /// `None` when the connection follows its own policy
+    dispatcher: Option<usize>,
     /// Whether the connection was last scheduled for connection setup: it is
     /// on the heap as ready now and sends without consulting its policy
     in_setup: bool,
@@ -262,6 +269,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
             policy,
             group_id,
             on_heap: false,
+            dispatcher: None,
             in_setup: false,
             request_timeout: None,
             deadlines: VecDeque::new(),
@@ -770,6 +778,16 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
     }
 }
 
+/// A connection picked to send, and the schedule its request follows
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pick {
+    /// Connection to send on
+    pub connection_id: usize,
+    /// Index of the group dispatcher whose due arrival the request takes;
+    /// `None` when the request follows the connection's own policy
+    dispatcher: Option<usize>,
+}
+
 /// Connection pool managing multiple connections with per-connection policies
 ///
 /// Uses a single `ConnectionGroup` internally for efficient I/O multiplexing.
@@ -786,6 +804,9 @@ pub struct ConnectionPool<G: ConnectionGroup, ReqId: Eq + Hash + Clone> {
     connection_ids: Vec<usize>,
     /// Min-heap for O(log N) lookup of next ready connection
     ready_heap: ReadyHeap,
+    /// Arrival processes of the group-dispatched traffic groups, one per
+    /// group, with their idle connections
+    dispatchers: Vec<GroupDispatcher>,
     /// Reused buffer for TX timestamps drained from the group
     tx_timestamps: Vec<TxTimestampInfo>,
     /// Whether the group carries datagrams, which are parsed one at a time
@@ -866,6 +887,7 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         let mut connection_states = HashMap::with_capacity(total_connections);
         let mut connection_ids = Vec::with_capacity(total_connections);
         let mut ready_heap = ReadyHeap::new();
+        let mut dispatchers: Vec<GroupDispatcher> = Vec::new();
 
         for (
             group_id,
@@ -875,15 +897,23 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
             mut policy_scheduler,
         ) in groups
         {
+            let dispatcher = policy_scheduler.dispatch_policy().map(|policy| {
+                dispatchers.push(GroupDispatcher::new(group_id, policy));
+                dispatchers.len() - 1
+            });
             for index in 0..connection_count {
                 let (connection_id, address) = add_connection(&mut group, &target)?;
                 let mut policy = policy_scheduler.assign_policy(index);
 
                 // The first call starts the connection's intended schedule once
-                // it is connected; anchoring the schedules restarts it. Then add
-                // it to the heap.
-                let next_send_time = policy.next_send_time(crate::timing::time_ns());
-                ready_heap.push(connection_id, next_send_time);
+                // it is connected, or for a group-dispatched connection, the
+                // group's; anchoring the schedules restarts it. Then add it to
+                // the heap or its dispatcher's idle list.
+                let now_ns = crate::timing::time_ns();
+                match dispatcher {
+                    Some(dispatcher) => dispatchers[dispatcher].push_idle(connection_id, now_ns),
+                    None => ready_heap.push(connection_id, policy.next_send_time(now_ns)),
+                }
 
                 let mut state = ConnectionState::new(
                     connection_id,
@@ -893,6 +923,7 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
                     group_id,
                 );
 
+                state.dispatcher = dispatcher;
                 state.set_on_heap(true);
                 connection_states.insert(connection_id, state);
                 connection_ids.push(connection_id);
@@ -905,6 +936,7 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
             connection_states,
             connection_ids,
             ready_heap,
+            dispatchers,
             tx_timestamps: Vec::new(),
             next_deadline_ns: None,
         })
@@ -1142,7 +1174,10 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         for response in &responses {
             // A fast error reply would make an adaptive policy speed up
             if !response.is_warmup && response.error.is_none() {
-                state.policy.on_response(response.latency);
+                match state.dispatcher {
+                    Some(dispatcher) => self.dispatchers[dispatcher].on_response(response.latency),
+                    None => state.policy.on_response(response.latency),
+                }
             }
         }
         Ok(responses)
@@ -1200,6 +1235,57 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         self.pick_connection_at(crate::timing::time_ns())
     }
 
+    /// Pick the next connection to send on: one the ready heap holds ready,
+    /// else the idle connection a group dispatcher's due arrival goes to
+    ///
+    /// Send the request with [`Self::intended_send_time`] of the pick, then
+    /// call [`Self::on_request_sent`]; a connection setup request takes no
+    /// arrival and calls neither.
+    pub fn pick_send(&mut self) -> Option<Pick> {
+        self.pick_send_at(crate::timing::time_ns())
+    }
+
+    pub(crate) fn pick_send_at(&mut self, current_time_ns: u64) -> Option<Pick> {
+        if let Some(connection_id) = self.pick_connection_at(current_time_ns) {
+            return Some(Pick { connection_id, dispatcher: None });
+        }
+        let states = &mut self.connection_states;
+        for (index, dispatcher) in self.dispatchers.iter_mut().enumerate() {
+            let picked = dispatcher.pop_due(current_time_ns, |connection_id| {
+                // A connection closed while idle stays off the list for good
+                states.get_mut(&connection_id).is_some_and(|state| {
+                    state.set_on_heap(false);
+                    state.can_send()
+                })
+            });
+            if let Some(connection_id) = picked {
+                return Some(Pick { connection_id, dispatcher: Some(index) });
+            }
+        }
+        None
+    }
+
+    /// Intended send time of the request sent on `pick`: the due arrival of
+    /// its dispatcher, or the next one of its connection's policy
+    pub fn intended_send_time(&self, pick: Pick) -> Option<u64> {
+        match pick.dispatcher {
+            Some(dispatcher) => self.dispatchers[dispatcher].intended_send_time(),
+            None => self.get_state(pick.connection_id)?.intended_send_time(),
+        }
+    }
+
+    /// Advance the schedule `pick`'s request followed past it
+    pub fn on_request_sent(&mut self, pick: Pick, sent_time_ns: u64) {
+        match pick.dispatcher {
+            Some(dispatcher) => self.dispatchers[dispatcher].on_request_sent(sent_time_ns),
+            None => {
+                if let Some(state) = self.get_state_mut(pick.connection_id) {
+                    state.on_request_sent(sent_time_ns);
+                }
+            }
+        }
+    }
+
     pub(crate) fn pick_connection_at(&mut self, current_time_ns: u64) -> Option<usize> {
         while let Some(connection_id) = self.ready_heap.pop_ready(current_time_ns) {
             let Some(state) = self.connection_states.get_mut(&connection_id) else {
@@ -1228,7 +1314,9 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
     /// A connection whose protocol reports [`Protocol::setup_pending`] is
     /// ready at once, off its schedule, so its setup requests go out as soon
     /// as it can send. Any other connection waits for its policy's next
-    /// wakeup, which starts its schedule if setup restarted it.
+    /// wakeup, which starts its schedule if setup restarted it, or for a
+    /// group-dispatched connection, joins the back of its dispatcher's idle
+    /// list.
     ///
     /// The heap stores ALL connections that can send, including rate-limited connections
     /// with future send times. This allows us to peek at the earliest ready time for
@@ -1271,6 +1359,11 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
             // - Connection setup or closed-loop (None): ready immediately
             // - Rate-limited (Some(future)): will be popped when time arrives
             state.in_setup = protocol.setup_pending(connection_id);
+            if let (Some(dispatcher), false) = (state.dispatcher, state.in_setup) {
+                state.set_on_heap(true);
+                self.dispatchers[dispatcher].push_idle(connection_id, current_time_ns);
+                return true;
+            }
             let next_send_time = if state.in_setup {
                 None
             } else {
@@ -1290,11 +1383,23 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
     ///
     /// Useful for determining how long to sleep in the worker loop.
     pub fn peek_next_ready_time(&self) -> Option<u64> {
-        self.ready_heap.peek_next_time()
+        let heap = self.ready_heap.peek_next_time();
+        if heap.is_none() && !self.ready_heap.is_empty() {
+            return None;
+        }
+        self.dispatchers
+            .iter()
+            .filter_map(GroupDispatcher::next_wakeup)
+            .chain(heap)
+            .min()
     }
 
     pub(crate) fn has_ready(&self, current_time_ns: u64) -> bool {
         self.ready_heap.has_ready(current_time_ns)
+            || self
+                .dispatchers
+                .iter()
+                .any(|dispatcher| dispatcher.next_wakeup().is_some_and(|t| t <= current_time_ns))
     }
 
     /// Anchor every connection's intended schedule at `start_ns`, the start
@@ -1304,6 +1409,9 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
     /// intended time at or after both `start_ns` and that call.
     pub fn anchor_schedules(&mut self, start_ns: u64) {
         self.ready_heap.clear();
+        for dispatcher in &mut self.dispatchers {
+            dispatcher.anchor(start_ns);
+        }
         for state in self.connection_states.values_mut() {
             state.policy.anchor(start_ns);
             state.set_on_heap(false);
@@ -1315,17 +1423,30 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
     /// to `end_ns`, walking at most `cap` per connection
     ///
     /// Returns `(group_id, connection_id, count, capped)` for every connection
-    /// with a nonzero count, including closed ones. Consumes the schedules, so
-    /// call it only once the connections stop sending.
+    /// with a nonzero count, including closed ones. A group dispatcher's
+    /// arrivals count under its lowest connection ID, with the cap applying
+    /// to the dispatcher as a whole. Consumes the schedules, so call it only
+    /// once the connections stop sending.
     pub fn count_unsent(&mut self, end_ns: u64, cap: u64) -> Vec<(usize, usize, u64, bool)> {
+        let mut dispatcher_connections = vec![usize::MAX; self.dispatchers.len()];
         let mut unsent: Vec<_> = self
             .connection_states
             .values_mut()
             .filter_map(|state| {
+                if let Some(dispatcher) = state.dispatcher {
+                    let lowest = &mut dispatcher_connections[dispatcher];
+                    *lowest = (*lowest).min(state.connection_id);
+                }
                 let (count, capped) = state.policy.count_intended_before(end_ns, cap);
                 (count > 0).then_some((state.group_id, state.connection_id, count, capped))
             })
             .collect();
+        for (dispatcher, connection_id) in self.dispatchers.iter_mut().zip(dispatcher_connections) {
+            let (count, capped) = dispatcher.count_intended_before(end_ns, cap);
+            if count > 0 {
+                unsent.push((dispatcher.group_id(), connection_id, count, capped));
+            }
+        }
         unsent.sort_unstable_by_key(|&(group_id, connection_id, _, _)| (group_id, connection_id));
         unsent
     }

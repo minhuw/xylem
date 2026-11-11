@@ -8,6 +8,9 @@
 //! - **Policy**: Each connection has a `Policy` that decides when to send the next request
 //!   (e.g., `ClosedLoopPolicy`, `FixedRatePolicy`, `PoissonPolicy`)
 //! - **ReadyHeap**: A min-heap data structure for O(log N) lookup of the next ready connection
+//! - **GroupDispatcher**: Under group dispatch, one arrival process shared by a
+//!   thread's connections of a traffic group, which sends each arrival on the
+//!   connection idle longest (see [`dispatch`])
 //!
 //! ## Example: Uniform Traffic
 //!
@@ -38,6 +41,7 @@
 //! assert_eq!(rate_at_60s, 10_000_000.0);
 //! ```
 
+pub mod dispatch;
 pub mod policy;
 pub mod ready_heap;
 
@@ -47,4 +51,5 @@ pub use policy::{
     PatternPolicyScheduler, PoissonPolicy, Policy, PolicyScheduler, UniformPolicyScheduler,
 };
 
+pub use dispatch::{GroupDispatchScheduler, GroupDispatcher};
 pub use ready_heap::ReadyHeap;

@@ -15,6 +15,7 @@ use xylem_core::stats::{
     AggregatedStats, BreakdownClock, BreakdownSummary, PartSummary, RequestCounts, SendLagSummary,
     TupleStatsCollector, LATE_SEND_THRESHOLD,
 };
+use xylem_core::traffic_group::Dispatch;
 
 /// Latency summary in microseconds. Optional min, max, standard deviation, and
 /// confidence interval fields use `null` in JSON when absent. Numeric mean and
@@ -417,6 +418,9 @@ pub struct TrafficGroupResults {
     pub threads: Vec<usize>,
     pub connections: usize,
     pub policy: String,
+    /// How the policy's arrivals reach the connections: "connection" or "group"
+    #[serde(default)]
+    pub dispatch: Dispatch,
     pub stats: GroupStats,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub protocol_metadata: Option<JsonValue>,
@@ -545,6 +549,7 @@ impl DetailedExperimentResults {
                     threads: config.threads.clone(),
                     connections: config.connections_per_thread * config.threads.len(),
                     policy: policy_str,
+                    dispatch: config.traffic_policy.dispatch(),
                     stats: GroupStats {
                         total_requests: aggregated.total_requests,
                         throughput_rps: aggregated.throughput_rps,
@@ -758,10 +763,10 @@ impl DetailedExperimentResults {
     fn format_policy_config(policy: &xylem_core::traffic_group::PolicyConfig) -> String {
         match policy {
             xylem_core::traffic_group::PolicyConfig::ClosedLoop => "closed-loop".to_string(),
-            xylem_core::traffic_group::PolicyConfig::FixedRate { rate } => {
+            xylem_core::traffic_group::PolicyConfig::FixedRate { rate, .. } => {
                 format!("fixed-rate({})", rate)
             }
-            xylem_core::traffic_group::PolicyConfig::Poisson { rate } => {
+            xylem_core::traffic_group::PolicyConfig::Poisson { rate, .. } => {
                 format!("poisson({})", rate)
             }
             xylem_core::traffic_group::PolicyConfig::Adaptive { .. } => "adaptive".to_string(),
@@ -778,7 +783,12 @@ impl DetailedExperimentResults {
                     period.as_secs_f64()
                 )
             }
-            xylem_core::traffic_group::PolicyConfig::Ramp { start_rate, end_rate, duration } => {
+            xylem_core::traffic_group::PolicyConfig::Ramp {
+                start_rate,
+                end_rate,
+                duration,
+                ..
+            } => {
                 format!("ramp({} -> {} over {}s)", start_rate, end_rate, duration.as_secs_f64())
             }
             xylem_core::traffic_group::PolicyConfig::Spike {
@@ -794,7 +804,12 @@ impl DetailedExperimentResults {
                     spike_duration.as_secs_f64()
                 )
             }
-            xylem_core::traffic_group::PolicyConfig::Sawtooth { min_rate, max_rate, period } => {
+            xylem_core::traffic_group::PolicyConfig::Sawtooth {
+                min_rate,
+                max_rate,
+                period,
+                ..
+            } => {
                 format!("sawtooth({}-{}, period={}s)", min_rate, max_rate, period.as_secs_f64())
             }
         }
@@ -850,6 +865,9 @@ impl DetailedExperimentResults {
             println!("{}", "-".repeat(70));
             println!("Target:          {} ({})", group.target, group.protocol);
             println!("Policy:          {}", group.policy);
+            if !group.dispatch.is_connection() {
+                println!("Dispatch:        {}", group.dispatch);
+            }
             println!("Threads:         {:?}", group.threads);
             println!("Connections:     {}", group.connections);
             println!();

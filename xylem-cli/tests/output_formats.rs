@@ -561,6 +561,7 @@ const MASKED_JSON: &str = r#"{
       ],
       "connections": 1,
       "policy": "closed-loop",
+      "dispatch": "connection",
       "stats": {
         "total_requests": #,
         "throughput_rps": #,
@@ -695,7 +696,17 @@ fn assert_json_results(
     assert_eq!(groups.len(), 1);
     assert_eq!(
         sorted_keys(&groups[0]),
-        ["connections", "id", "name", "policy", "protocol", "stats", "target", "threads"]
+        [
+            "connections",
+            "dispatch",
+            "id",
+            "name",
+            "policy",
+            "protocol",
+            "stats",
+            "target",
+            "threads"
+        ]
     );
     for latency in [&json["global"]["latency"], &groups[0]["stats"]["latency"]] {
         // The default HDR histogram records every latency, so min and max

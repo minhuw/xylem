@@ -56,6 +56,7 @@ fn html_report_preserves_data_and_escapes_profile_text() {
         threads: vec![0],
         connections: 1,
         policy: text.into(),
+        dispatch: Default::default(),
         stats: GroupStats {
             total_requests: 1,
             throughput_rps: 12.3456,

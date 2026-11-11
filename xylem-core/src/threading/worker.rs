@@ -285,7 +285,8 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
 
     fn send_requests(&mut self) -> Result<()> {
         // SEND PHASE: Send requests to ready connections
-        // Rate limiting is handled by connection-level policies via pool's ready_heap
+        // Rate limiting is handled by connection-level policies via pool's
+        // ready_heap, or for group dispatch, by each group's arrival process
         //
         // Safety limit: Cap the number of consecutive sends to prevent infinite loops
         // For closed-loop with pipelining, we want to fill all pipelines, but not spin forever
@@ -293,7 +294,8 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         let max_sends_per_iteration = self.pool.connection_count() * 16; // Allow generous headroom
         let mut sends_this_iteration = 0;
 
-        while let Some(connection_id) = self.pool.pick_connection() {
+        while let Some(pick) = self.pool.pick_send() {
+            let connection_id = pick.connection_id;
             let state = self.pool.get_state(connection_id).expect("Connection state not found");
             let group_id = state.group_id();
 
@@ -322,7 +324,7 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
 
                 // Send request (track warmup status for response handling). An
                 // open-loop request's latency starts at its intended send time.
-                let intended_ns = state.intended_send_time();
+                let intended_ns = self.pool.intended_send_time(pick);
                 let lag = self.pool.send_scheduled(
                     connection_id,
                     &request.data,
@@ -333,9 +335,7 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
 
                 // Advance the policy's schedule and record stats (skip stats for
                 // warmup requests)
-                if let Some(state) = self.pool.get_state_mut(connection_id) {
-                    state.on_request_sent(timing::time_ns());
-                }
+                self.pool.on_request_sent(pick, timing::time_ns());
                 if !request.metadata.is_warmup {
                     self.stats.record_tx_bytes(group_id, connection_id, request.data.len());
                     self.stats.record_sent(group_id, connection_id, lag);
@@ -1496,6 +1496,175 @@ mod tests {
         let counts = worker.stats.request_counts_global();
         assert_eq!((counts.sent, counts.unsent, counts.unsent_capped), (1, 49, false));
         assert_eq!(worker.stats.request_counts(0).unsent, 49);
+    }
+
+    /// A worker whose `connections` connections share the arrivals of `policy`
+    fn group_worker(
+        factory: &FakeFactory,
+        connections: usize,
+        max_pending: usize,
+        policy: Box<dyn crate::scheduler::Policy>,
+    ) -> Worker<FakeGroup, FakeProtocol> {
+        let mut stats = TupleStatsCollector::default();
+        stats.register_group_policy(0, SamplingPolicy::Limited { max_samples: 1000, rate: 1.0 });
+        Worker::new(
+            factory,
+            FakeProtocol::default(),
+            stats,
+            WorkerConfig {
+                target: "127.0.0.1:1".parse().unwrap(),
+                duration: Duration::from_millis(100),
+                conn_count: connections,
+                max_pending_per_conn: max_pending,
+                drain_timeout: FAKE_DRAIN_TIMEOUT,
+            },
+            Box::new(crate::scheduler::GroupDispatchScheduler::new(policy)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn group_dispatch_sends_arrivals_on_idle_connections_and_counts_waits_as_late() {
+        use crate::scheduler::FixedRatePolicy;
+        let factory = FakeFactory::default();
+        factory.0.lock().unwrap().live_timestamps = true;
+        // Two connections, one request in flight each, one arrival per ms
+        let mut worker = group_worker(&factory, 2, 1, Box::new(FixedRatePolicy::new(1000.0)));
+        let ms = 1_000_000;
+        let start = timing::time_ns() + 2 * ms;
+        worker.anchor_schedules(start);
+        worker.send_requests().unwrap();
+        assert_eq!(factory.0.lock().unwrap().sent.len(), 0, "nothing before the start");
+        assert_eq!(worker.pool.peek_next_ready_time(), Some(start));
+
+        // The first two arrivals go out on the two idle connections
+        timing::busy_wait_until(start);
+        worker.send_requests().unwrap();
+        timing::busy_wait_until(start + ms);
+        worker.send_requests().unwrap();
+        assert_eq!(factory.0.lock().unwrap().sent.len(), 2);
+        let pending =
+            |worker: &Worker<_, _>, id| worker.pool.get_state(id).unwrap().pending_count();
+        assert_eq!((pending(&worker, 0), pending(&worker, 1)), (1, 1));
+
+        // No connection is idle: the arrivals at 2 and 3 ms wait, and with
+        // nothing to send there is no send wakeup
+        timing::busy_wait_until(start + 3 * ms + ms / 2);
+        worker.send_requests().unwrap();
+        assert_eq!(factory.0.lock().unwrap().sent.len(), 2);
+        assert!(!worker.pool.has_ready(timing::time_ns()));
+        assert_eq!(worker.pool.peek_next_ready_time(), None);
+
+        // Connection 0 frees up: the arrival intended at 2 ms goes out on it
+        // at once, late, and connection 0 is busy again
+        let factory_io = std::sync::Arc::clone(&factory.0);
+        {
+            let mut io = factory_io.lock().unwrap();
+            io.response_connection_id = 0;
+            io.responses.push_back(Ok(0u64.to_le_bytes().to_vec()));
+        }
+        worker.process_responses(Duration::ZERO).unwrap();
+        worker.send_requests().unwrap();
+        assert_eq!(factory.0.lock().unwrap().sent.len(), 3);
+        assert_eq!((pending(&worker, 0), pending(&worker, 1)), (1, 1));
+        let counts = worker.stats.request_counts_global();
+        assert_eq!(counts.sent, 3);
+        assert!(counts.late_sends >= 1, "{counts:?}");
+        let lag = worker.stats.send_lag_global();
+        assert!(lag.max.unwrap() >= Duration::from_micros(1_500), "{lag:?}");
+
+        // Its latency runs from its intended time, so it includes the wait
+        {
+            let mut io = factory_io.lock().unwrap();
+            io.responses.push_back(Ok(2u64.to_le_bytes().to_vec()));
+        }
+        worker.process_responses(Duration::ZERO).unwrap();
+        assert!(global(&worker).max_latency.unwrap() >= lag.max.unwrap());
+
+        // The arrivals at 3, 4 and 5 ms never went out
+        worker.record_unsent(start + 5 * ms + 1);
+        assert_eq!(worker.stats.request_counts_global().unsent, 3);
+    }
+
+    #[test]
+    fn group_dispatch_starts_once_a_connection_is_set_up() {
+        use crate::scheduler::FixedRatePolicy;
+        let factory = FakeFactory::default();
+        factory.0.lock().unwrap().live_timestamps = true;
+        let mut worker = group_worker(&factory, 2, 1, Box::new(FixedRatePolicy::new(1000.0)));
+        let protocol = worker.protocols.get_mut(&0).unwrap();
+        protocol.setup = 2;
+        protocol.report_setup = true;
+        let start = timing::time_ns();
+        worker.anchor_schedules(start);
+
+        // Each connection sends its setup request at once, off the arrivals
+        worker.send_requests().unwrap();
+        assert_eq!(factory.0.lock().unwrap().sent.len(), 2);
+        thread::sleep(Duration::from_millis(5));
+        worker.send_requests().unwrap();
+        assert_eq!(factory.0.lock().unwrap().sent.len(), 2, "setup is pending");
+
+        // Connection 1 fails in setup; the setup reply makes connection 0
+        // idle, and the arrivals start then: setup is neither late nor unsent
+        worker.pool.close(1).unwrap();
+        let reply_ns = timing::time_ns();
+        {
+            let mut io = factory.0.lock().unwrap();
+            io.response_connection_id = 0;
+            io.responses.push_back(Ok(0u64.to_le_bytes().to_vec()));
+        }
+        worker.process_responses(Duration::ZERO).unwrap();
+        worker.record_unsent(reply_ns);
+        assert_eq!(worker.stats.request_counts_global().unsent, 0);
+        let deadline = timing::time_ns() + 50_000_000;
+        while factory.0.lock().unwrap().sent.len() < 3 && timing::time_ns() < deadline {
+            worker.send_requests().unwrap();
+        }
+        assert_eq!(factory.0.lock().unwrap().sent.len(), 3);
+        assert_eq!(worker.pool.get_state(0).unwrap().pending_count(), 1);
+        let counts = worker.stats.request_counts_global();
+        assert_eq!((counts.sent, counts.unsent), (1, 0));
+    }
+
+    /// Records the latencies a policy is told about; sends without a schedule
+    struct FeedbackPolicy(Arc<std::sync::Mutex<Vec<Duration>>>);
+
+    impl crate::scheduler::Policy for FeedbackPolicy {
+        fn next_send_time(&mut self, _: u64) -> Option<u64> {
+            None
+        }
+        fn on_response(&mut self, latency: Duration) {
+            self.0.lock().unwrap().push(latency);
+        }
+        fn on_request_sent(&mut self, _: u64) {}
+        fn reset(&mut self) {}
+        fn name(&self) -> &'static str {
+            "Feedback"
+        }
+    }
+
+    #[test]
+    fn group_dispatch_feeds_responses_back_to_the_arrival_policy() {
+        let factory = FakeFactory::default();
+        let feedback = Arc::<std::sync::Mutex<Vec<Duration>>>::default();
+        let mut worker =
+            group_worker(&factory, 3, 1, Box::new(FeedbackPolicy(Arc::clone(&feedback))));
+        worker.protocols.get_mut(&0).unwrap().errors.insert(1, "ERR");
+        // Connection 1 closes while idle and leaves the idle list. Without a
+        // schedule, every other idle connection sends at once.
+        worker.pool.close(1).unwrap();
+        worker.send_requests().unwrap();
+        assert_eq!(factory.0.lock().unwrap().sent.len(), 2);
+        for (connection_id, id) in [(0, 0u64), (2, 1)] {
+            let mut io = factory.0.lock().unwrap();
+            io.response_connection_id = connection_id;
+            io.responses.push_back(Ok(id.to_le_bytes().to_vec()));
+            drop(io);
+            worker.process_responses(Duration::ZERO).unwrap();
+        }
+        // The error reply to request 1 gives no feedback
+        assert_eq!(feedback.lock().unwrap().len(), 1);
     }
 
     #[test]
