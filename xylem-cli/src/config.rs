@@ -189,17 +189,19 @@ enum ProtocolKind {
     MemcachedAscii,
     Http,
     Masstree,
+    Dns,
     XylemEcho,
 }
 
 /// Every accepted traffic group protocol name. The invalid-protocol error lists
 /// the names in this order.
-const PROTOCOLS: [(&str, ProtocolKind); 6] = [
+const PROTOCOLS: [(&str, ProtocolKind); 7] = [
     ("redis", ProtocolKind::Redis),
     ("memcached-binary", ProtocolKind::MemcachedBinary),
     ("memcached-ascii", ProtocolKind::MemcachedAscii),
     ("http", ProtocolKind::Http),
     ("masstree", ProtocolKind::Masstree),
+    ("dns", ProtocolKind::Dns),
     ("xylem-echo", ProtocolKind::XylemEcho), // Test protocol
 ];
 
@@ -212,6 +214,7 @@ pub enum ProtocolConfig {
     MemcachedAscii(xylem_protocols::MemcachedConfig),
     Http(xylem_protocols::HttpConfig),
     Masstree(xylem_protocols::MasstreeConfig),
+    Dns(xylem_protocols::DnsConfig),
     XylemEcho(xylem_protocols::XylemEchoConfig),
 }
 
@@ -480,6 +483,18 @@ impl ProfileConfig {
                 continue;
             };
             validate_udp(group, protocol, i, &mut errors);
+            if protocol == ProtocolKind::Dns
+                && group.max_pending_per_connection > xylem_protocols::dns::ID_COUNT
+            {
+                errors.push(anyhow!(
+                    "Traffic group {} '{}' max_pending_per_connection {} exceeds the {} DNS \
+                     message IDs of a connection",
+                    i,
+                    group.name,
+                    group.max_pending_per_connection,
+                    xylem_protocols::dns::ID_COUNT
+                ));
+            }
 
             // Key-value protocols (Redis, Memcached) require protocol_config with keys
             // HTTP and XylemEcho have sensible defaults and don't require protocol_config
@@ -590,9 +605,10 @@ fn combine(mut errors: Vec<anyhow::Error>) -> Result<()> {
 
 /// Protocols that work over transport "udp": each frames its requests and
 /// responses as datagrams and matches responses by a request ID
-const UDP_PROTOCOLS: [ProtocolKind; 3] = [
+const UDP_PROTOCOLS: [ProtocolKind; 4] = [
     ProtocolKind::MemcachedAscii,
     ProtocolKind::MemcachedBinary,
+    ProtocolKind::Dns,
     ProtocolKind::XylemEcho,
 ];
 
@@ -790,6 +806,17 @@ fn parse_protocol_config(
         ProtocolKind::Masstree => {
             let config = parse_typed_config(pc, "Masstree", group_idx, group_name)?;
             Ok(ProtocolConfig::Masstree(config))
+        }
+        ProtocolKind::Dns => {
+            let config: xylem_protocols::DnsConfig =
+                parse_typed_config(pc, "DNS", group_idx, group_name)?;
+            config.validate().with_context(|| {
+                format!(
+                    "Traffic group {} '{}' has invalid DNS protocol_config",
+                    group_idx, group_name
+                )
+            })?;
+            Ok(ProtocolConfig::Dns(config))
         }
         ProtocolKind::XylemEcho => {
             let config = parse_typed_config(pc, "XylemEcho", group_idx, group_name)?;
@@ -1467,6 +1494,7 @@ file = "results/test.json"
         // xylem-echo and http take no keys
         let keys = match protocol {
             "xylem-echo" | "http" => "",
+            "dns" => "[[traffic_groups.protocol_config.names]]\nname = \"a.test.\"",
             _ => {
                 "[traffic_groups.protocol_config.keys]\nstrategy = \"sequential\"\nvalue_size = 64"
             }
@@ -1503,7 +1531,7 @@ file = "results/test.json"
 
     #[test]
     fn udp_is_accepted_only_for_protocols_that_support_it() {
-        for protocol in ["memcached-ascii", "memcached-binary", "xylem-echo"] {
+        for protocol in ["memcached-ascii", "memcached-binary", "dns", "xylem-echo"] {
             let config = udp_profile(protocol, "udp", "").unwrap();
             let group = &config.traffic_groups[0];
             assert_eq!(group.request_timeout, None);
@@ -1514,11 +1542,64 @@ file = "results/test.json"
             assert!(
                 error.contains(&format!("protocol '{protocol}' does not support transport 'udp'"))
             );
-            assert!(error.contains("memcached-binary, memcached-ascii, xylem-echo"), "{error}");
+            assert!(
+                error.contains("memcached-binary, memcached-ascii, dns, xylem-echo"),
+                "{error}"
+            );
         }
         // Stream transports have no request timeout
         let config = udp_profile("memcached-ascii", "tcp", "").unwrap();
         assert_eq!(config.traffic_groups[0].effective_request_timeout(), None);
+    }
+
+    #[test]
+    fn dns_protocol_config_is_checked() {
+        let config = udp_profile("dns", "tcp", "max_pending_per_connection = 65536").unwrap();
+        assert!(matches!(&config.protocol_configs[..], [ProtocolConfig::Dns(_)]));
+        let error = udp_profile("dns", "tcp", "max_pending_per_connection = 65537").unwrap_err();
+        assert!(format!("{error:#}").contains("exceeds the 65536 DNS message IDs"), "{error:#}");
+
+        let profile = |protocol_config: &str| {
+            let profile = format!(
+                r#"
+[experiment]
+name = "dns"
+duration = "1s"
+
+[[traffic_groups]]
+name = "main"
+protocol = "dns"
+target = "127.0.0.1:53"
+threads = [0]
+connections_per_thread = 1
+protocol_config = {protocol_config}
+
+[traffic_groups.traffic_policy]
+type = "closed-loop"
+
+[output]
+format = "json"
+file = "results/test.json"
+"#
+            );
+            let mut config: ProfileConfig = toml::from_str(&profile).unwrap();
+            config.validate().map_err(|error| format!("{error:#}"))
+        };
+        profile(r#"{ names = [{ name = "a.test." }], qtypes = [{ qtype = "MX" }] }"#).unwrap();
+        for (protocol_config, expected) in [
+            ("{}", "names must list at least one entry"),
+            (r#"{ names = [{ name = "a..test" }] }"#, "empty label"),
+            (
+                r#"{ names = [{ name = "a.test" }], qtypes = [{ qtype = "AXFR" }] }"#,
+                "out of scope",
+            ),
+            (r#"{ names = [{ pattern = "{key}.test" }] }"#, "a pattern needs keys"),
+            (r#"{ names = [{ name = "a.test" }], edns = { udp_size = 100 } }"#, ">= 512"),
+            (r#"{ names = [{ name = "a.test" }], nxdomain = "ignore" }"#, "unknown variant"),
+        ] {
+            let error = profile(protocol_config).unwrap_err();
+            assert!(error.contains(expected), "{protocol_config}: {error}");
+        }
     }
 
     #[test]
@@ -2830,7 +2911,7 @@ protocol_config = {}
         assert!(
             format!("{err:#}").contains(
                 "Invalid protocol 'redis-cluster' for traffic group 0 'main'. Valid options: \
-                 redis, memcached-binary, memcached-ascii, http, masstree, xylem-echo. \
+                 redis, memcached-binary, memcached-ascii, http, masstree, dns, xylem-echo. \
                  Redis Cluster support was removed"
             ),
             "{err:#}"

@@ -56,7 +56,7 @@ pub trait Protocol: Send {
 - `name` returns the protocol name, and `reset` clears per-connection state.
 
 The core engine decides when to send; the protocol decides what to send. The
-Redis, Memcached, HTTP and Masstree protocols have a `from_config` constructor
+Redis, Memcached, HTTP, Masstree and DNS protocols have a `from_config` constructor
 that builds them from their `protocol_config` section.
 
 ## Protocol Design
@@ -71,6 +71,8 @@ The following protocol implementations are available:
 - **HTTP** - HTTP/1.1 for web service testing
 - **Memcached** - Binary and text protocol variants for cache testing
 - **Masstree** - MessagePack-based protocol for the Masstree key-value store
+- **DNS** - Standard queries with one question, length-prefixed on byte
+  streams and bare in UDP datagrams
 - **Xylem Echo** - Echo protocol for testing xylem itself
 
 Detailed documentation for each protocol is available in the [Protocols](../guide/protocols.md) section of the User Guide.

@@ -972,7 +972,7 @@
           "default": "count"
         },
         "protocol": {
-          "description": "Protocol for this group (redis, memcached-binary, memcached-ascii, http, xylem-echo)",
+          "description": "Protocol for this group (redis, memcached-binary, memcached-ascii, http, masstree, dns, xylem-echo)",
           "type": "string"
         },
         "protocol_config": {

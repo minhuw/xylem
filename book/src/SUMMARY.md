@@ -18,6 +18,7 @@
   - [HTTP Protocol](./guide/protocols/http.md)
   - [Memcached Protocol](./guide/protocols/memcached.md)
   - [Masstree Protocol](./guide/protocols/masstree.md)
+  - [DNS Protocol](./guide/protocols/dns.md)
   - [Xylem Echo Protocol](./guide/protocols/xylem-echo.md)
 - [Transports](./guide/transports.md)
   - [TCP](./guide/transports/tcp.md)

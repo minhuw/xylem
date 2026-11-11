@@ -9,7 +9,7 @@ Each traffic group must specify its own `protocol` and `target`:
 ```toml
 [[traffic_groups]]
 name = "main"
-protocol = "redis"  # or "http", "memcached-binary", "memcached-ascii", "xylem-echo"
+protocol = "redis"  # or "http", "memcached-binary", "memcached-ascii", "masstree", "dns", "xylem-echo"
 target = "127.0.0.1:6379"
 threads = [0, 1, 2, 3]
 connections_per_thread = 10
@@ -42,6 +42,7 @@ threads = [2, 3]
 - **http** - HTTP/1.1
 - **memcached-binary** - Memcached binary protocol
 - **memcached-ascii** - Memcached text protocol
+- **dns** - DNS queries (see [DNS Protocol](../protocols/dns.md))
 - **xylem-echo** - Echo protocol (testing/development only)
 
 See the [Architecture - Protocol Layer](../../architecture/protocols.md) for implementation details.

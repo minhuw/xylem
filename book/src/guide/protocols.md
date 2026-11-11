@@ -7,6 +7,7 @@ Xylem supports multiple application protocols for different types of RPC workloa
 - **[Redis](./protocols/redis.md)** - Redis protocol for key-value operations
 - **[HTTP](./protocols/http.md)** - HTTP/1.1 protocol for web services
 - **[Memcached](./protocols/memcached.md)** - Memcached protocol for caching
+- **[DNS](./protocols/dns.md)** - DNS queries over TCP (RFC 7766 framing) or UDP
 
 ## Protocol Selection
 

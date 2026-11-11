@@ -42,6 +42,7 @@ replies by request ID:
 |----------|----------|
 | `memcached-ascii` | memcached's UDP frame header; multi-datagram responses are reassembled |
 | `memcached-binary` | the same frame header; verified against memcached 1.6.45 |
+| `dns` | one bare DNS message per datagram (no 2-byte length); truncated responses count as error kind `TC` |
 | `xylem-echo` | one 16-byte request per datagram, for `xylem-echo-server`'s UDP listener |
 
 `redis`, `http` and `masstree` with `transport = "udp"` fail validation.

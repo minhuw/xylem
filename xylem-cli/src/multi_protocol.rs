@@ -12,13 +12,15 @@ pub enum MultiProtocol {
     Http(xylem_protocols::http::HttpProtocol),
     XylemEcho(xylem_protocols::xylem_echo::XylemEchoProtocol),
     Masstree(xylem_protocols::MasstreeProtocol),
+    Dns(xylem_protocols::DnsProtocol),
 }
 
 impl MultiProtocol {
     /// Construct a traffic group's protocol from the protocol_config that
     /// `ProfileConfig::validate` parsed. HTTP sends `target` as the Host header
-    /// unless the config sets `host`. Memcached frames its datagrams when
-    /// the group's `transport` is "udp".
+    /// unless the config sets `host`. Memcached frames its datagrams, and
+    /// DNS sends bare messages instead of length-prefixed ones, when the
+    /// group's `transport` is "udp".
     pub fn from_config(
         config: &ProtocolConfig,
         target: &str,
@@ -58,6 +60,17 @@ impl MultiProtocol {
             ProtocolConfig::Masstree(mt_config) => {
                 Self::Masstree(xylem_protocols::MasstreeProtocol::from_config(mt_config, seed)?)
             }
+            ProtocolConfig::Dns(dns_config) => {
+                let framing = if udp {
+                    xylem_protocols::DnsFraming::Datagram
+                } else {
+                    xylem_protocols::DnsFraming::Stream
+                };
+                Self::Dns(
+                    xylem_protocols::DnsProtocol::from_config(dns_config, seed)?
+                        .with_framing(framing),
+                )
+            }
             ProtocolConfig::XylemEcho(_echo_config) => create_xylem_echo_protocol(),
         };
         Ok(protocol)
@@ -82,6 +95,11 @@ impl Protocol for MultiProtocol {
                     request.metadata,
                 )
             }
+            MultiProtocol::Dns(p) => {
+                let request = p.next_request(conn_id);
+                let (conn, id) = request.request_id;
+                Request::new(request.data, (conn, u64::from(id)), request.metadata)
+            }
         }
     }
 
@@ -99,6 +117,9 @@ impl Protocol for MultiProtocol {
             MultiProtocol::Masstree(p) => {
                 Ok(p.parse_response(conn_id, data)?.map_id(|(conn, seq)| (conn, seq as u64)))
             }
+            MultiProtocol::Dns(p) => {
+                Ok(p.parse_response(conn_id, data)?.map_id(|(conn, id)| (conn, u64::from(id))))
+            }
         }
     }
 
@@ -110,6 +131,7 @@ impl Protocol for MultiProtocol {
             MultiProtocol::Http(p) => p.name(),
             MultiProtocol::XylemEcho(p) => p.name(),
             MultiProtocol::Masstree(p) => p.name(),
+            MultiProtocol::Dns(p) => p.name(),
         }
     }
 
@@ -121,6 +143,7 @@ impl Protocol for MultiProtocol {
             MultiProtocol::Http(p) => p.reset(),
             MultiProtocol::XylemEcho(p) => p.reset(),
             MultiProtocol::Masstree(p) => p.reset(),
+            MultiProtocol::Dns(p) => p.reset(),
         }
     }
 
@@ -132,6 +155,7 @@ impl Protocol for MultiProtocol {
             MultiProtocol::Http(p) => p.can_send(conn_id),
             MultiProtocol::XylemEcho(p) => p.can_send(conn_id),
             MultiProtocol::Masstree(p) => p.can_send(conn_id),
+            MultiProtocol::Dns(p) => p.can_send(conn_id),
         }
     }
 
@@ -143,6 +167,7 @@ impl Protocol for MultiProtocol {
             MultiProtocol::Http(p) => p.setup_pending(conn_id),
             MultiProtocol::XylemEcho(p) => p.setup_pending(conn_id),
             MultiProtocol::Masstree(p) => p.setup_pending(conn_id),
+            MultiProtocol::Dns(p) => p.setup_pending(conn_id),
         }
     }
 }
@@ -168,5 +193,24 @@ mod tests {
             Box::new(xylem_protocols::FixedCommandSelector::new(xylem_protocols::RedisOp::Get));
         let protocol = create_redis_protocol(selector);
         assert_eq!(protocol.name(), "redis");
+    }
+
+    #[test]
+    fn dns_sends_bare_messages_over_udp_only() {
+        let config: xylem_protocols::DnsConfig =
+            serde_json::from_value(serde_json::json!({ "names": [{ "name": "a.test" }] })).unwrap();
+        let config = ProtocolConfig::Dns(config);
+        for (transport, framing) in [
+            ("tcp", xylem_protocols::DnsFraming::Stream),
+            ("unix", xylem_protocols::DnsFraming::Stream),
+            ("udp", xylem_protocols::DnsFraming::Datagram),
+        ] {
+            let protocol = MultiProtocol::from_config(&config, "127.0.0.1:53", transport, None);
+            let Ok(MultiProtocol::Dns(dns)) = protocol else {
+                panic!("not a DNS protocol");
+            };
+            assert_eq!(dns.framing(), framing, "{transport}");
+            assert_eq!(dns.name(), "dns");
+        }
     }
 }

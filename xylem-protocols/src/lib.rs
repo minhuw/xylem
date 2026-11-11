@@ -6,6 +6,7 @@
 pub use xylem_common::{ErrorReply, Parsed, Protocol, Request, RequestMeta};
 
 pub mod configs;
+pub mod dns;
 pub mod http;
 pub mod masstree;
 pub mod memcached;
@@ -19,6 +20,7 @@ pub use configs::{
     MasstreeScanConfig, MemcachedConfig, RedisAuthConfig, RedisCommandParams, RedisCommandWeight,
     RedisConfig, RedisOperationsConfig, ValueSizeConfig, XylemEchoConfig,
 };
+pub use dns::{DnsConfig, DnsFraming, DnsProtocol};
 pub use http::HttpMethod;
 pub use http::HttpProtocol;
 pub use masstree::{MasstreeOp, MasstreeProtocol, ResultCode};
