@@ -6,7 +6,7 @@
 //! FxHash with a final rotation (as in `rustc-hash` 2): one add and multiply
 //! per word.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 
 /// Odd multiplier with well-spread bits, from `rustc-hash` 2
@@ -77,12 +77,10 @@ pub type FastBuildHasher = BuildHasherDefault<FastHasher>;
 /// A `HashMap` with [`FastHasher`]
 pub type FastHashMap<K, V> = HashMap<K, V, FastBuildHasher>;
 
-/// A `HashSet` with [`FastHasher`]
-pub type FastHashSet<T> = HashSet<T, FastBuildHasher>;
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::hash::BuildHasher;
 
     #[test]

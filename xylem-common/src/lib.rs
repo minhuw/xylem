@@ -16,6 +16,6 @@ pub use distributions::{
     ZipfianDistribution,
 };
 
-pub use hash::{FastHashMap, FastHashSet};
+pub use hash::FastHashMap;
 pub use protocol::{ConnectionRole, ErrorReply, Outbox, Parsed, Protocol};
 pub use request::{Request, RequestMeta};
