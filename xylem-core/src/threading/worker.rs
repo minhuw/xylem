@@ -310,9 +310,22 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         // With N connections and depth D, we should need at most N*D sends to fill all pipelines
         let max_sends_per_iteration = self.pool.connection_count() * 16; // Allow generous headroom
         let mut sends_this_iteration = 0;
+        // The round's first connection, until its requests went out
+        let mut first_connection = None;
 
         while let Some(pick) = self.pool.pick_send() {
             let connection_id = pick.connection_id;
+            // The round's first connection sends at once when the round
+            // moves on, as a kernel socket would have sent its first request;
+            // its requests picked until then share that write
+            match first_connection {
+                None if sends_this_iteration == 0 => first_connection = Some(connection_id),
+                Some(first) if first != connection_id => {
+                    self.flush()?;
+                    first_connection = None;
+                }
+                _ => {}
+            }
             let state = self.pool.get_state(connection_id).expect("Connection state not found");
             let group_id = state.group_id();
 
@@ -373,11 +386,6 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             self.pool.try_schedule_connection(connection_id, protocol);
 
             sends_this_iteration += 1;
-            // The round's first request goes out at once, as on a kernel
-            // socket; the rest wait for one write per connection after the loop
-            if sends_this_iteration == 1 {
-                self.flush()?;
-            }
             if sends_this_iteration >= max_sends_per_iteration {
                 eprintln!(
                     "[WARN] Hit send limit ({}) in one iteration - forcing receive phase",
@@ -391,7 +399,7 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         // its packets, and a user-space stack's pass costs time per
         // connection, so one per send would grow with the square of the
         // connections that send together
-        if sends_this_iteration > 1 {
+        if sends_this_iteration > 0 {
             self.flush()?;
         }
         Ok(())
@@ -860,20 +868,45 @@ mod tests {
     }
 
     #[test]
-    fn a_round_flushes_its_first_send_at_once_and_the_rest_together() {
+    fn a_round_writes_each_connection_once_and_flushes_once() {
         let factory = FakeFactory::default();
-        // Closed loop with 4 requests in flight: one round sends 4, the
-        // first alone and the other 3 in one write
+        // Closed loop with 4 requests in flight: one round sends 4, in one write
         let mut worker = fake_worker(&factory, 4, Box::new(UniformPolicyScheduler::closed_loop()));
         worker.send_requests().unwrap();
-        let sizes: Vec<usize> = factory.0.lock().unwrap().sent.iter().map(Vec::len).collect();
-        assert_eq!(sizes, [8, 24]);
-        assert_eq!(factory.0.lock().unwrap().flushes, [1, 2]);
+        let sent: Vec<u8> = (0u64..4).flat_map(u64::to_le_bytes).collect();
+        assert_eq!(factory.0.lock().unwrap().sent, [sent]);
+        assert_eq!(factory.0.lock().unwrap().flushes, [1]);
         assert_eq!(worker.stats.request_counts_global().sent, 4);
 
         // A round that sends nothing flushes nothing
         worker.send_requests().unwrap();
-        assert_eq!(factory.0.lock().unwrap().flushes, [1, 2]);
+        assert_eq!(factory.0.lock().unwrap().flushes, [1]);
+    }
+
+    #[test]
+    fn a_round_sends_its_first_connection_once_it_moves_on() {
+        let factory = FakeFactory::default();
+        let mut stats = TupleStatsCollector::default();
+        stats.register_group_policy(0, SamplingPolicy::Limited { max_samples: 1000, rate: 1.0 });
+        let config = WorkerConfig {
+            target: "127.0.0.1:1".parse().unwrap(),
+            duration: Duration::from_millis(100),
+            conn_count: 3,
+            max_pending_per_conn: 2,
+            drain_timeout: FAKE_DRAIN_TIMEOUT,
+        };
+        let mut worker =
+            Worker::with_closed_loop(&factory, FakeProtocol::default(), stats, config).unwrap();
+        worker.send_requests().unwrap();
+        let io = factory.0.lock().unwrap();
+        // The round picks the connections in turn. The first connection's
+        // request went out once the round moved on, as a kernel socket would
+        // have sent it; then each connection's queued requests took one
+        // write, and the round one more flush
+        assert_eq!(io.flushes, [1, 4]);
+        assert_eq!(io.sent_on, [0, 1, 2, 0]);
+        let sizes: Vec<usize> = io.sent.iter().map(Vec::len).collect();
+        assert_eq!(sizes, [8, 16, 16, 8]);
     }
 
     #[test]
