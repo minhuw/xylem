@@ -384,3 +384,114 @@ fn test_masstree_pipelined() {
 
     println!("Test passed!");
 }
+
+/// Every operation in one weighted mix, with multi-column puts so GETs and
+/// scans meet rows of several columns, scans from generated keys and
+/// weighted value sizes. Returns the run's global request counts.
+fn run_every_operation(target: String) -> serde_json::Value {
+    let profile = serde_json::json!({
+        "experiment": { "name": "masstree-mix", "duration": "2s", "seed": 5 },
+        "traffic_groups": [{
+            "name": "mix", "threads": [0], "connections_per_thread": 2,
+            "max_pending_per_connection": 4, "target": target, "protocol": "masstree",
+            "traffic_policy": { "type": "closed-loop" },
+            "protocol_config": {
+                "keys": { "strategy": "random", "max": 500, "value_size": 16 },
+                "insert_phase": {},
+                "value_size": { "strategy": "weighted",
+                    "sizes": [{ "size": 8, "weight": 3.0 }, { "size": 2000, "weight": 1.0 }] },
+                "scan": { "count": 5 },
+                "operations": { "strategy": "weighted", "commands": [
+                    { "name": "get", "weight": 4.0 },
+                    { "name": "set", "weight": 1.0 },
+                    { "name": "put", "weight": 2.0, "params": { "columns": 3 } },
+                    { "name": "scan", "weight": 1.0 },
+                    { "name": "scan", "weight": 1.0, "params": { "count": 20, "fields": [0, 2] } },
+                    { "name": "remove", "weight": 1.0 },
+                ] },
+            },
+        }],
+    });
+    let json = common::run_profile(profile);
+    let requests = json["global"]["requests"].clone();
+    let count = |key: &str| requests[key].as_u64().unwrap();
+    assert!(count("completed") > 1000, "{requests}");
+    assert_eq!(count("errors"), 0, "{requests}");
+    assert_eq!(count("failed"), 0, "{requests}");
+    assert_eq!(count("timed_out"), 0, "{requests}");
+    // Scans of up to 20 rows of up to three 2000-byte columns: responses
+    // average far more than a value
+    let mbps = json["global"]["throughput_mbps"].as_f64().unwrap();
+    let rps = json["global"]["throughput_rps"].as_f64().unwrap();
+    assert!(mbps * 1e6 / 8.0 / rps > 1000.0, "{mbps} Mbps at {rps} rps");
+    requests
+}
+
+#[test]
+fn masstree_runs_every_operation_in_a_mix() {
+    let masstree = common::masstree::MasstreeGuard::new().expect("Failed to start Masstree");
+    run_every_operation(masstree.get_addr().to_string());
+}
+
+/// Stackbench's `mtd` (a fork of the masstree-beta the Docker image builds),
+/// killed on drop
+struct StackbenchMtd {
+    child: std::process::Child,
+    port: u16,
+}
+
+impl StackbenchMtd {
+    /// Start the `mtd` at `path` without logging on a free port and wait
+    /// until it accepts connections
+    fn start(path: &str) -> Self {
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let child = std::process::Command::new(path)
+            .args(["-n", &format!("--port={port}"), "--threads=2"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap_or_else(|e| panic!("cannot run {path}: {e}"));
+        let mtd = Self { child, port };
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(std::time::Instant::now() < deadline, "{path} did not listen on {port}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        mtd
+    }
+}
+
+impl Drop for StackbenchMtd {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// The mix against the `mtd` Stackbench builds, from
+/// `nix build <stackbench>#benchmarks.masstree.default`; its `bin/mtd` path
+/// goes in XYLEM_STACKBENCH_MTD. A checkpoint is the one command the two
+/// servers may answer differently: Stackbench's answers `[seq, -1]` on
+/// backends without blocking calls, which the Linux build has.
+#[test]
+#[ignore = "needs XYLEM_STACKBENCH_MTD=<stackbench masstree build>/bin/mtd"]
+fn stackbench_mtd_runs_every_operation_in_a_mix() {
+    let path = std::env::var("XYLEM_STACKBENCH_MTD")
+        .expect("XYLEM_STACKBENCH_MTD names the Stackbench mtd binary");
+    let mtd = StackbenchMtd::start(&path);
+    run_every_operation(format!("127.0.0.1:{}", mtd.port));
+
+    let profile = serde_json::json!({
+        "experiment": { "name": "masstree-checkpoint", "duration": "1s", "seed": 5 },
+        "traffic_groups": [{
+            "name": "checkpoint", "threads": [0], "connections_per_thread": 1,
+            "target": format!("127.0.0.1:{}", mtd.port), "protocol": "masstree",
+            "traffic_policy": { "type": "closed-loop" },
+            "protocol_config": { "operation": "checkpoint" },
+        }],
+    });
+    let json = common::run_profile(profile);
+    let requests = &json["global"]["requests"];
+    assert!(requests["completed"].as_u64().unwrap() > 10, "{requests}");
+    assert_eq!(requests["errors"], 0, "{requests}");
+}

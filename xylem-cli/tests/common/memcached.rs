@@ -50,4 +50,27 @@ impl MemcachedGuard {
     pub fn addr(&self) -> SocketAddr {
         addr(self.port)
     }
+
+    /// The server's `stats` counters by name
+    pub fn stats(&self) -> std::collections::HashMap<String, u64> {
+        use std::io::{Read, Write};
+        let mut socket = std::net::TcpStream::connect(self.addr()).unwrap();
+        socket.write_all(b"stats\r\n").unwrap();
+        let mut reply = Vec::new();
+        let mut buf = [0; 4096];
+        while !reply.ends_with(b"END\r\n") {
+            let n = socket.read(&mut buf).unwrap();
+            assert!(n > 0, "memcached closed the stats connection");
+            reply.extend_from_slice(&buf[..n]);
+        }
+        String::from_utf8(reply)
+            .unwrap()
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.strip_prefix("STAT ")?.split(' ');
+                let name = fields.next()?.to_string();
+                Some((name, fields.next()?.parse().ok()?))
+            })
+            .collect()
+    }
 }

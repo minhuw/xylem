@@ -203,3 +203,146 @@ fn test_memcached_ascii_rate_limited() {
     let rate_error = (actual_rate - target_rate).abs() / target_rate;
     assert!(rate_error < 0.10, "Rate error should be < 10%, got {:.1}%", rate_error * 100.0);
 }
+
+/// A one-second closed-loop profile of `protocol` against `target` with
+/// `protocol_config`
+fn memcached_profile(
+    protocol: &str,
+    target: String,
+    transport: &str,
+    protocol_config: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "experiment": { "name": "memcached-mix", "duration": "1s", "seed": 3 },
+        "traffic_groups": [{
+            "name": "mix", "threads": [0], "connections_per_thread": 2,
+            "max_pending_per_connection": 4, "target": target, "transport": transport,
+            "protocol": protocol, "traffic_policy": { "type": "closed-loop" },
+            "protocol_config": protocol_config,
+        }],
+    })
+}
+
+/// Every operation in one weighted mix, with weighted value sizes: the
+/// server runs each of them and no reply is an error. Incr and decr draw
+/// their keys from a range nothing stores, so they miss instead of hitting
+/// the non-numeric values SET writes.
+fn run_every_operation(protocol: &str, prefix: &str) {
+    let memcached = common::memcached::MemcachedGuard::new().expect("Failed to start Memcached");
+    let before = memcached.stats();
+    let counters = ["incr_misses", "decr_misses"];
+    let unstored = serde_json::json!({
+        "strategy": "sequential", "start": 1_000_000_000u64, "value_size": 32, "prefix": prefix
+    });
+    let config = serde_json::json!({
+        "keys": { "strategy": "random", "max": 200, "value_size": 32, "prefix": prefix },
+        "insert_phase": { "key_count": 200 },
+        "value_size": { "strategy": "weighted",
+            "sizes": [{ "size": 16, "weight": 3.0 }, { "size": 3000, "weight": 1.0 }] },
+        "operations": { "strategy": "weighted", "commands": [
+            { "name": "get", "weight": 3.0 },
+            { "name": "set", "weight": 1.0 },
+            { "name": "add", "weight": 1.0 },
+            { "name": "replace", "weight": 1.0 },
+            { "name": "delete", "weight": 1.0 },
+            { "name": "touch", "weight": 1.0, "params": { "exptime": 600 } },
+            { "name": "mget", "weight": 1.0, "params": { "count": 4 } },
+            { "name": "incr", "weight": 0.5, "params": { "delta": 3 }, "keys": unstored },
+            { "name": "decr", "weight": 0.5, "keys": unstored },
+        ] },
+    });
+    let target = memcached.addr().to_string();
+    let json = common::run_profile(memcached_profile(protocol, target, "tcp", config));
+    let requests = &json["global"]["requests"];
+    let completed = requests["completed"].as_u64().unwrap();
+    assert!(completed > 1000, "{requests}");
+    assert_eq!(requests["errors"], 0, "{requests}");
+    assert_eq!(requests["failed"], 0, "{requests}");
+
+    let after = memcached.stats();
+    let delta = |name: &str| after[name] - before.get(name).copied().unwrap_or(0);
+    // Each operation reached the server, with hits and misses
+    for name in [
+        "get_hits",
+        "get_misses",
+        "cmd_set",
+        "delete_hits",
+        "delete_misses",
+        "cmd_touch",
+        "touch_hits",
+        "touch_misses",
+    ]
+    .into_iter()
+    .chain(counters)
+    {
+        assert!(delta(name) > 0, "{name} did not grow");
+    }
+    assert_eq!(delta("incr_hits") + delta("decr_hits"), 0);
+    // A multi-get's keys count one get each: gets outnumber the get requests
+    let gets = delta("get_hits") + delta("get_misses");
+    assert!(gets > completed / 2, "{gets} gets of {completed} requests");
+}
+
+#[test]
+fn memcached_ascii_runs_every_operation_in_a_mix() {
+    run_every_operation("memcached-ascii", "mix-ascii:");
+}
+
+#[test]
+fn memcached_binary_runs_every_operation_in_a_mix() {
+    run_every_operation("memcached-binary", "mix-binary:");
+}
+
+/// Incr on the stored non-numeric values is an error reply of each codec's kind
+#[test]
+fn memcached_incr_of_a_non_numeric_value_is_an_error_reply() {
+    let memcached = common::memcached::MemcachedGuard::new().expect("Failed to start Memcached");
+    for (protocol, kind) in
+        [("memcached-ascii", "CLIENT_ERROR"), ("memcached-binary", "DELTA_BADVAL")]
+    {
+        let config = serde_json::json!({
+            "keys": { "strategy": "round-robin", "max": 10, "value_size": 4,
+                "prefix": format!("{protocol}:") },
+            "insert_phase": {},
+            "operation": "incr",
+        });
+        let target = memcached.addr().to_string();
+        let json = common::run_profile(memcached_profile(protocol, target, "tcp", config));
+        let requests = &json["global"]["requests"];
+        let completed = requests["completed"].as_u64().unwrap();
+        assert!(completed > 100, "{requests}");
+        assert_eq!(requests["errors"], completed, "{requests}");
+        assert_eq!(requests["errors_by_kind"], serde_json::json!({ kind: completed }));
+    }
+}
+
+/// The single-key operations over UDP: memcached answers a multi-get over
+/// UDP with a datagram per value, so mget is TCP-only
+#[test]
+fn memcached_operations_over_udp() {
+    let memcached = common::memcached::MemcachedGuard::new().expect("Failed to start Memcached");
+    for protocol in ["memcached-ascii", "memcached-binary"] {
+        let config = serde_json::json!({
+            "keys": { "strategy": "round-robin", "max": 50, "value_size": 3000,
+                "prefix": format!("udp-{protocol}:") },
+            "insert_phase": {},
+            "operations": { "strategy": "weighted", "commands": [
+                { "name": "get", "weight": 4.0 },
+                { "name": "replace", "weight": 1.0 },
+                { "name": "add", "weight": 1.0 },
+                { "name": "touch", "weight": 1.0 },
+                { "name": "incr", "weight": 1.0, "keys": { "strategy": "sequential",
+                    "start": 1_000_000_000u64, "value_size": 3000,
+                    "prefix": format!("udp-{protocol}:") } },
+            ] },
+        });
+        let target = format!("127.0.0.1:{}", memcached.get_udp_port());
+        let json = common::run_profile(memcached_profile(protocol, target, "udp", config));
+        let requests = &json["global"]["requests"];
+        let count = |key: &str| requests[key].as_u64().unwrap();
+        assert!(count("completed") > 100, "{protocol}: {requests}");
+        assert_eq!(count("errors"), 0, "{protocol}: {requests}");
+        assert_eq!(count("failed"), 0, "{protocol}: {requests}");
+        assert!(count("timed_out") * 100 <= count("sent"), "{protocol}: {requests}");
+    }
+}
