@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use xylem_common::{ConnectionRole, Outbox, Protocol};
+use xylem_common::{ConnectionRole, FastHashMap, Outbox, Protocol};
 use xylem_transport::{ConnectionGroup, TransportFactory};
 
 fn unix_time_us() -> Option<u64> {
@@ -52,7 +52,7 @@ pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 pub struct Worker<G: ConnectionGroup, P: Protocol, S: StatsRecorder = TupleStatsCollector> {
     pool: ConnectionPool<G, P::RequestId>,
     /// Map of traffic group ID to protocol instance
-    protocols: HashMap<usize, P>,
+    protocols: FastHashMap<usize, P>,
     stats: S,
     config: WorkerConfig,
     /// Optional request dumper for recording all requests
@@ -141,10 +141,11 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
     /// group's protocol the connections it got
     fn from_pool(
         pool: ConnectionPool<G, P::RequestId>,
-        mut protocols: HashMap<usize, P>,
+        protocols: HashMap<usize, P>,
         stats: S,
         config: WorkerConfig,
     ) -> Self {
+        let mut protocols: FastHashMap<usize, P> = protocols.into_iter().collect();
         for (&group_id, protocol) in protocols.iter_mut() {
             protocol.bind_connections(&pool.group_connection_ids(group_id));
         }

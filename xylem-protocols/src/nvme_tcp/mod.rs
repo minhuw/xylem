@@ -40,8 +40,9 @@ use pdu::{
 };
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
-use std::collections::HashMap;
-use xylem_common::{ConnectionRole, ErrorReply, Outbox, Parsed, Protocol, Request, RequestMeta};
+use xylem_common::{
+    ConnectionRole, ErrorReply, FastHashMap, Outbox, Parsed, Protocol, Request, RequestMeta,
+};
 use xylem_core::seed::{components, derive_seed};
 
 /// Request ID: the connection and the command ID, or [`IC_REQ_TAG`] for
@@ -141,7 +142,7 @@ struct Queue {
     awaiting: bool,
     maxh2cdata: u32,
     next_cid: u16,
-    commands: HashMap<u16, Command>,
+    commands: FastHashMap<u16, Command>,
     rx: Rx,
     /// H2CData PDUs to send, taken by `drain_outbox`
     tx: Vec<u8>,
@@ -156,7 +157,7 @@ impl Queue {
             awaiting: false,
             maxh2cdata: 0,
             next_cid: 0,
-            commands: HashMap::new(),
+            commands: FastHashMap::default(),
             rx: Rx::Header,
             tx: Vec::new(),
         }
@@ -215,7 +216,7 @@ pub struct NvmeTcpProtocol {
     config: NvmeTcpConfig,
     queue_depth: usize,
     seed: Option<u64>,
-    queues: HashMap<usize, Queue>,
+    queues: FastHashMap<usize, Queue>,
     controllers: Vec<Controller>,
     layout: Option<Layout>,
     blocks: Option<KeyGeneration>,
@@ -255,7 +256,7 @@ impl NvmeTcpProtocol {
             config: config.clone(),
             queue_depth,
             seed,
-            queues: HashMap::new(),
+            queues: FastHashMap::default(),
             controllers: Vec::new(),
             layout: None,
             blocks: None,

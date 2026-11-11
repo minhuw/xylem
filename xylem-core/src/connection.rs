@@ -14,7 +14,7 @@ use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
 use std::net::SocketAddr;
 use std::time::Duration;
-use xylem_common::{ConnectionRole, ErrorReply, Parsed, Protocol};
+use xylem_common::{ConnectionRole, ErrorReply, FastHashMap, Parsed, Protocol};
 use xylem_transport::{
     ConnectionGroup, KernelTimestamp, RecvOutcome, SendProgress, Timestamp, TransportFactory,
     TxRange, TxTimestampInfo,
@@ -194,7 +194,7 @@ struct PendingRequest {
 ///
 /// Uses two data structures for efficient request tracking:
 ///
-/// 1. `pending_map: HashMap<ReqId, PendingRequest>` - Primary storage, O(1) lookup by request ID
+/// 1. `pending_map: FastHashMap<ReqId, PendingRequest>` - Primary storage, O(1) lookup by request ID
 ///    Used when responses arrive (protocol provides req_id)
 ///
 /// 2. `tx_pending_queue: VecDeque<(u32, ReqId, u64)>` - Queue for TX timestamp correlation
@@ -242,7 +242,7 @@ pub struct ConnectionState<ReqId: Eq + Hash + Clone> {
     /// Maximum pending requests allowed
     max_pending_requests: usize,
     /// Primary storage: ReqId -> PendingRequest for O(1) response lookup
-    pending_map: HashMap<ReqId, PendingRequest>,
+    pending_map: FastHashMap<ReqId, PendingRequest>,
     /// Queue of (tx_end, ReqId, enqueue_time_ns) for TX timestamp correlation - push back, pop front
     /// The enqueue_time_ns is used for stale entry cleanup (entries older than 1 minute are removed)
     tx_pending_queue: VecDeque<(u32, ReqId, u64)>,
@@ -274,7 +274,7 @@ pub struct ConnectionState<ReqId: Eq + Hash + Clone> {
     deadlines: VecDeque<(u64, ReqId)>,
     /// Timed-out requests whose late responses are still recognised, mapped
     /// to whether each was a warmup request
-    timed_out_ids: HashMap<ReqId, bool>,
+    timed_out_ids: FastHashMap<ReqId, bool>,
     /// `timed_out_ids` keys in timeout order, for forgetting the oldest
     timed_out_order: VecDeque<ReqId>,
     /// Late responses to timed-out measurement requests, not yet taken by the worker
@@ -315,7 +315,10 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
             connection_id,
             target,
             max_pending_requests,
-            pending_map: HashMap::with_capacity(max_pending_requests),
+            pending_map: FastHashMap::with_capacity_and_hasher(
+                max_pending_requests,
+                Default::default(),
+            ),
             tx_pending_queue: VecDeque::with_capacity(max_pending_requests),
             recv_buffer: Vec::new(),
             recv_len: 0,
@@ -327,7 +330,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
             in_setup: false,
             request_timeout: None,
             deadlines: VecDeque::new(),
-            timed_out_ids: HashMap::new(),
+            timed_out_ids: FastHashMap::default(),
             timed_out_order: VecDeque::new(),
             late_responses: 0,
             absorbed_bytes: 0,
@@ -957,7 +960,7 @@ pub struct ConnectionPool<G: ConnectionGroup, ReqId: Eq + Hash + Clone> {
     /// Connection group for I/O (single multiplexer for all connections)
     group: G,
     /// Per-connection application state
-    connection_states: HashMap<usize, ConnectionState<ReqId>>,
+    connection_states: FastHashMap<usize, ConnectionState<ReqId>>,
     /// Ordered list of connection IDs for iteration
     connection_ids: Vec<usize>,
     /// Min-heap for O(log N) lookup of next ready connection
@@ -1064,7 +1067,8 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
             .iter()
             .map(|(group_id, _, count, _, _)| roles.get(group_id).map_or(*count, Vec::len))
             .sum();
-        let mut connection_states = HashMap::with_capacity(total_connections);
+        let mut connection_states =
+            FastHashMap::with_capacity_and_hasher(total_connections, Default::default());
         let mut connection_ids = Vec::with_capacity(total_connections);
         let mut ready_heap = ReadyHeap::new();
         let mut dispatchers: Vec<GroupDispatcher> = Vec::new();

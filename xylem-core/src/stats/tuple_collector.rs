@@ -12,6 +12,7 @@ use sketches_ddsketch::{Config as DDSketchConfig, DDSketch};
 use std::collections::HashMap;
 use std::time::Duration;
 use tdigest::TDigest;
+use xylem_common::FastHashMap;
 
 /// Number of t-digest samples buffered before they are merged into the digest.
 /// Each merge rebuilds the digest, so batching keeps that cost off the
@@ -556,17 +557,17 @@ impl ActualLoadLoop {
 /// groups without converting or discarding their sketches.
 pub struct TupleStatsCollector {
     /// Statistics entries keyed by (time_bucket, group_id, thread_id, connection_id)
-    entries: HashMap<StatsKey, StatsEntry>,
+    entries: FastHashMap<StatsKey, StatsEntry>,
     /// Thread recorded in the keys of new entries; see [`Self::set_thread_id`].
     thread_id: usize,
     /// Independent global storage per bucket, recorded with the global policy.
     /// This avoids trying to convert incompatible group sketches during aggregation.
-    global_entries: HashMap<u64, StatsEntry>,
+    global_entries: FastHashMap<u64, StatsEntry>,
     /// Global sampling policy for latency storage (used for global aggregation)
     sampling_policy: SamplingPolicy,
     /// Per-group sampling policies (used for per-group aggregation)
     /// If a group is not in this map, falls back to global sampling_policy
-    group_sampling_policies: HashMap<usize, SamplingPolicy>,
+    group_sampling_policies: FastHashMap<usize, SamplingPolicy>,
     /// Time bucket duration in nanoseconds
     bucket_duration_ns: u64,
     /// Experiment start time in nanoseconds
@@ -583,17 +584,17 @@ pub struct TupleStatsCollector {
     /// collectors whose workers never ran remain neutral when merged.
     actual_load_loop: ActualLoadLoop,
     /// Request counts per group
-    request_counts: HashMap<usize, RequestCounts>,
+    request_counts: FastHashMap<usize, RequestCounts>,
     /// Send lags of open-loop requests per group
-    send_lags: HashMap<usize, SendLagStats>,
+    send_lags: FastHashMap<usize, SendLagStats>,
     /// Latencies of error replies per group, under the group's policy. They
     /// are not part of the latency distribution of the entries.
-    error_latencies: HashMap<usize, LatencyStorage>,
+    error_latencies: FastHashMap<usize, LatencyStorage>,
     /// Latencies of every group's error replies, under the global policy
     global_error_latency: LatencyStorage,
     /// Latency breakdowns of measurement requests completed by successful
     /// responses per group; error replies are left out as from the entries
-    breakdowns: HashMap<usize, BreakdownStats>,
+    breakdowns: FastHashMap<usize, BreakdownStats>,
 }
 
 impl TupleStatsCollector {
@@ -601,21 +602,21 @@ impl TupleStatsCollector {
     pub fn new(sampling_policy: SamplingPolicy, bucket_duration: Duration) -> Self {
         let global_error_latency = LatencyStorage::from_policy(&sampling_policy);
         Self {
-            entries: HashMap::new(),
+            entries: FastHashMap::default(),
             thread_id: 0,
-            global_entries: HashMap::new(),
+            global_entries: FastHashMap::default(),
             sampling_policy,
-            group_sampling_policies: HashMap::new(),
+            group_sampling_policies: FastHashMap::default(),
             bucket_duration_ns: bucket_duration.as_nanos() as u64,
             experiment_start_ns: crate::timing::time_ns(),
             first_record_ns: None,
             measurement_end_ns: None,
             actual_load_loop: ActualLoadLoop::Empty,
-            request_counts: HashMap::new(),
-            send_lags: HashMap::new(),
-            error_latencies: HashMap::new(),
+            request_counts: FastHashMap::default(),
+            send_lags: FastHashMap::default(),
+            error_latencies: FastHashMap::default(),
             global_error_latency,
-            breakdowns: HashMap::new(),
+            breakdowns: FastHashMap::default(),
         }
     }
 
@@ -627,21 +628,21 @@ impl TupleStatsCollector {
     ) -> Self {
         let global_error_latency = LatencyStorage::from_policy(&sampling_policy);
         Self {
-            entries: HashMap::new(),
+            entries: FastHashMap::default(),
             thread_id: 0,
-            global_entries: HashMap::new(),
+            global_entries: FastHashMap::default(),
             sampling_policy,
-            group_sampling_policies: HashMap::new(),
+            group_sampling_policies: FastHashMap::default(),
             bucket_duration_ns: bucket_duration.as_nanos() as u64,
             experiment_start_ns: start_time_ns,
             first_record_ns: None,
             measurement_end_ns: None,
             actual_load_loop: ActualLoadLoop::Empty,
-            request_counts: HashMap::new(),
-            send_lags: HashMap::new(),
-            error_latencies: HashMap::new(),
+            request_counts: FastHashMap::default(),
+            send_lags: FastHashMap::default(),
+            error_latencies: FastHashMap::default(),
             global_error_latency,
-            breakdowns: HashMap::new(),
+            breakdowns: FastHashMap::default(),
         }
     }
 
@@ -1129,11 +1130,11 @@ impl TupleStatsCollector {
 
         let first = &collectors[0];
         let mut merged = Self {
-            entries: HashMap::new(),
+            entries: FastHashMap::default(),
             thread_id: 0,
-            global_entries: HashMap::new(),
+            global_entries: FastHashMap::default(),
             sampling_policy: first.sampling_policy.clone(),
-            group_sampling_policies: HashMap::new(),
+            group_sampling_policies: FastHashMap::default(),
             bucket_duration_ns: first.bucket_duration_ns,
             experiment_start_ns: first.experiment_start_ns,
             first_record_ns: collectors.iter().filter_map(|c| c.first_record_ns).min(),
@@ -1141,11 +1142,11 @@ impl TupleStatsCollector {
             actual_load_loop: collectors
                 .iter()
                 .fold(ActualLoadLoop::Empty, |combined, c| combined.merge(c.actual_load_loop)),
-            request_counts: HashMap::new(),
-            send_lags: HashMap::new(),
-            error_latencies: HashMap::new(),
+            request_counts: FastHashMap::default(),
+            send_lags: FastHashMap::default(),
+            error_latencies: FastHashMap::default(),
             global_error_latency: LatencyStorage::from_policy(&first.sampling_policy),
-            breakdowns: HashMap::new(),
+            breakdowns: FastHashMap::default(),
         };
 
         // Validate policies before merging any entries.
@@ -1207,12 +1208,12 @@ impl TupleStatsCollector {
     }
 
     /// Get raw entries
-    pub fn entries(&self) -> &HashMap<StatsKey, StatsEntry> {
+    pub fn entries(&self) -> &FastHashMap<StatsKey, StatsEntry> {
         &self.entries
     }
 
     /// Take ownership of entries
-    pub fn into_entries(self) -> HashMap<StatsKey, StatsEntry> {
+    pub fn into_entries(self) -> FastHashMap<StatsKey, StatsEntry> {
         self.entries
     }
 

@@ -3,6 +3,7 @@
 
 use super::*;
 use pdu::{u16_at, u32_at, u64_at};
+use std::collections::HashMap;
 
 const CNTLID: u16 = 0x21;
 const SUBNQN: &str = "nqn.2016-06.io.spdk:fake";

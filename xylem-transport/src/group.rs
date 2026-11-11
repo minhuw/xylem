@@ -9,7 +9,6 @@
 
 use crate::mux::{Interest, Multiplexer};
 use crate::{Error, Result, TxRange};
-use std::collections::HashMap;
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::Duration;
 
@@ -305,7 +304,10 @@ pub(crate) trait GroupSocket {
 /// connection closes or fails to connect.
 pub(crate) struct GroupCore<C> {
     mux: Multiplexer,
-    connections: HashMap<usize, C>,
+    /// Live connections by id; `None` for an id that closed or never connected
+    connections: Vec<Option<C>>,
+    /// Number of live connections
+    live: usize,
     next_id: usize,
     /// Number of connections with kernel TX timestamps enabled
     #[cfg(target_os = "linux")]
@@ -316,7 +318,8 @@ impl<C: GroupSocket> GroupCore<C> {
     pub(crate) fn new() -> Result<Self> {
         Ok(Self {
             mux: Multiplexer::new()?,
-            connections: HashMap::new(),
+            connections: Vec::new(),
+            live: 0,
             next_id: 0,
             #[cfg(target_os = "linux")]
             tx_stamping: 0,
@@ -370,19 +373,29 @@ impl<C: GroupSocket> GroupCore<C> {
         if conn.tx_counter().is_some() {
             self.tx_stamping += 1;
         }
-        self.connections.insert(conn_id, conn);
+        if self.connections.len() <= conn_id {
+            self.connections.resize_with(conn_id + 1, || None);
+        }
+        debug_assert!(self.connections[conn_id].is_none(), "ids are never reused");
+        self.connections[conn_id] = Some(conn);
+        self.live += 1;
     }
 
     #[cfg(test)]
     pub(crate) fn get(&self, conn_id: usize) -> Option<&C> {
-        self.connections.get(&conn_id)
+        self.connections.get(conn_id)?.as_ref()
     }
 
     /// Look up a live connection for I/O
     pub(crate) fn conn_mut(&mut self, conn_id: usize) -> Result<&mut C> {
         self.connections
-            .get_mut(&conn_id)
+            .get_mut(conn_id)
+            .and_then(Option::as_mut)
             .ok_or_else(|| Error::Connection("Connection not found".to_string()))
+    }
+
+    fn is_live(&self, conn_id: usize) -> bool {
+        self.connections.get(conn_id).is_some_and(Option::is_some)
     }
 
     /// Wait for readable sockets, and writable ones registered for writes
@@ -396,7 +409,7 @@ impl<C: GroupSocket> GroupCore<C> {
                 .iter()
                 .filter(|e| e.readable || e.writable)
                 .map(|e| e.id)
-                .filter(|id| self.connections.contains_key(id)),
+                .filter(|&id| self.is_live(id)),
         );
         Ok(())
     }
@@ -434,7 +447,10 @@ impl<C: GroupSocket> GroupCore<C> {
             return;
         }
 
-        for (&conn_id, conn) in &mut self.connections {
+        for (conn_id, conn) in self.connections.iter_mut().enumerate() {
+            let Some(conn) = conn else {
+                continue;
+            };
             let fd = conn.socket_fd();
             let Some(counter) = conn.tx_counter() else {
                 continue;
@@ -468,13 +484,14 @@ impl<C: GroupSocket> GroupCore<C> {
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.connections.len()
+        self.live
     }
 
     /// Close a connection, deregistering its socket before it is dropped
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     pub(crate) fn close(&mut self, conn_id: usize) -> Result<()> {
-        if let Some(mut conn) = self.connections.remove(&conn_id) {
+        if let Some(mut conn) = self.connections.get_mut(conn_id).and_then(Option::take) {
+            self.live -= 1;
             let _ = self.mux.deregister(conn.socket_fd());
             #[cfg(target_os = "linux")]
             if conn.tx_counter().is_some() {
@@ -485,8 +502,7 @@ impl<C: GroupSocket> GroupCore<C> {
     }
 
     pub(crate) fn close_all(&mut self) -> Result<()> {
-        let conn_ids: Vec<usize> = self.connections.keys().copied().collect();
-        for conn_id in conn_ids {
+        for conn_id in 0..self.connections.len() {
             self.close(conn_id)?;
         }
         Ok(())
