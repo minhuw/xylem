@@ -7,7 +7,9 @@
 //!
 //! The target binary is `XYLEM_NVMF_TGT`, else `nvmf_tgt` built from this
 //! flake's nixpkgs (`nix build --inputs-from . nixpkgs#spdk`), which the
-//! binary cache usually has.
+//! binary cache usually has. The target records its `nvmf_tcp` tracepoints,
+//! which `spdk_trace` reads to show what the target did with each request:
+//! `XYLEM_SPDK_TRACE`, else the one next to `nvmf_tgt`.
 
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -17,6 +19,8 @@ use std::time::{Duration, Instant};
 const SUBNQN: &str = "nqn.2016-06.io.spdk:xylem-test";
 /// LBAs of the Malloc bdev
 const NUM_BLOCKS: u64 = 32768;
+/// Tracepoints the target keeps
+const TRACE_ENTRIES: usize = 65536;
 
 /// The nvmf_tgt binary to run
 fn nvmf_tgt() -> PathBuf {
@@ -39,10 +43,19 @@ fn nvmf_tgt() -> PathBuf {
     Path::new(out.trim()).join("bin/nvmf_tgt")
 }
 
+/// The spdk_trace binary that reads the tracepoints of `nvmf_tgt`
+fn spdk_trace(nvmf_tgt: &Path) -> PathBuf {
+    match std::env::var_os("XYLEM_SPDK_TRACE") {
+        Some(path) => path.into(),
+        None => nvmf_tgt.with_file_name("spdk_trace"),
+    }
+}
+
 /// An SPDK NVMe/TCP target, killed on drop
 struct SpdkTarget {
     child: Child,
     port: u16,
+    spdk_trace: PathBuf,
     _dir: tempfile::TempDir,
 }
 
@@ -82,9 +95,11 @@ impl SpdkTarget {
         });
         let log_path = dir.path().join("nvmf_tgt.log");
         let log = std::fs::File::create(&log_path).unwrap();
-        let mut child = Command::new(nvmf_tgt())
+        let nvmf_tgt = nvmf_tgt();
+        let mut child = Command::new(&nvmf_tgt)
             .args(["--no-huge", "-s", "512", "-m", &format!("[{core}]")])
-            .args(["--no-pci", "--disable-cpumask-locks", "--num-trace-entries", "0"])
+            .args(["--no-pci", "--disable-cpumask-locks", "-e", "nvmf_tcp"])
+            .args(["--num-trace-entries", &TRACE_ENTRIES.to_string()])
             .arg("-r")
             .arg(dir.path().join("rpc.sock"))
             .arg("-c")
@@ -107,7 +122,35 @@ impl SpdkTarget {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        Self { child, port, _dir: dir }
+        Self {
+            child,
+            port,
+            spdk_trace: spdk_trace(&nvmf_tgt),
+            _dir: dir,
+        }
+    }
+
+    /// Of the requests whose tracepoints the target still holds, how many
+    /// it took, and how many it sent an R2T for (`TCP_REQ_AWAIT_R2T_ACK`):
+    /// a write whose data is not in its command capsule. Its trace ring
+    /// keeps the last `TRACE_ENTRIES` tracepoints, each request leaving
+    /// about a dozen.
+    fn traced_requests(&self) -> (usize, usize) {
+        let output = Command::new(&self.spdk_trace)
+            .args(["-s", "nvmf", "-p", &self.child.id().to_string()])
+            .output()
+            .expect("run spdk_trace; or set XYLEM_SPDK_TRACE to an spdk_trace binary");
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let trace = String::from_utf8(output.stdout).unwrap();
+        let count = |name: &str| trace.split_whitespace().filter(|word| *word == name).count();
+        (count("TCP_REQ_NEW"), count("TCP_REQ_AWAIT_R2T_ACK"))
+    }
+
+    /// Check that the target took writes after R2Ts: every request it
+    /// still holds tracepoints of but the few admin commands
+    fn assert_writes_used_r2t(&self) {
+        let (requests, r2t) = self.traced_requests();
+        assert!(requests > 100 && r2t * 10 >= requests * 9, "{r2t} R2Ts for {requests} requests");
     }
 }
 
@@ -192,19 +235,39 @@ fn nvme_tcp_integration_4k_reads_and_in_capsule_writes() {
             serde_json::json!({ "access": access, "read_percent": 0 }),
         );
         all_completed(&writes);
+        // Their data fits the 4096-byte in-capsule size: no R2T
+        let (requests, r2t) = target.traced_requests();
+        assert!(requests > 100 && r2t == 0, "{r2t} R2Ts for {requests} requests");
     }
 }
 
 #[test]
-fn nvme_tcp_integration_large_writes_via_r2t_on_several_controllers() {
+fn nvme_tcp_integration_large_writes_via_r2t() {
     let target = SpdkTarget::start();
-    // Two controllers of two I/O queues each; 64 KiB writes exceed the
-    // 4096-byte in-capsule size and go after R2Ts, 128 KiB reads arrive in
-    // C2HData PDUs larger than the receive buffer
+    // 64 and 128 KiB writes exceed the 4096-byte in-capsule size: the target
+    // asks for their data with R2Ts, which xylem answers with H2CData PDUs
+    // that need several writes on the socket
+    for block_size in [65536, 131072] {
+        for (access, queue_depth) in [("random", 1), ("sequential", 4), ("random", 32)] {
+            let config = serde_json::json!({
+                "block_size": block_size, "read_percent": 0, "access": access
+            });
+            all_completed(&run(&target, 1, queue_depth, config));
+            target.assert_writes_used_r2t();
+        }
+    }
+}
+
+#[test]
+fn nvme_tcp_integration_large_writes_and_reads_on_several_controllers() {
+    let target = SpdkTarget::start();
+    // Two controllers of two I/O queues each; 64 KiB writes go after R2Ts,
+    // 128 KiB reads arrive in C2HData PDUs larger than the receive buffer
     let config = serde_json::json!({
         "block_size": 65536, "read_percent": 0, "io_queues_per_controller": 2
     });
     all_completed(&run(&target, 4, 4, config));
+    target.assert_writes_used_r2t();
     let config = serde_json::json!({ "block_size": 131072, "io_queues_per_controller": 2 });
     all_completed(&run(&target, 4, 2, config));
 }
@@ -214,11 +277,15 @@ fn nvme_tcp_integration_readback_compare() {
     let target = SpdkTarget::start();
     // The whole 2048-LBA range is written first, then every read of the mix
     // must return the pattern; a mismatch fails the run
-    for block_size in [4096, 65536] {
+    for block_size in [4096, 65536, 131072] {
         let config = serde_json::json!({
             "block_size": block_size, "read_percent": 50, "verify": true, "lba_count": 2048
         });
         all_completed(&run(&target, 4, 8, config));
+        // Blocks larger than the in-capsule size are written after R2Ts
+        let (requests, r2t) = target.traced_requests();
+        assert!(requests > 100, "{requests} requests");
+        assert_eq!(r2t > 0, block_size > 4096, "{r2t} R2Ts for {requests} requests");
     }
 }
 
