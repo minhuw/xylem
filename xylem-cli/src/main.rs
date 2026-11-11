@@ -264,15 +264,14 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
         CpuPinning::Auto
     };
 
-    // Validate CPU pinning configuration
+    // Validate CPU pinning against actual available IDs, which may be sparse.
     if !thread_ids.is_empty() {
-        if let Some(core_count) = xylem_core::threading::get_core_count() {
-            let max_core_needed = *thread_ids.iter().max().unwrap();
-            if max_core_needed >= core_count {
+        if let Some(core_ids) = xylem_core::threading::get_available_core_ids() {
+            for id in unavailable_cpu_ids(&thread_ids, &core_ids) {
                 tracing::warn!(
-                    "CPU pinning may fail: thread ID {} exceeds available cores ({})",
-                    max_core_needed,
-                    core_count
+                    "CPU pinning may fail: thread ID {} is not in available CPU IDs {:?}",
+                    id,
+                    core_ids
                 );
             }
         }
@@ -908,9 +907,24 @@ fn timestamp_config(
     }
 }
 
+fn unavailable_cpu_ids<'a>(
+    thread_ids: &'a [usize],
+    core_ids: &'a [usize],
+) -> impl Iterator<Item = usize> + 'a {
+    thread_ids.iter().copied().filter(|id| !core_ids.contains(id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cpu_precheck_uses_actual_available_ids() {
+        let available = [9, 10, 11, 12];
+        assert_eq!(unavailable_cpu_ids(&[9, 10, 11, 12], &available).count(), 0);
+        assert_eq!(unavailable_cpu_ids(&[9, 3, 12], &available).collect::<Vec<_>>(), vec![3]);
+        assert_eq!(unavailable_cpu_ids(&[9], &[]).collect::<Vec<_>>(), vec![9]);
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
