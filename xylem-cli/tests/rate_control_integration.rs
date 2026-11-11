@@ -6,6 +6,7 @@
 //!
 //! Requires Redis Docker container.
 
+use std::net::SocketAddr;
 use std::time::Duration;
 use xylem_core::scheduler::UniformPolicyScheduler;
 use xylem_core::threading::{Worker, WorkerConfig};
@@ -15,8 +16,12 @@ use xylem_transport::TcpTransportFactory;
 mod common;
 
 /// Run a closed-loop throughput experiment and return the actual rate
-fn run_throughput_experiment(duration_secs: u64, conn_count: usize, pipeline_depth: usize) -> f64 {
-    let target_addr = "127.0.0.1:6379".parse().unwrap();
+fn run_throughput_experiment(
+    target_addr: SocketAddr,
+    duration_secs: u64,
+    conn_count: usize,
+    pipeline_depth: usize,
+) -> f64 {
     let duration = Duration::from_secs(duration_secs);
 
     let protocol = xylem_protocols::redis::RedisProtocol::new(Box::new(
@@ -44,10 +49,10 @@ fn run_throughput_experiment(duration_secs: u64, conn_count: usize, pipeline_dep
 /// Test closed-loop throughput with single connection
 #[test]
 fn test_throughput_single_connection() {
-    let _guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
+    let guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
     println!("\n=== Testing Single Connection Throughput ===");
-    let rate = run_throughput_experiment(3, 1, 8);
+    let rate = run_throughput_experiment(guard.addr(), 3, 1, 8);
 
     println!("Actual rate: {rate:.2} req/s");
 
@@ -62,10 +67,10 @@ fn test_throughput_single_connection() {
 /// Test closed-loop throughput with multiple connections
 #[test]
 fn test_throughput_multiple_connections() {
-    let _guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
+    let guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
     println!("\n=== Testing Multiple Connection Throughput ===");
-    let rate = run_throughput_experiment(3, 4, 8);
+    let rate = run_throughput_experiment(guard.addr(), 3, 4, 8);
 
     println!("Actual rate: {rate:.2} req/s");
 
@@ -80,7 +85,7 @@ fn test_throughput_multiple_connections() {
 /// Test throughput scaling with pipeline depth
 #[test]
 fn test_throughput_scaling_with_pipeline_depth() {
-    let _guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
+    let guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
     println!("\n=== Testing Throughput Scaling with Pipeline Depth ===");
 
@@ -92,7 +97,7 @@ fn test_throughput_scaling_with_pipeline_depth() {
     println!("{:-<40}", "");
 
     for depth in depths {
-        let rate = run_throughput_experiment(3, 2, depth);
+        let rate = run_throughput_experiment(guard.addr(), 3, 2, depth);
         println!("{depth:<20} {rate:<20.0}");
         rates.push(rate);
     }
@@ -113,11 +118,11 @@ fn test_throughput_scaling_with_pipeline_depth() {
 
 /// Run a rate-limited experiment and return (target_rate, actual_rate, error_percent)
 fn run_rate_limited_experiment(
+    target_addr: SocketAddr,
     target_rate: f64,
     duration_secs: u64,
     conn_count: usize,
 ) -> (f64, f64, f64) {
-    let target_addr = "127.0.0.1:6379".parse().unwrap();
     let duration = Duration::from_secs(duration_secs);
 
     let protocol = xylem_protocols::redis::RedisProtocol::new(Box::new(
@@ -152,10 +157,10 @@ fn run_rate_limited_experiment(
 /// Test rate accuracy with low rate (100 req/s)
 #[test]
 fn test_rate_accuracy_low_rate() {
-    let _guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
+    let guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
     println!("\n=== Testing Low Rate (100 req/s) ===");
-    let (target, actual, error) = run_rate_limited_experiment(100.0, 5, 1);
+    let (target, actual, error) = run_rate_limited_experiment(guard.addr(), 100.0, 5, 1);
 
     println!("Target rate: {target:.2} req/s");
     println!("Actual rate: {actual:.2} req/s");
@@ -172,11 +177,11 @@ fn test_rate_accuracy_low_rate() {
 /// Test rate accuracy with medium rate (1000 req/s)
 #[test]
 fn test_rate_accuracy_medium_rate() {
-    let _guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
+    let guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
     println!("\n=== Testing Medium Rate (1000 req/s) ===");
     // Use 1 connection since rate limiting is per-connection
-    let (target, actual, error) = run_rate_limited_experiment(1000.0, 5, 1);
+    let (target, actual, error) = run_rate_limited_experiment(guard.addr(), 1000.0, 5, 1);
 
     println!("Target rate: {target:.2} req/s");
     println!("Actual rate: {actual:.2} req/s");
@@ -193,12 +198,12 @@ fn test_rate_accuracy_medium_rate() {
 /// Test Poisson rate limiting produces correct average rate
 #[test]
 fn test_poisson_rate_limiting() {
-    let _guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
+    let guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
     println!("\n=== Testing Poisson Rate Limiting (500 req/s) ===");
 
-    let target_addr = "127.0.0.1:6379".parse().unwrap();
     let duration = Duration::from_secs(5);
+    let target_addr = guard.addr();
     let target_rate = 500.0;
 
     let protocol = xylem_protocols::redis::RedisProtocol::new(Box::new(

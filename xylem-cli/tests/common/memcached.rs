@@ -1,76 +1,53 @@
-//! Memcached test utilities
+//! Memcached test fixture
 //!
-//! Provides helpers for managing Memcached instances in integration tests.
-//! Uses the shared docker-compose fixture for Memcached lifecycle management.
+//! Each guard starts its own compose project on host ports Docker picks and
+//! tears it down on drop.
 
-use super::compose::{ComposeSpec, ComposeStack};
-
-/// Guard for Memcached that ensures cleanup
-///
-/// This will start a Memcached instance using Docker Compose and clean it up on drop.
+use super::compose::{addr, answers, ComposeSpec, ComposeStack};
+use std::net::SocketAddr;
+/// Guard for Memcached in a compose project of its own, torn down on drop
 pub struct MemcachedGuard {
-    /// Held for its drop, which stops Memcached if this guard started it
+    /// Held for its drop, which tears the project down
     _stack: ComposeStack,
+    port: u16,
+    udp_port: u16,
 }
 
 impl MemcachedGuard {
-    /// Start a Memcached instance using Docker Compose
-    ///
-    /// This will:
-    /// 1. Check if Docker and docker-compose are available
-    /// 2. Start Memcached (port 11211) via docker-compose
-    /// 3. Wait for Memcached to be ready
-    ///
-    /// If Memcached is already running, the guard uses it and leaves it running on drop.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if:
-    /// - Docker or docker-compose is not available
-    /// - Memcached fails to start
-    /// - Memcached doesn't become ready within 30 seconds
+    /// Start Memcached and wait until it answers
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let stack = ComposeStack::start(&ComposeSpec {
             name: "Memcached",
-            compose_file: "tests/memcached/docker-compose.yml",
+            compose_file: "tests/memcached/docker-compose.test.yml",
             build_images: false,
-            is_ready: Self::is_memcached_ready,
+            is_ready: |stack| {
+                stack
+                    .published_port("memcached", 11211, "tcp")
+                    .is_some_and(|port| answers(port, b"stats\r\n", b"STAT"))
+                    && stack.published_port("memcached", 11211, "udp").is_some()
+            },
         })?;
-        Ok(Self { _stack: stack })
+        let port = stack
+            .published_port("memcached", 11211, "tcp")
+            .ok_or("Memcached TCP port not published")?;
+        let udp_port = stack
+            .published_port("memcached", 11211, "udp")
+            .ok_or("Memcached UDP port not published")?;
+        Ok(Self { _stack: stack, port, udp_port })
     }
 
-    /// Check if Memcached is ready
-    pub(super) fn is_memcached_ready() -> bool {
-        use std::io::{Read, Write};
-        use std::net::TcpStream;
-
-        let stream = TcpStream::connect("127.0.0.1:11211");
-        match stream {
-            Ok(mut stream) => {
-                // Send stats command
-                if stream.write_all(b"stats\r\n").is_err() {
-                    return false;
-                }
-
-                // Try to read response
-                let mut buf = [0u8; 1024];
-                match stream.read(&mut buf) {
-                    Ok(n) if n > 0 => {
-                        let response = String::from_utf8_lossy(&buf[..n]);
-                        response.contains("STAT")
-                    }
-                    _ => false,
-                }
-            }
-            Err(_) => false,
-        }
-    }
-
-    /// Get the port Memcached is listening on
+    /// Host port Docker published for the TCP service
     pub fn get_port(&self) -> u16 {
-        11211
+        self.port
+    }
+
+    /// Host port Docker published for the UDP service
+    pub fn get_udp_port(&self) -> u16 {
+        self.udp_port
+    }
+
+    /// `127.0.0.1:<get_port()>`
+    pub fn addr(&self) -> SocketAddr {
+        addr(self.port)
     }
 }
-
-// Guard lifecycle tests moved to tests/guard_lifecycle.rs to avoid
-// duplicate container starts when multiple test binaries run in parallel

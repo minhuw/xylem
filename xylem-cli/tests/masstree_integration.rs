@@ -14,11 +14,11 @@ mod common;
 #[test]
 fn test_masstree_get_single_thread() {
     // Start Masstree server (will auto-cleanup on drop)
-    let _masstree = common::masstree::MasstreeGuard::new().expect("Failed to start Masstree");
+    let masstree = common::masstree::MasstreeGuard::new().expect("Failed to start Masstree");
 
     println!("Running Masstree GET single-threaded test...");
 
-    let target_addr = "127.0.0.1:2117".parse().unwrap();
+    let target_addr = masstree.addr();
     let duration = Duration::from_secs(3);
 
     // Create Masstree protocol with GET operations
@@ -80,11 +80,11 @@ fn test_masstree_get_single_thread() {
 #[test]
 fn test_masstree_set_single_thread() {
     // Start Masstree server (will auto-cleanup on drop)
-    let _masstree = common::masstree::MasstreeGuard::new().expect("Failed to start Masstree");
+    let masstree = common::masstree::MasstreeGuard::new().expect("Failed to start Masstree");
 
     println!("Running Masstree SET single-threaded test...");
 
-    let target_addr = "127.0.0.1:2117".parse().unwrap();
+    let target_addr = masstree.addr();
     let duration = Duration::from_secs(3);
 
     // Create Masstree protocol with SET operations
@@ -135,11 +135,11 @@ fn test_masstree_set_single_thread() {
 #[test]
 fn test_masstree_multi_thread() {
     // Start Masstree server (will auto-cleanup on drop)
-    let _masstree = common::masstree::MasstreeGuard::new().expect("Failed to start Masstree");
+    let masstree = common::masstree::MasstreeGuard::new().expect("Failed to start Masstree");
 
     println!("Running Masstree multi-threaded test...");
 
-    let target_addr = "127.0.0.1:2117".parse().unwrap();
+    let target_addr = masstree.addr();
     let duration = Duration::from_secs(3);
     let num_threads = 4;
 
@@ -209,11 +209,11 @@ fn test_masstree_multi_thread() {
 #[test]
 fn test_masstree_remove_operation() {
     // Start Masstree server (will auto-cleanup on drop)
-    let _masstree = common::masstree::MasstreeGuard::new().expect("Failed to start Masstree");
+    let masstree = common::masstree::MasstreeGuard::new().expect("Failed to start Masstree");
 
     println!("Running Masstree REMOVE single-threaded test...");
 
-    let target_addr = "127.0.0.1:2117".parse().unwrap();
+    let target_addr = masstree.addr();
     let duration = Duration::from_secs(2);
 
     // Create Masstree protocol with REMOVE operations
@@ -260,11 +260,11 @@ fn test_masstree_remove_operation() {
 #[test]
 fn test_masstree_rate_limited() {
     // Start Masstree server (will auto-cleanup on drop)
-    let _masstree = common::masstree::MasstreeGuard::new().expect("Failed to start Masstree");
+    let masstree = common::masstree::MasstreeGuard::new().expect("Failed to start Masstree");
 
     println!("Running Masstree rate-limited test...");
 
-    let target_addr = "127.0.0.1:2117".parse().unwrap();
+    let target_addr = masstree.addr();
     let duration = Duration::from_secs(3);
     let target_rate = 300.0; // 300 req/s
 
@@ -319,11 +319,11 @@ fn test_masstree_rate_limited() {
 #[test]
 fn test_masstree_pipelined() {
     // Start Masstree server (will auto-cleanup on drop)
-    let _masstree = common::masstree::MasstreeGuard::new().expect("Failed to start Masstree");
+    let masstree = common::masstree::MasstreeGuard::new().expect("Failed to start Masstree");
 
     println!("Running Masstree pipelined test (pipeline depth=4)...");
 
-    let target_addr = "127.0.0.1:2117".parse().unwrap();
+    let target_addr = masstree.addr();
     let duration = Duration::from_secs(3);
 
     // Create Masstree protocol with GET operations

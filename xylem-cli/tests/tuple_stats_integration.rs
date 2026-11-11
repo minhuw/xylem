@@ -21,9 +21,9 @@ fn create_tuple_stats() -> TupleStatsCollector {
 
 #[test]
 fn test_tuple_stats_single_thread_redis() {
-    let _redis = common::redis::RedisGuard::new().expect("Failed to start Redis");
+    let redis = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
-    let target_addr = "127.0.0.1:6379".parse().unwrap();
+    let target_addr = redis.addr();
     let duration = Duration::from_secs(3);
     let conn_count = 4;
 
@@ -99,9 +99,9 @@ fn test_tuple_stats_single_thread_redis() {
 
 #[test]
 fn test_tuple_stats_multi_thread_redis() {
-    let _redis = common::redis::RedisGuard::new().expect("Failed to start Redis");
+    let redis = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
-    let target_addr: std::net::SocketAddr = "127.0.0.1:6379".parse().unwrap();
+    let target_addr = redis.addr();
     let duration = Duration::from_secs(3);
     let conn_count = 2;
     let num_threads = 2;
@@ -183,9 +183,9 @@ fn test_tuple_stats_output_generation() {
     use xylem_cli::output::DetailedExperimentResults;
     use xylem_core::traffic_group::{PolicyConfig, TrafficGroupConfig};
 
-    let _redis = common::redis::RedisGuard::new().expect("Failed to start Redis");
+    let redis = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
-    let target_addr = "127.0.0.1:6379".parse().unwrap();
+    let target_addr = redis.addr();
     let duration = Duration::from_secs(2);
     let conn_count = 3;
 
@@ -220,7 +220,7 @@ fn test_tuple_stats_output_generation() {
         on_error: xylem_core::traffic_group::OnError::Count,
         timestamps: Default::default(),
         protocol: "redis".to_string(),
-        target: "127.0.0.1:6379".to_string(),
+        target: target_addr.to_string(),
         transport: "tcp".to_string(),
         traffic_policy: PolicyConfig::ClosedLoop,
         sampling_policy: policy,
@@ -232,7 +232,7 @@ fn test_tuple_stats_output_generation() {
         "Tuple Stats Test".to_string(),
         Some("Integration test for tuple-keyed stats".to_string()),
         Some(42),
-        "127.0.0.1:6379".to_string(),
+        target_addr.to_string(),
         "redis".to_string(),
         "tcp".to_string(),
         duration,
@@ -293,13 +293,13 @@ fn test_tuple_stats_output_generation() {
 
 #[test]
 fn test_tuple_stats_time_buckets() {
-    let _redis = common::redis::RedisGuard::new().expect("Failed to start Redis");
+    let redis = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
     // Use shorter bucket duration to get more granular data
     let policy = SamplingPolicy::Limited { max_samples: 100_000, rate: 1.0 };
     let stats = TupleStatsCollector::new(policy, Duration::from_millis(500)); // 500ms buckets
 
-    let target_addr = "127.0.0.1:6379".parse().unwrap();
+    let target_addr = redis.addr();
     let duration = Duration::from_secs(3);
 
     let protocol = xylem_protocols::redis::RedisProtocol::new(Box::new(

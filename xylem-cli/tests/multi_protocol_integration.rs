@@ -203,12 +203,12 @@ fn run_multi_protocol_test(
 #[test]
 fn test_multi_protocol_same_thread() {
     // Simpler test: just Redis on same thread (tests multi-group architecture)
-    let _redis = common::redis::RedisGuard::new().expect("Failed to start Redis");
+    let redis = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
-    run_redis_memcached_test().expect("Redis + Memcached test failed");
+    run_redis_memcached_test(redis.addr()).expect("Redis + Memcached test failed");
 }
 
-fn run_redis_memcached_test() -> Result<(), Box<dyn std::error::Error>> {
+fn run_redis_memcached_test(target_addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Testing multi-protocol architecture with two Redis groups...");
     eprintln!("(Using Redis for both groups to work around single-target limitation)");
 
@@ -254,7 +254,7 @@ fn run_redis_memcached_test() -> Result<(), Box<dyn std::error::Error>> {
         ];
 
         let worker_config = WorkerConfig {
-            target: "127.0.0.1:6379".parse().unwrap(),
+            target: target_addr,
             duration,
             conn_count: 10,
             max_pending_per_conn: 1,

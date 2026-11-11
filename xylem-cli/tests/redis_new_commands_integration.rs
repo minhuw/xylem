@@ -4,9 +4,9 @@
 //! SETRANGE, GETRANGE, CLUSTER SLOTS
 //!
 //! These tests use Docker Compose to manage Redis servers with various configurations:
-//! - Standard Redis (port 6379)
-//! - Password-protected Redis (port 6380)
-//! - ACL-enabled Redis (port 6381)
+//! - Standard Redis
+//! - Password-protected Redis
+//! - ACL-enabled Redis
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -19,7 +19,7 @@ mod common;
 /// Helper to send command and read response
 fn send_command_and_read_response(
     protocol: &mut RedisProtocol,
-    addr: &str,
+    addr: std::net::SocketAddr,
     conn_id: usize,
     key: u64,
     value_size: usize,
@@ -217,7 +217,8 @@ fn test_auth_acl_username_password() {
 fn test_select_database() {
     let redis = common::redis_auth::RedisAuthGuard::new().expect("Failed to start Redis with auth");
     let password = redis.get_password();
-    let cli: &[&str] = &["-p", "6380", "-a", password];
+    let port = redis.get_port().to_string();
+    let cli: &[&str] = &["-p", &port, "-a", password];
     let prefix = "select-test:";
 
     // AUTH then SELECT: the workload's SETs land in database 5 only
@@ -239,9 +240,10 @@ fn test_select_database() {
 
 #[test]
 fn test_hello_resp2() {
-    let _redis = common::redis::RedisGuard::new().expect("Failed to start Redis");
+    let redis = common::redis::RedisGuard::new().expect("Failed to start Redis");
     // resp = 2 is the default protocol and sends no HELLO
-    let run = run_xylem(6379, &format!("resp = 2\n{}", keys_config("resp2-test:")), &[]);
+    let run =
+        run_xylem(redis.get_port(), &format!("resp = 2\n{}", keys_config("resp2-test:")), &[]);
     assert!(run.success, "{}", run.output);
     assert!(run.completed() > 0);
     println!("✓ RESP2 run: {} requests", run.completed());
@@ -262,14 +264,15 @@ fn test_hello_resp3() {
     let run = run_xylem(redis.get_port(), &config, &[]);
     assert!(run.success, "{}", run.output);
     assert!(run.completed() > 0);
-    let cli: &[&str] = &["-p", "6381", "--user", username, "-a", password];
+    let port = redis.get_port().to_string();
+    let cli: &[&str] = &["-p", &port, "--user", username, "-a", password];
     assert!(existing_keys(cli, 2, "resp3-test:") > 0, "keys land in database 2");
     println!("✓ RESP3 run: {} requests", run.completed());
 }
 
 #[test]
 fn test_setex_with_expiry() {
-    let _redis = common::redis::RedisGuard::new().expect("Failed to start Redis");
+    let redis = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
     println!("Testing SETEX command with expiry...");
 
@@ -277,7 +280,7 @@ fn test_setex_with_expiry() {
     let mut setex_protocol =
         RedisProtocol::new(Box::new(FixedCommandSelector::new(RedisOp::SetEx { ttl_seconds: 1 })));
 
-    let mut stream = TcpStream::connect("127.0.0.1:6379").unwrap();
+    let mut stream = TcpStream::connect(redis.addr()).unwrap();
     let setex_req = setex_protocol.generate_request_with_key(0, 888, 20);
     stream.write_all(&setex_req.data).unwrap();
 
@@ -324,11 +327,11 @@ fn test_setex_with_expiry() {
 
 #[test]
 fn test_setrange_getrange() {
-    let _redis = common::redis::RedisGuard::new().expect("Failed to start Redis");
+    let redis = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
     println!("Testing SETRANGE and GETRANGE commands...");
 
-    let mut stream = TcpStream::connect("127.0.0.1:6379").unwrap();
+    let mut stream = TcpStream::connect(redis.addr()).unwrap();
 
     // First SET a base value
     let mut set_protocol = RedisProtocol::new(Box::new(FixedCommandSelector::new(RedisOp::Set)));
@@ -370,7 +373,7 @@ fn test_setrange_getrange() {
 
 #[test]
 fn test_cluster_slots_non_cluster() {
-    let _redis = common::redis::RedisGuard::new().expect("Failed to start Redis");
+    let redis = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
     println!("Testing CLUSTER SLOTS on non-cluster Redis...");
 
@@ -379,7 +382,7 @@ fn test_cluster_slots_non_cluster() {
     let slots = RedisOp::Custom(CommandTemplate::parse("CLUSTER SLOTS").unwrap());
     let mut slots_protocol = RedisProtocol::new(Box::new(FixedCommandSelector::new(slots)));
 
-    let response = send_command_and_read_response(&mut slots_protocol, "127.0.0.1:6379", 0, 1, 64)
+    let response = send_command_and_read_response(&mut slots_protocol, redis.addr(), 0, 1, 64)
         .expect("CLUSTER SLOTS command failed to send");
 
     let response_str = String::from_utf8_lossy(&response);

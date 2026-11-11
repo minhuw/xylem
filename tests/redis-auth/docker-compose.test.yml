@@ -1,0 +1,6 @@
+services:
+  redis-auth:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1::6379"
+    command: redis-server --requirepass testpassword --save "" --appendonly no

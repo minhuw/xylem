@@ -3,7 +3,8 @@
 //! These tests use Docker Compose to manage a Redis server for testing.
 //! Docker is required to run these tests.
 
-use std::process::Command;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 use xylem_core::stats::{SamplingPolicy, TupleStatsCollector};
 use xylem_core::threading::{ThreadingRuntime, Worker, WorkerConfig};
@@ -13,54 +14,44 @@ use xylem_transport::TcpTransportFactory;
 mod common;
 
 /// Get Redis stats using INFO command
-fn get_redis_stats() -> Result<RedisStats, Box<dyn std::error::Error>> {
-    let output = Command::new("redis-cli").args(["-p", "6379", "INFO", "stats"]).output()?;
-
-    let info = String::from_utf8(output.stdout)?;
-
-    // Parse total_commands_processed from INFO output
-    let mut total_commands = 0u64;
-    let mut total_connections = 0u64;
-
-    for line in info.lines() {
-        if line.starts_with("total_commands_processed:") {
-            total_commands =
-                line.split(':').nth(1).and_then(|s| s.trim().parse().ok()).unwrap_or(0);
-        } else if line.starts_with("total_connections_received:") {
-            total_connections =
-                line.split(':').nth(1).and_then(|s| s.trim().parse().ok()).unwrap_or(0);
-        }
+fn get_redis_commands(addr: SocketAddr) -> Result<u64, Box<dyn std::error::Error>> {
+    let mut stream = TcpStream::connect(addr)?;
+    stream.write_all(b"*2\r\n$4\r\nINFO\r\n$5\r\nstats\r\n")?;
+    let mut reader = BufReader::new(stream);
+    let mut header = String::new();
+    reader.read_line(&mut header)?;
+    let length: usize = header
+        .strip_prefix('$')
+        .and_then(|s| s.strip_suffix("\r\n"))
+        .ok_or("invalid INFO bulk reply")?
+        .parse()?;
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body)?;
+    let mut terminator = [0; 2];
+    reader.read_exact(&mut terminator)?;
+    if terminator != *b"\r\n" {
+        return Err("invalid INFO bulk terminator".into());
     }
-
-    Ok(RedisStats {
-        total_commands_processed: total_commands,
-        total_connections_received: total_connections,
-    })
-}
-
-/// Redis server statistics
-#[derive(Debug, Clone)]
-struct RedisStats {
-    total_commands_processed: u64,
-    #[allow(dead_code)]
-    total_connections_received: u64,
+    let info = String::from_utf8(body)?;
+    let value = info
+        .lines()
+        .find_map(|line| line.strip_prefix("total_commands_processed:"))
+        .ok_or("INFO stats missing total_commands_processed")?;
+    Ok(value.trim().parse()?)
 }
 
 #[test]
 fn test_redis_single_thread() {
     // Start Redis server (will auto-cleanup on drop)
-    let _redis = common::redis::RedisGuard::new().expect("Failed to start Redis");
+    let redis = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
     println!("Running single-threaded test...");
 
     // Get initial Redis stats
-    let stats_before = get_redis_stats().expect("Failed to get initial Redis stats");
-    println!(
-        "Redis stats before test: {} commands processed",
-        stats_before.total_commands_processed
-    );
+    let stats_before = get_redis_commands(redis.addr()).expect("Failed to get initial Redis stats");
+    println!("Redis stats before test: {} commands processed", stats_before);
 
-    let target_addr = "127.0.0.1:6379".parse().unwrap();
+    let target_addr = redis.addr();
     let duration = Duration::from_secs(2);
 
     // Create Redis protocol with GET operations
@@ -103,13 +94,12 @@ fn test_redis_single_thread() {
     println!("  P99 latency: {:.2} μs", global.latency_p99.as_micros());
 
     // Get Redis stats after test
-    let stats_after = get_redis_stats().expect("Failed to get final Redis stats");
-    let redis_commands_processed =
-        stats_after.total_commands_processed - stats_before.total_commands_processed;
+    let stats_after = get_redis_commands(redis.addr()).expect("Failed to get final Redis stats");
+    let redis_commands_processed = stats_after - stats_before;
 
     println!("\nRedis server validation:");
-    println!("  Commands before: {}", stats_before.total_commands_processed);
-    println!("  Commands after: {}", stats_after.total_commands_processed);
+    println!("  Commands before: {}", stats_before);
+    println!("  Commands after: {}", stats_after);
     println!("  Commands processed: {redis_commands_processed}");
     println!("  Client requests: {}", global.total_requests);
 
@@ -120,21 +110,13 @@ fn test_redis_single_thread() {
         "Should have collected latency samples"
     );
 
-    // STRICT VALIDATION: Verify Redis actually processed the requests
-    // Redis counts each GET command, so it should match our completed requests
-    assert!(redis_commands_processed > 0, "Redis should have processed some commands");
-
-    // Allow small discrepancy due to INFO command itself and potential connection setup commands
-    let discrepancy = (redis_commands_processed as i64 - global.total_requests as i64).abs();
-    assert!(
-        discrepancy < 10,
-        "Redis commands processed ({}) should match client requests ({}) within small margin (discrepancy: {})",
-        redis_commands_processed,
-        global.total_requests,
-        discrepancy
-    );
-
-    println!("✓ Redis stats validation passed (discrepancy: {discrepancy} commands)");
+    // INFO reports its count before that INFO itself is counted. The delta
+    // therefore includes the initial INFO and all completed GETs, including
+    // responses collected during drain. This workload sends no setup commands.
+    let counts = stats.request_counts_global();
+    assert_eq!(counts.timed_out, 0, "{counts:?}");
+    assert_eq!(counts.failed, 0, "{counts:?}");
+    assert_eq!(redis_commands_processed, counts.completed + 1);
 
     // Sanity check on latency (should be < 10ms for local Redis)
     assert!(
@@ -147,11 +129,11 @@ fn test_redis_single_thread() {
 #[test]
 fn test_global_sampling_none_disables_latency() {
     // Start Redis server (will auto-cleanup on drop)
-    let _redis = common::redis::RedisGuard::new().expect("Failed to start Redis");
+    let redis = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
     println!("Testing SamplingPolicy::None (no latency tracking)...");
 
-    let target_addr = "127.0.0.1:6379".parse().unwrap();
+    let target_addr = redis.addr();
     let duration = Duration::from_secs(2);
 
     // Create Redis protocol with GET operations
@@ -218,14 +200,14 @@ fn test_global_sampling_none_disables_latency() {
 #[test]
 fn test_redis_multi_thread() {
     // Start Redis server (will auto-cleanup on drop)
-    let _redis = common::redis::RedisGuard::new().expect("Failed to start Redis");
+    let redis = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
     println!("Running multi-threaded test...");
 
     // Get initial Redis stats
-    let stats_before = get_redis_stats().expect("Failed to get initial Redis stats");
+    let stats_before = get_redis_commands(redis.addr()).expect("Failed to get initial Redis stats");
 
-    let target_addr = "127.0.0.1:6379".parse().unwrap();
+    let target_addr = redis.addr();
     let duration = Duration::from_secs(2);
     let num_threads = 4;
 
@@ -281,9 +263,8 @@ fn test_redis_multi_thread() {
     println!("  P99 latency: {:.2} μs", global.latency_p99.as_micros());
 
     // Get Redis stats after test
-    let stats_after = get_redis_stats().expect("Failed to get final Redis stats");
-    let redis_commands_processed =
-        stats_after.total_commands_processed - stats_before.total_commands_processed;
+    let stats_after = get_redis_commands(redis.addr()).expect("Failed to get final Redis stats");
+    let redis_commands_processed = stats_after - stats_before;
 
     println!("\nRedis server validation:");
     println!("  Commands processed by Redis: {redis_commands_processed}");
@@ -292,19 +273,12 @@ fn test_redis_multi_thread() {
     // Verify we got some requests through
     assert!(global.total_requests > 0, "Should have completed some requests");
 
-    // STRICT VALIDATION: Verify Redis actually processed the requests
-    assert!(redis_commands_processed > 0, "Redis should have processed some commands");
-
-    let discrepancy = (redis_commands_processed as i64 - global.total_requests as i64).abs();
-    assert!(
-        discrepancy < 50, // Allow slightly more discrepancy for multi-threaded (connection setup per thread)
-        "Redis commands processed ({}) should match client requests ({}) within margin (discrepancy: {})",
-        redis_commands_processed,
-        global.total_requests,
-        discrepancy
-    );
-
-    println!("✓ Redis stats validation passed (discrepancy: {discrepancy} commands)");
+    // The initial INFO contributes one command to the delta; completed
+    // includes responses collected during drain across all workers.
+    let counts = merged_stats.request_counts_global();
+    assert_eq!(counts.timed_out, 0, "{counts:?}");
+    assert_eq!(counts.failed, 0, "{counts:?}");
+    assert_eq!(redis_commands_processed, counts.completed + 1);
 
     // With 4 threads, we should get more throughput than single-threaded
     // (though this depends on Redis and system capacity)
@@ -318,11 +292,11 @@ fn test_redis_multi_thread() {
 #[test]
 fn test_redis_closed_loop_minimal() {
     // Start Redis server (will auto-cleanup on drop)
-    let _redis = common::redis::RedisGuard::new().expect("Failed to start Redis");
+    let redis = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
     println!("Running closed-loop minimal pipelining test...");
 
-    let target_addr = "127.0.0.1:6379".parse().unwrap();
+    let target_addr = redis.addr();
     let duration = Duration::from_secs(2);
 
     let protocol = xylem_protocols::redis::RedisProtocol::new(Box::new(

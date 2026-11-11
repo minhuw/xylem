@@ -16,7 +16,6 @@ test:
     @echo "   Running unit tests first..."
     cargo nextest run --profile unit --workspace
     @echo "   Running integration tests (serially to avoid Docker conflicts)..."
-    @just test-cleanup
     cargo nextest run --profile integration --workspace
 
 # Run the redis_basic example against a Docker Redis server
@@ -45,15 +44,9 @@ test-doc:
     cargo test --workspace --doc
 
 # Run integration tests only (requires Docker)
-test-integration: test-cleanup
+test-integration:
     @echo "🔌 Running integration tests only..."
     cargo nextest run --profile integration --workspace
-
-# Clean up test Docker containers (safe to run without Docker)
-test-cleanup:
-    @echo "🧹 Cleaning up test containers..."
-    @(docker ps -aq --filter name=xylem-test | xargs -r docker rm -f || true) 2>/dev/null || true
-    @echo "✅ Test containers cleaned up"
 
 # Run the ntcp (user-space TCP) end-to-end test over TUN devices in an
 # unprivileged user + network namespace; needs no root and no Docker
@@ -62,22 +55,22 @@ test-ntcp:
     tests/ntcp/tun_netns.sh
 
 # Run Redis-related integration tests
-test-redis: test-cleanup
+test-redis:
     @echo "🎯 Running Redis integration tests..."
     cargo nextest run --profile integration -E 'binary(redis_integration) or binary(redis_new_commands_integration) or binary(pipelining_integration)'
 
 # Run Memcached integration tests
-test-memcached: test-cleanup
+test-memcached:
     @echo "🎯 Running Memcached integration tests..."
     cargo nextest run --profile integration -E 'binary(memcached_integration)'
 
 # Run HTTP integration tests
-test-http: test-cleanup
+test-http:
     @echo "🌐 Running HTTP integration tests..."
     cargo nextest run --profile integration -E 'binary(http_integration)'
 
 # Run Masstree integration tests
-test-masstree: test-cleanup
+test-masstree:
     @echo "🌲 Running Masstree integration tests..."
     cargo nextest run --profile integration -E 'binary(masstree_integration)'
 

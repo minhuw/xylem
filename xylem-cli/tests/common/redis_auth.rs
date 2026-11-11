@@ -1,68 +1,48 @@
-//! Redis with password authentication test utilities
+//! Password-protected Redis test fixture
 //!
-//! Provides helpers for managing password-protected Redis instances in integration tests.
-//! Uses the shared docker-compose fixture for Redis lifecycle management.
+//! Each guard starts its own compose project on host ports Docker picks and
+//! tears it down on drop.
 
-use std::process::Command;
+use super::compose::{addr, answers, ComposeSpec, ComposeStack};
+use std::net::SocketAddr;
 
-use super::compose::{ComposeSpec, ComposeStack};
-
-/// Guard for password-protected Redis that ensures cleanup
-///
-/// This will start a Redis instance with password authentication using Docker Compose
-/// and clean it up on drop.
+/// Guard for password-protected Redis in a compose project of its own, torn down on drop
 pub struct RedisAuthGuard {
-    /// Held for its drop, which stops Redis if this guard started it
+    /// Held for its drop, which tears the project down
     _stack: ComposeStack,
+    port: u16,
 }
 
 impl RedisAuthGuard {
-    /// Start a password-protected Redis instance using Docker Compose
-    ///
-    /// This will:
-    /// 1. Check if Docker and docker-compose are available
-    /// 2. Start Redis (port 6380) with requirepass via docker-compose
-    /// 3. Wait for Redis to be ready
-    ///
-    /// If Redis is already running, the guard uses it and leaves it running on drop.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if:
-    /// - Docker or docker-compose is not available
-    /// - Redis fails to start
-    /// - Redis doesn't become ready within 30 seconds
+    /// Start password-protected Redis and wait until it answers
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let stack = ComposeStack::start(&ComposeSpec {
             name: "Redis (password)",
-            compose_file: "tests/redis-auth/docker-compose.yml",
+            compose_file: "tests/redis-auth/docker-compose.test.yml",
             build_images: false,
-            is_ready: Self::is_redis_ready,
+            is_ready: |stack| {
+                stack
+                    .published_port("redis-auth", 6379, "tcp")
+                    .is_some_and(|port| answers(port, b"AUTH testpassword\r\nPING\r\n", b"+PONG"))
+            },
         })?;
-        Ok(Self { _stack: stack })
+        let port = stack
+            .published_port("redis-auth", 6379, "tcp")
+            .ok_or("Redis host port not published")?;
+        Ok(Self { _stack: stack, port })
     }
 
-    /// Check if Redis is ready (with password authentication)
-    fn is_redis_ready() -> bool {
-        let output = Command::new("redis-cli")
-            .args(["-p", "6380", "-a", "testpassword", "PING"])
-            .output();
-
-        match output {
-            Ok(out) => {
-                let response = String::from_utf8_lossy(&out.stdout);
-                response.contains("PONG")
-            }
-            Err(_) => false,
-        }
-    }
-
-    /// Get the port Redis is listening on
+    /// Host port Docker published for the TCP service
     pub fn get_port(&self) -> u16 {
-        6380
+        self.port
     }
 
-    /// Get the password for authentication
+    /// `127.0.0.1:<get_port()>`
+    pub fn addr(&self) -> SocketAddr {
+        addr(self.port)
+    }
+
+    /// Password for authentication
     pub fn get_password(&self) -> &str {
         "testpassword"
     }

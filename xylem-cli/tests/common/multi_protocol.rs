@@ -1,20 +1,13 @@
-//! Multi-protocol test utilities
+//! Multi-protocol test fixture
 //!
-//! Provides helpers for managing multiple protocol services (Redis, Memcached, Nginx) in integration tests.
-//! Uses the shared docker-compose fixture for lifecycle management.
+//! Each guard starts its own compose project on host ports Docker picks and
+//! tears it down on drop.
 
-use std::io::{Read, Write};
-use std::net::TcpStream;
-use std::time::Duration;
-
-use super::compose::{published_port, ComposeSpec, ComposeStack};
+use super::compose::{addr, answers, ComposeSpec, ComposeStack};
 use super::nginx::NginxGuard;
-
-/// Compose file of the multi-protocol stack, relative to the workspace root
-const COMPOSE_FILE: &str = "tests/multi-protocol/docker-compose.yml";
+use std::net::SocketAddr;
 
 /// Host ports Docker published for the Redis, Memcached and Nginx services
-#[derive(Clone, Copy)]
 struct Ports {
     redis: u16,
     memcached: u16,
@@ -22,96 +15,70 @@ struct Ports {
 }
 
 impl Ports {
-    /// Ports of this stack's services, if all three are running
-    fn published() -> Option<Self> {
+    fn published(stack: &ComposeStack) -> Option<Self> {
         Some(Self {
-            redis: published_port(COMPOSE_FILE, "redis", 6379)?,
-            memcached: published_port(COMPOSE_FILE, "memcached", 11211)?,
-            http: published_port(COMPOSE_FILE, "nginx", 80)?,
+            redis: stack.published_port("redis", 6379, "tcp")?,
+            memcached: stack.published_port("memcached", 11211, "tcp")?,
+            http: stack.published_port("nginx", 80, "tcp")?,
         })
     }
 }
 
-/// Guard for multi-protocol services that ensures cleanup
-///
-/// This will start Redis, Memcached, and Nginx using Docker Compose and clean them up on drop.
+/// Guard for Redis, Memcached and Nginx in a compose project of their own,
+/// torn down on drop
 pub struct MultiProtocolGuard {
-    /// Held for its drop, which stops the services if this guard started them
+    /// Held for its drop, which tears the project down
     _stack: ComposeStack,
     /// Host ports Docker published for the services
     ports: Ports,
 }
 
 impl MultiProtocolGuard {
-    /// Start multi-protocol services using Docker Compose
-    ///
-    /// This will:
-    /// 1. Check if Docker and docker-compose are available
-    /// 2. Start Redis, Memcached and Nginx via docker-compose, on host ports
-    ///    Docker picks, so they never clash with the single-service stacks
-    /// 3. Wait for all services to be ready
-    ///
-    /// If this stack's three services already answer, the guard uses them and
-    /// leaves them running on drop.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if:
-    /// - Docker or docker-compose is not available
-    /// - Services fail to start
-    /// - Services don't become ready within 30 seconds
+    /// Start Redis, Memcached and Nginx and wait until all three answer
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let stack = ComposeStack::start(&ComposeSpec {
             name: "Multi-protocol services",
-            compose_file: COMPOSE_FILE,
+            compose_file: "tests/multi-protocol/docker-compose.test.yml",
             build_images: false,
-            is_ready: Self::are_services_ready,
+            is_ready: |stack| {
+                Ports::published(stack).is_some_and(|p| {
+                    answers(p.redis, b"PING\r\n", b"+PONG")
+                        && answers(p.memcached, b"stats\r\n", b"STAT")
+                        && NginxGuard::is_nginx_ready(p.http)
+                })
+            },
         })?;
-        let ports = Ports::published().ok_or("Multi-protocol host ports not published")?;
+        let ports = Ports::published(&stack).ok_or("Multi-protocol host ports not published")?;
         Ok(Self { _stack: stack, ports })
     }
 
-    /// Check if all services are ready
-    fn are_services_ready() -> bool {
-        Ports::published().is_some_and(|ports| {
-            answers(ports.redis, b"PING\r\n", "+PONG")
-                && answers(ports.memcached, b"stats\r\n", "STAT")
-                && NginxGuard::is_nginx_ready(ports.http)
-        })
-    }
-
-    /// Get the Redis port
+    /// Host port of Redis
     pub fn redis_port(&self) -> u16 {
         self.ports.redis
     }
 
-    /// Get the Memcached port
+    /// Host port of Memcached
     pub fn memcached_port(&self) -> u16 {
         self.ports.memcached
     }
 
-    /// Get the HTTP port
+    /// Host port of Nginx
     pub fn http_port(&self) -> u16 {
         self.ports.http
     }
-}
 
-/// Whether the server on `port` of 127.0.0.1 answers `request` with a reply
-/// that starts with `expected`
-fn answers(port: u16, request: &[u8], expected: &str) -> bool {
-    let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) else {
-        return false;
-    };
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
-    if stream.write_all(request).is_err() {
-        return false;
+    /// `127.0.0.1:<redis_port()>`
+    pub fn redis_addr(&self) -> SocketAddr {
+        addr(self.ports.redis)
     }
-    let mut buf = [0u8; 1024];
-    match stream.read(&mut buf) {
-        Ok(n) if n > 0 => buf[..n].starts_with(expected.as_bytes()),
-        _ => false,
+
+    /// `127.0.0.1:<memcached_port()>`
+    pub fn memcached_addr(&self) -> SocketAddr {
+        addr(self.ports.memcached)
+    }
+
+    /// `127.0.0.1:<http_port()>`
+    pub fn http_addr(&self) -> SocketAddr {
+        addr(self.ports.http)
     }
 }
-
-// Guard lifecycle tests moved to tests/guard_lifecycle.rs to avoid
-// duplicate container starts when multiple test binaries run in parallel

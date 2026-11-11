@@ -14,10 +14,10 @@ mod common;
 /// Test Memcached Binary protocol with single thread
 #[test]
 fn test_memcached_binary_single_thread() {
-    let _memcached = common::memcached::MemcachedGuard::new().expect("Failed to start Memcached");
+    let memcached = common::memcached::MemcachedGuard::new().expect("Failed to start Memcached");
 
     let runtime = ThreadingRuntime::new(1);
-    let target_addr = "127.0.0.1:11211".parse().unwrap();
+    let target_addr = memcached.addr();
 
     let results = runtime
         .run_workers_generic(move |_thread_id| {
@@ -59,10 +59,10 @@ fn test_memcached_binary_single_thread() {
 /// Test Memcached ASCII protocol with single thread
 #[test]
 fn test_memcached_ascii_single_thread() {
-    let _memcached = common::memcached::MemcachedGuard::new().expect("Failed to start Memcached");
+    let memcached = common::memcached::MemcachedGuard::new().expect("Failed to start Memcached");
 
     let runtime = ThreadingRuntime::new(1);
-    let target_addr = "127.0.0.1:11211".parse().unwrap();
+    let target_addr = memcached.addr();
 
     let results = runtime
         .run_workers_generic(move |_thread_id| {
@@ -104,10 +104,10 @@ fn test_memcached_ascii_single_thread() {
 /// Test Memcached Binary protocol with multiple threads
 #[test]
 fn test_memcached_binary_multi_thread() {
-    let _memcached = common::memcached::MemcachedGuard::new().expect("Failed to start Memcached");
+    let memcached = common::memcached::MemcachedGuard::new().expect("Failed to start Memcached");
 
     let runtime = ThreadingRuntime::new(4);
-    let target_addr = "127.0.0.1:11211".parse().unwrap();
+    let target_addr = memcached.addr();
 
     let results = runtime
         .run_workers_generic(move |_thread_id| {
@@ -152,10 +152,10 @@ fn test_memcached_binary_multi_thread() {
 /// Test Memcached ASCII protocol with rate limiting
 #[test]
 fn test_memcached_ascii_rate_limited() {
-    let _memcached = common::memcached::MemcachedGuard::new().expect("Failed to start Memcached");
+    let memcached = common::memcached::MemcachedGuard::new().expect("Failed to start Memcached");
 
     let runtime = ThreadingRuntime::new(1);
-    let target_addr = "127.0.0.1:11211".parse().unwrap();
+    let target_addr = memcached.addr();
     let target_rate = 1000.0; // 1000 req/s
 
     let results = runtime

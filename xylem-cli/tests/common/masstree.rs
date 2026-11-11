@@ -1,64 +1,55 @@
-//! Masstree test utilities
+//! Masstree test fixture
 //!
-//! Provides helpers for managing Masstree instances in integration tests.
-//! Uses the shared docker-compose fixture for Masstree lifecycle management.
+//! Each guard starts its own compose project on host ports Docker picks and
+//! tears it down on drop.
 
+use super::compose::{addr, ComposeSpec, ComposeStack};
+use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
-use super::compose::{ComposeSpec, ComposeStack};
-
-/// Guard for Masstree that ensures cleanup
-///
-/// This will start a Masstree instance using Docker Compose and clean it up on drop.
+/// Guard for Masstree in a compose project of its own, torn down on drop
 pub struct MasstreeGuard {
-    /// Held for its drop, which stops Masstree if this guard started it
+    /// Held for its drop, which tears the project down
     _stack: ComposeStack,
+    port: u16,
+    address: String,
 }
 
 impl MasstreeGuard {
-    /// Start a Masstree instance using Docker Compose
-    ///
-    /// This will:
-    /// 1. Check if Docker and docker-compose are available
-    /// 2. Build the Masstree image (may take several minutes on first run)
-    /// 3. Start Masstree (port 2117) via docker-compose
-    /// 4. Wait for Masstree to be ready
-    ///
-    /// If Masstree is already running, the guard uses it and leaves it running on drop.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if:
-    /// - Docker or docker-compose is not available
-    /// - Masstree image fails to build
-    /// - Masstree fails to start
-    /// - Masstree doesn't become ready within 30 seconds after container starts
+    /// Start Masstree and wait until it answers
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let stack = ComposeStack::start(&ComposeSpec {
             name: "Masstree",
-            compose_file: "tests/masstree/docker-compose.yml",
+            compose_file: "tests/masstree/docker-compose.test.yml",
             build_images: true,
-            is_ready: Self::is_masstree_ready,
+            is_ready: |stack| {
+                stack.published_port("masstree", 2117, "tcp").is_some_and(|port| {
+                    TcpStream::connect_timeout(&addr(port), Duration::from_millis(500)).is_ok()
+                })
+            },
         })?;
-        Ok(Self { _stack: stack })
+        let port = stack
+            .published_port("masstree", 2117, "tcp")
+            .ok_or("Masstree port not published")?;
+        Ok(Self {
+            _stack: stack,
+            port,
+            address: addr(port).to_string(),
+        })
     }
 
-    /// Check if Masstree is ready by attempting a TCP connection
-    fn is_masstree_ready() -> bool {
-        use std::net::TcpStream;
-
-        // Try to connect to the Masstree port
-        TcpStream::connect_timeout(&"127.0.0.1:2117".parse().unwrap(), Duration::from_millis(500))
-            .is_ok()
-    }
-
-    /// Get the port Masstree is listening on
+    /// Host port Docker published for the TCP service
     pub fn get_port(&self) -> u16 {
-        2117
+        self.port
     }
 
-    /// Get the address string for Masstree
-    pub fn get_addr(&self) -> &'static str {
-        "127.0.0.1:2117"
+    /// `127.0.0.1:<get_port()>`
+    pub fn addr(&self) -> SocketAddr {
+        addr(self.port)
+    }
+
+    /// [`Self::addr`] as a string
+    pub fn get_addr(&self) -> &str {
+        &self.address
     }
 }

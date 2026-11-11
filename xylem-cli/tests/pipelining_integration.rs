@@ -21,11 +21,11 @@ mod common;
 
 #[test]
 fn test_redis_pipelined_single_connection() {
-    let _guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
+    let guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
     println!("Running pipelined test with 1 connection...");
 
-    let target_addr = "127.0.0.1:6379".parse().unwrap();
+    let target_addr = guard.addr();
     let duration = Duration::from_secs(2);
 
     let protocol = xylem_protocols::redis::RedisProtocol::new(Box::new(
@@ -69,11 +69,11 @@ fn test_redis_pipelined_single_connection() {
 
 #[test]
 fn test_redis_pipelined_multiple_connections() {
-    let _guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
+    let guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
     println!("Running pipelined test with 4 connections...");
 
-    let target_addr = "127.0.0.1:6379".parse().unwrap();
+    let target_addr = guard.addr();
     let duration = Duration::from_secs(2);
 
     let protocol = xylem_protocols::redis::RedisProtocol::new(Box::new(
@@ -122,11 +122,11 @@ fn test_redis_pipelined_multiple_connections() {
 /// pipelining depth.
 #[test]
 fn test_redis_pipelined_closed_loop() {
-    let _guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
+    let guard = common::redis::RedisGuard::new().expect("Failed to start Redis");
 
     println!("Running pipelined closed-loop test...");
 
-    let target_addr = "127.0.0.1:6379".parse().unwrap();
+    let target_addr = guard.addr();
     let duration = Duration::from_secs(2);
 
     let protocol = xylem_protocols::redis::RedisProtocol::new(Box::new(
