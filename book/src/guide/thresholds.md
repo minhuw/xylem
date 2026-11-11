@@ -89,7 +89,8 @@ fields added in later versions:
   `requests.sent`, `requests.completed`, `requests.errors`,
   `requests.timed_out`, `requests.failed`, `requests.late_responses`,
   `requests.late_sends`, `requests.unsent`, `latency.sample_count`,
-  `error_latency.sample_count`, `send_lag.sample_count`,
+  `latency.percentile_sample_count`, `error_latency.sample_count`,
+  `error_latency.percentile_sample_count`, `send_lag.sample_count`,
   `latency_breakdown.kernel_split_count`, the `sample_count` of each
   breakdown part, and any `_us` field written in full, such as
   `latency.p99_us`.
@@ -144,16 +145,29 @@ of fixed keys, and an unknown key in it is an error like anywhere else.
 A threshold fails when the run has no value for it, and its `observed` is
 `null`:
 
-- a `null` field, such as `send_lag` of a closed loop, `latency.min` when
+- a `null` field, such as `send_lag` of a closed loop, `latency.min_us` when
   no latency was recorded (see [latency fields](./output-formats.md#latency-fields)),
   or `latency_breakdown.host_stack_us` and `network_server_us` when no request
   had a kernel split (user-space timestamps, or a transport without kernel
   timestamps);
+- a duration field of `latency` or `error_latency` when its `sample_count`
+  is zero;
+- `std_dev_us` or `confidence_interval_us` of either summary when its
+  `sample_count` is less than two, even if legacy JSON contains a number;
+- a percentile of either summary when `percentile_sample_count` is missing,
+  `null` or zero, even if `sample_count` is positive;
 - a `rate` when nothing was sent;
 - a traffic group that recorded no requests, which is not in the results.
 
-The percentiles and mean of `latency` and `error_latency` are 0, not `null`,
-without samples: a run without error replies passes `error_latency` ceilings.
+These rules apply to summary aggregations and full field paths. JSON uses a
+numeric zero placeholder for the mean when no latency was recorded, and for
+percentiles when the estimator has no samples; those placeholders do not pass
+thresholds. Older files can have a zero sample count even when observations
+existed; without a trustworthy positive count, thresholds conservatively treat
+the values as unavailable and leave the JSON unchanged. For example, an
+`error_latency` ceiling fails when the run has no error replies. A genuine
+measured zero can pass when the required counts are available, and the counts
+themselves can be checked even when zero.
 
 `--set` can set a threshold whose key has no dot, such as
 `--set 'thresholds.latency=["p99 < 1ms"]'`. A dot in the key, as in

@@ -16,8 +16,11 @@ use xylem_core::stats::{
     TupleStatsCollector, LATE_SEND_THRESHOLD,
 };
 
-/// Latency summary in microseconds. Values the sampling policy cannot provide
-/// are `None`, written as `null` in JSON and `n/a` in text and HTML.
+/// Latency summary in microseconds. Optional min, max, standard deviation, and
+/// confidence interval fields use `null` in JSON when absent. Numeric mean and
+/// percentile values can be zero placeholders. The mean requires a nonzero
+/// `sample_count`; percentiles also require a nonzero `percentile_sample_count`.
+/// Text and HTML display unavailable values as `n/a`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LatencyStats {
     /// Smallest recorded latency; null when no latency was recorded.
@@ -37,11 +40,38 @@ pub struct LatencyStats {
     /// fewer than two latencies.
     pub confidence_interval_us: Option<f64>,
     /// Number of latencies recorded, after any sampling rate.
-    pub sample_count: usize,
+    pub sample_count: u64,
+    /// Retained percentile samples for reservoir policies, or total represented
+    /// observation weight for sketches and histograms, after aggregation.
+    /// Unknown for older serialized summaries that did not include this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub percentile_sample_count: Option<u64>,
     /// Latencies above a configured `max_value_us` of an HDR histogram, which
     /// were recorded at that bound. Omitted unless the bound is configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clamped_samples: Option<u64>,
+}
+
+impl LatencyStats {
+    /// The mean is meaningful only when a latency was recorded.
+    fn mean_for_display(&self) -> Option<f64> {
+        (self.sample_count > 0).then_some(self.mean_us)
+    }
+
+    /// Percentiles also require retained or represented percentile samples.
+    fn percentile_for_display(&self, value: f64) -> Option<f64> {
+        (self.sample_count > 0 && self.percentile_sample_count.unwrap_or(0) > 0).then_some(value)
+    }
+
+    /// Min and max require at least one recorded latency.
+    fn range_for_display(&self, value: Option<f64>) -> Option<f64> {
+        value.filter(|_| self.sample_count > 0)
+    }
+
+    /// Sample standard deviation and mean confidence interval require two.
+    fn dispersion_for_display(&self, value: Option<f64>) -> Option<f64> {
+        value.filter(|_| self.sample_count >= 2)
+    }
 }
 
 /// Lag of open-loop requests behind their intended send times, in
@@ -175,6 +205,11 @@ pub(crate) fn format_optional(value: Option<f64>) -> String {
     value.map_or_else(|| "n/a".to_string(), |value| format!("{value:.2}"))
 }
 
+/// Format an optional sample count, preserving zero and large integers.
+fn format_optional_count(value: Option<u64>) -> String {
+    value.map_or_else(|| "n/a".to_string(), |value| value.to_string())
+}
+
 /// The error replies by kind, as ` (KIND: count, ...)`; empty without any.
 /// Kinds come from the server, so control characters are escaped.
 fn error_kinds(requests: &RequestCounts) -> String {
@@ -189,7 +224,7 @@ fn error_kinds(requests: &RequestCounts) -> String {
     format!(" ({})", kinds.join(", "))
 }
 
-/// Per-second per-connection statistics record
+/// Statistics for one (time bucket, group, thread, connection) tuple.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatsRecord {
     pub time_secs: f64,
@@ -199,12 +234,39 @@ pub struct StatsRecord {
     pub thread_id: usize,
     pub connection_id: usize,
     pub request_count: u64,
+    /// Recorded successful latencies for this tuple, after any sampling rate.
+    /// Unknown for records serialized before this field was added.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_sample_count: Option<u64>,
+    /// Samples retained by this tuple's reservoir, or observations represented
+    /// by its sketch or histogram. Aggregate reservoirs have their own capacity,
+    /// so their retained counts need not equal summed record counts. Unknown for
+    /// older serialized records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub percentile_sample_count: Option<u64>,
     pub throughput_rps: f64,
     pub throughput_mbps: f64,
     pub latency_p50_us: f64,
     pub latency_p99_us: f64,
     pub latency_p999_us: f64,
     pub latency_mean_us: f64,
+}
+
+impl StatsRecord {
+    /// Format the console preview using only this record's sample counts.
+    fn format_preview(&self) -> String {
+        let p99 = if self.latency_sample_count.unwrap_or(0) > 0
+            && self.percentile_sample_count.unwrap_or(0) > 0
+        {
+            format!("{:.2}μs", self.latency_p99_us)
+        } else {
+            "n/a".to_string()
+        };
+        format!(
+            "  t={:.1}s g={} t{} c={}: {:.0} rps, p99={p99}",
+            self.time_secs, self.group_id, self.thread_id, self.connection_id, self.throughput_rps
+        )
+    }
 }
 
 /// Write `results` to `path` as pretty-printed JSON, then print `message`
@@ -234,7 +296,7 @@ pub struct DetailedExperimentResults {
     pub validity: Vec<ValidityResult>,
     pub global: GlobalStats,
     pub traffic_groups: Vec<TrafficGroupResults>,
-    /// Raw statistics records at per-second per-connection granularity.
+    /// Raw statistics records per time bucket, group, thread and connection.
     /// Users can aggregate by time, group, or connection as needed.
     /// Only included when `stats.include_records = true` in config.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -390,7 +452,7 @@ impl DetailedExperimentResults {
     /// Create detailed results from tuple stats collector
     ///
     /// # Arguments
-    /// * `include_records` - Whether to include per-second per-connection records
+    /// * `include_records` - Whether to include per-bucket, per-connection records
     pub fn from_tuple_stats(
         experiment_name: String,
         experiment_description: Option<String>,
@@ -408,8 +470,6 @@ impl DetailedExperimentResults {
         // Rates cover the measurement window, which excludes setup and
         // warmup; collectors that never ran a worker fall back to `duration`.
         let measured = tuple_stats.measured_duration().unwrap_or(duration);
-
-        let actual_load_loop = tuple_stats.actual_load_loop_unix_us();
 
         // Aggregate global stats
         let global_aggregated = tuple_stats.aggregate_global(measured);
@@ -432,6 +492,8 @@ impl DetailedExperimentResults {
                         thread_id: key.thread_id,
                         connection_id: key.connection_id,
                         request_count: entry.request_count,
+                        latency_sample_count: Some(entry.latency.count()),
+                        percentile_sample_count: Some(entry.latency.percentile_sample_count()),
                         throughput_rps: entry.request_count as f64 / width_secs,
                         throughput_mbps: (total_bytes * 8.0) / (width_secs * 1_000_000.0),
                         latency_p50_us: latency_percentiles[0] as f64 / 1000.0,
@@ -508,8 +570,8 @@ impl DetailedExperimentResults {
                 description: experiment_description,
                 duration_secs,
                 measured_duration_secs: measured.as_secs_f64(),
-                actual_load_loop_start_unix_us: actual_load_loop.map(|(start, _)| start),
-                actual_load_loop_end_unix_us: actual_load_loop.map(|(_, end)| end),
+                actual_load_loop_start_unix_us: tuple_stats.actual_load_loop_unix_us().map(|v| v.0),
+                actual_load_loop_end_unix_us: tuple_stats.actual_load_loop_unix_us().map(|v| v.1),
                 seed,
             },
             target: TargetMetadata {
@@ -543,32 +605,62 @@ impl DetailedExperimentResults {
             p99999_us: micros(aggregated.latency_p99999),
             std_dev_us: aggregated.std_dev.map(micros),
             confidence_interval_us: aggregated.confidence_interval.map(micros),
-            sample_count: aggregated.latency_sample_count as usize,
+            sample_count: aggregated.latency_sample_count,
+            percentile_sample_count: aggregated.percentile_sample_count,
             clamped_samples: aggregated.clamped_samples,
         }
     }
 
-    /// Print the latency summary lines with `indent` before each label.
-    fn print_latency(latency: &LatencyStats, indent: &str) {
-        // Values start in column 17, as in the rest of the summary.
+    /// Format the latency summary lines with `indent` before each label.
+    fn format_latency(latency: &LatencyStats, indent: &str) -> String {
+        // Align values in column 17 when the label fits.
         let width = 17 - indent.len();
-        let line = |label: &str, value: String| println!("{indent}{label:<width$}{value}");
-        line("Mean:", format!("{:.2}", latency.mean_us));
-        line("Min:", format_optional(latency.min_us));
-        line("Max:", format_optional(latency.max_us));
-        line("p50:", format!("{:.2}", latency.p50_us));
-        line("p95:", format!("{:.2}", latency.p95_us));
-        line("p99:", format!("{:.2}", latency.p99_us));
-        line("p999:", format!("{:.2}", latency.p999_us));
-        line("Std Dev:", format_optional(latency.std_dev_us));
-        line(
-            "95% CI:",
-            latency.confidence_interval_us.map_or("n/a".into(), |ci| format!("±{ci:.2}")),
-        );
-        line("Samples:", latency.sample_count.to_string());
+        let mut lines = vec![
+            ("Mean:", format_optional(latency.mean_for_display())),
+            ("Min:", format_optional(latency.range_for_display(latency.min_us))),
+            ("Max:", format_optional(latency.range_for_display(latency.max_us))),
+            ("p50:", format_optional(latency.percentile_for_display(latency.p50_us))),
+            ("p95:", format_optional(latency.percentile_for_display(latency.p95_us))),
+            ("p99:", format_optional(latency.percentile_for_display(latency.p99_us))),
+            ("p999:", format_optional(latency.percentile_for_display(latency.p999_us))),
+            ("Std Dev:", format_optional(latency.dispersion_for_display(latency.std_dev_us))),
+            (
+                "95% CI:",
+                latency
+                    .dispersion_for_display(latency.confidence_interval_us)
+                    .map_or("n/a".into(), |ci| format!("±{ci:.2}")),
+            ),
+            ("Samples:", latency.sample_count.to_string()),
+            ("Percentile samples:", format_optional_count(latency.percentile_sample_count)),
+        ];
         if let Some(clamped) = latency.clamped_samples {
-            line("Clamped:", clamped.to_string());
+            lines.push(("Clamped:", clamped.to_string()));
         }
+        lines
+            .into_iter()
+            .map(|(label, value)| {
+                let width = width.max(label.len() + 1);
+                format!("{indent}{label:<width$}{value}\n")
+            })
+            .collect()
+    }
+
+    /// Format the error latency summary with request-count-style indentation.
+    fn format_error_latency(latency: &LatencyStats, indent: &str) -> String {
+        let width = 17 - indent.len();
+        let line = |label: &str, value: String| {
+            let width = width.max(label.len() + 1);
+            format!("{indent}{label:<width$}{value}\n")
+        };
+        format!(
+            "{indent}Error latency (μs):\n{}{}{}{}{}{}",
+            line("  Mean:", format_optional(latency.mean_for_display())),
+            line("  p50:", format_optional(latency.percentile_for_display(latency.p50_us))),
+            line("  p99:", format_optional(latency.percentile_for_display(latency.p99_us))),
+            line("  Max:", format_optional(latency.range_for_display(latency.max_us))),
+            line("  Samples:", latency.sample_count.to_string()),
+            line("  Percentile samples:", format_optional_count(latency.percentile_sample_count)),
+        )
     }
 
     /// Print the request counts, error replies and send lags with `indent`
@@ -609,12 +701,7 @@ impl DetailedExperimentResults {
                 requests.errors
             );
             println!();
-            println!("{indent}Error latency (μs):");
-            line("  Mean:", format!("{:.2}", error_latency.mean_us));
-            line("  p50:", format!("{:.2}", error_latency.p50_us));
-            line("  p99:", format!("{:.2}", error_latency.p99_us));
-            line("  Max:", format_optional(error_latency.max_us));
-            line("  Samples:", error_latency.sample_count.to_string());
+            print!("{}", Self::format_error_latency(error_latency, indent));
         }
         println!();
         println!("{indent}Send lag (μs, late above {:.0}):", send_lag.late_threshold_us);
@@ -741,7 +828,7 @@ impl DetailedExperimentResults {
         println!("Bandwidth:       {:.2} Mbps", self.global.throughput_mbps);
         println!();
         println!("Latency (μs):");
-        Self::print_latency(&self.global.latency, "  ");
+        print!("{}", Self::format_latency(&self.global.latency, "  "));
         println!();
         Self::print_requests(
             &self.global.requests,
@@ -772,7 +859,7 @@ impl DetailedExperimentResults {
             println!("  Bandwidth:     {:.2} Mbps", group.stats.throughput_mbps);
             println!();
             println!("  Latency (μs):");
-            Self::print_latency(&group.stats.latency, "    ");
+            print!("{}", Self::format_latency(&group.stats.latency, "    "));
             println!();
             Self::print_requests(
                 &group.stats.requests,
@@ -813,16 +900,8 @@ impl DetailedExperimentResults {
 
             // Show first few entries
             println!("Sample records (time, group, thread, conn, rps, p99):");
-            for r in self.records.iter().take(10) {
-                println!(
-                    "  t={:.1}s g={} t{} c={}: {:.0} rps, p99={:.2}μs",
-                    r.time_secs,
-                    r.group_id,
-                    r.thread_id,
-                    r.connection_id,
-                    r.throughput_rps,
-                    r.latency_p99_us
-                );
+            for record in self.records.iter().take(10) {
+                println!("{}", record.format_preview());
             }
             if self.records.len() > 10 {
                 println!("  ... and {} more records", self.records.len() - 10);
@@ -950,4 +1029,774 @@ fn write_html_file(results: &DetailedExperimentResults, path: &Path) -> Result<(
         return Err(e);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod percentile_count_tests {
+    use super::*;
+
+    #[test]
+    fn latency_sample_count_preserves_u64_in_output_and_thresholds() {
+        let mut config: crate::config::ProfileConfig = toml::from_str(
+            r#"
+[experiment]
+name = "latency-count"
+duration = "1s"
+
+[[traffic_groups]]
+name = "api"
+target = "unused"
+protocol = "xylem-echo"
+threads = [0]
+connections_per_thread = 1
+traffic_policy = { type = "closed-loop" }
+
+[output]
+file = "unused"
+
+[thresholds]
+latency = ["mean == 5us", "p99 == 5us"]
+"#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+
+        let duration = Duration::from_secs(1);
+        let mut collector =
+            TupleStatsCollector::new(xylem_core::stats::SamplingPolicy::Unlimited, duration);
+        collector.record_latency(0, 0, Duration::from_micros(5));
+        let mut summary = collector.aggregate_global(duration);
+        let mut results = DetailedExperimentResults::from_tuple_stats(
+            "latency-count".into(),
+            None,
+            None,
+            "unused".into(),
+            "xylem-echo".into(),
+            "tcp".into(),
+            duration,
+            &collector,
+            &config.traffic_groups,
+            false,
+        );
+
+        for count in [0, 1, u32::MAX as u64, u32::MAX as u64 + 1, u32::MAX as u64 + 2, u64::MAX] {
+            // Change only the aggregate count; no large number of samples is needed.
+            summary.latency_sample_count = count;
+            let stats = DetailedExperimentResults::latency_stats(&summary);
+            let sample_count: u64 = stats.sample_count;
+            assert_eq!(sample_count, count);
+
+            let json = serde_json::to_string(&stats).unwrap();
+            let value: JsonValue = serde_json::from_str(&json).unwrap();
+            assert_eq!(value["sample_count"].as_u64(), Some(count));
+            let decoded: LatencyStats = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded.sample_count, count);
+            results.global.latency = decoded;
+            let output = serde_json::to_value(&results).unwrap();
+            assert_eq!(output["global"]["latency"]["sample_count"].as_u64(), Some(count));
+
+            let verdict = crate::thresholds::evaluate(&mut results, &config);
+            assert_eq!(
+                verdict,
+                if count == 0 {
+                    Verdict::ThresholdsFailed
+                } else {
+                    Verdict::Pass
+                },
+                "count {count}"
+            );
+            assert_eq!(results.thresholds.len(), 2);
+            for threshold in &results.thresholds {
+                assert_eq!(threshold.observed, (count > 0).then_some(5.0), "count {count}");
+            }
+        }
+    }
+
+    #[test]
+    fn latency_json_includes_percentile_count_and_accepts_old_output() {
+        let policy = xylem_core::stats::SamplingPolicy::Limited { max_samples: 3, rate: 1.0 };
+        let mut collector = TupleStatsCollector::new(policy, Duration::from_secs(1));
+        for _ in 0..10 {
+            collector.record_latency(0, 0, Duration::from_micros(5));
+        }
+        let summary = collector.aggregate_global(Duration::from_secs(1));
+        let stats = DetailedExperimentResults::latency_stats(&summary);
+        assert_eq!((stats.sample_count, stats.percentile_sample_count), (10, Some(3)));
+        let mut json = serde_json::to_value(stats).unwrap();
+        assert_eq!(json["percentile_sample_count"], 3);
+        let decoded: LatencyStats = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(decoded.percentile_sample_count, Some(3));
+        json.as_object_mut().unwrap().remove("percentile_sample_count");
+        let old: LatencyStats = serde_json::from_value(json).unwrap();
+        assert_eq!(old.percentile_sample_count, None);
+        assert!(serde_json::to_value(&old).unwrap().get("percentile_sample_count").is_none());
+        assert_eq!(old.sample_count, 10);
+    }
+
+    #[test]
+    fn freshly_computed_empty_summaries_serialize_zero() {
+        let mut collector = TupleStatsCollector::new(
+            xylem_core::stats::SamplingPolicy::None,
+            Duration::from_secs(1),
+        );
+        collector.record_latency(1, 0, Duration::from_micros(5));
+        collector.record_error_reply(1, 0, "error", Duration::from_micros(5));
+        let duration = Duration::from_secs(1);
+        for summary in [
+            collector.aggregate_global(duration),
+            collector.aggregate_by_group(duration)[&1].clone(),
+            collector.error_latency_global(),
+            collector.error_latency(1),
+        ] {
+            let stats = DetailedExperimentResults::latency_stats(&summary);
+            assert_eq!(stats.percentile_sample_count, Some(0));
+            let json = serde_json::to_value(stats).unwrap();
+            assert_eq!(json.get("percentile_sample_count"), Some(&serde_json::json!(0)));
+            let decoded: LatencyStats = serde_json::from_value(json).unwrap();
+            assert_eq!(decoded.percentile_sample_count, Some(0));
+        }
+    }
+}
+
+#[cfg(test)]
+mod latency_display_tests {
+    use super::*;
+    use xylem_core::stats::SamplingPolicy;
+    use xylem_core::traffic_group::{OnError, PolicyConfig, TrafficGroupConfig};
+
+    #[derive(Clone, Copy, Debug)]
+    enum Case {
+        NoSamples,
+        ZeroRetained,
+        LegacyUnknown,
+        LegacyNull,
+        ObservedZero,
+        ObservedNonzero,
+        EmptyWithStaleValues,
+    }
+
+    const CASES: [Case; 7] = [
+        Case::NoSamples,
+        Case::ZeroRetained,
+        Case::LegacyUnknown,
+        Case::LegacyNull,
+        Case::ObservedZero,
+        Case::ObservedNonzero,
+        Case::EmptyWithStaleValues,
+    ];
+
+    impl Case {
+        fn expected(self) -> (&'static str, &'static str, Option<f64>) {
+            match self {
+                Self::NoSamples | Self::EmptyWithStaleValues => ("n/a", "n/a", None),
+                Self::ZeroRetained | Self::LegacyUnknown | Self::LegacyNull => {
+                    ("7.00", "n/a", None)
+                }
+                Self::ObservedZero => ("0.00", "0.00", Some(0.0)),
+                Self::ObservedNonzero => ("7.00", "7.00", Some(7.0)),
+            }
+        }
+
+        fn expected_percentile_count(self) -> &'static str {
+            match self {
+                Self::NoSamples | Self::ZeroRetained => "0",
+                Self::LegacyUnknown | Self::LegacyNull => "n/a",
+                Self::ObservedZero | Self::ObservedNonzero | Self::EmptyWithStaleValues => "1",
+            }
+        }
+    }
+
+    fn results(case: Case) -> DetailedExperimentResults {
+        let policy = match case {
+            Case::NoSamples => SamplingPolicy::None,
+            Case::ZeroRetained => SamplingPolicy::Limited { max_samples: 0, rate: 1.0 },
+            _ => SamplingPolicy::Unlimited,
+        };
+        let latency = if matches!(case, Case::ObservedZero) {
+            Duration::ZERO
+        } else {
+            Duration::from_micros(7)
+        };
+        let duration = Duration::from_secs(1);
+        let mut collector = TupleStatsCollector::new(policy.clone(), duration);
+        collector.record_latency(0, 0, latency);
+        collector.record_error_reply(0, 0, "<error>", latency);
+        let group = TrafficGroupConfig {
+            name: "api <&>".into(),
+            threads: vec![0],
+            connections_per_thread: 1,
+            max_pending_per_connection: 1,
+            request_timeout: None,
+            on_error: OnError::Count,
+            timestamps: Default::default(),
+            protocol: "xylem-echo".into(),
+            target: "unused".into(),
+            transport: "tcp".into(),
+            traffic_policy: PolicyConfig::ClosedLoop,
+            sampling_policy: policy,
+            protocol_config: None,
+        };
+        let mut results = DetailedExperimentResults::from_tuple_stats(
+            "display <&>".into(),
+            None,
+            None,
+            "unused".into(),
+            "xylem-echo".into(),
+            "tcp".into(),
+            duration,
+            &collector,
+            &[group],
+            false,
+        );
+        assert_eq!(results.traffic_groups.len(), 1);
+        assert_eq!(results.global.requests.errors, 1);
+        assert_eq!(results.traffic_groups[0].stats.requests.errors, 1);
+
+        if matches!(case, Case::LegacyUnknown | Case::LegacyNull) {
+            let mut json = serde_json::to_value(&results).unwrap();
+            for path in [
+                "/global/latency",
+                "/global/error_latency",
+                "/traffic_groups/0/stats/latency",
+                "/traffic_groups/0/stats/error_latency",
+            ] {
+                let summary = json.pointer_mut(path).unwrap().as_object_mut().unwrap();
+                if matches!(case, Case::LegacyNull) {
+                    summary.insert("percentile_sample_count".into(), serde_json::Value::Null);
+                } else {
+                    summary.remove("percentile_sample_count");
+                }
+            }
+            results = serde_json::from_value(json).unwrap();
+        }
+        if matches!(case, Case::EmptyWithStaleValues) {
+            let group = &mut results.traffic_groups[0].stats;
+            for summary in [
+                &mut results.global.latency,
+                &mut results.global.error_latency,
+                &mut group.latency,
+                &mut group.error_latency,
+            ] {
+                // Older summaries can contain placeholder values even with no samples.
+                summary.sample_count = 0;
+            }
+        }
+        results
+    }
+
+    fn assert_summary_counts(case: Case, results: &DetailedExperimentResults) {
+        let group = &results.traffic_groups[0].stats;
+        for summary in [
+            &results.global.latency,
+            &results.global.error_latency,
+            &group.latency,
+            &group.error_latency,
+        ] {
+            let expected = match case {
+                Case::NoSamples => (0, Some(0)),
+                Case::ZeroRetained => (1, Some(0)),
+                Case::LegacyUnknown | Case::LegacyNull => (1, None),
+                Case::ObservedZero | Case::ObservedNonzero => (1, Some(1)),
+                Case::EmptyWithStaleValues => (0, Some(1)),
+            };
+            assert_eq!(
+                (summary.sample_count, summary.percentile_sample_count),
+                expected,
+                "{case:?}"
+            );
+        }
+    }
+
+    fn assert_text_line(text: &str, indent: &str, label: &str, value: &str) {
+        let width = (17 - indent.len()).max(label.len() + 1);
+        let expected = format!("{indent}{label:<width$}{value}\n");
+        assert!(text.contains(&expected), "missing {expected:?} in {text:?}");
+    }
+
+    #[test]
+    fn text_latency_summaries_show_only_available_values() {
+        for case in CASES {
+            let results = results(case);
+            assert_summary_counts(case, &results);
+            let (mean, percentile, _) = case.expected();
+            let group = &results.traffic_groups[0].stats;
+            for (summary, indent) in [(&results.global.latency, "  "), (&group.latency, "    ")] {
+                let text = DetailedExperimentResults::format_latency(summary, indent);
+                assert_text_line(&text, indent, "Mean:", mean);
+                for label in ["p50:", "p95:", "p99:", "p999:"] {
+                    assert_text_line(&text, indent, label, percentile);
+                }
+                assert_text_line(&text, indent, "Samples:", &summary.sample_count.to_string());
+                assert_text_line(
+                    &text,
+                    indent,
+                    "Percentile samples:",
+                    case.expected_percentile_count(),
+                );
+            }
+            for (summary, indent) in
+                [(&results.global.error_latency, ""), (&group.error_latency, "  ")]
+            {
+                let text = DetailedExperimentResults::format_error_latency(summary, indent);
+                assert!(text.starts_with(&format!("{indent}Error latency (μs):\n")));
+                assert_text_line(&text, indent, "  Mean:", mean);
+                assert_text_line(&text, indent, "  p50:", percentile);
+                assert_text_line(&text, indent, "  p99:", percentile);
+                assert_text_line(&text, indent, "  Samples:", &summary.sample_count.to_string());
+                assert_text_line(
+                    &text,
+                    indent,
+                    "  Percentile samples:",
+                    case.expected_percentile_count(),
+                );
+            }
+        }
+
+        // Zero clamped samples remain a known count even without latencies.
+        let mut latency = results(Case::NoSamples).global.latency;
+        latency.clamped_samples = Some(0);
+        let text = DetailedExperimentResults::format_latency(&latency, "  ");
+        assert_text_line(&text, "  ", "Clamped:", "0");
+    }
+
+    fn html_row<'a>(section: &'a str, label: &str) -> &'a str {
+        section
+            .split_once(&format!("<td>{label}</td>"))
+            .unwrap_or_else(|| panic!("missing HTML row {label}"))
+            .1
+            .split_once("<td>")
+            .unwrap()
+            .1
+            .split_once("</td>")
+            .unwrap()
+            .0
+    }
+
+    fn html_card<'a>(section: &'a str, label: &str) -> &'a str {
+        section
+            .split_once(&format!("<div class=\"stat-label\">{label}</div>"))
+            .unwrap_or_else(|| panic!("missing HTML card {label}"))
+            .1
+            .split_once("<div class=\"stat-value\">")
+            .unwrap()
+            .1
+            .split_once("</div>")
+            .unwrap()
+            .0
+    }
+
+    fn chart_data(html: &str, chart_id: &str) -> Vec<Option<f64>> {
+        let chart = html.split_once(&format!("document.getElementById('{chart_id}')")).unwrap().1;
+        let data = chart.split_once("data: [").unwrap().1;
+        let data = data.split_once(']').unwrap().0;
+        serde_json::from_str(&format!("[{data}]")).unwrap()
+    }
+
+    fn html_value(value: &str) -> String {
+        if value == "n/a" {
+            value.to_string()
+        } else {
+            format!("{value} μs")
+        }
+    }
+
+    #[test]
+    fn html_latency_summaries_and_charts_show_only_available_values() {
+        for case in CASES {
+            let results = results(case);
+            assert_summary_counts(case, &results);
+            let json_before = serde_json::to_value(&results).unwrap();
+            let report = tempfile::NamedTempFile::new().unwrap();
+            html::generate_html_report(&results, report.path().to_str().unwrap()).unwrap();
+            let report = std::fs::read_to_string(report.path()).unwrap();
+            assert_eq!(serde_json::to_value(&results).unwrap(), json_before);
+
+            let (mean, percentile, chart_value) = case.expected();
+            let global = report.split_once("<h2>Traffic Groups Comparison</h2>").unwrap().0;
+            let group = report.split_once("<div class=\"group-section\">").unwrap().1;
+            assert!(global.contains(&format!(
+                "<div class=\"stat-label\">Median Latency</div>\n                <div class=\"stat-value\">{}</div>",
+                html_value(percentile)
+            )), "{case:?}");
+            assert_eq!(
+                html_card(global, "Latency Samples"),
+                results.global.latency.sample_count.to_string(),
+                "{case:?}"
+            );
+            assert_eq!(
+                html_card(global, "Latency Percentile Samples"),
+                case.expected_percentile_count(),
+                "{case:?}"
+            );
+            for (section, summary) in [
+                (global, &results.global.error_latency),
+                (group, &results.traffic_groups[0].stats.error_latency),
+            ] {
+                assert_eq!(
+                    html_row(section, "Mean Error Reply Latency"),
+                    html_value(mean),
+                    "{case:?}"
+                );
+                assert_eq!(
+                    html_row(section, "p99 Error Reply Latency"),
+                    html_value(percentile),
+                    "{case:?}"
+                );
+                assert_eq!(
+                    html_row(section, "Error Reply Latency Samples"),
+                    summary.sample_count.to_string(),
+                    "{case:?}"
+                );
+                assert_eq!(
+                    html_row(section, "Error Reply Latency Percentile Samples"),
+                    case.expected_percentile_count(),
+                    "{case:?}"
+                );
+                assert!(html_row(section, "Error Replies").contains("&lt;error&gt;"));
+            }
+            assert_eq!(
+                html_row(group, "Latency Samples"),
+                results.traffic_groups[0].stats.latency.sample_count.to_string(),
+                "{case:?}"
+            );
+            assert_eq!(
+                html_row(group, "Latency Percentile Samples"),
+                case.expected_percentile_count(),
+                "{case:?}"
+            );
+            assert_eq!(html_row(group, "Mean Latency"), html_value(mean), "{case:?}");
+            for label in ["p50 Latency", "p99 Latency"] {
+                assert_eq!(html_row(group, label), html_value(percentile), "{case:?}");
+            }
+            assert_eq!(chart_data(&report, "globalLatencyChart"), vec![chart_value; 5], "{case:?}");
+            assert_eq!(chart_data(&report, "groupLatencyChart0"), vec![chart_value; 4], "{case:?}");
+            assert!(report.contains("Xylem Experiment Report: display &lt;&amp;&gt;"));
+            assert!(group.contains("Traffic Group 0: api &lt;&amp;&gt;"));
+
+            let paths = [
+                "/global/latency",
+                "/global/error_latency",
+                "/traffic_groups/0/stats/latency",
+                "/traffic_groups/0/stats/error_latency",
+            ];
+            for path in paths {
+                let summary = json_before.pointer(path).unwrap();
+                let expected_mean = match case {
+                    Case::NoSamples | Case::ObservedZero => 0.0,
+                    _ => 7.0,
+                };
+                let expected_percentile = match case {
+                    Case::NoSamples | Case::ZeroRetained | Case::ObservedZero => 0.0,
+                    _ => 7.0,
+                };
+                assert_eq!(summary["mean_us"], expected_mean, "{case:?}");
+                for field in ["p50_us", "p95_us", "p99_us", "p999_us", "p9999_us", "p99999_us"] {
+                    assert_eq!(summary[field], expected_percentile, "{case:?} {field}");
+                }
+                assert_eq!(
+                    summary.get("percentile_sample_count").is_none(),
+                    matches!(case, Case::LegacyUnknown | Case::LegacyNull)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn global_group_and_error_displays_use_their_own_sample_counts() {
+        let mut results = results(Case::ObservedNonzero);
+        results.global.latency.sample_count = u64::MAX;
+        results.global.latency.percentile_sample_count = Some(u64::MAX);
+        results.global.error_latency.sample_count = 0;
+        results.global.error_latency.percentile_sample_count = None;
+        results.traffic_groups[0].stats.latency.percentile_sample_count = Some(0);
+        results.traffic_groups[0].stats.error_latency.sample_count = 8;
+        results.traffic_groups[0].stats.error_latency.percentile_sample_count = Some(3);
+        let group = &results.traffic_groups[0].stats;
+
+        let global_text = DetailedExperimentResults::format_latency(&results.global.latency, "  ");
+        let group_text = DetailedExperimentResults::format_latency(&group.latency, "    ");
+        assert_text_line(&global_text, "  ", "p99:", "7.00");
+        assert_text_line(&global_text, "  ", "Percentile samples:", "18446744073709551615");
+        assert_text_line(&group_text, "    ", "Mean:", "7.00");
+        assert_text_line(&group_text, "    ", "p99:", "n/a");
+        assert_text_line(&group_text, "    ", "Percentile samples:", "0");
+        let global_error =
+            DetailedExperimentResults::format_error_latency(&results.global.error_latency, "");
+        let group_error =
+            DetailedExperimentResults::format_error_latency(&group.error_latency, "  ");
+        assert_text_line(&global_error, "", "  Mean:", "n/a");
+        assert_text_line(&global_error, "", "  p99:", "n/a");
+        assert_text_line(&global_error, "", "  Percentile samples:", "n/a");
+        assert_text_line(&group_error, "  ", "  Mean:", "7.00");
+        assert_text_line(&group_error, "  ", "  p99:", "7.00");
+        assert_text_line(&group_error, "  ", "  Percentile samples:", "3");
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        html::generate_html_report(&results, file.path().to_str().unwrap()).unwrap();
+        let report = std::fs::read_to_string(file.path()).unwrap();
+        let global = report.split_once("<h2>Traffic Groups Comparison</h2>").unwrap().0;
+        let group = report.split_once("<div class=\"group-section\">").unwrap().1;
+        assert_eq!(html_card(global, "Latency Percentile Samples"), "18446744073709551615");
+        assert_eq!(html_row(global, "Mean Error Reply Latency"), "n/a");
+        assert_eq!(html_row(global, "p99 Error Reply Latency"), "n/a");
+        assert_eq!(html_row(global, "Error Reply Latency Percentile Samples"), "n/a");
+        assert_eq!(html_row(group, "Mean Latency"), "7.00 μs");
+        assert_eq!(html_row(group, "p99 Latency"), "n/a");
+        assert_eq!(html_row(group, "Latency Percentile Samples"), "0");
+        assert_eq!(html_row(group, "Mean Error Reply Latency"), "7.00 μs");
+        assert_eq!(html_row(group, "p99 Error Reply Latency"), "7.00 μs");
+        assert_eq!(html_row(group, "Error Reply Latency Percentile Samples"), "3");
+        assert_eq!(chart_data(&report, "globalLatencyChart"), vec![Some(7.0); 5]);
+        assert_eq!(chart_data(&report, "groupLatencyChart0"), vec![None; 4]);
+    }
+}
+
+#[cfg(test)]
+mod raw_record_tests {
+    use super::*;
+    use xylem_core::stats::SamplingPolicy;
+    use xylem_core::traffic_group::{OnError, PolicyConfig, TrafficGroupConfig};
+
+    fn group(id: usize, sampling_policy: SamplingPolicy) -> TrafficGroupConfig {
+        TrafficGroupConfig {
+            name: format!("group-{id}"),
+            threads: vec![0],
+            connections_per_thread: 4,
+            max_pending_per_connection: 1,
+            request_timeout: None,
+            on_error: OnError::Count,
+            timestamps: Default::default(),
+            protocol: "xylem-echo".into(),
+            target: "unused".into(),
+            transport: "tcp".into(),
+            traffic_policy: PolicyConfig::ClosedLoop,
+            sampling_policy,
+            protocol_config: None,
+        }
+    }
+
+    fn build_results(
+        collector: &TupleStatsCollector,
+        groups: &[TrafficGroupConfig],
+        include_records: bool,
+    ) -> DetailedExperimentResults {
+        DetailedExperimentResults::from_tuple_stats(
+            "records".into(),
+            None,
+            None,
+            "unused".into(),
+            "xylem-echo".into(),
+            "tcp".into(),
+            Duration::from_secs(1),
+            collector,
+            groups,
+            include_records,
+        )
+    }
+
+    fn record(results: &DetailedExperimentResults, group: usize, conn: usize) -> &StatsRecord {
+        results
+            .records
+            .iter()
+            .find(|record| record.group_id == group && record.connection_id == conn)
+            .unwrap()
+    }
+
+    #[test]
+    fn records_use_their_own_collector_counts_and_preserve_numeric_latencies() {
+        let policies = [
+            SamplingPolicy::None,
+            SamplingPolicy::Limited { max_samples: 0, rate: 1.0 },
+            SamplingPolicy::Limited { max_samples: 8, rate: 0.0 },
+            SamplingPolicy::Limited { max_samples: 2, rate: 1.0 },
+            SamplingPolicy::Unlimited,
+            SamplingPolicy::Limited { max_samples: 3, rate: 0.5 },
+            SamplingPolicy::DdSketch { alpha: 0.01, max_bins: 1024 },
+            SamplingPolicy::TDigest { compression: 100 },
+            SamplingPolicy::HdrHistogram { sigfigs: 3, max_value_us: None },
+        ];
+        let groups: Vec<_> = policies
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(id, policy)| group(id, policy))
+            .collect();
+        // Global sampling differs from some group policies, so its counts
+        // cannot establish whether an individual entry has samples.
+        let mut collector =
+            TupleStatsCollector::new(SamplingPolicy::Unlimited, Duration::from_secs(3600));
+        for (id, policy) in policies.into_iter().enumerate() {
+            collector.register_group_policy(id, policy);
+        }
+        for (group, count) in [(0, 1), (1, 2), (2, 3), (3, 5), (5, 128), (6, 4), (7, 4), (8, 4)] {
+            for _ in 0..count {
+                collector.record_latency(group, 0, Duration::from_micros(7));
+            }
+        }
+        collector.record_latency(4, 0, Duration::ZERO);
+        collector.record_error_reply(4, 1, "error", Duration::from_micros(5));
+        collector.record_latency(4, 2, Duration::from_micros(11));
+        collector.end_measurement(xylem_core::timing::time_ns());
+        collector.record_latency(4, 3, Duration::from_micros(9));
+
+        let results = build_results(&collector, &groups, true);
+        assert_eq!(results.records.len(), collector.entries().len());
+        assert!(results.global.latency.sample_count > 0);
+        assert!(results.traffic_groups[4].stats.latency.sample_count > 0);
+        for (key, entry) in collector.entries() {
+            let record = record(&results, key.group_id, key.connection_id);
+            let percentiles = entry.latency.percentiles(&[0.5, 0.99, 0.999]);
+            assert_eq!(record.thread_id, key.thread_id);
+            assert_eq!(record.request_count, entry.request_count);
+            assert_eq!(record.latency_sample_count, Some(entry.latency.count()));
+            assert_eq!(
+                record.percentile_sample_count,
+                Some(entry.latency.percentile_sample_count())
+            );
+            assert_eq!(record.latency_mean_us, entry.latency.mean() as f64 / 1000.0);
+            assert_eq!(record.latency_p50_us, percentiles[0] as f64 / 1000.0);
+            assert_eq!(record.latency_p99_us, percentiles[1] as f64 / 1000.0);
+            assert_eq!(record.latency_p999_us, percentiles[2] as f64 / 1000.0);
+        }
+
+        let check = |group, conn, requests, samples, percentiles, mean, p99, preview: &str| {
+            let record = record(&results, group, conn);
+            assert_eq!(record.request_count, requests);
+            assert_eq!(record.latency_sample_count, Some(samples));
+            assert_eq!(record.percentile_sample_count, Some(percentiles));
+            assert_eq!(record.latency_mean_us, mean);
+            assert_eq!(record.latency_p99_us, p99);
+            assert!(record.format_preview().ends_with(preview), "{record:?}");
+            let json = serde_json::to_value(record).unwrap();
+            assert_eq!(json["latency_sample_count"], samples);
+            assert_eq!(json["percentile_sample_count"], percentiles);
+            assert_eq!(json["latency_mean_us"], mean);
+            assert_eq!(json["latency_p99_us"], p99);
+        };
+        check(0, 0, 1, 0, 0, 0.0, 0.0, "p99=n/a");
+        check(1, 0, 2, 2, 0, 7.0, 0.0, "p99=n/a");
+        check(2, 0, 3, 0, 0, 0.0, 0.0, "p99=n/a");
+        check(3, 0, 5, 5, 2, 7.0, 7.0, "p99=7.00μs");
+        check(4, 0, 1, 1, 1, 0.0, 0.0, "p99=0.00μs");
+        check(4, 1, 1, 0, 0, 0.0, 0.0, "p99=n/a");
+        check(4, 2, 1, 1, 1, 11.0, 11.0, "p99=11.00μs");
+        check(4, 3, 0, 1, 1, 9.0, 9.0, "p99=9.00μs");
+
+        // A legacy record stays unknown even in a full result whose group and
+        // global summaries have known percentile samples.
+        let mut json = serde_json::to_value(&results).unwrap();
+        let legacy_record = json["records"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|record| record["group_id"] == 4 && record["connection_id"] == 0)
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
+        legacy_record.remove("latency_sample_count");
+        legacy_record.remove("percentile_sample_count");
+        let decoded: DetailedExperimentResults = serde_json::from_value(json).unwrap();
+        assert!(decoded.global.latency.percentile_sample_count.unwrap() > 0);
+        assert!(decoded.traffic_groups[4].stats.latency.percentile_sample_count.unwrap() > 0);
+        assert!(record(&decoded, 4, 0).format_preview().ends_with("p99=n/a"));
+        assert!(record(&decoded, 4, 2).format_preview().ends_with("p99=11.00μs"));
+        let reserialized = serde_json::to_value(&decoded).unwrap();
+        let legacy_record = reserialized["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["group_id"] == 4 && record["connection_id"] == 0)
+            .unwrap();
+        assert!(legacy_record.get("latency_sample_count").is_none());
+        assert!(legacy_record.get("percentile_sample_count").is_none());
+        assert_eq!(legacy_record["latency_p99_us"], 0.0);
+
+        for group in 6..=8 {
+            let record = record(&results, group, 0);
+            assert_eq!(
+                (record.latency_sample_count, record.percentile_sample_count),
+                (Some(4), Some(4))
+            );
+        }
+
+        // The 50% filter is random, so check its actual entry counts instead
+        // of assuming how many observations passed the filter.
+        let sampled = record(&results, 5, 0);
+        let sampled_count = sampled.latency_sample_count.unwrap();
+        assert_eq!(sampled.request_count, 128);
+        assert!(sampled_count <= 128);
+        assert_eq!(sampled.percentile_sample_count, Some(sampled_count.min(3)));
+        assert_eq!(sampled.latency_mean_us, if sampled_count == 0 { 0.0 } else { 7.0 });
+        assert!(sampled.format_preview().ends_with(if sampled_count == 0 {
+            "p99=n/a"
+        } else {
+            "p99=7.00μs"
+        }));
+        assert!(build_results(&collector, &groups, false).records.is_empty());
+    }
+
+    #[test]
+    fn legacy_record_counts_are_unknown_omitted_and_used_for_preview() {
+        let legacy = serde_json::json!({
+            "time_secs": 1.0,
+            "group_id": 2,
+            "thread_id": 3,
+            "connection_id": 4,
+            "request_count": 9,
+            "throughput_rps": 9.0,
+            "throughput_mbps": 1.0,
+            "latency_p50_us": 0.0,
+            "latency_p99_us": 0.0,
+            "latency_p999_us": 0.0,
+            "latency_mean_us": 0.0
+        });
+        let decoded: StatsRecord = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!((decoded.latency_sample_count, decoded.percentile_sample_count), (None, None));
+        assert_eq!(decoded.format_preview(), "  t=1.0s g=2 t3 c=4: 9 rps, p99=n/a");
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), legacy);
+
+        // Even a nonzero legacy value is unavailable if either count is absent.
+        for missing in ["latency_sample_count", "percentile_sample_count"] {
+            let mut json = legacy.clone();
+            json["latency_p99_us"] = serde_json::json!(42.0);
+            json["latency_sample_count"] = serde_json::json!(1);
+            json["percentile_sample_count"] = serde_json::json!(1);
+            json.as_object_mut().unwrap().remove(missing);
+            let record: StatsRecord = serde_json::from_value(json).unwrap();
+            assert!(record.format_preview().ends_with("p99=n/a"));
+            let round_trip = serde_json::to_value(record).unwrap();
+            assert!(round_trip.get(missing).is_none());
+            assert_eq!(round_trip["latency_p99_us"], 42.0);
+        }
+
+        for (samples, percentiles, expected) in [
+            (Some(1), Some(1), "p99=0.00μs"),
+            (Some(0), Some(1), "p99=n/a"),
+            (Some(1), Some(0), "p99=n/a"),
+            (None, Some(1), "p99=n/a"),
+            (Some(1), None, "p99=n/a"),
+            (None, None, "p99=n/a"),
+        ] {
+            let mut json = legacy.clone();
+            json["latency_sample_count"] = serde_json::json!(samples);
+            json["percentile_sample_count"] = serde_json::json!(percentiles);
+            let record: StatsRecord = serde_json::from_value(json).unwrap();
+            assert_eq!(
+                (record.latency_sample_count, record.percentile_sample_count),
+                (samples, percentiles)
+            );
+            assert!(record.format_preview().ends_with(expected));
+            let round_trip = serde_json::to_value(record).unwrap();
+            for (field, value) in
+                [("latency_sample_count", samples), ("percentile_sample_count", percentiles)]
+            {
+                assert_eq!(round_trip.get(field).and_then(JsonValue::as_u64), value);
+                assert_eq!(round_trip.get(field).is_none(), value.is_none());
+            }
+            for field in ["latency_p50_us", "latency_p99_us", "latency_p999_us", "latency_mean_us"]
+            {
+                assert_eq!(round_trip[field], legacy[field]);
+            }
+        }
+    }
 }

@@ -40,9 +40,10 @@ pub enum SamplingPolicy {
     /// T-Digest: Adaptive clustering sketch optimized for extreme tail percentiles
     /// Better accuracy than DDSketch for p999+, fully mergeable
     TDigest {
-        /// Compression parameter (higher = more accurate, more memory)
-        /// Typical values: 100-1000
+        /// Positive compression parameter (higher = more accurate, more memory)
+        /// Default: 1000; typical values: 100-1000
         #[serde(default = "default_tdigest_compression")]
+        #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
         compression: usize,
     },
     /// HDR Histogram: records every latency with bounded relative error.

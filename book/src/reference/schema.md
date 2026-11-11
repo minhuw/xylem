@@ -280,12 +280,27 @@ figures, which records every latency and merges independently of order.
     - `rate` (float, default 1.0): fraction of latencies offered to the sample.
     - `max_samples` (integer, default 131072).
   - `"dd-sketch"` (`alpha`, `max_bins`) and `"t-digest"` (`compression`):
-    mergeable quantile sketches.
+    mergeable quantile sketches. T-digest `compression` must be a positive
+    integer; it defaults to 1000. Higher values use more memory and generally
+    improve accuracy. This requirement applies to both group and global policies.
   - `"none"`: Disable latency sampling (throughput/bytes still recorded)
 
 For every type except `none`, the mean, min, max, standard deviation and
 sample count are computed exactly from every recorded latency; only the
 percentiles depend on the storage type.
+
+DDSketch 0.4.2 uses floor-based value-to-bin mapping and corresponding bin
+representatives; 0.3.x used ceiling-based mapping. Approximate percentiles,
+and therefore percentile threshold results, can change for the same samples
+and `alpha`. `max_bins` limits the number of logarithmic bins, not a numeric
+latency range. When the observed values require more than that many bins, the
+lowest bins collapse and their estimates can exceed the configured relative
+error. Xylem places values up to and including 1 ns in the zero bucket and
+truncates estimated values to whole nanoseconds; these can also prevent a
+strict relative error bound, especially near zero.
+
+The dependency's public count saturates at `usize::MAX` on 32-bit targets;
+Xylem's independently tracked `u64` sample count preserves the recorded count.
 
 ```toml
 [traffic_groups.sampling_policy]

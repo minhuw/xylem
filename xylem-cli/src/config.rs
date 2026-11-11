@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use xylem_core::stats::SamplingPolicy;
 use xylem_core::traffic_group::{PolicyConfig, TimestampSourceConfig};
 
 mod keys;
@@ -293,6 +294,12 @@ impl ProfileConfig {
         if self.experiment.duration.as_secs() == 0 {
             errors.push(anyhow!("Experiment duration must be > 0"));
         }
+        if matches!(
+            self.stats.sampling_policy.as_ref(),
+            Some(SamplingPolicy::TDigest { compression: 0 })
+        ) {
+            errors.push(anyhow!("stats.sampling_policy.compression must be > 0 for t-digest"));
+        }
 
         let valid_transports: &[&str] = if ntcp::SUPPORTED {
             &["tcp", "udp", "unix", ntcp::TRANSPORT]
@@ -317,6 +324,14 @@ impl ProfileConfig {
         let mut protocol_configs = Vec::with_capacity(self.traffic_groups.len());
 
         for (i, group) in self.traffic_groups.iter().enumerate() {
+            if matches!(&group.sampling_policy, SamplingPolicy::TDigest { compression: 0 }) {
+                errors.push(anyhow!(
+                    "Traffic group {} '{}': sampling_policy.compression must be > 0 for t-digest",
+                    i,
+                    group.name
+                ));
+            }
+
             // Validate target address
             if group.target.is_empty() {
                 errors.push(anyhow!(
@@ -1046,6 +1061,168 @@ mod tests {
             .protocol_config
             .as_ref()
             .and_then(|pc| pc.get("keys").and_then(|v| serde_json::from_value(v.clone()).ok()))
+    }
+
+    fn redis_bench_profile() -> ProfileConfig {
+        ProfileConfig::from_file("../tests/redis/redis-bench.toml").unwrap()
+    }
+
+    #[test]
+    fn tdigest_zero_compression_is_rejected_for_global_policy() {
+        let mut config = redis_bench_profile();
+        config.stats.sampling_policy = Some(SamplingPolicy::TDigest { compression: 0 });
+        assert_eq!(
+            config.validate().unwrap_err().to_string(),
+            "stats.sampling_policy.compression must be > 0 for t-digest"
+        );
+    }
+
+    #[test]
+    fn tdigest_zero_compression_is_rejected_for_each_group() {
+        for (index, name) in [(0, "latency-agent"), (1, "throughput-agent")] {
+            let mut config = redis_bench_profile();
+            config.traffic_groups[index].sampling_policy =
+                SamplingPolicy::TDigest { compression: 0 };
+            assert_eq!(
+                config.validate().unwrap_err().to_string(),
+                format!(
+                    "Traffic group {index} '{name}': sampling_policy.compression must be > 0 for t-digest"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn tdigest_errors_are_aggregated_before_group_validation_continues() {
+        let mut config = redis_bench_profile();
+        config.experiment.duration = Duration::ZERO;
+        config.stats.sampling_policy = Some(SamplingPolicy::TDigest { compression: 0 });
+        for group in &mut config.traffic_groups {
+            group.sampling_policy = SamplingPolicy::TDigest { compression: 0 };
+        }
+        config.traffic_groups[0].protocol = "invalid".into();
+        config.traffic_groups[1].protocol_config = None;
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.starts_with("The profile has 6 errors:\n"), "{error}");
+        for expected in [
+            "Experiment duration must be > 0",
+            "stats.sampling_policy.compression must be > 0 for t-digest",
+            "Traffic group 0 'latency-agent': sampling_policy.compression must be > 0 for t-digest",
+            "Invalid protocol 'invalid' for traffic group 0 'latency-agent'",
+            "Traffic group 1 'throughput-agent': sampling_policy.compression must be > 0 for t-digest",
+            "Traffic group 1 'throughput-agent' has no protocol_config",
+        ] {
+            assert!(error.contains(expected), "{expected}: {error}");
+        }
+    }
+
+    #[test]
+    fn tdigest_default_one_and_large_compression_are_accepted() {
+        let mut config = ProfileConfig::from_file_with_overrides(
+            "../tests/redis/redis-bench.toml",
+            &[
+                r#"stats.sampling_policy={ type = "t-digest" }"#.into(),
+                r#"traffic_groups.0.sampling_policy={ type = "t-digest" }"#.into(),
+                r#"traffic_groups.1.sampling_policy={ type = "t-digest", compression = 1 }"#.into(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            config.stats.sampling_policy,
+            Some(SamplingPolicy::TDigest { compression: 1000 })
+        );
+        assert_eq!(
+            config.traffic_groups[0].sampling_policy,
+            SamplingPolicy::TDigest { compression: 1000 }
+        );
+        assert_eq!(
+            config.traffic_groups[1].sampling_policy,
+            SamplingPolicy::TDigest { compression: 1 }
+        );
+
+        config.stats.sampling_policy = Some(SamplingPolicy::TDigest { compression: 1 });
+        config.traffic_groups[0].sampling_policy =
+            SamplingPolicy::TDigest { compression: usize::MAX };
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn tdigest_overrides_are_validated_after_all_changes() {
+        let path = "../tests/redis/redis-bench.toml";
+        let error = ProfileConfig::from_file_with_overrides(
+            path,
+            &[
+                "stats.sampling_policy.type=t-digest".into(),
+                "stats.sampling_policy.compression=0".into(),
+                "traffic_groups.0.sampling_policy.type=t-digest".into(),
+                "traffic_groups.0.sampling_policy.compression=0".into(),
+                r#"traffic_groups.1.sampling_policy={ type = "t-digest", compression = 0 }"#.into(),
+            ],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.starts_with("The profile has 3 errors:\n"), "{error}");
+        for expected in [
+            "stats.sampling_policy.compression must be > 0 for t-digest",
+            "Traffic group 0 'latency-agent': sampling_policy.compression must be > 0 for t-digest",
+            "Traffic group 1 'throughput-agent': sampling_policy.compression must be > 0 for t-digest",
+        ] {
+            assert!(error.contains(expected), "{expected}: {error}");
+        }
+
+        // An override can also repair a bad value in the file before validation.
+        let source = std::fs::read_to_string(path).unwrap();
+        let source = source.replace("type = \"unlimited\"", "type = \"t-digest\"\ncompression = 0");
+        let source =
+            format!("{source}\nsampling_policy = {{ type = \"t-digest\", compression = 0 }}\n");
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), source).unwrap();
+        let error = ProfileConfig::from_file_with_overrides(file.path(), &[]).unwrap_err();
+        assert!(error.to_string().starts_with("The profile has 2 errors:\n"), "{error}");
+        let config = ProfileConfig::from_file_with_overrides(
+            file.path(),
+            &[
+                "stats.sampling_policy.compression=1".into(),
+                "traffic_groups.0.sampling_policy.compression=1".into(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(config.stats.sampling_policy, Some(SamplingPolicy::TDigest { compression: 1 }));
+        assert_eq!(
+            config.traffic_groups[0].sampling_policy,
+            SamplingPolicy::TDigest { compression: 1 }
+        );
+    }
+
+    #[test]
+    fn tdigest_schema_has_positive_compression_for_global_and_group_policies() {
+        let generated = serde_json::to_value(schemars::schema_for!(ProfileConfig)).unwrap();
+        let checked_in: serde_json::Value =
+            serde_json::from_str(include_str!("../../schema/profile.schema.json")).unwrap();
+        for schema in [&generated, &checked_in] {
+            let definitions = &schema["$defs"];
+            assert_eq!(
+                definitions["StatsConfig"]["properties"]["sampling_policy"]["anyOf"][0]["$ref"],
+                "#/$defs/SamplingPolicy"
+            );
+            assert_eq!(
+                definitions["TrafficGroupConfig"]["properties"]["sampling_policy"]["$ref"],
+                "#/$defs/SamplingPolicy"
+            );
+            let variant = definitions["SamplingPolicy"]["oneOf"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|variant| variant["properties"]["type"]["const"] == "t-digest")
+                .unwrap();
+            let compression = &variant["properties"]["compression"];
+            assert_eq!(compression["type"], "integer");
+            assert_eq!(compression["minimum"], 1);
+            assert_eq!(compression["default"], 1000);
+            assert!(compression.get("maximum").is_none());
+            assert!(!variant["required"].as_array().unwrap().contains(&"compression".into()));
+        }
     }
 
     #[test]

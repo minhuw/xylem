@@ -57,12 +57,12 @@ shared start.
 The JSON `experiment` object may also contain
 `actual_load_loop_start_unix_us` and `actual_load_loop_end_unix_us`: wall-clock
 microseconds since the Unix epoch on the machine running xylem. They give the
-earliest worker load-loop start and latest end, including any gaps between
-workers. Each loop starts after the shared start wait, ends before drain, and
-may include connection setup or warmup. These readings do not imply
-synchronization between guest and host clocks. Both fields are omitted if no
-interval was recorded or any worker's boundary is missing, reversed, or above
-`2^53 - 1`.
+earliest worker load-loop start and latest end, including gaps between worker
+loops. Each worker's sampling starts after the shared start wait and ends
+before the drain; protocol setup or warmup inside the loop may be included.
+These readings do not imply synchronization between guest and host clocks.
+Both fields are omitted if no interval was recorded or any worker's samples
+are missing, reversed, or above `2^53 - 1`.
 
 ## Request accounting
 
@@ -115,8 +115,9 @@ completes its request:
 - It counts in `completed`, `errors` and `errors_by_kind`, and toward
   `total_requests`, throughput and received bytes like any response.
 - Its latency goes to `error_latency`, which has the same fields as
-  `latency` and uses the group's sampling policy, and not to `latency` or the
-  [latency breakdown](#latency-breakdown). Fast rejections would otherwise
+  `latency`: the global summary uses the global sampling policy, and each
+  group summary uses that group's policy. It is not included in `latency` or
+  the [latency breakdown](#latency-breakdown). Fast rejections would otherwise
   pull the percentiles down, so `latency` and its `sample_count` cover
   successful responses only.
 - It is not fed back to an adaptive traffic policy, which would otherwise
@@ -282,9 +283,10 @@ NIC clock was converted to xylem's clock:
 
 ## Latency fields
 
-Each `latency` object in JSON (global and per group) holds, in microseconds:
+Each `latency` object in JSON (global and per group) holds these fields;
+durations are in microseconds:
 
-- `p50_us` ... `p99999_us`: percentiles from the group's sampling policy.
+- `p50_us` ... `p99999_us`: percentiles from the applicable sampling policy.
 - `mean_us`, `min_us`, `max_us`: exact, from every recorded latency.
 - `std_dev_us`: sample standard deviation.
 - `confidence_interval_us`: half-width of the 95% confidence interval of the
@@ -292,13 +294,29 @@ Each `latency` object in JSON (global and per group) holds, in microseconds:
 - `sample_count`: number of latencies recorded, after any `limited` rate.
   `latency` records successful responses only; `error_latency`, with the same
   fields, records [error replies](#error-replies).
+- `percentile_sample_count`: samples retained for percentiles by a reservoir,
+  or observations represented by a histogram or sketch, after aggregation.
+  Absent in legacy JSON, where the count is unknown.
 - `clamped_samples`: present only for an HDR histogram with `max_value_us`;
   the number of latencies above that bound, recorded as the bound.
 
-A value the run cannot provide is `null` in JSON and `n/a` in the console and
-HTML: `min_us` and `max_us` without recorded latencies (for example with
-`type = "none"`), and `std_dev_us` and `confidence_interval_us` with fewer than
-two.
+Console and HTML latency and error-latency summaries show both the recorded
+sample count and the percentile sample count. A zero percentile count means no
+observations were retained or represented; `n/a` means the count is unknown in
+legacy data. A zero-capacity reservoir can therefore show a mean and recorded
+samples while its percentile count is zero and its percentiles are `n/a`.
+
+Without recorded latencies (for example with `type = "none"`), newly generated
+JSON has `null` for `min_us` and `max_us`; `std_dev_us` and
+`confidence_interval_us` are `null` with fewer than two latencies. Legacy JSON
+can contain numeric placeholders in those fields. Some older files report a
+zero `sample_count` even when observations existed, so that count is not always
+trustworthy. Console and HTML conservatively display values as `n/a` when the
+count does not establish availability; the stored JSON values remain unchanged.
+JSON uses numeric zero placeholders for `mean_us` without recorded latencies
+and for percentiles when their estimator has no samples. See
+[threshold availability](./thresholds.md#values-the-run-lacks) for how these
+values are checked.
 
 For raw per-time-bucket, per-connection records in JSON, use:
 
@@ -312,6 +330,22 @@ Each record names its connection by `group_id`, `thread_id` and
 `connection_id`. Connection IDs restart at 0 on every worker thread, so
 `thread_id` (the thread's entry in `threads`) is needed to tell connections
 apart.
+
+Each record covers one `(bucket, group_id, thread_id, connection_id)` and has
+its own `latency_sample_count`: the number of successful latencies recorded for
+that tuple after any `limited` rate. Its `percentile_sample_count` is the number
+retained by that record's reservoir, or represented by its histogram or sketch.
+A group or global reservoir aggregates separately and has its own capacity, so
+its retained count need not equal the sum of record counts. The global policy
+can also differ from group policies. These counts can differ from `request_count`,
+which includes error replies and excludes drain completions. A zero-capacity
+reservoir, for example, can record latencies for its mean while retaining none
+for percentiles. The numeric `latency_mean_us` and
+`latency_p50_us`/`latency_p99_us`/`latency_p999_us` fields use zero placeholders
+when their values are unavailable; use the corresponding count to distinguish a
+placeholder from an observed zero. The console sample-record preview shows
+`p99=n/a` when either count is zero or unknown. Both count fields are absent in
+legacy JSON, where their values are unknown and the preview also shows `n/a`.
 
 HTML uses Chart.js (loaded from a CDN) and the light theme. Only
 `output.html.library = "chartjs"` and `output.html.theme = "light"` are supported.

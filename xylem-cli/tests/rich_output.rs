@@ -220,9 +220,9 @@ fn test_html_report_generation() {
         false, // include_records - not needed for HTML
     );
 
-    // Generate HTML to a temporary file owned by this test
+    // Generate HTML to temp file
     let temp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
-    let temp_path = temp_dir.path().join("xylem_test_report.html");
+    let temp_path = temp_dir.path().join("report.html");
     let result = html::generate_html_report(&results, temp_path.to_str().unwrap());
 
     assert!(result.is_ok(), "HTML generation failed: {:?}", result.err());
@@ -448,7 +448,8 @@ fn latency_breakdown_is_reported_per_group_and_globally() {
 }
 
 #[test]
-fn actual_load_loop_json_is_optional_compatible_and_merged() {
+fn actual_load_loop_json_is_optional_and_round_trips() {
+    let mut stats = TupleStatsCollector::default();
     let make_results = |stats: &TupleStatsCollector| {
         DetailedExperimentResults::from_tuple_stats(
             "test".into(),
@@ -463,41 +464,118 @@ fn actual_load_loop_json_is_optional_compatible_and_merged() {
             false,
         )
     };
-    let empty = TupleStatsCollector::default();
-    let old_json = serde_json::to_value(make_results(&empty)).unwrap();
+    let absent = serde_json::to_value(make_results(&stats)).unwrap();
+    assert!(absent["experiment"].get("actual_load_loop_start_unix_us").is_none());
+    assert!(absent["experiment"].get("actual_load_loop_end_unix_us").is_none());
+    let old: DetailedExperimentResults = serde_json::from_value(absent).unwrap();
+    assert_eq!(old.experiment.actual_load_loop_start_unix_us, None);
+
+    stats.record_actual_load_loop(1_700_000_000_000_000, 1_700_000_001_000_000);
+    let json = serde_json::to_value(make_results(&stats)).unwrap();
+    assert_eq!(json["experiment"]["actual_load_loop_start_unix_us"], 1_700_000_000_000_000u64);
+    assert_eq!(json["experiment"]["actual_load_loop_end_unix_us"], 1_700_000_001_000_000u64);
+    let parsed: DetailedExperimentResults = serde_json::from_value(json).unwrap();
+    assert_eq!(parsed.experiment.actual_load_loop_end_unix_us, Some(1_700_000_001_000_000));
+    let mut invalid = TupleStatsCollector::default();
+    invalid.record_actual_load_loop_samples(None, Some(1_700_000_001_000_000));
+    let merged = TupleStatsCollector::merge(vec![stats, invalid]);
+    let json = serde_json::to_value(make_results(&merged)).unwrap();
+    assert!(json["experiment"].get("actual_load_loop_start_unix_us").is_none());
+    assert!(json["experiment"].get("actual_load_loop_end_unix_us").is_none());
+}
+
+#[test]
+fn actual_load_loop_json_preserves_other_fields_when_merged() {
+    let make_results = |stats: &TupleStatsCollector| {
+        DetailedExperimentResults::from_tuple_stats(
+            "test".into(),
+            None,
+            None,
+            "target".into(),
+            "protocol".into(),
+            "tcp".into(),
+            Duration::from_secs(1),
+            stats,
+            &[],
+            true,
+        )
+    };
+    let mut first = TupleStatsCollector::default();
+    first.record_latency(0, 0, Duration::from_micros(100));
+    let old_json = serde_json::to_value(make_results(&first)).unwrap();
     assert!(old_json["experiment"].get("actual_load_loop_start_unix_us").is_none());
     assert!(old_json["experiment"].get("actual_load_loop_end_unix_us").is_none());
+    assert_eq!(old_json["global"]["latency"]["percentile_sample_count"], 1);
+    assert_eq!(old_json["global"]["error_latency"]["percentile_sample_count"], 0);
+    assert_eq!(old_json["records"][0]["latency_sample_count"], 1);
+    assert_eq!(old_json["records"][0]["percentile_sample_count"], 1);
     let old: DetailedExperimentResults = serde_json::from_value(old_json.clone()).unwrap();
     assert_eq!(old.experiment.actual_load_loop_start_unix_us, None);
     assert_eq!(old.experiment.actual_load_loop_end_unix_us, None);
     assert_eq!(serde_json::to_value(old).unwrap(), old_json);
 
-    let mut first = TupleStatsCollector::default();
+    // Older output also lacks the newer per-summary and per-record counts.
+    let mut legacy_json = old_json.clone();
+    for key in ["latency", "error_latency"] {
+        assert!(legacy_json["global"][key]
+            .as_object_mut()
+            .unwrap()
+            .remove("percentile_sample_count")
+            .is_some());
+    }
+    let record = legacy_json["records"][0].as_object_mut().unwrap();
+    assert!(record.remove("latency_sample_count").is_some());
+    assert!(record.remove("percentile_sample_count").is_some());
+    let legacy: DetailedExperimentResults = serde_json::from_value(legacy_json.clone()).unwrap();
+    assert_eq!(legacy.experiment.actual_load_loop_start_unix_us, None);
+    assert_eq!(legacy.experiment.actual_load_loop_end_unix_us, None);
+    assert_eq!(serde_json::to_value(legacy).unwrap(), legacy_json);
+
     first.record_actual_load_loop(1_700_000_000_200_000, 1_700_000_000_300_000);
     let mut second = TupleStatsCollector::default();
     second.record_actual_load_loop(1_700_000_000_000_000, 1_700_000_000_100_000);
-    let merged = TupleStatsCollector::merge(vec![first, empty, second]);
-    let json = serde_json::to_value(make_results(&merged)).unwrap();
+    let merged = TupleStatsCollector::merge(vec![first, TupleStatsCollector::default(), second]);
+    let results = make_results(&merged);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("results.json");
+    results.write_json(path.to_str().unwrap()).unwrap();
+    let json: serde_json::Value =
+        serde_json::from_reader(std::fs::File::open(path).unwrap()).unwrap();
+    assert_eq!(json, serde_json::to_value(results).unwrap());
     assert_eq!(json["experiment"]["actual_load_loop_start_unix_us"], 1_700_000_000_000_000u64);
     assert_eq!(json["experiment"]["actual_load_loop_end_unix_us"], 1_700_000_000_300_000u64);
     let parsed: DetailedExperimentResults = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(parsed.experiment.actual_load_loop_start_unix_us, Some(1_700_000_000_000_000));
+    assert_eq!(parsed.experiment.actual_load_loop_end_unix_us, Some(1_700_000_000_300_000));
     assert_eq!(serde_json::to_value(parsed).unwrap(), json);
+
     let mut without_timing = json;
     let experiment = without_timing["experiment"].as_object_mut().unwrap();
-    experiment.remove("actual_load_loop_start_unix_us");
-    experiment.remove("actual_load_loop_end_unix_us");
-    assert_eq!(without_timing, old_json, "all existing JSON fields are unchanged");
+    assert!(experiment.remove("actual_load_loop_start_unix_us").is_some());
+    assert!(experiment.remove("actual_load_loop_end_unix_us").is_some());
+    assert_eq!(without_timing, old_json, "all other JSON fields are unchanged");
 
-    for (start, end) in
-        [(None, Some(1)), (Some(1), None), (Some(2), Some(1)), (Some(1), Some(1 << 53))]
-    {
+    for (start, end) in [
+        (None, Some(1)),
+        (Some(1), None),
+        (None, None),
+        (Some(2), Some(1)),
+        (Some(1), Some(1 << 53)),
+        (Some(1 << 53), Some(1 << 53)),
+    ] {
         let mut invalid = TupleStatsCollector::default();
         invalid.record_actual_load_loop_samples(start, end);
         let mut valid = TupleStatsCollector::default();
         valid.record_actual_load_loop(100, 200);
         let stats = TupleStatsCollector::merge(vec![valid, invalid]);
         let json = serde_json::to_value(make_results(&stats)).unwrap();
-        assert!(json["experiment"].get("actual_load_loop_start_unix_us").is_none());
-        assert!(json["experiment"].get("actual_load_loop_end_unix_us").is_none());
+        assert!(
+            json["experiment"].get("actual_load_loop_start_unix_us").is_none(),
+            "{start:?} {end:?}"
+        );
+        assert!(
+            json["experiment"].get("actual_load_loop_end_unix_us").is_none(),
+            "{start:?} {end:?}"
+        );
     }
 }

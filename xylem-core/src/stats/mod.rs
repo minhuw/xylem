@@ -198,6 +198,11 @@ pub struct AggregatedStats {
     pub confidence_interval: Option<Duration>,
     /// Number of latencies recorded, after any sampling rate.
     pub latency_sample_count: u64,
+    /// Retained percentile samples for reservoir policies, or total represented
+    /// observation weight for sketches and histograms, after aggregation.
+    /// Unknown for older serialized summaries that did not include this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub percentile_sample_count: Option<u64>,
     /// Latencies a bounded HDR histogram recorded at its `max_value_us`;
     /// `None` unless the policy sets that bound.
     pub clamped_samples: Option<u64>,

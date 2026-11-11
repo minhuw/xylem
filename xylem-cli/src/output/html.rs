@@ -154,7 +154,15 @@ pub fn generate_html_report(results: &DetailedExperimentResults, path: &str) -> 
             </div>
             <div class="stat-card">
                 <div class="stat-label">Median Latency</div>
-                <div class="stat-value">{median:.2} μs</div>
+                <div class="stat-value">{median}</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Latency Samples</div>
+                <div class="stat-value">{latency_samples}</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Latency Percentile Samples</div>
+                <div class="stat-value">{latency_percentile_samples}</div>
             </div>
         </div>
 
@@ -250,7 +258,12 @@ pub fn generate_html_report(results: &DetailedExperimentResults, path: &str) -> 
         requests = results.global.total_requests,
         throughput = results.global.throughput_rps,
         bandwidth = results.global.throughput_mbps,
-        median = results.global.latency.p50_us,
+        median = micros_or_na(
+            results.global.latency.percentile_for_display(results.global.latency.p50_us)
+        ),
+        latency_samples = results.global.latency.sample_count,
+        latency_percentile_samples =
+            super::format_optional_count(results.global.latency.percentile_sample_count),
         global_requests = request_rows(
             &results.global.requests,
             &results.global.error_latency,
@@ -258,13 +271,16 @@ pub fn generate_html_report(results: &DetailedExperimentResults, path: &str) -> 
         ),
         global_breakdown = breakdown_section(&results.global.latency_breakdown),
         group_sections = generate_group_sections(&results.traffic_groups),
-        global_latencies = script_json(&[
-            results.global.latency.p50_us,
-            results.global.latency.p95_us,
-            results.global.latency.p99_us,
-            results.global.latency.p999_us,
-            results.global.latency.p9999_us,
-        ])?,
+        global_latencies = script_json(
+            &[
+                results.global.latency.p50_us,
+                results.global.latency.p95_us,
+                results.global.latency.p99_us,
+                results.global.latency.p999_us,
+                results.global.latency.p9999_us,
+            ]
+            .map(|value| results.global.latency.percentile_for_display(value))
+        )?,
         group_labels =
             script_json(&results.traffic_groups.iter().map(|g| &g.name).collect::<Vec<_>>())?,
         group_throughputs = script_json(
@@ -323,15 +339,15 @@ fn generate_group_sections(groups: &[super::TrafficGroupResults]) -> String {
                 </tr>
                 <tr>
                     <td>p50 Latency</td>
-                    <td>{median:.2} μs</td>
+                    <td>{median}</td>
                 </tr>
                 <tr>
                     <td>p99 Latency</td>
-                    <td>{tail:.2} μs</td>
+                    <td>{tail}</td>
                 </tr>
                 <tr>
                     <td>Mean Latency</td>
-                    <td>{mean:.2} μs</td>
+                    <td>{mean}</td>
                 </tr>
                 <tr>
                     <td>Min Latency</td>
@@ -353,6 +369,10 @@ fn generate_group_sections(groups: &[super::TrafficGroupResults]) -> String {
                     <td>Latency Samples</td>
                     <td>{samples}</td>
                 </tr>
+                <tr>
+                    <td>Latency Percentile Samples</td>
+                    <td>{percentile_samples}</td>
+                </tr>
                 {requests_rows}
             </table>
             {breakdown}
@@ -368,18 +388,28 @@ fn generate_group_sections(groups: &[super::TrafficGroupResults]) -> String {
                 connections = group.connections,
                 requests = group.stats.total_requests,
                 throughput = group.stats.throughput_rps,
-                median = group.stats.latency.p50_us,
-                tail = group.stats.latency.p99_us,
-                mean = group.stats.latency.mean_us,
-                min = micros_or_na(group.stats.latency.min_us),
-                max = micros_or_na(group.stats.latency.max_us),
-                std_dev = micros_or_na(group.stats.latency.std_dev_us),
+                median = micros_or_na(
+                    group.stats.latency.percentile_for_display(group.stats.latency.p50_us)
+                ),
+                tail = micros_or_na(
+                    group.stats.latency.percentile_for_display(group.stats.latency.p99_us)
+                ),
+                mean = micros_or_na(group.stats.latency.mean_for_display()),
+                min =
+                    micros_or_na(group.stats.latency.range_for_display(group.stats.latency.min_us)),
+                max =
+                    micros_or_na(group.stats.latency.range_for_display(group.stats.latency.max_us)),
+                std_dev = micros_or_na(
+                    group.stats.latency.dispersion_for_display(group.stats.latency.std_dev_us)
+                ),
                 ci = group
                     .stats
                     .latency
-                    .confidence_interval_us
+                    .dispersion_for_display(group.stats.latency.confidence_interval_us)
                     .map_or_else(|| "n/a".to_string(), |ci| format!("±{ci:.2} μs")),
                 samples = group.stats.latency.sample_count,
+                percentile_samples =
+                    super::format_optional_count(group.stats.latency.percentile_sample_count),
                 requests_rows = request_rows(
                     &group.stats.requests,
                     &group.stats.error_latency,
@@ -480,16 +510,20 @@ fn request_rows(
     } else {
         format!("{} ({})", requests.errors, kinds.join(", "))
     };
-    let error_latency_row = |value: f64| match error_latency.sample_count {
-        0 => "n/a".to_string(),
-        _ => format!("{value:.2} μs"),
-    };
     [
         ("Requests Sent", requests.sent.to_string()),
         ("Requests Completed", requests.completed.to_string()),
         ("Error Replies", errors),
-        ("Mean Error Reply Latency", error_latency_row(error_latency.mean_us)),
-        ("p99 Error Reply Latency", error_latency_row(error_latency.p99_us)),
+        ("Mean Error Reply Latency", micros_or_na(error_latency.mean_for_display())),
+        (
+            "p99 Error Reply Latency",
+            micros_or_na(error_latency.percentile_for_display(error_latency.p99_us)),
+        ),
+        ("Error Reply Latency Samples", error_latency.sample_count.to_string()),
+        (
+            "Error Reply Latency Percentile Samples",
+            super::format_optional_count(error_latency.percentile_sample_count),
+        ),
         ("Requests Timed Out (no latency)", requests.timed_out.to_string()),
         ("Late Responses (dropped)", requests.late_responses.to_string()),
         ("Requests Failed", requests.failed.to_string()),
@@ -592,14 +626,133 @@ fn generate_group_charts(groups: &[super::TrafficGroupResults]) -> Result<String
         }});"#,
                 id = group.id,
                 label = script_json(&format!("{}  Latency (μs)", group.name))?,
-                latencies = script_json(&[
-                    group.stats.latency.p50_us,
-                    group.stats.latency.p95_us,
-                    group.stats.latency.p99_us,
-                    group.stats.latency.p999_us,
-                ])?,
+                latencies = script_json(
+                    &[
+                        group.stats.latency.p50_us,
+                        group.stats.latency.p95_us,
+                        group.stats.latency.p99_us,
+                        group.stats.latency.p999_us,
+                    ]
+                    .map(|value| group.stats.latency.percentile_for_display(value))
+                )?,
             ))
         })
         .collect::<Result<Vec<_>>>()?
         .join("\n"))
+}
+
+#[cfg(test)]
+mod optional_latency_display_tests {
+    use super::*;
+    use crate::output::{DetailedExperimentResults, GroupStats, LatencyStats, TrafficGroupResults};
+    use std::time::Duration;
+    use xylem_core::stats::{SamplingPolicy, TupleStatsCollector};
+
+    fn legacy(sample_count: u64, values: [Option<f64>; 4]) -> LatencyStats {
+        let mut json = serde_json::to_value(LatencyStats::default()).unwrap();
+        json["sample_count"] = sample_count.into();
+        for (field, value) in ["min_us", "max_us", "std_dev_us", "confidence_interval_us"]
+            .into_iter()
+            .zip(values)
+        {
+            json[field] = serde_json::to_value(value).unwrap();
+        }
+        serde_json::from_value(json).unwrap()
+    }
+
+    fn group(latency: LatencyStats) -> TrafficGroupResults {
+        TrafficGroupResults {
+            id: 0,
+            name: "group".into(),
+            target: "unused".into(),
+            protocol: "unused".into(),
+            threads: vec![0],
+            connections: 1,
+            policy: "closed-loop".into(),
+            stats: GroupStats {
+                total_requests: 0,
+                throughput_rps: 0.0,
+                throughput_mbps: 0.0,
+                latency,
+                error_latency: LatencyStats::default(),
+                requests: Default::default(),
+                send_lag: Default::default(),
+                latency_breakdown: Default::default(),
+            },
+            protocol_metadata: None,
+        }
+    }
+
+    fn assert_line(text: &str, label: &str, expected: &str) {
+        assert!(
+            text.lines()
+                .any(|line| line.trim().strip_prefix(label).map(str::trim) == Some(expected)),
+            "missing {label} {expected} in {text:?}"
+        );
+    }
+
+    fn cell<'a>(html: &'a str, label: &str) -> &'a str {
+        html.split_once(&format!("<td>{label}</td>"))
+            .unwrap()
+            .1
+            .trim_start()
+            .strip_prefix("<td>")
+            .unwrap()
+            .split_once("</td>")
+            .unwrap()
+            .0
+    }
+
+    #[test]
+    fn optional_latency_fields_require_their_sample_counts() {
+        let duration = Duration::from_secs(1);
+        let mut collector = TupleStatsCollector::new(SamplingPolicy::Unlimited, duration);
+        collector.record_latency(0, 0, Duration::ZERO);
+        let one_zero =
+            DetailedExperimentResults::latency_stats(&collector.aggregate_global(duration));
+        collector.record_latency(0, 0, Duration::ZERO);
+        let two_zero =
+            DetailedExperimentResults::latency_stats(&collector.aggregate_global(duration));
+        assert_eq!((one_zero.sample_count, two_zero.sample_count), (1, 2));
+        let populated = [Some(7.0), Some(8.0), Some(9.0), Some(10.0)];
+        let cases = [
+            ("legacy zero count", legacy(0, populated), ["n/a", "n/a", "n/a", "n/a"]),
+            ("legacy one count", legacy(1, populated), ["7.00", "8.00", "n/a", "n/a"]),
+            ("legacy one zero", legacy(1, [Some(0.0); 4]), ["0.00", "0.00", "n/a", "n/a"]),
+            ("legacy two counts", legacy(2, populated), ["7.00", "8.00", "9.00", "±10.00"]),
+            ("nulls with two counts", legacy(2, [None; 4]), ["n/a", "n/a", "n/a", "n/a"]),
+            ("observed zero once", one_zero, ["0.00", "0.00", "n/a", "n/a"]),
+            ("observed zero twice", two_zero, ["0.00", "0.00", "0.00", "±0.00"]),
+        ];
+        for (name, stats, expected) in cases {
+            let json = serde_json::to_value(&stats).unwrap();
+            let stats: LatencyStats = serde_json::from_value(json.clone()).unwrap();
+            for indent in ["  ", "    "] {
+                let text = DetailedExperimentResults::format_latency(&stats, indent);
+                for (label, value) in
+                    ["Min:", "Max:", "Std Dev:", "95% CI:"].into_iter().zip(expected)
+                {
+                    assert_line(&text, label, value);
+                }
+            }
+            for indent in ["", "  "] {
+                let text = DetailedExperimentResults::format_error_latency(&stats, indent);
+                assert_line(&text, "Max:", expected[1]);
+            }
+            let group = group(stats);
+            let html = generate_group_sections(std::slice::from_ref(&group));
+            for (label, value) in ["Min Latency", "Max Latency", "Latency Std Dev", "Mean 95% CI"]
+                .into_iter()
+                .zip(expected)
+            {
+                let value = if value == "n/a" {
+                    value.to_string()
+                } else {
+                    format!("{value} μs")
+                };
+                assert_eq!(cell(&html, label), value, "{name} {label}");
+            }
+            assert_eq!(serde_json::to_value(&group.stats.latency).unwrap(), json, "{name}");
+        }
+    }
 }

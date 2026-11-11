@@ -298,11 +298,18 @@ impl LatencyStorage {
                 Quantiles::TDigest { digest, pending },
                 Quantiles::TDigest { digest: other, pending: other_pending },
             ) if digest.max_size() == other.max_size() => {
-                // Fold pending values into both digests first, so the merged
-                // digest holds every value and this side has none pending.
-                let mine = digest.merge_unsorted(std::mem::take(pending));
-                let theirs = other.merge_unsorted(other_pending.clone());
-                *digest = TDigest::merge_digests(vec![mine, theirs]);
+                // An all-empty dependency merge returns its default size, not
+                // the configured size. Keep this digest after checking compatibility.
+                if !digest.is_empty()
+                    || !pending.is_empty()
+                    || !other.is_empty()
+                    || !other_pending.is_empty()
+                {
+                    // Fold both buffers into the merged digest.
+                    let mine = digest.merge_unsorted(std::mem::take(pending));
+                    let theirs = other.merge_unsorted(other_pending.clone());
+                    *digest = TDigest::merge_digests(vec![mine, theirs]);
+                }
             }
             (
                 Quantiles::HdrHistogram { hist, clamped },
@@ -324,6 +331,23 @@ impl LatencyStorage {
     /// storage this can exceed the number of samples kept for percentiles.
     pub fn count(&self) -> u64 {
         self.moments.count
+    }
+
+    /// Observations represented by the percentile estimator, after merges.
+    /// Sketches retain observation counts even when values are compressed;
+    /// the t-digest count includes values still waiting in its buffer.
+    pub fn percentile_sample_count(&self) -> u64 {
+        match &self.quantiles {
+            Quantiles::None => 0,
+            Quantiles::Samples(reservoir) => reservoir.samples.len() as u64,
+            // Every observation reaches the sketch, including collapsed bins.
+            // Its count() returns usize and saturates on 32-bit targets.
+            Quantiles::DdSketch(_) => self.moments.count,
+            // Moments count every value inserted into the digest or its pending
+            // buffer, without converting the digest's floating-point count.
+            Quantiles::TDigest { .. } => self.moments.count,
+            Quantiles::HdrHistogram { hist, .. } => hist.len(),
+        }
     }
 
     /// Number of latencies a bounded HDR histogram recorded at its maximum
@@ -554,8 +578,9 @@ pub struct TupleStatsCollector {
     ///
     /// [`StatsRecorder::end_measurement`]: super::StatsRecorder::end_measurement
     measurement_end_ns: Option<u64>,
-    /// Aggregate of worker loop intervals in Unix microseconds. Unusable
-    /// samples invalidate the aggregate; empty collectors remain neutral.
+    /// Aggregate of worker loop intervals in Unix microseconds, including loops
+    /// that exited with an error. Unusable clock samples invalidate the aggregate;
+    /// collectors whose workers never ran remain neutral when merged.
     actual_load_loop: ActualLoadLoop,
     /// Request counts per group
     request_counts: HashMap<usize, RequestCounts>,
@@ -1228,9 +1253,10 @@ impl TupleStatsCollector {
     }
 
     /// Earliest worker loop start and latest worker loop end, in Unix microseconds.
-    /// The merged interval includes gaps between worker loops. Returns `None`
-    /// if no interval was recorded or any worker's samples are unusable. These
-    /// readings do not imply alignment with any other host's clock.
+    /// The merged interval includes any gaps between worker loops. Returns `None`
+    /// if no interval was recorded or if any worker's samples were missing, out
+    /// of order, or above `2^53 - 1`. Empty collectors remain neutral when merged.
+    /// These wall-clock readings do not imply alignment with any other host's clock.
     pub fn actual_load_loop_unix_us(&self) -> Option<(u64, u64)> {
         match self.actual_load_loop {
             ActualLoadLoop::Valid(start, end) => Some((start, end)),
@@ -1309,6 +1335,7 @@ impl TupleStatsCollector {
             confidence_interval: std_dev
                 .map(|sd| Duration::from_secs_f64(1.96 * sd / (latency.count() as f64).sqrt())),
             latency_sample_count: latency.count(),
+            percentile_sample_count: Some(latency.percentile_sample_count()),
             clamped_samples: latency.clamped_count(),
             throughput_rps: if duration_secs > 0.0 {
                 total_requests as f64 / duration_secs
@@ -1441,6 +1468,95 @@ mod tests {
             assert_eq!(stats.total_requests, 200);
             assert!(stats.latency_p99 > Duration::ZERO);
         }
+    }
+
+    #[test]
+    fn tdigest_no_error_multiworker_collector_merge() {
+        let policy = SamplingPolicy::TDigest { compression: 1000 };
+        let start = crate::timing::time_ns();
+        let collectors = (0..3)
+            .map(|thread_id| {
+                let mut collector = TupleStatsCollector::with_start_time(
+                    policy.clone(),
+                    Duration::from_secs(3600),
+                    start,
+                );
+                collector.set_thread_id(thread_id);
+                collector.record_sent(7, None);
+                collector.record_latency(7, 0, Duration::from_micros(10 * (thread_id as u64 + 1)));
+                collector
+            })
+            .collect();
+
+        let merged = TupleStatsCollector::merge(collectors);
+        let counts = merged.request_counts_global();
+        assert_eq!((counts.sent, counts.completed, counts.errors), (3, 3, 0));
+        let global = merged.aggregate_global(Duration::from_secs(1));
+        assert_eq!(global.total_requests, 3);
+        assert_eq!(global.latency_sample_count, 3);
+        assert_eq!(global.percentile_sample_count, Some(3));
+        assert_eq!(global.mean_latency, Duration::from_micros(20));
+        assert_eq!(global.min_latency, Some(Duration::from_micros(10)));
+        assert_eq!(global.max_latency, Some(Duration::from_micros(30)));
+        assert_eq!(global.std_dev, Some(Duration::from_micros(10)));
+        assert_eq!(global.latency_p50, Duration::from_micros(20));
+        assert_eq!(global.latency_p99, Duration::from_micros(30));
+        let errors = merged.error_latency_global();
+        assert_eq!(errors.latency_sample_count, 0);
+        assert_eq!(errors.percentile_sample_count, Some(0));
+        assert_eq!(errors.min_latency, None);
+        assert_eq!(errors.max_latency, None);
+        assert_eq!(errors.std_dev, None);
+    }
+
+    #[test]
+    fn tdigest_error_only_workers_merge_empty_success_bucket() {
+        let policy = SamplingPolicy::TDigest { compression: 1000 };
+        let start = crate::timing::time_ns();
+        let collectors = (0..2)
+            .map(|thread_id| {
+                let mut collector = TupleStatsCollector::with_start_time(
+                    policy.clone(),
+                    Duration::from_secs(3600),
+                    start,
+                );
+                collector.set_thread_id(thread_id);
+                collector.record_sent(7, None);
+                collector.record_error_reply(
+                    7,
+                    0,
+                    "error",
+                    Duration::from_micros(10 + 20 * thread_id as u64),
+                );
+                collector
+            })
+            .collect();
+
+        let merged = TupleStatsCollector::merge(collectors);
+        let counts = merged.request_counts_global();
+        assert_eq!((counts.sent, counts.completed, counts.errors), (2, 2, 2));
+        assert_eq!(counts.errors_by_kind.get("error"), 2);
+        let errors = merged.error_latency_global();
+        assert_eq!(errors.latency_sample_count, 2);
+        assert_eq!(errors.percentile_sample_count, Some(2));
+        assert_eq!(errors.mean_latency, Duration::from_micros(20));
+        assert_eq!(errors.min_latency, Some(Duration::from_micros(10)));
+        assert_eq!(errors.max_latency, Some(Duration::from_micros(30)));
+
+        // The shared bucket counted error replies but has no successful latency.
+        let global = merged.aggregate_global(Duration::from_secs(1));
+        assert_eq!(global.total_requests, 2);
+        assert_eq!(global.latency_sample_count, 0);
+        assert_eq!(global.percentile_sample_count, Some(0));
+        assert_eq!(global.mean_latency, Duration::ZERO);
+        assert_eq!(global.latency_p50, Duration::ZERO);
+        assert_eq!(global.min_latency, None);
+        assert_eq!(global.max_latency, None);
+        assert_eq!(global.std_dev, None);
+        let group = &merged.aggregate_by_group(Duration::from_secs(1))[&7];
+        assert_eq!(group.total_requests, 2);
+        assert_eq!(group.latency_sample_count, 0);
+        assert_eq!(group.percentile_sample_count, Some(0));
     }
 
     #[test]
@@ -1785,11 +1901,473 @@ mod tests {
         assert!((400_000..=600_000).contains(&p50)); // ~500us in ns
     }
 
+    // Compare every represented rank, not just the separate exact moments count.
+    // A collapsed store can have the right count metadata but wrong bin weights.
+    fn assert_ddsketch_merge_ranks(max_bins: u32, low: u64, high: u64, collapsed: bool) {
+        let policy = SamplingPolicy::DdSketch { alpha: 0.01, max_bins };
+        let lows = || std::iter::repeat_n(low, 100);
+        let highs = || std::iter::repeat_n(high, 10);
+        let direct = storage_with(&policy, highs().chain(lows()));
+        let mut high_first = storage_with(&policy, highs());
+        high_first.merge_ref(&storage_with(&policy, lows()));
+        let mut low_first = storage_with(&policy, lows());
+        low_first.merge_ref(&storage_with(&policy, highs()));
+
+        for storage in [&direct, &high_first, &low_first] {
+            assert_eq!(storage.count(), 110);
+            let Quantiles::DdSketch(sketch) = &storage.quantiles else {
+                unreachable!()
+            };
+            assert_eq!(sketch.count(), 110);
+        }
+        // Sample inside each rank interval; the last rank is only reached at 1.0.
+        let ps: Vec<f64> = (0..109).map(|rank| (rank as f64 + 0.5) / 109.0).chain([1.0]).collect();
+        let expected = direct.percentiles(&ps);
+        assert_eq!(high_first.percentiles(&ps), expected, "high destination, {max_bins} bins");
+        assert_eq!(low_first.percentiles(&ps), expected, "low destination, {max_bins} bins");
+        if collapsed {
+            // The low bin was collapsed upward; its estimate need not be near low.
+            assert!(direct.percentile(0.5) > low * 2);
+        } else {
+            for (estimate, value) in
+                [(direct.percentile(0.5), low), (direct.percentile(0.95), high)]
+            {
+                assert!(estimate.abs_diff(value) * 100 <= value, "{estimate} vs {value}");
+            }
+        }
+    }
+
+    #[test]
+    fn ddsketch_merge_preserves_collapsed_bin_weights_in_both_orders() {
+        assert_ddsketch_merge_ranks(128, 100, 1_000_000, true);
+        // The default 1024 bins also collapse over a sufficiently wide range.
+        assert_ddsketch_merge_ranks(1024, 100, 1_000_000_000_000, true);
+    }
+
+    #[test]
+    fn ddsketch_merge_preserves_noncollapsing_bin_weights_in_both_orders() {
+        assert_ddsketch_merge_ranks(128, 100, 200, false);
+    }
+
+    #[test]
+    fn ddsketch_merge_empty_sketches() {
+        let policy = SamplingPolicy::DdSketch { alpha: 0.01, max_bins: 128 };
+        let empty = LatencyStorage::from_policy(&policy);
+        let mut empty_merged = LatencyStorage::from_policy(&policy);
+        empty_merged.merge_ref(&empty);
+        assert_eq!(empty_merged.count(), 0);
+        assert_eq!(empty_merged.percentile(0.5), 0);
+
+        let data = storage_with(&policy, [100, 100, 1_000_000]);
+        let ps = [0.0, 0.5, 0.9, 1.0];
+        let expected = data.percentiles(&ps);
+        empty_merged.merge_ref(&data);
+        assert_eq!(empty_merged.count(), 3);
+        assert_eq!(empty_merged.percentiles(&ps), expected);
+        empty_merged.merge_ref(&empty);
+        assert_eq!(empty_merged.count(), 3);
+        assert_eq!(empty_merged.percentiles(&ps), expected);
+    }
+
+    #[test]
+    fn ddsketch_merge_zero_only_and_positive_preserves_endpoints() {
+        let policy = SamplingPolicy::DdSketch { alpha: 0.01, max_bins: 128 };
+        let mut zero_first = storage_with(&policy, [0, 0]);
+        zero_first.merge_ref(&storage_with(&policy, [100, 1_000]));
+        let mut positive_first = storage_with(&policy, [100, 1_000]);
+        positive_first.merge_ref(&storage_with(&policy, [0, 0]));
+
+        for storage in [&zero_first, &positive_first] {
+            assert_eq!(storage.count(), 4);
+            let Quantiles::DdSketch(sketch) = &storage.quantiles else {
+                unreachable!()
+            };
+            assert_eq!(sketch.count(), 4);
+            assert_eq!(storage.percentiles(&[0.0, 1.0]), [0, 1_000]);
+        }
+    }
+
+    #[test]
+    fn ddsketch_merge_collapsed_with_noncollapsed_in_both_orders() {
+        const LOW: u64 = 100;
+        const HIGH: u64 = 100_000_000_000;
+        const MIDDLE: u64 = HIGH / 10;
+        for max_bins in [128, 1024] {
+            let policy = SamplingPolicy::DdSketch { alpha: 0.01, max_bins };
+            let collapsed = storage_with(
+                &policy,
+                std::iter::repeat_n(LOW, 100).chain(std::iter::repeat_n(HIGH, 10)),
+            );
+            let middle = storage_with(&policy, std::iter::repeat_n(MIDDLE, 30));
+            let direct = storage_with(
+                &policy,
+                std::iter::repeat_n(LOW, 100)
+                    .chain(std::iter::repeat_n(MIDDLE, 30))
+                    .chain(std::iter::repeat_n(HIGH, 10)),
+            );
+            let quantiles = [0.0, 0.5, 0.75, 0.95, 1.0];
+            let expected = direct.percentiles(&quantiles);
+            assert_eq!((expected[0], expected[4]), (LOW, HIGH));
+            assert!(expected[1] > LOW && expected[1] < MIDDLE);
+            assert!(expected[2].abs_diff(MIDDLE) <= MIDDLE / 100 + 1);
+            assert!(expected[3].abs_diff(HIGH) <= HIGH / 100 + 1);
+            for (first, second) in [(&collapsed, &middle), (&middle, &collapsed)] {
+                let mut merged = LatencyStorage::from_policy(&policy);
+                merged.merge_ref(first);
+                merged.merge_ref(second);
+                assert_eq!(merged.count(), 140);
+                assert_eq!(merged.moments, direct.moments);
+                assert_eq!(merged.percentiles(&quantiles), expected, "{max_bins} bins");
+            }
+        }
+    }
+
+    #[test]
+    fn ddsketch_zero_only_merges_preserve_interior_quantiles() {
+        let policy = SamplingPolicy::DdSketch { alpha: 0.01, max_bins: 1024 };
+        let empty = LatencyStorage::from_policy(&policy);
+        let zero = storage_with(&policy, std::iter::repeat_n(0, 37));
+        let positive = storage_with(&policy, [10_000, 10_000]);
+        let quantiles = [0.0, 0.5, 0.99, 1.0];
+        for (first, second, expected_count) in
+            [(&empty, &zero, 37), (&zero, &empty, 37), (&zero, &zero, 74)]
+        {
+            let mut merged = LatencyStorage::from_policy(&policy);
+            merged.merge_ref(first);
+            merged.merge_ref(second);
+            assert_eq!(merged.count(), expected_count);
+            assert_eq!((merged.min(), merged.max()), (Some(0), Some(0)));
+            assert_eq!(merged.percentiles(&quantiles), [0, 0, 0, 0]);
+        }
+        for (first, second) in [(&zero, &positive), (&positive, &zero)] {
+            let mut merged = LatencyStorage::from_policy(&policy);
+            merged.merge_ref(first);
+            merged.merge_ref(second);
+            let values = merged.percentiles(&quantiles);
+            assert_eq!(merged.count(), 39);
+            assert_eq!((merged.min(), merged.max()), (Some(0), Some(10_000)));
+            assert_eq!((values[0], values[1], values[3]), (0, 0, 10_000));
+            assert!(values[2].abs_diff(10_000) <= 101, "p99: {}", values[2]);
+        }
+    }
+
+    #[test]
+    fn ddsketch_one_nanosecond_uses_zero_bucket_for_interior_quantiles() {
+        let policy = SamplingPolicy::DdSketch { alpha: 0.01, max_bins: 1024 };
+        let storage = storage_with(&policy, [1, 1]);
+        // Endpoints retain exact extrema; the interior rank uses the zero bucket.
+        assert_eq!(storage.percentiles(&[0.0, 0.5, 1.0]), [1, 0, 1]);
+        let above_cutoff = storage_with(&policy, [2, 2]);
+        assert!(above_cutoff.percentile(0.5) > 0, "2 ns must be outside the zero bucket");
+    }
+
+    #[test]
+    fn ddsketch_quantiles_follow_uncollapsed_distribution() {
+        let policy = SamplingPolicy::DdSketch { alpha: 0.01, max_bins: 1024 };
+        let samples = std::iter::repeat_n(1_000_000, 100)
+            .chain(std::iter::repeat_n(1_000, 100))
+            .chain(std::iter::repeat_n(20_000, 100));
+        let storage = storage_with(&policy, samples);
+        let quantiles = [0.0, 0.1, 0.33, 0.5, 0.66, 0.9, 0.99, 1.0];
+        // DDSketch uses floor(p * (n - 1)); 100 observations have each value.
+        let expected: [u64; 8] =
+            [1_000, 1_000, 1_000, 20_000, 20_000, 1_000_000, 1_000_000, 1_000_000];
+        assert_eq!(storage.count(), 300);
+        for ((p, estimate), exact) in
+            quantiles.into_iter().zip(storage.percentiles(&quantiles)).zip(expected)
+        {
+            // The extra nanosecond accounts for conversion from f64 to u64.
+            assert!(
+                estimate.abs_diff(exact) <= exact / 100 + 1,
+                "p{p}: {estimate}, expected {exact}"
+            );
+        }
+        assert_eq!((storage.percentile(0.0), storage.percentile(1.0)), (1_000, 1_000_000));
+    }
+
+    #[test]
+    fn ddsketch_bin_boundary_estimates_meet_accuracy() {
+        // With alpha = 1/3, values near 1024 ns exercise a bin boundary.
+        // Check accuracy instead of relying on floating-point boundary placement.
+        let policy = SamplingPolicy::DdSketch { alpha: 1.0 / 3.0, max_bins: 128 };
+        for ns in [1023, 1024, 1025, 2047, 2048] {
+            let storage = storage_with(&policy, [ns, ns]);
+            let estimates = storage.percentiles(&[0.0, 0.5, 1.0]);
+            assert_eq!((estimates[0], estimates[2]), (ns, ns));
+            assert!(estimates[1].abs_diff(ns) * 3 <= ns + 3, "{ns}: {}", estimates[1]);
+        }
+    }
+
+    // Build a weighted population through Xylem's record/merge boundary in
+    // O(log count) merges, without allocating one value per observation.
+    fn ddsketch_repeated(policy: &SamplingPolicy, ns: u64, mut count: u64) -> LatencyStorage {
+        let mut result = LatencyStorage::from_policy(policy);
+        let mut power = storage_with(policy, [ns]);
+        while count != 0 {
+            if count & 1 != 0 {
+                result.merge_ref(&power);
+            }
+            count >>= 1;
+            if count != 0 {
+                let mut doubled = LatencyStorage::from_policy(policy);
+                doubled.merge_ref(&power);
+                doubled.merge_ref(&power);
+                power = doubled;
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn ddsketch_quantiles_and_counts_across_u32_boundary() {
+        const HALF: u64 = 1 << 31;
+        const LOW: u64 = 1_000_000;
+        const HIGH: u64 = 1_000_000_000;
+        let policy = SamplingPolicy::DdSketch { alpha: 0.01, max_bins: 1024 };
+        let below_half = ddsketch_repeated(&policy, LOW, HALF - 1);
+        let low_half = ddsketch_repeated(&policy, LOW, HALF);
+        let high_half = ddsketch_repeated(&policy, HIGH, HALF);
+        let one_high = storage_with(&policy, [HIGH]);
+        let quantiles = [0.0, 0.25, 0.5, 0.75, 1.0];
+
+        for (low, extra, total, expected) in [
+            (&below_half, false, (1u64 << 32) - 1, [LOW, LOW, HIGH, HIGH, HIGH]),
+            (&low_half, false, 1u64 << 32, [LOW, LOW, LOW, HIGH, HIGH]),
+            (&low_half, true, (1u64 << 32) + 1, [LOW, LOW, HIGH, HIGH, HIGH]),
+        ] {
+            let mut merged = LatencyStorage::from_policy(&policy);
+            merged.merge_ref(low);
+            merged.merge_ref(&high_half);
+            if extra {
+                merged.merge_ref(&one_high);
+            }
+            assert_eq!(merged.count(), total);
+            assert_eq!(merged.percentile_sample_count(), total);
+            let Quantiles::DdSketch(sketch) = &merged.quantiles else {
+                unreachable!()
+            };
+            assert_eq!(sketch.count(), usize::try_from(total).unwrap_or(usize::MAX));
+            assert_eq!((merged.min(), merged.max()), (Some(LOW), Some(HIGH)));
+            for ((p, estimate), exact) in
+                quantiles.into_iter().zip(merged.percentiles(&quantiles)).zip(expected)
+            {
+                assert!(
+                    estimate.abs_diff(exact) <= exact / 100 + 1,
+                    "count {total}, p{p}: {estimate}, expected {exact}"
+                );
+            }
+
+            // Model 0.3.2 on a 32-bit target from Xylem's independent u64
+            // total; this is not native execution of the old dependency.
+            let narrowed = merged.count() as u32;
+            let old_p75 = if narrowed == 0 {
+                None
+            } else {
+                let rank = (0.75 * (f64::from(narrowed) - 1.0)) as u64;
+                Some(if rank < low.count() { LOW } else { HIGH })
+            };
+            let expected_old_p75 = match total {
+                n if n < (1u64 << 32) => Some(HIGH),
+                n if n == (1u64 << 32) => None,
+                _ => Some(LOW),
+            };
+            assert_eq!(old_p75, expected_old_p75);
+        }
+    }
+
     /// T-digest policy as parsed from a config that omits `compression`.
     fn default_tdigest_policy() -> SamplingPolicy {
         let policy: SamplingPolicy = serde_json::from_str(r#"{"type": "t-digest"}"#).unwrap();
         assert_eq!(policy, SamplingPolicy::TDigest { compression: 1000 });
         policy
+    }
+
+    #[test]
+    fn tdigest_empty_merges_preserve_configuration_for_later_observations() {
+        let policy = SamplingPolicy::TDigest { compression: 1000 };
+        let mut merged = LatencyStorage::from_policy(&policy);
+        let empty = LatencyStorage::from_policy(&policy);
+        for _ in 0..3 {
+            assert_eq!(merged.try_merge_ref(&empty), Ok(()));
+            let Quantiles::TDigest { digest, pending } = &merged.quantiles else {
+                panic!("expected a t-digest");
+            };
+            assert_eq!(digest.max_size(), 1000);
+            assert!(digest.is_empty());
+            assert!(pending.is_empty());
+            assert_eq!(merged.count(), 0);
+            assert_eq!(merged.percentile_sample_count(), 0);
+            assert_eq!(merged.percentiles(&[0.0, 0.5, 1.0]), [0, 0, 0]);
+            assert_eq!(merged.mean(), 0);
+            assert_eq!((merged.min(), merged.max(), merged.std_dev()), (None, None, None));
+        }
+
+        let observed = record_tdigest(&[10_000, 20_000, 30_000]);
+        assert_eq!(merged.try_merge_ref(&observed), Ok(()));
+        assert_eq!(merged.count(), 3);
+        assert_eq!(merged.percentile_sample_count(), 3);
+        assert_eq!(merged.mean(), 20_000);
+        assert_eq!(merged.percentiles(&[0.0, 0.5, 1.0]), [10_000, 20_000, 30_000]);
+    }
+
+    #[test]
+    fn tdigest_empty_and_nonempty_merge_in_both_orders() {
+        let policy = SamplingPolicy::TDigest { compression: 1000 };
+        let flushed_only = vec![10_000; TDIGEST_BATCH_SIZE];
+        let mut flushed_and_pending = flushed_only.clone();
+        flushed_and_pending.extend([20_000, 30_000]);
+        for (values, expected_p50, flushed, has_pending) in [
+            (vec![10_000, 20_000, 30_000], 20_000, false, true),
+            (flushed_only, 10_000, true, false),
+            (flushed_and_pending, 10_000, true, true),
+        ] {
+            for empty_first in [true, false] {
+                let nonempty = record_tdigest(&values);
+                let Quantiles::TDigest { digest, pending } = &nonempty.quantiles else {
+                    panic!("expected a t-digest");
+                };
+                assert_eq!(!digest.is_empty(), flushed);
+                assert_eq!(!pending.is_empty(), has_pending);
+                let expected_moments = nonempty.moments.clone();
+                let empty = LatencyStorage::from_policy(&policy);
+                let (mut merged, other) = if empty_first {
+                    (empty, nonempty)
+                } else {
+                    (nonempty, empty)
+                };
+                let other_moments = other.moments.clone();
+                let other_percentiles = other.percentiles(&[0.0, 0.5, 1.0]);
+                assert_eq!(merged.try_merge_ref(&other), Ok(()));
+                assert_eq!(merged.moments, expected_moments);
+                assert_eq!(merged.count(), values.len() as u64);
+                assert_eq!(merged.percentile_sample_count(), values.len() as u64);
+                assert_eq!(
+                    merged.percentiles(&[0.0, 0.5, 1.0]),
+                    [10_000, expected_p50, *values.iter().max().unwrap()]
+                );
+                assert_eq!(other.moments, other_moments);
+                assert_eq!(other.percentiles(&[0.0, 0.5, 1.0]), other_percentiles);
+                let Quantiles::TDigest { digest, pending } = &merged.quantiles else {
+                    panic!("expected a t-digest");
+                };
+                assert_eq!(digest.max_size(), 1000);
+                assert!(pending.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn tdigest_merge_includes_both_pending_buffers_in_both_orders() {
+        for reverse in [false, true] {
+            let mut first = record_tdigest(&vec![10_000; TDIGEST_BATCH_SIZE]);
+            first.record(Duration::from_nanos(20_000));
+            let second = record_tdigest(&[30_000, 40_000]);
+            let (mut merged, other) = if reverse {
+                (second, first)
+            } else {
+                (first, second)
+            };
+            assert_eq!(merged.try_merge_ref(&other), Ok(()));
+            assert_eq!(merged.count(), 1027);
+            assert_eq!(merged.percentile_sample_count(), 1027);
+            assert_eq!(merged.moments.sum, 10_330_000);
+            assert_eq!(merged.moments.sum_sq, 105_300_000_000);
+            assert_eq!((merged.min(), merged.max()), (Some(10_000), Some(40_000)));
+            assert_eq!(merged.mean(), (10_330_000.0_f64 / 1027.0).round() as u64);
+            let expected_std = ((1027.0_f64 * 105_300_000_000.0 - 10_330_000.0_f64.powi(2))
+                / (1027.0 * 1026.0))
+                .sqrt();
+            assert!((merged.std_dev().unwrap() - expected_std).abs() < 1e-9);
+            assert_eq!(merged.percentiles(&[0.0, 0.5, 1.0]), [10_000, 10_000, 40_000]);
+            // This rank lies near the buffered 20 us sample; without it, the
+            // estimate falls back near the 10 us population.
+            let p9976 = merged.percentile(0.9976);
+            assert!((15_000..=25_000).contains(&p9976), "reverse={reverse}, p99.76={p9976}");
+            let Quantiles::TDigest { digest, pending } = &merged.quantiles else {
+                panic!("expected a t-digest");
+            };
+            assert_eq!(digest.max_size(), 1000);
+            assert!(pending.is_empty());
+            assert_eq!(digest.count(), 1027.0);
+        }
+    }
+
+    #[test]
+    fn tdigest_merge_two_pending_only_buffers_in_both_orders() {
+        for reverse in [false, true] {
+            let first = record_tdigest(&[10_000; 4]);
+            let second = record_tdigest(&[1_000_000; 4]);
+            for storage in [&first, &second] {
+                let Quantiles::TDigest { digest, pending } = &storage.quantiles else {
+                    panic!("expected a t-digest");
+                };
+                assert!(digest.is_empty());
+                assert_eq!(digest.count(), 0.0);
+                assert!(!pending.is_empty());
+            }
+            let (mut merged, other) = if reverse {
+                (second, first)
+            } else {
+                (first, second)
+            };
+            assert_eq!(merged.try_merge_ref(&other), Ok(()));
+            let percentiles = merged.percentiles(&[0.25, 0.75]);
+            assert!(percentiles[0] < 100_000, "reverse={reverse}, p25={}", percentiles[0]);
+            assert!(percentiles[1] > 900_000, "reverse={reverse}, p75={}", percentiles[1]);
+            let Quantiles::TDigest { digest, pending } = &merged.quantiles else {
+                panic!("expected a t-digest");
+            };
+            assert_eq!(digest.max_size(), 1000);
+            assert!(pending.is_empty());
+            assert_eq!(digest.count(), 8.0);
+            assert_eq!(merged.count(), 8);
+            assert_eq!(merged.percentile_sample_count(), 8);
+            assert_eq!(
+                merged.moments,
+                Moments {
+                    count: 8,
+                    sum: 4_040_000,
+                    sum_sq: 4_000_400_000_000,
+                    min: 10_000,
+                    max: 1_000_000,
+                }
+            );
+        }
+    }
+
+    fn tdigest_snapshot(storage: &LatencyStorage) -> (TDigest, Vec<f64>, Moments) {
+        let Quantiles::TDigest { digest, pending } = &storage.quantiles else {
+            panic!("expected a t-digest");
+        };
+        (digest.clone(), pending.clone(), storage.moments.clone())
+    }
+
+    #[test]
+    fn tdigest_incompatible_compressions_are_rejected_even_when_empty() {
+        for (mine, theirs) in [(1000, 100), (100, 1000)] {
+            for (mine_value, their_value) in
+                [(None, None), (Some(10_000), None), (None, Some(20_000))]
+            {
+                let mut left =
+                    LatencyStorage::from_policy(&SamplingPolicy::TDigest { compression: mine });
+                let mut right =
+                    LatencyStorage::from_policy(&SamplingPolicy::TDigest { compression: theirs });
+                if let Some(ns) = mine_value {
+                    left.record(Duration::from_nanos(ns));
+                }
+                if let Some(ns) = their_value {
+                    right.record(Duration::from_nanos(ns));
+                }
+                let left_before = tdigest_snapshot(&left);
+                let right_before = tdigest_snapshot(&right);
+                assert_eq!(
+                    left.try_merge_ref(&right),
+                    Err("latency storage configurations differ")
+                );
+                assert_eq!(tdigest_snapshot(&left), left_before);
+                assert_eq!(tdigest_snapshot(&right), right_before);
+            }
+        }
     }
 
     /// 100,000 latencies with a long exponential tail above a 20 us floor. The
@@ -1901,11 +2479,19 @@ mod tests {
     }
 
     #[test]
-    fn actual_load_loop_merge_uses_valid_intervals_and_empty_collectors_are_neutral() {
+    fn actual_load_loop_merge_uses_complete_valid_intervals() {
         use crate::stats::StatsRecorder;
 
-        // An existing recorder need not implement the new hook, even if it has
-        // an unrelated method named `record_actual_load_loop`.
+        fn record_samples<S: StatsRecorder>(
+            recorder: &mut S,
+            start: Option<u64>,
+            end: Option<u64>,
+        ) {
+            recorder.record_actual_load_loop_samples(start, end);
+        }
+
+        // A pre-existing recorder need not implement the new timing hook, even
+        // if it has an unrelated method with the interval-recording name.
         struct DefaultRecorder;
         impl DefaultRecorder {
             fn record_actual_load_loop(&mut self, _: &str) {}
@@ -1917,23 +2503,31 @@ mod tests {
         }
         let mut recorder = DefaultRecorder;
         recorder.record_actual_load_loop("unrelated");
-        StatsRecorder::record_actual_load_loop_samples(&mut recorder, None, Some(1));
+        record_samples(&mut recorder, None, Some(1));
 
         let mut a = TupleStatsCollector::default();
         a.record_actual_load_loop(200, 400);
         let mut b = TupleStatsCollector::default();
-        StatsRecorder::record_actual_load_loop_samples(&mut b, Some(100), Some(150));
+        b.record_actual_load_loop(100, 300);
         let merged = TupleStatsCollector::merge(vec![a, TupleStatsCollector::default(), b]);
-        assert_eq!(merged.actual_load_loop_unix_us(), Some((100, 400)), "gaps are included");
+        assert_eq!(merged.actual_load_loop_unix_us(), Some((100, 400)));
         assert_eq!(TupleStatsCollector::merge(vec![]).actual_load_loop_unix_us(), None);
 
+        let mut first = TupleStatsCollector::default();
+        first.record_actual_load_loop_samples(Some(100), Some(200));
+        let mut second = TupleStatsCollector::default();
+        record_samples(&mut second, Some(300), Some(400));
+        let merged = TupleStatsCollector::merge(vec![first, second]);
+        assert_eq!(merged.actual_load_loop_unix_us(), Some((100, 400)), "gaps are included");
+
+        let max_safe_integer = (1 << 53) - 1;
         let mut boundary = TupleStatsCollector::default();
-        boundary.record_actual_load_loop((1 << 53) - 1, (1 << 53) - 1);
-        assert_eq!(boundary.actual_load_loop_unix_us(), Some(((1 << 53) - 1, (1 << 53) - 1)));
+        boundary.record_actual_load_loop(max_safe_integer, max_safe_integer);
+        assert_eq!(boundary.actual_load_loop_unix_us(), Some((max_safe_integer, max_safe_integer)));
     }
 
     #[test]
-    fn actual_load_loop_invalid_samples_invalidate_both_boundaries_across_merges() {
+    fn actual_load_loop_invalid_worker_poisons_merge_in_both_orders() {
         for (start, end) in [
             (Some(100), Some(90)),
             (None, Some(120)),
@@ -1942,20 +2536,30 @@ mod tests {
             (Some(1), Some(1 << 53)),
             (Some(1 << 53), Some(1 << 53)),
         ] {
-            for invalid_first in [false, true] {
+            for (invalid_first, another_valid) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
                 let mut valid = TupleStatsCollector::default();
                 valid.record_actual_load_loop(110, 120);
                 let mut invalid = TupleStatsCollector::default();
                 invalid.record_actual_load_loop_samples(start, end);
-                // Once invalid, another sample in the same collector cannot restore it.
-                invalid.record_actual_load_loop(100, 200);
+                assert_eq!(invalid.actual_load_loop_unix_us(), None, "{start:?} {end:?}");
+                if another_valid {
+                    // A later valid interval in the same collector cannot restore it.
+                    invalid.record_actual_load_loop(100, 200);
+                    assert_eq!(invalid.actual_load_loop_unix_us(), None, "{start:?} {end:?}");
+                }
                 let workers = if invalid_first {
                     vec![invalid, valid]
                 } else {
                     vec![valid, invalid]
                 };
                 let merged = TupleStatsCollector::merge(workers);
-                assert_eq!(merged.actual_load_loop_unix_us(), None, "{start:?} {end:?}");
+                assert_eq!(
+                    merged.actual_load_loop_unix_us(),
+                    None,
+                    "{start:?} {end:?} {invalid_first} {another_valid}"
+                );
                 let mut later = TupleStatsCollector::default();
                 later.record_actual_load_loop(130, 140);
                 assert_eq!(
@@ -2180,6 +2784,162 @@ mod tests {
         assert_eq!(collector.time_buckets(), vec![0]);
         assert_eq!(collector.entries().values().map(|e| e.rx_bytes).sum::<u64>(), 10);
         assert_eq!(collector.request_counts(0).completed, 2);
+    }
+
+    #[test]
+    fn percentile_sample_count_tracks_merged_reservoirs_and_error_summaries() {
+        let policy = SamplingPolicy::Limited { max_samples: 3, rate: 1.0 };
+        let collector = |thread_id| {
+            let mut collector = TupleStatsCollector::new(policy.clone(), Duration::from_secs(3600));
+            collector.set_thread_id(thread_id);
+            collector
+        };
+        let mut first = collector(0);
+        let mut second = collector(1);
+        for collector in [&mut first, &mut second] {
+            for i in 0..5 {
+                collector.record_latency(1, i % 2, Duration::from_micros(10 + i as u64));
+                collector.record_error_reply(1, i % 2, "error", Duration::from_micros(20));
+            }
+        }
+        let merged = TupleStatsCollector::merge(vec![first, second]);
+        let duration = Duration::from_secs(1);
+        for summary in [
+            merged.aggregate_global(duration),
+            merged.aggregate_by_group(duration)[&1].clone(),
+            merged.error_latency_global(),
+            merged.error_latency(1),
+        ] {
+            assert_eq!(summary.latency_sample_count, 10);
+            assert_eq!(summary.percentile_sample_count, Some(3));
+        }
+        assert_eq!(merged.error_latency(2).percentile_sample_count, Some(0));
+    }
+
+    #[test]
+    fn percentile_sample_count_respects_distinct_global_and_group_policies() {
+        let collector = |thread_id| {
+            let mut collector = TupleStatsCollector::new(
+                SamplingPolicy::HdrHistogram { sigfigs: 3, max_value_us: None },
+                Duration::from_secs(3600),
+            );
+            collector
+                .register_group_policy(1, SamplingPolicy::Limited { max_samples: 3, rate: 1.0 });
+            collector.set_thread_id(thread_id);
+            collector
+        };
+        let mut first = collector(0);
+        let mut second = collector(1);
+        for collector in [&mut first, &mut second] {
+            for _ in 0..5 {
+                collector.record_latency(1, 0, Duration::from_micros(10));
+                collector.record_error_reply(1, 0, "error", Duration::from_micros(20));
+            }
+        }
+        let merged = TupleStatsCollector::merge(vec![first, second]);
+        let duration = Duration::from_secs(1);
+        assert_eq!(merged.aggregate_global(duration).percentile_sample_count, Some(10));
+        assert_eq!(merged.aggregate_by_group(duration)[&1].percentile_sample_count, Some(3));
+        assert_eq!(merged.error_latency_global().percentile_sample_count, Some(10));
+        assert_eq!(merged.error_latency(1).percentile_sample_count, Some(3));
+    }
+
+    #[test]
+    fn ddsketch_percentile_sample_count_crosses_u32_boundary() {
+        let policy = SamplingPolicy::DdSketch { alpha: 0.01, max_bins: 128 };
+        // Include zero-bucket values and a wide enough positive range to collapse bins.
+        let mut storage = storage_with(&policy, [0, 1, 100, 1_000_000_000_000]);
+        assert!(storage.percentile(0.75) > 200);
+
+        // Doubling a real sketch builds 2^32 represented observations in 30 merges.
+        for _ in 0..30 {
+            let Quantiles::DdSketch(sketch) = &storage.quantiles else {
+                unreachable!()
+            };
+            // Every count in this loop still fits in a 32-bit usize.
+            assert_eq!(sketch.count() as u64, storage.count());
+            let copy = LatencyStorage {
+                quantiles: Quantiles::DdSketch(sketch.clone()),
+                moments: storage.moments.clone(),
+            };
+            storage.merge_ref(&copy);
+        }
+        let boundary = 1_u64 << 32;
+        assert_eq!(storage.count(), boundary);
+        assert_eq!(storage.percentile_sample_count(), boundary);
+        let Quantiles::DdSketch(sketch) = &storage.quantiles else {
+            unreachable!()
+        };
+        // The public count saturates when usize cannot hold the u64 total.
+        assert_eq!(sketch.count(), usize::try_from(boundary).unwrap_or(usize::MAX));
+
+        storage.record(Duration::from_nanos(5));
+        storage.merge_ref(&storage_with(&policy, [0, 1_000_000_000_000]));
+        assert_eq!(storage.count(), boundary + 3);
+        assert_eq!(storage.percentile_sample_count(), boundary + 3);
+        let Quantiles::DdSketch(sketch) = &storage.quantiles else {
+            unreachable!()
+        };
+        assert_eq!(sketch.count(), usize::try_from(boundary + 3).unwrap_or(usize::MAX));
+    }
+
+    #[test]
+    fn percentile_sample_count_tracks_sketches_and_pending_values() {
+        let policies = [
+            SamplingPolicy::None,
+            SamplingPolicy::Unlimited,
+            SamplingPolicy::DdSketch { alpha: 0.01, max_bins: 1024 },
+            SamplingPolicy::TDigest { compression: 100 },
+            SamplingPolicy::HdrHistogram { sigfigs: 3, max_value_us: Some(10) },
+        ];
+        for policy in policies {
+            let mut first = LatencyStorage::from_policy(&policy);
+            let mut second = LatencyStorage::from_policy(&policy);
+            for _ in 0..1025 {
+                first.record(Duration::from_micros(20));
+            }
+            second.record(Duration::from_micros(1));
+            let expected = if matches!(policy, SamplingPolicy::None) {
+                0
+            } else {
+                1025
+            };
+            assert_eq!(first.percentile_sample_count(), expected, "{policy:?}");
+            first.merge(second);
+            assert_eq!(
+                first.percentile_sample_count(),
+                if expected == 0 { 0 } else { 1026 },
+                "{policy:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn aggregated_percentile_count_serialization_defaults_for_old_data() {
+        let mut collector =
+            TupleStatsCollector::new(SamplingPolicy::default(), Duration::from_secs(1));
+        collector.record_latency(0, 0, Duration::from_micros(10));
+        let stats = collector.aggregate_global(Duration::from_secs(1));
+        let mut json = serde_json::to_value(stats).unwrap();
+        assert_eq!(json["percentile_sample_count"], 1);
+        let decoded: AggregatedStats = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(decoded.percentile_sample_count, Some(1));
+        json.as_object_mut().unwrap().remove("percentile_sample_count");
+        let old: AggregatedStats = serde_json::from_value(json).unwrap();
+        assert_eq!(old.percentile_sample_count, None);
+        assert!(serde_json::to_value(&old).unwrap().get("percentile_sample_count").is_none());
+        assert_eq!(old.latency_sample_count, 1);
+    }
+
+    #[test]
+    fn empty_aggregated_estimator_serializes_an_explicit_zero() {
+        let collector = TupleStatsCollector::new(SamplingPolicy::None, Duration::from_secs(1));
+        let stats = collector.aggregate_global(Duration::from_secs(1));
+        assert_eq!(stats.percentile_sample_count, Some(0));
+        let json = serde_json::to_value(stats).unwrap();
+        assert_eq!(json.get("percentile_sample_count"), Some(&serde_json::json!(0)));
+        let decoded: AggregatedStats = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.percentile_sample_count, Some(0));
     }
 
     #[test]

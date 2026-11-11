@@ -104,6 +104,23 @@ fn error_replies_are_counted_by_kind_with_their_own_latency() {
     let errors = format!("  Errors:        {} (503: {})", count("errors"), count("errors"));
     assert!(stdout.contains(&errors), "{stdout}");
     assert!(stdout.contains(&format!("  WARNING: {} requests got an error reply", count("errors"))));
+    let (global_text, group_text) = stdout.split_once("TRAFFIC GROUP 0: web").unwrap();
+    for (text, indent, latency) in [
+        (global_text, "", &json["global"]["error_latency"]),
+        (group_text, "  ", &group["error_latency"]),
+    ] {
+        let error_summary = text
+            .split_once(&format!("{indent}Error latency (μs):\n"))
+            .unwrap()
+            .1
+            .split_once("\n\n")
+            .unwrap()
+            .0;
+        assert!(error_summary.contains(&format!(
+            "{indent}  Percentile samples: {}",
+            latency["percentile_sample_count"].as_u64().unwrap()
+        )));
+    }
 }
 
 #[test]

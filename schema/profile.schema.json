@@ -834,11 +834,11 @@
           "type": "object",
           "properties": {
             "compression": {
-              "description": "Compression parameter (higher = more accurate, more memory)\nTypical values: 100-1000",
+              "description": "Positive compression parameter (higher = more accurate, more memory)\nDefault: 1000; typical values: 100-1000",
               "type": "integer",
               "format": "uint",
               "default": 1000,
-              "minimum": 0
+              "minimum": 1
             },
             "type": {
               "type": "string",

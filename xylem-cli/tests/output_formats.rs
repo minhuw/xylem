@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Command, Output};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DESCRIPTION: &str = "Output format characterization";
 
@@ -95,7 +95,7 @@ fn file_names(dir: &Path) -> Vec<String> {
 }
 
 /// Summary lines that end in a measured value, by their label.
-const MEASURED_LABELS: [&str; 45] = [
+const MEASURED_LABELS: [&str; 47] = [
     "Measured: ",
     "Total Requests:  ",
     "Throughput:      ",
@@ -110,6 +110,7 @@ const MEASURED_LABELS: [&str; 45] = [
     "  Std Dev:       ",
     "  95% CI:        ",
     "  Samples:       ",
+    "  Percentile samples: ",
     "  Requests:      ",
     "  Throughput:    ",
     "  Bandwidth:     ",
@@ -123,6 +124,7 @@ const MEASURED_LABELS: [&str; 45] = [
     "    Std Dev:     ",
     "    95% CI:      ",
     "    Samples:     ",
+    "    Percentile samples: ",
     "  Sent:          ",
     "  Completed:     ",
     "  Errors:        ",
@@ -238,6 +240,7 @@ Latency (μs):
   Std Dev:       #.##
   95% CI:        ±#.##
   Samples:       #
+  Percentile samples: #
 
 Requests:
   Sent:          #
@@ -287,6 +290,7 @@ Statistics:
     Std Dev:     #.##
     95% CI:      ±#.##
     Samples:     #
+    Percentile samples: #
 
   Requests:
     Sent:        #
@@ -380,6 +384,7 @@ fn summary_values(json_text: &str) -> Vec<String> {
         let ci: f64 = raw_number(section, "confidence_interval_us").parse().unwrap();
         values.push(format!("±{ci:.2}"));
         values.push(raw_number(section, "sample_count").to_string());
+        values.push(raw_number(section, "percentile_sample_count").to_string());
         for key in [
             "sent",
             "completed",
@@ -407,10 +412,11 @@ fn summary_values(json_text: &str) -> Vec<String> {
 }
 
 /// JSON fields whose values are measured.
-const MEASURED_KEYS: [&str; 24] = [
+const MEASURED_KEYS: [&str; 25] = [
     "measured_duration_secs",
     "actual_load_loop_start_unix_us",
     "actual_load_loop_end_unix_us",
+    "percentile_sample_count",
     "total_requests",
     "min_us",
     "max_us",
@@ -492,7 +498,8 @@ const MASKED_JSON: &str = r#"{
       "p99999_us": #,
       "std_dev_us": #,
       "confidence_interval_us": #,
-      "sample_count": #
+      "sample_count": #,
+      "percentile_sample_count": #
     },
     "error_latency": {
       "min_us": null,
@@ -506,7 +513,8 @@ const MASKED_JSON: &str = r#"{
       "p99999_us": #,
       "std_dev_us": null,
       "confidence_interval_us": null,
-      "sample_count": #
+      "sample_count": #,
+      "percentile_sample_count": #
     },
     "requests": {
       "sent": #,
@@ -569,7 +577,8 @@ const MASKED_JSON: &str = r#"{
           "p99999_us": #,
           "std_dev_us": #,
           "confidence_interval_us": #,
-          "sample_count": #
+          "sample_count": #,
+          "percentile_sample_count": #
         },
         "error_latency": {
           "min_us": null,
@@ -583,7 +592,8 @@ const MASKED_JSON: &str = r#"{
           "p99999_us": #,
           "std_dev_us": null,
           "confidence_interval_us": null,
-          "sample_count": #
+          "sample_count": #,
+          "percentile_sample_count": #
         },
         "requests": {
           "sent": #,
@@ -630,19 +640,36 @@ fn sorted_keys(value: &serde_json::Value) -> Vec<&str> {
 }
 
 /// Check the JSON results file and return its text.
-fn assert_json_results(path: &Path, target: &str) -> String {
+fn unix_time_us() -> Option<u64> {
+    SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_micros().try_into().ok()
+}
+
+fn assert_json_results(
+    path: &Path,
+    target: &str,
+    before: Option<u64>,
+    after: Option<u64>,
+) -> String {
     let text = std::fs::read_to_string(path).unwrap();
     let json: serde_json::Value = serde_json::from_str(&text).unwrap();
     let experiment = &json["experiment"];
+    let start = experiment.get("actual_load_loop_start_unix_us");
+    let end = experiment.get("actual_load_loop_end_unix_us");
     let mut expected = MASKED_JSON.replace("TARGET", target);
-    match (
-        experiment.get("actual_load_loop_start_unix_us"),
-        experiment.get("actual_load_loop_end_unix_us"),
-    ) {
+    match (start, end) {
         (Some(start), Some(end)) => {
             let start = start.as_u64().expect("load-loop start must be Unix microseconds");
             let end = end.as_u64().expect("load-loop end must be Unix microseconds");
-            assert!(start > 0 && start <= end && end < (1 << 53));
+            assert!(
+                start > 0 && start <= end && end < (1_u64 << 53),
+                "load-loop interval: {start}..{end}"
+            );
+            if let (Some(before), Some(after)) = (before, after) {
+                assert!(
+                    before <= start && end <= after,
+                    "run: {before}..{after}, load loop: {start}..{end}"
+                );
+            }
             expected = expected.replace(
                 "    \"measured_duration_secs\": #,\n",
                 "    \"measured_duration_secs\": #,\n    \"actual_load_loop_start_unix_us\": #,\n    \"actual_load_loop_end_unix_us\": #,\n",
@@ -694,9 +721,13 @@ fn assert_json_results(path: &Path, target: &str) -> String {
         let count = |key: &str| stats["requests"][key].as_u64().unwrap();
         let successful = count("completed") - count("errors");
         assert_eq!(stats["latency"]["sample_count"].as_u64().unwrap(), successful);
+        // The default HDR estimator retains every recorded latency.
+        assert_eq!(stats["latency"]["percentile_sample_count"].as_u64().unwrap(), successful);
         assert_eq!(count("errors"), 0);
         assert_eq!(stats["requests"]["errors_by_kind"], serde_json::json!({}));
         assert_eq!(stats["error_latency"]["sample_count"], 0);
+        assert_eq!(stats["error_latency"]["percentile_sample_count"].as_u64().unwrap(), 0);
+        assert!(stats["error_latency"].get("clamped_samples").is_none());
         let in_window = stats["total_requests"].as_u64().unwrap();
         assert!(in_window <= count("completed") && count("completed") <= in_window + 1);
         assert_eq!(count("sent"), count("completed") + count("timed_out") + count("failed"));
@@ -771,11 +802,13 @@ fn json_format_replaces_the_extension_with_json() {
     let expected = ["results.json", "results.json", "results.v1.json"];
     for (file, expected) in FILES.into_iter().zip(expected) {
         let dir = tempfile::tempdir().unwrap();
+        let before = unix_time_us();
         let (output, target) = run_cli("json", &dir.path().join(file));
+        let after = unix_time_us();
         assert_success(&output);
         assert_eq!(file_names(dir.path()), [expected]);
         let json_path = dir.path().join(expected);
-        let json_text = assert_json_results(&json_path, &target);
+        let json_text = assert_json_results(&json_path, &target, before, after);
         let stdout = String::from_utf8(output.stdout).unwrap();
         let (masked, values) = mask_summary(&stdout);
         assert_eq!(
@@ -819,12 +852,14 @@ fn both_format_strips_one_extension_then_replaces_the_next() {
     ];
     for (file, expected) in FILES.into_iter().zip(expected) {
         let dir = tempfile::tempdir().unwrap();
+        let before = unix_time_us();
         let (output, target) = run_cli("both", &dir.path().join(file));
+        let after = unix_time_us();
         assert_success(&output);
         assert_eq!(file_names(dir.path()), expected);
         let json_path = dir.path().join("results.json");
         let html_path = dir.path().join("results.html");
-        let json_text = assert_json_results(&json_path, &target);
+        let json_text = assert_json_results(&json_path, &target, before, after);
         let html = assert_html_report(&html_path, &target);
         let stdout = String::from_utf8(output.stdout).unwrap();
         let (masked, values) = mask_summary(&stdout);
@@ -855,11 +890,17 @@ fn both_format_strips_one_extension_then_replaces_the_next() {
             .iter()
             .map(|key| raw_number(group, key))
             .collect();
+        for (label, value) in [
+            ("Total Requests", raw_number(global, "total_requests")),
+            ("Latency Samples", raw_number(global, "sample_count")),
+            ("Latency Percentile Samples", raw_number(global, "percentile_sample_count")),
+        ] {
+            let card = format!(
+                "<div class=\"stat-label\">{label}</div>\n                <div class=\"stat-value\">{value}</div>"
+            );
+            assert_eq!(html.matches(&card).count(), 1, "{card}");
+        }
         for line in [
-            format!(
-                "                <div class=\"stat-value\">{}</div>",
-                raw_number(global, "total_requests")
-            ),
             format!("                    data: [{}],", global_latencies.join(",")),
             format!("                    data: [{}],", raw_number(group, "throughput_rps")),
             format!("                    data: [{}],", group_latencies.join(",")),

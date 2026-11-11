@@ -7,6 +7,21 @@ use xylem_cli::output::{
 };
 use xylem_core::stats::{SamplingPolicy, TupleStatsCollector};
 
+fn assert_cell(section: &str, label: &str, expected: &str) {
+    let label = format!("<td>{label}</td>");
+    let value = section
+        .split_once(&label)
+        .unwrap_or_else(|| panic!("missing {label}"))
+        .1
+        .trim_start()
+        .strip_prefix("<td>")
+        .expect("missing value cell")
+        .split_once("</td>")
+        .expect("unterminated value cell")
+        .0;
+    assert_eq!(value, expected, "{label}");
+}
+
 #[test]
 fn html_report_preserves_data_and_escapes_profile_text() {
     let text = "O'Reilly \\\" <b>& </script><script>throw 'injected'</script>\u{2028}\u{2029}";
@@ -31,6 +46,8 @@ fn html_report_preserves_data_and_escapes_profile_text() {
     results.global.latency.p99_us = 3.75;
     results.global.latency.p999_us = 4.125;
     results.global.latency.p9999_us = 5.0625;
+    results.global.latency.sample_count = 1;
+    results.global.latency.percentile_sample_count = Some(1);
     results.traffic_groups.push(TrafficGroupResults {
         id: 0,
         name: text.into(),
@@ -72,20 +89,92 @@ fn html_report_preserves_data_and_escapes_profile_text() {
     assert!(script.contains("data: [1.25,2.5,3.75,4.125,5.0625]"));
     assert!(script.contains("data: [1.25,2.5,3.75,4.125]"));
     assert!(script.contains("data: [12.3456]"));
-    // No latency was recorded: unavailable values are n/a, never 0. That is
-    // four group latencies, the global and group mean, p99 and max send lag,
-    // the global and group mean and p99 error reply latency, and the five
-    // global and group service values of the latency breakdown.
-    assert_eq!(body.matches("<td>n/a</td>").count(), 24);
+    let (global, group) = body.split_once("<div class=\"group-section\">").unwrap();
+    for section in [global, group] {
+        for label in [
+            "Mean Error Reply Latency",
+            "p99 Error Reply Latency",
+            "Mean Send Lag",
+            "p99 Send Lag",
+            "Max Send Lag",
+        ] {
+            assert_cell(section, label, "n/a");
+        }
+        assert!(section.contains(
+            "<td>Service</td>\n<td>n/a</td><td>n/a</td><td>n/a</td><td>n/a</td><td>n/a</td>"
+        ));
+    }
+    for label in ["Min Latency", "Max Latency", "Latency Std Dev", "Mean 95% CI"] {
+        assert_cell(group, label, "n/a");
+    }
+    assert_cell(group, "p50 Latency", "1.25 μs");
+    assert_cell(group, "p99 Latency", "3.75 μs");
     assert_eq!(body.matches("<h4>Latency Breakdown</h4>").count(), 2);
     assert_eq!(body.matches("<td colspan=\"5\">n/a (no kernel split)</td>").count(), 4);
     assert_eq!(body.matches("they do not add up to the total").count(), 2);
     assert_eq!(body.matches("<td>Requests Timed Out (no latency)</td>").count(), 2);
-    assert!(body.contains("<td>0</td>"), "sample count");
+    assert!(body.contains("<td>Latency Samples</td>\n                    <td>1</td>"));
     // Verify JSON labels round-trip even when a JavaScript runtime is unavailable.
     let label_json = script.split("labels: ").nth(2).unwrap().lines().next().unwrap();
     let labels: Vec<String> = serde_json::from_str(label_json.trim_end_matches(',')).unwrap();
     assert_eq!(labels, [text]);
+
+    let sampled_latency = |policy, latency| {
+        let mut stats = TupleStatsCollector::new(policy, Duration::from_secs(1));
+        stats.record_latency(0, 0, latency);
+        DetailedExperimentResults::from_tuple_stats(
+            "sample".into(),
+            None,
+            None,
+            "unused".into(),
+            "xylem-echo".into(),
+            "tcp".into(),
+            Duration::from_secs(1),
+            &stats,
+            &[],
+            false,
+        )
+        .global
+        .latency
+    };
+    let mut availability = results.clone();
+    availability.global.latency = sampled_latency(
+        SamplingPolicy::Limited { max_samples: 0, rate: 1.0 },
+        Duration::from_micros(7),
+    );
+    availability.traffic_groups[0].stats.latency =
+        sampled_latency(SamplingPolicy::Unlimited, Duration::ZERO);
+    assert_eq!(
+        (
+            availability.global.latency.sample_count,
+            availability.global.latency.percentile_sample_count
+        ),
+        (1, Some(0))
+    );
+    let observed_zero = &availability.traffic_groups[0].stats.latency;
+    assert_eq!(
+        (observed_zero.sample_count, observed_zero.percentile_sample_count),
+        (1, Some(1))
+    );
+    let availability_file = tempfile::NamedTempFile::new().unwrap();
+    generate_html_report(&availability, availability_file.path().to_str().unwrap()).unwrap();
+    let availability_html = std::fs::read_to_string(availability_file.path()).unwrap();
+    let (availability_body, availability_script) =
+        availability_html.split_once("    <script>\n").unwrap();
+    let availability_script = availability_script.split_once("    </script>").unwrap().0;
+    assert!(!availability_script.contains('<'));
+    assert!(!availability_script.contains('\u{2028}'));
+    assert!(!availability_script.contains('\u{2029}'));
+    assert!(availability_script.contains("data: [null,null,null,null,null]"));
+    assert!(availability_script.contains("data: [0.0,0.0,0.0,0.0]"));
+    let (availability_global, availability_group) =
+        availability_body.split_once("<div class=\"group-section\">").unwrap();
+    assert!(availability_global.contains(
+        "<div class=\"stat-label\">Median Latency</div>\n                <div class=\"stat-value\">n/a</div>"
+    ));
+    for label in ["Mean Latency", "p50 Latency", "p99 Latency"] {
+        assert_cell(availability_group, label, "0.00 μs");
+    }
 
     // Node is optional locally; CI's Ubuntu runner provides it. Execute the full
     // script with a Chart stub to catch syntax errors and positional regressions.
@@ -117,6 +206,11 @@ assert.deepEqual(charts[1].options.data.labels, [{expected}]);
 assert.deepEqual(charts[1].options.data.datasets[0].data, [12.3456]);
 assert.equal(charts[2].options.data.datasets[0].label, {expected} + '  Latency (μs)');
 assert.deepEqual(charts[2].options.data.datasets[0].data, [1.25,2.5,3.75,4.125]);
+charts.length = 0;
+{availability_script}
+assert.equal(charts.length, 3);
+assert.deepEqual(charts[0].options.data.datasets[0].data, [null,null,null,null,null]);
+assert.deepEqual(charts[2].options.data.datasets[0].data, [0,0,0,0]);
 "#
     );
     child.stdin.take().unwrap().write_all(harness.as_bytes()).unwrap();

@@ -97,6 +97,65 @@ fn stdout(output: &Output) -> String {
 }
 
 #[test]
+fn latency_thresholds_require_retained_successful_samples() {
+    use xylem_cli::config::ProfileConfig;
+    use xylem_cli::output::DetailedExperimentResults;
+    use xylem_cli::thresholds::{evaluate, Verdict};
+    use xylem_core::stats::{SamplingPolicy, TupleStatsCollector};
+
+    let dir = tempfile::tempdir().unwrap();
+    let profile = write_profile(
+        dir.path(),
+        "127.0.0.1:9",
+        serde_json::json!({ "type": "closed-loop" }),
+        serde_json::json!({
+            "latency": ["p99 < 1ms"],
+            "latency{group=echo}": ["p99 < 1ms"]
+        }),
+    );
+    let mut config: ProfileConfig =
+        toml::from_str(&std::fs::read_to_string(profile).unwrap()).unwrap();
+    config.validate().unwrap();
+
+    for (policy, error_only, expected_samples, expected_verdict) in [
+        (SamplingPolicy::None, false, 0, Verdict::ThresholdsFailed),
+        (SamplingPolicy::default(), true, 0, Verdict::ThresholdsFailed),
+        (SamplingPolicy::default(), false, 1, Verdict::Pass),
+    ] {
+        let mut collector = TupleStatsCollector::new(policy.clone(), Duration::from_secs(1));
+        collector.register_group_policy(0, policy);
+        collector.record_sent(0, None);
+        if error_only {
+            collector.record_error_reply(0, 0, "error", Duration::ZERO);
+        } else {
+            collector.record_latency(0, 0, Duration::ZERO);
+        }
+        let mut results = DetailedExperimentResults::from_tuple_stats(
+            "thresholds".into(),
+            None,
+            None,
+            "127.0.0.1:9".into(),
+            "xylem-echo".into(),
+            "tcp".into(),
+            Duration::from_secs(1),
+            &collector,
+            &config.traffic_groups,
+            false,
+        );
+        assert_eq!(results.global.requests.completed, 1);
+        assert_eq!(results.traffic_groups[0].stats.requests.completed, 1);
+        assert_eq!(results.global.latency.sample_count, expected_samples);
+        assert_eq!(results.traffic_groups[0].stats.latency.sample_count, expected_samples);
+        assert_eq!(evaluate(&mut results, &config), expected_verdict);
+        assert_eq!(results.thresholds.len(), 2);
+        for threshold in &results.thresholds {
+            assert_eq!(threshold.observed, (expected_samples > 0).then_some(0.0));
+            assert_eq!(threshold.ok, expected_samples > 0);
+        }
+    }
+}
+
+#[test]
 fn a_run_within_its_thresholds_exits_0() {
     let (output, json) = run_against_echo(
         Duration::ZERO,

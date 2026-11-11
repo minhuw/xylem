@@ -289,6 +289,27 @@ impl Threshold {
 
     /// The value this threshold compares in `stats`, if the run has one
     fn observe(&self, stats: &Value) -> Option<f64> {
+        // Older summaries may contain numeric placeholders in unavailable
+        // duration fields, even for statistics needing two samples.
+        if let [summary, field] = self.path.as_slice() {
+            if matches!(summary.as_str(), "latency" | "error_latency") && field.ends_with("_us") {
+                let summary = stats.get(summary)?;
+                let samples = summary.get("sample_count")?.as_u64()?;
+                if samples == 0
+                    || (samples < 2
+                        && matches!(field.as_str(), "std_dev_us" | "confidence_interval_us"))
+                {
+                    return None;
+                }
+                let percentile =
+                    field.strip_prefix('p').and_then(|name| name.strip_suffix("_us")).is_some_and(
+                        |digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()),
+                    );
+                if percentile && summary.get("percentile_sample_count")?.as_u64()? == 0 {
+                    return None;
+                }
+            }
+        }
         let value = lookup(stats, &self.path)?.as_f64()?;
         if !self.rate {
             return Some(value);
@@ -338,6 +359,7 @@ fn probe_stats() -> (Value, Value) {
         std_dev_us: Some(0.0),
         confidence_interval_us: Some(0.0),
         sample_count: 0,
+        percentile_sample_count: Some(0),
         clamped_samples: Some(0),
     };
     let requests = RequestCounts {
@@ -922,6 +944,431 @@ file = "unused"
         results
     }
 
+    #[test]
+    fn empty_latency_summaries_are_unavailable_but_zero_samples_are_valid() {
+        let config = profile(
+            r#"
+[thresholds]
+latency = ["mean < 1us", "p50 < 1us", "p95 < 1us", "p99 < 1us", "p99.9 < 1us", "p99.99 < 1us", "p99.999 < 1us"]
+"latency.p99_us" = ["!= 1us"]
+"latency.sample_count" = [">= 0"]
+"latency{group=api}" = ["mean < 1us", "p99 < 1us"]
+error_latency = ["mean < 1us", "p99 < 1us"]
+"error_latency{group=api}" = ["mean < 1us", "p99 < 1us"]
+"send_lag.late_threshold_us" = ["> 0us"]
+"#,
+        )
+        .unwrap();
+        let mut results = results(&config);
+        results.global.latency = LatencyStats::default();
+        results.global.error_latency = LatencyStats::default();
+        results.traffic_groups[0].stats.latency = LatencyStats::default();
+        results.traffic_groups[0].stats.error_latency = LatencyStats::default();
+
+        assert_eq!(evaluate(&mut results, &config), Verdict::ThresholdsFailed);
+        for threshold in &results.thresholds {
+            if threshold.metric == "latency.sample_count"
+                || threshold.metric == "send_lag.late_threshold_us"
+            {
+                assert!(threshold.ok, "{threshold:?}");
+            } else {
+                assert_eq!(threshold.observed, None, "{threshold:?}");
+                assert!(!threshold.ok, "{threshold:?}");
+            }
+        }
+
+        // A zero duration with a recorded sample is a real value. Give each
+        // scope a different count to verify that it uses its own summary.
+        results.global.latency.sample_count = 1;
+        results.global.latency.percentile_sample_count = Some(1);
+        results.traffic_groups[0].stats.error_latency.sample_count = 1;
+        results.traffic_groups[0].stats.error_latency.percentile_sample_count = Some(1);
+        assert_eq!(evaluate(&mut results, &config), Verdict::ThresholdsFailed);
+        for threshold in &results.thresholds {
+            let available = (threshold.metric.starts_with("latency") && threshold.group.is_none())
+                || (threshold.metric == "error_latency"
+                    && threshold.group.as_deref() == Some("api"))
+                || threshold.metric == "send_lag.late_threshold_us";
+            if threshold.metric == "latency.sample_count" {
+                assert_eq!(threshold.observed, Some(1.0));
+                assert!(threshold.ok);
+            } else if available {
+                assert!(threshold.observed.is_some(), "{threshold:?}");
+                if threshold.metric != "send_lag.late_threshold_us" {
+                    assert_eq!(threshold.observed, Some(0.0), "{threshold:?}");
+                }
+                assert!(threshold.ok, "{threshold:?}");
+            } else {
+                assert_eq!(threshold.observed, None, "{threshold:?}");
+                assert!(!threshold.ok, "{threshold:?}");
+            }
+        }
+
+        results.global.error_latency.sample_count = 1;
+        results.global.error_latency.percentile_sample_count = Some(1);
+        results.traffic_groups[0].stats.latency.sample_count = 1;
+        results.traffic_groups[0].stats.latency.percentile_sample_count = Some(1);
+        assert_eq!(evaluate(&mut results, &config), Verdict::Pass);
+        assert!(results.thresholds.iter().all(|threshold| threshold.ok));
+    }
+
+    #[test]
+    fn percentile_thresholds_require_retained_samples() {
+        let mut config = profile(
+            r#"
+[thresholds]
+latency = ["p50 < 1ms", "p95 < 1ms", "p99 < 1ms", "p99.9 < 1ms", "p99.99 < 1ms", "p99.999 < 1ms", "mean == 5us", "min == 0us", "max == 10us"]
+"latency.p99_us" = ["!= 1ms"]
+"latency{group=api}" = ["p99 < 1ms", "mean == 5us"]
+error_latency = ["p99 < 1ms", "mean == 5us"]
+"error_latency{group=api}" = ["p99 < 1ms", "mean == 5us"]
+"latency.percentile_sample_count" = ["== 0"]
+"requests.sent" = ["> 0"]
+"#,
+        )
+        .unwrap();
+        let policy = SamplingPolicy::Limited { max_samples: 0, rate: 1.0 };
+        config.traffic_groups[0].sampling_policy = policy.clone();
+        config.validate().unwrap();
+        let mut collector = TupleStatsCollector::new(policy.clone(), Duration::from_secs(1));
+        collector.register_group_policy(0, policy);
+        for latency in [Duration::ZERO, Duration::from_micros(10)] {
+            collector.record_latency(0, 0, latency);
+            collector.record_error_reply(0, 0, "error", latency);
+        }
+        let mut results = results_of(&config, &collector);
+        for summary in [
+            &results.global.latency,
+            &results.global.error_latency,
+            &results.traffic_groups[0].stats.latency,
+            &results.traffic_groups[0].stats.error_latency,
+        ] {
+            assert_eq!((summary.sample_count, summary.percentile_sample_count), (2, Some(0)));
+            assert_eq!(summary.p99_us, 0.0);
+            assert_eq!(summary.mean_us, 5.0);
+        }
+        assert_eq!(evaluate(&mut results, &config), Verdict::ThresholdsFailed);
+        for threshold in &results.thresholds {
+            if threshold.field.ends_with("_us")
+                && threshold.field.split('.').next_back().unwrap().starts_with('p')
+            {
+                assert_eq!(threshold.observed, None, "{threshold:?}");
+                assert!(!threshold.ok, "{threshold:?}");
+            } else {
+                assert!(threshold.ok, "{threshold:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn percentile_thresholds_treat_unknown_counts_as_unavailable() {
+        let config = profile(
+            r#"
+[thresholds]
+latency = ["p99 < 1us", "mean == 0us"]
+"latency{group=api}" = ["p99 < 1us", "mean == 0us"]
+error_latency = ["p99 < 1us", "mean == 0us"]
+"error_latency{group=api}" = ["p99 < 1us", "mean == 0us"]
+"#,
+        )
+        .unwrap();
+        let policy = SamplingPolicy::Limited { max_samples: 1, rate: 1.0 };
+        let mut collector = TupleStatsCollector::new(policy.clone(), Duration::from_secs(1));
+        collector.register_group_policy(0, policy);
+        collector.record_latency(0, 0, Duration::ZERO);
+        collector.record_error_reply(0, 0, "error", Duration::ZERO);
+        let mut results = results_of(&config, &collector);
+        assert_eq!(evaluate(&mut results, &config), Verdict::Pass);
+        assert!(results.thresholds.iter().all(|t| t.observed == Some(0.0) && t.ok));
+
+        // Deserialize older summaries without the estimator count, and also
+        // exercise explicit null and zero separately in the other scopes.
+        let mut legacy = serde_json::to_value(&results.global.latency).unwrap();
+        legacy.as_object_mut().unwrap().remove("percentile_sample_count");
+        results.global.latency = serde_json::from_value(legacy).unwrap();
+        let mut legacy_error = serde_json::to_value(&results.global.error_latency).unwrap();
+        legacy_error["percentile_sample_count"] = serde_json::Value::Null;
+        results.global.error_latency = serde_json::from_value(legacy_error).unwrap();
+        results.traffic_groups[0].stats.latency.percentile_sample_count = Some(0);
+        assert_eq!(evaluate(&mut results, &config), Verdict::ThresholdsFailed);
+        for threshold in &results.thresholds {
+            if threshold.field.ends_with("p99_us") {
+                let known_positive =
+                    threshold.metric == "error_latency" && threshold.group.is_some();
+                assert_eq!(threshold.observed, known_positive.then_some(0.0), "{threshold:?}");
+                assert_eq!(threshold.ok, known_positive, "{threshold:?}");
+            } else {
+                assert_eq!(threshold.observed, Some(0.0), "{threshold:?}");
+                assert!(threshold.ok, "{threshold:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_numeric_latency_placeholders_require_samples() {
+        let mut config = profile("").unwrap();
+        let mut thresholds = BTreeMap::new();
+        for summary in ["latency", "error_latency"] {
+            for filter in ["", "{group=api}"] {
+                thresholds.insert(
+                    format!("{summary}{filter}"),
+                    ["min", "max", "std_dev", "confidence_interval"]
+                        .iter()
+                        .map(|aggregation| format!("{aggregation} < 1us"))
+                        .collect(),
+                );
+                for field in ["sample_count", "clamped_samples"] {
+                    thresholds.insert(format!("{summary}.{field}{filter}"), vec![">= 0".into()]);
+                }
+                for field in ["min_us", "max_us", "std_dev_us", "confidence_interval_us"] {
+                    thresholds.insert(format!("{summary}.{field}{filter}"), vec!["< 1us".into()]);
+                }
+            }
+        }
+        thresholds.insert("latency.max_us".into(), vec!["!= 1us".into()]);
+        thresholds.insert("send_lag.late_threshold_us".into(), vec!["> 0us".into()]);
+        config.threshold_checks = parse_thresholds(&thresholds, &config.traffic_groups).unwrap();
+
+        // Legacy JSON may contain numeric placeholders even in optional fields.
+        let legacy: LatencyStats = serde_json::from_value(serde_json::json!({
+            "min_us": 0.0, "max_us": 0.0, "mean_us": 0.0,
+            "p50_us": 0.0, "p95_us": 0.0, "p99_us": 0.0,
+            "p999_us": 0.0, "p9999_us": 0.0, "p99999_us": 0.0,
+            "std_dev_us": 0.0, "confidence_interval_us": 0.0,
+            "sample_count": 0, "clamped_samples": 0
+        }))
+        .unwrap();
+        let mut results = results(&config);
+        results.global.latency = legacy.clone();
+        results.global.error_latency = legacy.clone();
+        results.traffic_groups[0].stats.latency = legacy.clone();
+        results.traffic_groups[0].stats.error_latency = legacy;
+
+        assert_eq!(evaluate(&mut results, &config), Verdict::ThresholdsFailed);
+        for threshold in &results.thresholds {
+            if threshold.field.ends_with("sample_count")
+                || threshold.field.ends_with("clamped_samples")
+                || threshold.metric == "send_lag.late_threshold_us"
+            {
+                assert!(threshold.observed.is_some() && threshold.ok, "{threshold:?}");
+            } else {
+                assert_eq!(threshold.observed, None, "{threshold:?}");
+                assert!(!threshold.ok, "{threshold:?}");
+            }
+        }
+
+        // A zero legacy count is inconclusive even if the stored fields are
+        // nonzero; do not infer the presence of observations from their values.
+        let group = &mut results.traffic_groups[0].stats;
+        for summary in [
+            &mut results.global.latency,
+            &mut results.global.error_latency,
+            &mut group.latency,
+            &mut group.error_latency,
+        ] {
+            summary.min_us = Some(7.0);
+            summary.max_us = Some(8.0);
+            summary.std_dev_us = Some(9.0);
+            summary.confidence_interval_us = Some(10.0);
+        }
+        let before = serde_json::to_value(&results.global.latency).unwrap();
+        assert_eq!(evaluate(&mut results, &config), Verdict::ThresholdsFailed);
+        assert_eq!(serde_json::to_value(&results.global.latency).unwrap(), before);
+        for threshold in &results.thresholds {
+            if threshold.field.ends_with("_us") && threshold.metric != "send_lag.late_threshold_us"
+            {
+                assert_eq!(threshold.observed, None, "{threshold:?}");
+            }
+        }
+        let group = &mut results.traffic_groups[0].stats;
+        for summary in [
+            &mut results.global.latency,
+            &mut results.global.error_latency,
+            &mut group.latency,
+            &mut group.error_latency,
+        ] {
+            summary.min_us = Some(0.0);
+            summary.max_us = Some(0.0);
+            summary.std_dev_us = Some(0.0);
+            summary.confidence_interval_us = Some(0.0);
+        }
+
+        // A reported count of one makes min and max available, but not legacy
+        // deviation or CI placeholders, for either spelling or scope.
+        results.global.latency.sample_count = 1;
+        results.traffic_groups[0].stats.error_latency.sample_count = 1;
+        assert_eq!(evaluate(&mut results, &config), Verdict::ThresholdsFailed);
+        for threshold in &results.thresholds {
+            if threshold.field.ends_with("_us") && threshold.metric != "send_lag.late_threshold_us"
+            {
+                let has_sample = (threshold.group.is_none()
+                    && threshold.field.starts_with("latency."))
+                    || (threshold.group.as_deref() == Some("api")
+                        && threshold.field.starts_with("error_latency."));
+                let is_range =
+                    threshold.field.ends_with(".min_us") || threshold.field.ends_with(".max_us");
+                let available = has_sample && is_range;
+                assert_eq!(threshold.observed, available.then_some(0.0), "{threshold:?}");
+                assert_eq!(threshold.ok, available, "{threshold:?}");
+            }
+        }
+
+        results.global.error_latency.sample_count = 1;
+        results.traffic_groups[0].stats.latency.sample_count = 1;
+        assert_eq!(evaluate(&mut results, &config), Verdict::ThresholdsFailed);
+        for threshold in &results.thresholds {
+            if threshold.field.ends_with("_us") && threshold.metric != "send_lag.late_threshold_us"
+            {
+                let is_range =
+                    threshold.field.ends_with(".min_us") || threshold.field.ends_with(".max_us");
+                assert_eq!(threshold.observed, is_range.then_some(0.0), "{threshold:?}");
+                assert_eq!(threshold.ok, is_range, "{threshold:?}");
+            }
+        }
+        // Nonzero legacy placeholders are equally unavailable at count one.
+        let group = &mut results.traffic_groups[0].stats;
+        for summary in [
+            &mut results.global.latency,
+            &mut results.global.error_latency,
+            &mut group.latency,
+            &mut group.error_latency,
+        ] {
+            summary.std_dev_us = Some(9.0);
+            summary.confidence_interval_us = Some(10.0);
+        }
+        let before = serde_json::to_value(&results.global.error_latency).unwrap();
+        assert_eq!(evaluate(&mut results, &config), Verdict::ThresholdsFailed);
+        assert_eq!(serde_json::to_value(&results.global.error_latency).unwrap(), before);
+        for threshold in &results.thresholds {
+            if threshold.field.ends_with(".std_dev_us")
+                || threshold.field.ends_with(".confidence_interval_us")
+            {
+                assert_eq!(threshold.observed, None, "{threshold:?}");
+                assert!(!threshold.ok, "{threshold:?}");
+            }
+        }
+        let group = &mut results.traffic_groups[0].stats;
+        for summary in [
+            &mut results.global.latency,
+            &mut results.global.error_latency,
+            &mut group.latency,
+            &mut group.error_latency,
+        ] {
+            summary.std_dev_us = Some(0.0);
+            summary.confidence_interval_us = Some(0.0);
+        }
+        results.global.error_latency.sample_count = 0;
+        results.traffic_groups[0].stats.latency.sample_count = 0;
+
+        // With a reported count of two, numeric zeros are available for all
+        // four metrics; real measured zeros are covered separately below.
+        results.global.latency.sample_count = 2;
+        results.traffic_groups[0].stats.error_latency.sample_count = 2;
+        assert_eq!(evaluate(&mut results, &config), Verdict::ThresholdsFailed);
+        for threshold in &results.thresholds {
+            if threshold.field.ends_with("_us") && threshold.metric != "send_lag.late_threshold_us"
+            {
+                let available = (threshold.group.is_none()
+                    && threshold.field.starts_with("latency."))
+                    || (threshold.group.as_deref() == Some("api")
+                        && threshold.field.starts_with("error_latency."));
+                assert_eq!(threshold.observed, available.then_some(0.0), "{threshold:?}");
+                assert_eq!(threshold.ok, available, "{threshold:?}");
+            }
+        }
+        results.global.error_latency.sample_count = 2;
+        results.traffic_groups[0].stats.latency.sample_count = 2;
+        assert_eq!(evaluate(&mut results, &config), Verdict::Pass);
+        assert!(results.thresholds.iter().all(|threshold| threshold.ok));
+    }
+
+    #[test]
+    fn deviation_thresholds_require_two_actual_samples_and_preserve_nulls() {
+        let mut config = profile("").unwrap();
+        let mut checks = BTreeMap::new();
+        for summary in ["latency", "error_latency"] {
+            for filter in ["", "{group=api}"] {
+                checks.insert(
+                    format!("{summary}{filter}"),
+                    ["min", "max", "std_dev", "confidence_interval"]
+                        .iter()
+                        .map(|name| format!("{name} == 0us"))
+                        .collect(),
+                );
+                for field in ["std_dev_us", "confidence_interval_us"] {
+                    checks.insert(format!("{summary}.{field}{filter}"), vec!["== 0us".into()]);
+                }
+            }
+        }
+        config.threshold_checks = parse_thresholds(&checks, &config.traffic_groups).unwrap();
+        let mut collector =
+            TupleStatsCollector::new(SamplingPolicy::Unlimited, Duration::from_secs(1));
+        for count in 1..=2 {
+            collector.record_latency(0, 0, Duration::ZERO);
+            collector.record_error_reply(0, 0, "error", Duration::ZERO);
+            let mut results = results_of(&config, &collector);
+            assert_eq!(
+                evaluate(&mut results, &config),
+                if count == 1 {
+                    Verdict::ThresholdsFailed
+                } else {
+                    Verdict::Pass
+                }
+            );
+            for threshold in &results.thresholds {
+                let needs_two = threshold.field.ends_with(".std_dev_us")
+                    || threshold.field.ends_with(".confidence_interval_us");
+                let expected = (!(count == 1 && needs_two)).then_some(0.0);
+                assert_eq!(threshold.observed, expected, "{threshold:?}");
+                assert_eq!(threshold.ok, expected.is_some(), "{threshold:?}");
+            }
+            if count == 2 {
+                let group = &mut results.traffic_groups[0].stats;
+                for summary in [
+                    &mut results.global.latency,
+                    &mut results.global.error_latency,
+                    &mut group.latency,
+                    &mut group.error_latency,
+                ] {
+                    summary.std_dev_us = None;
+                    summary.confidence_interval_us = None;
+                }
+                assert_eq!(evaluate(&mut results, &config), Verdict::ThresholdsFailed);
+                for threshold in &results.thresholds {
+                    let needs_two = threshold.field.ends_with(".std_dev_us")
+                        || threshold.field.ends_with(".confidence_interval_us");
+                    assert_eq!(threshold.observed, (!needs_two).then_some(0.0), "{threshold:?}");
+                    assert_eq!(threshold.ok, !needs_two, "{threshold:?}");
+                }
+            }
+        }
+
+        let mut collector =
+            TupleStatsCollector::new(SamplingPolicy::Unlimited, Duration::from_secs(1));
+        for duration in [Duration::ZERO, Duration::from_micros(10)] {
+            collector.record_latency(0, 0, duration);
+            collector.record_error_reply(0, 0, "error", duration);
+        }
+        let mut results = results_of(&config, &collector);
+        let std_dev = results.global.latency.std_dev_us.unwrap();
+        let ci = results.global.latency.confidence_interval_us.unwrap();
+        assert!(std_dev > 7.0 && ci > 9.0);
+        assert_eq!(evaluate(&mut results, &config), Verdict::ThresholdsFailed);
+        for threshold in &results.thresholds {
+            let expected = if threshold.field.ends_with(".min_us") {
+                0.0
+            } else if threshold.field.ends_with(".max_us") {
+                10.0
+            } else if threshold.field.ends_with(".std_dev_us") {
+                std_dev
+            } else {
+                ci
+            };
+            assert_eq!(threshold.observed, Some(expected), "{threshold:?}");
+            assert_eq!(threshold.ok, expected == 0.0, "{threshold:?}");
+        }
+    }
+
     /// Parse the thresholds of one metric key against the test profile
     fn parse(key: &str, expressions: &[&str]) -> Result<Vec<Threshold>> {
         let config = profile("")?;
@@ -1330,6 +1777,9 @@ error_latency = ["p99 > 4ms", "max < 1ms"]
     fn every_numeric_stats_field_is_a_metric_without_naming_it() {
         let config = profile("").unwrap();
         let mut results = results(&config);
+        // Exercise numeric error-latency fields with a sample present.
+        results.traffic_groups[0].stats.error_latency.sample_count = 1;
+        results.traffic_groups[0].stats.error_latency.percentile_sample_count = Some(1);
         let stats = serde_json::to_value(&results.traffic_groups[0].stats).unwrap();
         let mut paths = Vec::new();
         numeric_paths(&stats, &[], &mut paths);
