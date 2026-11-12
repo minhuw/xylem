@@ -10,7 +10,7 @@ leak-timeout = "100ms"
 # Integration tests group - slower tests that require Docker
 [[profile.default.overrides]]
 filter = 'test(/integration/)'
-threads-required = 1  # Integration tests share Docker containers
+threads-required = 1  # Each test brings up its own compose project
 slow-timeout = { period = "120s" }
 
 # Unit tests profile - fast tests that don't require external services
@@ -22,6 +22,38 @@ default-filter = 'not binary(~_integration)'
 # Includes only test files with "_integration" in their name
 [profile.integration]
 default-filter = 'binary(~_integration)'
-test-threads = 1  # Run integration tests serially to avoid Docker conflicts
+test-threads = 1  # Serial by default; the fixtures also allow --test-threads N
 slow-timeout = { period = "120s" }
 retries = 0
+
+[test-groups]
+# Tests that assert on late sends, achieved rates, latency or CPU time
+timing = { max-threads = 1 }
+
+[[profile.integration.overrides]]
+filter = '''
+    (binary(=busy_poll_integration)
+        & test(=busy_poll_integration_closed_loop_http_completes_and_spins_its_core))
+    | (binary(=group_dispatch_integration)
+        & (test(=group_dispatch_integration_fixed_rate_http_keeps_its_rate)
+            | test(=group_dispatch_integration_poisson_http_has_no_late_sends_where_per_connection_has)))
+    | (binary(=rate_control_integration)
+        & (test(=test_rate_accuracy_low_rate)
+            | test(=test_rate_accuracy_medium_rate)
+            | test(=test_poisson_rate_limiting)
+            | test(=test_throughput_scaling_with_pipeline_depth)))
+    | (binary(=http_integration)
+        & (test(=test_http_rate_limited) | test(=test_http_get_single_thread)))
+    | (binary(=masstree_integration)
+        & (test(=test_masstree_rate_limited) | test(=test_masstree_get_single_thread)))
+    | (binary(=memcached_integration)
+        & (test(=test_memcached_ascii_rate_limited)
+            | test(=test_memcached_binary_single_thread)
+            | test(=test_memcached_ascii_single_thread)))
+    | (binary(=redis_integration) & test(=test_redis_single_thread))
+'''
+test-group = 'timing'
+# They need the CPUs to themselves: the group alone keeps them apart from each
+# other (busy-poll and group dispatch pin their worker to the same last CPU),
+# but the rest of the suite beside them still makes sends late
+threads-required = 'num-test-threads'
