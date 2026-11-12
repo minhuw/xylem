@@ -8,6 +8,7 @@
 mod compose;
 
 // Docker-based service guards
+pub mod clickhouse;
 pub mod h2c;
 pub mod knot;
 pub mod masstree;

@@ -96,6 +96,11 @@ test-nvme:
     @echo "💾 Running NVMe/TCP integration tests..."
     cargo nextest run --profile integration -E 'binary(nvme_tcp_integration)'
 
+# Run ClickHouse integration tests (clickhouse-server in Docker)
+test-clickhouse:
+    @echo "🗄️ Running ClickHouse integration tests..."
+    cargo nextest run --profile integration -E 'binary(clickhouse_integration)'
+
 # Build debug version
 build:
     @echo "🔨 Building debug version..."
