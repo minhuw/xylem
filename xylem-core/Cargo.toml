@@ -22,6 +22,7 @@ tracing = { workspace = true }
 rand = { workspace = true }
 rand_distr = { workspace = true }
 core_affinity = { workspace = true }
+libc = { workspace = true }
 humantime-serde = { workspace = true }
 sha2 = "0.10"
 hex = "0.4"

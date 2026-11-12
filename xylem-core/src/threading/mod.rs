@@ -3,6 +3,7 @@
 //! Uses native OS threads (std::thread) for maximum control and performance.
 
 use crate::Result;
+use std::collections::HashMap;
 use std::sync::{Arc, Barrier, Condvar, Mutex, PoisonError};
 use std::thread;
 
@@ -10,7 +11,10 @@ pub mod affinity;
 pub mod worker;
 
 // Re-export main types
-pub use affinity::{get_available_core_ids, get_core_count, pin_thread, CpuPinning};
+pub use affinity::{
+    bind_memory_to_node, cpu_numa_node, get_available_core_ids, get_core_count, memory_policy,
+    numa_nodes, pin_thread, unbind_memory, CpuPinning, MemoryPolicy,
+};
 pub use worker::{Worker, WorkerConfig, DEFAULT_DRAIN_TIMEOUT, DEFAULT_SETUP_TIMEOUT};
 pub use xylem_common::{ConnectionRole, ErrorReply, Outbox, Parsed, Protocol, RequestMeta};
 
@@ -182,11 +186,113 @@ impl Drop for PreloadTicket {
     }
 }
 
+/// Where the threads of a run pin themselves and bind their memory, and
+/// the first failure among them
+struct ThreadPreparation {
+    cpu_pinning: CpuPinning,
+    /// The CPU and NUMA node each thread binds its memory to, by thread ID,
+    /// or why its node is unknown; none without NUMA binding
+    bindings: HashMap<usize, std::result::Result<(usize, usize), String>>,
+    /// The spawning thread's own memory policy, while there are bindings
+    spawner: Option<affinity::SavedMemoryPolicy>,
+    /// The threads and, once it spawned them all, the spawning thread
+    prepared: Barrier,
+    failure: Mutex<Option<String>>,
+}
+
+impl ThreadPreparation {
+    /// Spawn thread `thread_id` to run `work` once every thread is prepared
+    ///
+    /// A thread inherits its spawner's memory policy, so the spawning thread
+    /// binds itself to the new thread's node while it spawns it: what
+    /// `pthread_create` writes and the new thread's allocations before
+    /// `work`, such as its malloc arena, come from that node too.
+    fn spawn<T: Send + 'static>(
+        self: &Arc<Self>,
+        thread_id: usize,
+        work: impl FnOnce() -> Result<T> + Send + 'static,
+    ) -> thread::JoinHandle<Result<T>> {
+        let bound = self.bind_spawner(thread_id);
+        let preparation = Arc::clone(self);
+        let handle = thread::spawn(move || {
+            preparation.prepare(thread_id, bound)?;
+            work()
+        });
+        if bound {
+            let spawner = self.spawner.as_ref().expect("saved with the bindings");
+            if let Err(e) = spawner.restore() {
+                self.fail(format!("Cannot restore the spawning thread's memory policy: {e}"));
+            }
+        }
+        handle
+    }
+
+    /// Bind the calling thread to thread `thread_id`'s node, if it has one;
+    /// returns whether it did
+    fn bind_spawner(&self, thread_id: usize) -> bool {
+        let off = "set experiment.numa_membind = false to run without binding worker memory";
+        match self.bindings.get(&thread_id) {
+            Some(Err(message)) => self.fail(format!("Thread {thread_id}: {message}; {off}")),
+            Some(&Ok((cpu, node))) => match affinity::bind_memory_to_node(node) {
+                Ok(()) => return true,
+                Err(e) => self.fail(format!("Thread {thread_id} on CPU {cpu}: {e}; {off}")),
+            },
+            None => {}
+        }
+        false
+    }
+
+    /// Let the threads start their work, once the calling thread spawned
+    /// them all: a failure to restore its policy after the last spawn still
+    /// fails every thread
+    fn spawned(&self) {
+        self.prepared.wait();
+    }
+
+    fn fail(&self, message: String) {
+        let mut failure = self.failure.lock().unwrap_or_else(PoisonError::into_inner);
+        failure.get_or_insert(message);
+    }
+
+    /// Pin the calling thread, then wait for the other threads. Fails, on
+    /// every thread, if any thread failed to bind, so no thread starts the
+    /// run.
+    ///
+    /// A thread that cannot be pinned runs unpinned and unbound.
+    fn prepare(&self, thread_id: usize, bound: bool) -> Result<()> {
+        if let Err(e) = affinity::pin_thread(thread_id, &self.cpu_pinning) {
+            tracing::warn!("Failed to pin thread {} to CPU core {}: {}", thread_id, thread_id, e);
+            if bound {
+                match affinity::unbind_memory() {
+                    Ok(()) => {
+                        tracing::warn!("Thread {}'s memory is not bound to a NUMA node", thread_id)
+                    }
+                    Err(e) => self
+                        .fail(format!("Thread {thread_id}: cannot reset its memory policy: {e}")),
+                }
+            }
+        } else if let Some(Ok((cpu, node))) = self.bindings.get(&thread_id).filter(|_| bound) {
+            tracing::debug!(
+                "Bound thread {}'s memory to NUMA node {} of CPU {}",
+                thread_id,
+                node,
+                cpu
+            );
+        }
+        self.prepared.wait();
+        match &*self.failure.lock().unwrap_or_else(PoisonError::into_inner) {
+            Some(message) => Err(crate::Error::Config(message.clone())),
+            None => Ok(()),
+        }
+    }
+}
+
 /// Multi-threaded runtime for spawning and managing workers
 pub struct ThreadingRuntime {
     /// Thread IDs (used as CPU core IDs for pinning)
     thread_ids: Vec<usize>,
     cpu_pinning: CpuPinning,
+    numa_membind: bool,
 }
 
 impl ThreadingRuntime {
@@ -195,6 +301,7 @@ impl ThreadingRuntime {
         Self {
             thread_ids: (0..num_threads).collect(),
             cpu_pinning: CpuPinning::None,
+            numa_membind: false,
         }
     }
 
@@ -203,6 +310,7 @@ impl ThreadingRuntime {
         Self {
             thread_ids: (0..num_threads).collect(),
             cpu_pinning,
+            numa_membind: false,
         }
     }
 
@@ -211,7 +319,63 @@ impl ThreadingRuntime {
     /// Thread IDs are used directly as CPU core IDs for pinning.
     /// For example, thread_ids = [2, 3, 4] will pin workers to CPU cores 2, 3, 4.
     pub fn with_thread_ids(thread_ids: Vec<usize>, cpu_pinning: CpuPinning) -> Self {
-        Self { thread_ids, cpu_pinning }
+        Self {
+            thread_ids,
+            cpu_pinning,
+            numa_membind: false,
+        }
+    }
+
+    /// Bind each pinned thread's memory to the NUMA node of its CPU
+    /// (`set_mempolicy(MPOL_BIND)`) from its first allocation, before the
+    /// worker is built, for the rest of the thread's life
+    ///
+    /// Memory then never leaves the node, and the kernel's NUMA balancing
+    /// no longer scans it from the worker thread. Without CPU pinning there
+    /// is no node to bind to and this does nothing. If a thread fails to
+    /// bind, every thread fails before the run starts.
+    pub fn with_numa_membind(mut self, numa_membind: bool) -> Self {
+        self.numa_membind = numa_membind;
+        self
+    }
+
+    /// Look up each thread's NUMA node. A CPU that is not available gets no
+    /// binding: pinning to it fails, and the thread runs unpinned.
+    fn preparation(&self) -> Arc<ThreadPreparation> {
+        let mut bindings = HashMap::new();
+        if self.numa_membind {
+            let available = get_available_core_ids().unwrap_or_default();
+            for &thread_id in &self.thread_ids {
+                let Ok(Some(cpu)) = affinity::target_core_id(thread_id, &self.cpu_pinning) else {
+                    continue;
+                };
+                if available.contains(&cpu) {
+                    let node = cpu_numa_node(cpu)
+                        .map(|node| (cpu, node))
+                        .map_err(|e| format!("Cannot find the NUMA node of CPU {cpu}: {e}"));
+                    bindings.insert(thread_id, node);
+                }
+            }
+        }
+        let mut failure = None;
+        let spawner = match bindings.is_empty() {
+            true => None,
+            false => match affinity::SavedMemoryPolicy::save() {
+                Ok(saved) => Some(saved),
+                Err(e) => {
+                    failure = Some(format!("Cannot read the spawning thread's memory policy: {e}"));
+                    bindings.clear();
+                    None
+                }
+            },
+        };
+        Arc::new(ThreadPreparation {
+            cpu_pinning: self.cpu_pinning.clone(),
+            bindings,
+            spawner,
+            prepared: Barrier::new(self.thread_ids.len() + 1),
+            failure: Mutex::new(failure),
+        })
     }
 
     /// Run multiple workers in parallel and aggregate results (generic over stats type)
@@ -224,37 +388,18 @@ impl ThreadingRuntime {
         F: Fn(usize) -> Result<T> + Send + Sync + Clone + 'static,
         T: Send + 'static,
     {
-        // Create synchronization barrier for all threads
-        let barrier = Arc::new(Barrier::new(self.thread_ids.len()));
+        // Every thread pins itself and waits for the others
+        let preparation = self.preparation();
         let mut handles = Vec::new();
 
         // Spawn worker threads, one per thread_id
         for &thread_id in &self.thread_ids {
             let worker_factory = worker_factory.clone();
-            let barrier = barrier.clone();
-            let cpu_pinning = self.cpu_pinning.clone();
-
-            let handle = thread::spawn(move || {
-                // Pin thread to CPU core based on thread_id
-                // With CpuPinning::Auto, thread_id is used as the core ID
-                if let Err(e) = affinity::pin_thread(thread_id, &cpu_pinning) {
-                    tracing::warn!(
-                        "Failed to pin thread {} to CPU core {}: {}",
-                        thread_id,
-                        thread_id,
-                        e
-                    );
-                }
-
-                // Wait for all threads to be ready
-                barrier.wait();
-
-                // Run the worker with the actual thread_id
-                worker_factory(thread_id)
-            });
-
+            // With CpuPinning::Auto, thread_id is used as the core ID
+            let handle = preparation.spawn(thread_id, move || worker_factory(thread_id));
             handles.push(handle);
         }
+        preparation.spawned();
 
         // Collect results from all workers
         let mut results = Vec::new();
@@ -281,26 +426,16 @@ impl ThreadingRuntime {
         T: Send + 'static,
     {
         let tickets = StartGate::tickets(self.thread_ids.len());
+        let preparation = self.preparation();
         let mut handles = Vec::new();
 
         for (&thread_id, ticket) in self.thread_ids.iter().zip(tickets) {
             let worker_factory = worker_factory.clone();
-            let cpu_pinning = self.cpu_pinning.clone();
-
-            let handle = thread::spawn(move || {
-                if let Err(e) = affinity::pin_thread(thread_id, &cpu_pinning) {
-                    tracing::warn!(
-                        "Failed to pin thread {} to CPU core {}: {}",
-                        thread_id,
-                        thread_id,
-                        e
-                    );
-                }
-                worker_factory(thread_id, ticket)
-            });
-
+            // Pinned and bound before the worker allocates anything
+            let handle = preparation.spawn(thread_id, move || worker_factory(thread_id, ticket));
             handles.push(handle);
         }
+        preparation.spawned();
 
         let mut results = Vec::new();
         for handle in handles {
@@ -378,6 +513,67 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].aggregate_global(Duration::from_secs(1)).total_requests, 1);
+    }
+
+    /// A pinned thread is bound to its CPU's node before its worker is
+    /// built; an unpinned one keeps the default policy
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pinned_threads_bind_their_memory_to_their_cpus_node() {
+        if numa_nodes().unwrap().is_empty() {
+            return; // No NUMA support in this kernel
+        }
+        let cpus = get_available_core_ids().unwrap();
+        let before = memory_policy().unwrap();
+        let runtime = ThreadingRuntime::with_thread_ids(cpus.clone(), CpuPinning::Auto)
+            .with_numa_membind(true);
+        let policies = runtime.run_workers_with_start(|_, _| Ok(memory_policy()?)).unwrap();
+        for (&cpu, policy) in cpus.iter().zip(policies) {
+            let node = cpu_numa_node(cpu).unwrap();
+            assert_eq!(policy, MemoryPolicy { mode: "bind", nodes: vec![node] }, "CPU {cpu}");
+        }
+        let unbound = ThreadingRuntime::new(2).with_numa_membind(true);
+        let policies = unbound.run_workers_with_start(|_, _| Ok(memory_policy()?)).unwrap();
+        assert_eq!(policies, vec![before.clone(), before]);
+    }
+
+    /// A thread the kernel refuses to bind fails every thread before its
+    /// work, naming the errno and the switch, and the spawner keeps its policy
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_binding_fails_every_thread_before_its_work() {
+        let before = memory_policy().unwrap();
+        let preparation = Arc::new(ThreadPreparation {
+            cpu_pinning: CpuPinning::None,
+            // No host has node 1023 online
+            bindings: HashMap::from([(0, Ok((0, 1023)))]),
+            spawner: Some(affinity::SavedMemoryPolicy::save().unwrap()),
+            prepared: Barrier::new(3),
+            failure: Mutex::new(None),
+        });
+        let worked = Arc::new(Mutex::new(0));
+        let handles = [0, 1].map(|thread_id| {
+            let worked = Arc::clone(&worked);
+            preparation.spawn(thread_id, move || {
+                *worked.lock().unwrap() += 1;
+                Ok(())
+            })
+        });
+        preparation.spawned();
+        assert_eq!(memory_policy().unwrap(), before);
+        for handle in handles {
+            let error = handle.join().unwrap().unwrap_err().to_string();
+            assert!(
+                error.starts_with(
+                    "Configuration error: Thread 0 on CPU 0: Cannot bind memory to NUMA node \
+                     1023: set_mempolicy(MPOL_BIND) failed: EINVAL: "
+                ) && error.ends_with(
+                    "; set experiment.numa_membind = false to run without binding worker memory"
+                ),
+                "{error}"
+            );
+        }
+        assert_eq!(*worked.lock().unwrap(), 0);
     }
 
     #[test]

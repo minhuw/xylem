@@ -1809,6 +1809,7 @@ dependencies = [
  "hdrhistogram",
  "hex",
  "humantime-serde",
+ "libc",
  "rand",
  "rand_distr",
  "schemars",
