@@ -639,6 +639,13 @@ const MASKED_JSON: &str = r#"{
         }
       ]
     }
+  ],
+  "worker_threads": [
+    {
+      "thread_id": 0,
+      "memory_policy": MEMORY_POLICY,
+      "memory_nodes": MEMORY_NODES
+    }
   ]
 }"#;
 
@@ -671,7 +678,22 @@ fn assert_json_results(
     let local: std::net::SocketAddr = local_addr.parse().unwrap();
     let target_addr: std::net::SocketAddr = target.parse().unwrap();
     assert!(local.ip() == target_addr.ip() && local.port() != 0, "{local}");
-    let mut expected = MASKED_JSON.replace("TARGET", target).replace("LOCAL_ADDR", local_addr);
+    // Thread 0 pinned to CPU 0 is bound to that CPU's node on a host with
+    // several; it is unbound on one node or where it cannot be pinned
+    let threads = &json["worker_threads"];
+    let policy = &threads[0]["memory_policy"];
+    let nodes = threads[0]["memory_nodes"].as_array().unwrap();
+    assert!(
+        (policy == "none" && nodes.is_empty()) || (policy == "bind" && nodes.len() == 1),
+        "{threads}"
+    );
+    assert_eq!((threads.as_array().unwrap().len(), &threads[0]["thread_id"]), (1, &0.into()));
+    let nodes = serde_json::to_string_pretty(nodes).unwrap().replace('\n', "\n      ");
+    let mut expected = MASKED_JSON
+        .replace("TARGET", target)
+        .replace("LOCAL_ADDR", local_addr)
+        .replace("MEMORY_POLICY", &policy.to_string())
+        .replace("MEMORY_NODES", &nodes);
     match (start, end) {
         (Some(start), Some(end)) => {
             let start = start.as_u64().expect("load-loop start must be Unix microseconds");
@@ -704,7 +726,8 @@ fn assert_json_results(
             "thresholds",
             "traffic_groups",
             "validity",
-            "verdict"
+            "verdict",
+            "worker_threads"
         ]
     );
     let groups = json["traffic_groups"].as_array().unwrap();

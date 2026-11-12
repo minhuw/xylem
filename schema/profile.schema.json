@@ -194,6 +194,11 @@
           "description": "Experiment name",
           "type": "string"
         },
+        "numa_membind": {
+          "description": "Bind each worker thread's memory to the NUMA node of the CPU it is\npinned to (default true), from the thread's first allocation, before\nit builds its connections, buffers and statistics. Memory then stays\non the thread's node, and the kernel's NUMA balancing no longer\npauses the thread to scan it. The binding replaces any policy the\nprocess started with, such as numactl's. Ignored when the threads\nare not pinned and on a host with a single NUMA node. If the kernel\nrefuses the binding (a container or seccomp may), the run fails; set\nfalse to run without it.",
+          "type": "boolean",
+          "default": true
+        },
         "seed": {
           "description": "Random seed for reproducibility (None = use entropy)",
           "type": [

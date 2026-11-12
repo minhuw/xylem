@@ -308,6 +308,33 @@ pub struct DetailedExperimentResults {
     /// threads
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub nic_clock_calibration: Vec<NicClockCalibration>,
+    /// Every worker thread, by thread id
+    #[serde(default)]
+    pub worker_threads: Vec<WorkerThread>,
+}
+
+/// One worker thread of the run
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerThread {
+    pub thread_id: usize,
+    /// The thread's NUMA memory policy, read once it was pinned: "bind"
+    /// with `experiment.numa_membind`, "none" for the kernel's default
+    /// (first touch), or a policy the process was started with, such as
+    /// numactl's
+    pub memory_policy: String,
+    /// The nodes the policy allocates from; empty for "none"
+    pub memory_nodes: Vec<usize>,
+}
+
+impl WorkerThread {
+    /// Worker thread `thread_id` with memory policy `policy`
+    pub fn new(thread_id: usize, policy: xylem_core::threading::MemoryPolicy) -> Self {
+        Self {
+            thread_id,
+            memory_policy: policy.mode.to_string(),
+            memory_nodes: policy.nodes,
+        }
+    }
 }
 
 /// How one worker thread converted its NIC's timestamps to the user-space
@@ -643,6 +670,7 @@ impl DetailedExperimentResults {
             records,
             // `run_experiment` adds the worker threads' reports
             nic_clock_calibration: Vec::new(),
+            worker_threads: Vec::new(),
         }
     }
 

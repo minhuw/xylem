@@ -89,6 +89,17 @@ pub struct ExperimentConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub busy_poll_us: Option<u64>,
+    /// Bind each worker thread's memory to the NUMA node of the CPU it is
+    /// pinned to (default true), from the thread's first allocation, before
+    /// it builds its connections, buffers and statistics. Memory then stays
+    /// on the thread's node, and the kernel's NUMA balancing no longer
+    /// pauses the thread to scan it. The binding replaces any policy the
+    /// process started with, such as numactl's. Ignored when the threads
+    /// are not pinned and on a host with a single NUMA node. If the kernel
+    /// refuses the binding (a container or seccomp may), the run fails; set
+    /// false to run without it.
+    #[serde(default = "default_numa_membind")]
+    pub numa_membind: bool,
 }
 
 impl ExperimentConfig {
@@ -105,6 +116,10 @@ fn default_drain_timeout() -> Duration {
 
 fn default_setup_timeout() -> Duration {
     xylem_core::threading::DEFAULT_SETUP_TIMEOUT
+}
+
+fn default_numa_membind() -> bool {
+    true
 }
 
 /// Re-export KeysConfig from xylem-protocols for use in config files
@@ -1311,6 +1326,22 @@ mod tests {
         let set = ["experiment.setup_timeout=\"0s\"".to_string()];
         let error = ProfileConfig::from_file_with_overrides(path, &set).unwrap_err().to_string();
         assert_eq!(error, "experiment.setup_timeout must be > 0");
+    }
+
+    #[test]
+    fn numa_membind_defaults_to_on_and_takes_a_bool() {
+        let path = "../tests/redis/redis-bench.toml";
+        let config = ProfileConfig::from_file_with_overrides(path, &[]).unwrap();
+        assert!(config.experiment.numa_membind);
+
+        let set = ["experiment.numa_membind=false".to_string()];
+        let config = ProfileConfig::from_file_with_overrides(path, &set).unwrap();
+        assert!(!config.experiment.numa_membind);
+
+        for value in ["0", "\"no\""] {
+            let set = [format!("experiment.numa_membind={value}")];
+            assert!(ProfileConfig::from_file_with_overrides(path, &set).is_err(), "{value}");
+        }
     }
 
     #[test]
@@ -2809,7 +2840,7 @@ duration = "10s""#,
                 "experiment.duraton=1s",
                 "Invalid --set experiment.duraton=1s: unknown field `duraton` in experiment \
                  (did you mean `duration`?); expected one of `busy_poll_us`, `description`, \
-                 `drain_timeout`, `duration`, `name`, `seed`, `setup_timeout`",
+                 `drain_timeout`, `duration`, `name`, `numa_membind`, `seed`, `setup_timeout`",
             ),
             ("experimnt.seed=1", "unknown field `experimnt` at the top level (did you mean `experiment`?)"),
             ("traffic_groups.1.traffic_policy.rat=5", "in traffic_groups[1].traffic_policy (did you mean `rate`?)"),

@@ -331,6 +331,29 @@ NIC clock was converted to xylem's clock:
   timestamp was converted, and receives without one (or before the first
   fit), whose requests have no kernel split.
 
+### Worker threads
+
+The top-level `worker_threads` list has one entry per worker thread, by
+thread ID, with the NUMA memory policy the thread had before it built its
+worker:
+
+```json
+"worker_threads": [
+  { "thread_id": 15, "memory_policy": "bind", "memory_nodes": [1] }
+]
+```
+
+- `memory_policy`: `"bind"` with
+  [NUMA memory binding](../reference/schema.md#numa-memory-binding);
+  `"none"` for the kernel's default, which places memory on the node of the
+  CPU that first touches it; otherwise the policy the process was started
+  with, such as numactl's (`"preferred"`, `"interleave"`, `"local"`,
+  `"preferred_many"` or `"weighted_interleave"`).
+- `memory_nodes`: the nodes the policy allocates from, ascending; empty for
+  `"none"` and `"local"`.
+
+Results written before this field existed read as an empty list.
+
 ## Latency fields
 
 Each `latency` object in JSON (global and per group) holds these fields;

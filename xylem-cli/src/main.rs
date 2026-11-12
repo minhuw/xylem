@@ -379,12 +379,21 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
         (target_summary, protocol_summary)
     };
 
-    let runtime = ThreadingRuntime::with_thread_ids(thread_ids.clone(), cpu_pinning.clone());
+    let numa_membind = numa_membind(&config.experiment, &cpu_pinning)?;
+    let runtime = ThreadingRuntime::with_thread_ids(thread_ids.clone(), cpu_pinning.clone())
+        .with_numa_membind(numa_membind);
 
     // Support multiple traffic groups per thread with per-group protocols.
     // Each thread connects, then waits at the start gate: every thread starts
     // at the same time, which anchors every schedule and the stats' buckets.
     let results = runtime.run_workers_with_start(move |thread_idx, start| {
+        // Pinned and, with experiment.numa_membind, bound already
+        let worker_thread = output::WorkerThread::new(
+            thread_idx,
+            xylem_core::threading::memory_policy().map_err(|e| {
+                anyhow::anyhow!("Cannot read thread {thread_idx}'s memory policy: {e}")
+            })?,
+        );
         // Clone the request dumper for this worker thread
         let request_dumper_for_worker = request_dumper.clone();
         // Find which traffic groups this thread belongs to
@@ -573,7 +582,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
         }
 
         // Select transport factory based on thread's transport
-        match thread_transport {
+        let result = match thread_transport {
             "tcp" => {
                 #[cfg(target_os = "linux")]
                 let factory = TcpTransportFactory::with_timestamp_config(thread_timestamps);
@@ -755,7 +764,8 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
                 }
             }
             other => Err(xylem_core::Error::Config(format!("Unsupported transport: {}", other)))?,
-        }
+        };
+        result.map(|report| (report, worker_thread))
     })?;
 
     // Signal evalsync end if it was enabled
@@ -780,6 +790,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
             Err(e) => tracing::warn!("ntcp AF_XDP: cannot read the dropped-frame count: {e}"),
         }
     }
+    let (results, mut worker_threads): (Vec<_>, Vec<_>) = results.into_iter().unzip();
     let (results, reports): (Vec<_>, Vec<_>) = results.into_iter().unzip();
     let (calibrations, local_addrs): (Vec<_>, Vec<_>) = reports.into_iter().unzip();
     let stats = xylem_core::stats::TupleStatsCollector::merge(results);
@@ -810,6 +821,8 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
     detailed_results.nic_clock_calibration = calibrations.into_iter().flatten().collect();
     detailed_results.nic_clock_calibration.sort_by_key(|c| c.thread_id);
     detailed_results.set_connection_addrs(local_addrs);
+    worker_threads.sort_by_key(|thread| thread.thread_id);
+    detailed_results.worker_threads = worker_threads;
     let verdict = thresholds::evaluate(&mut detailed_results, &config);
 
     tracing::debug!(
@@ -940,6 +953,34 @@ fn timestamp_config(
         // Only ntcp's DPDK backend takes NIC timestamps (validated)
         TimestampSourceConfig::Nic => TcpTimestampConfig::default(),
     }
+}
+
+/// Whether the worker threads bind their memory to their CPUs' NUMA nodes:
+/// with `experiment.numa_membind`, when they are pinned on a host with more
+/// than one node
+fn numa_membind(
+    experiment: &config::ExperimentConfig,
+    pinning: &CpuPinning,
+) -> anyhow::Result<bool> {
+    if !experiment.numa_membind {
+        return Ok(false);
+    }
+    if *pinning == CpuPinning::None {
+        tracing::info!(
+            "experiment.numa_membind: worker threads are not pinned; memory is not bound"
+        );
+        return Ok(false);
+    }
+    let nodes = xylem_core::threading::numa_nodes()
+        .context("Cannot read the host's NUMA nodes for experiment.numa_membind")?;
+    if nodes.len() < 2 {
+        tracing::info!("experiment.numa_membind: single NUMA node host; memory is not bound");
+        return Ok(false);
+    }
+    tracing::info!(
+        "Binding each worker thread's memory to the NUMA node of its CPU (experiment.numa_membind)"
+    );
+    Ok(true)
 }
 
 fn unavailable_cpu_ids<'a>(

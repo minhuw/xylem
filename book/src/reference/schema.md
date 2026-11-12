@@ -60,6 +60,9 @@ seed = 42
 - `busy_poll_us` (integer, optional, at least 1): turn on busy polling with
   this budget in microseconds; see [busy polling](#busy-polling). Off when
   unset.
+- `numa_membind` (boolean, default `true`): bind each worker thread's memory
+  to the NUMA node of the CPU it is pinned to; see
+  [NUMA memory binding](#numa-memory-binding).
 
 ### Busy polling
 
@@ -95,6 +98,43 @@ drain happen. ntcp's DPDK and AF_XDP backends already spin in their polls,
 so it changes nothing there; with TUN, ntcp drives its stack on each poll
 instead of sleeping on the device. The JSON results record the budget as
 `experiment.busy_poll_us`, `null` without busy polling.
+
+### NUMA memory binding
+
+Each worker thread is pinned to the CPU of its thread ID (`threads`). On a
+host with more than one NUMA node, xylem also binds each worker thread's
+memory to its CPU's node (`set_mempolicy(MPOL_BIND)`), from the thread's
+first allocation on: its stack, its malloc arena, and everything its worker
+builds, such as connections, buffers and statistics. The kernel's NUMA
+balancing then neither moves that memory nor pauses the thread about once a
+second to scan it for misplaced pages, which otherwise delays sends by a few
+hundred microseconds.
+
+```toml
+[experiment]
+name = "no-binding"
+duration = "30s"
+numa_membind = false
+```
+
+- Memory the main thread allocated before the worker threads started, such
+  as the parsed profile, stays where it is.
+- The binding replaces any memory policy the process started with, such as
+  `numactl --membind`'s, for the worker threads. Set `numa_membind = false`
+  to keep it.
+- A bound thread allocates only from its node. If that node runs out of
+  memory, the kernel's OOM killer acts rather than take memory from another
+  node.
+- On a single-node host, or when the threads are not pinned, xylem logs that
+  it binds nothing and runs as with `numa_membind = false`.
+- If the kernel refuses the binding (a container or a seccomp filter may),
+  the run fails before it starts, with the errno; set `numa_membind = false`
+  to run without it. Xylem never changes host settings such as
+  `kernel.numa_balancing`.
+
+The JSON results record each worker thread's memory policy as the thread
+reported it before it built its worker; see
+[worker threads](../guide/output-formats.md#worker-threads).
 
 ## Transport and Target
 
