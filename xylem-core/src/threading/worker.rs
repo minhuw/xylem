@@ -396,7 +396,7 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
                 break Ok(());
             }
 
-            match self.send_requests() {
+            match self.send_requests_before(end_ns) {
                 Ok(0) => {}
                 Ok(_) => self.last_io_ns = now_ns,
                 Err(error) => break Err(error),
@@ -553,8 +553,18 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         }
     }
 
-    /// Returns the number of requests it picked, setup requests included
+    /// Send the requests due now; see [`Self::send_requests_before`]
     fn send_requests(&mut self) -> Result<usize> {
+        self.send_requests_before(u64::MAX)
+    }
+
+    /// Returns the number of requests it picked, setup requests included
+    ///
+    /// Picks no arrival intended at or after `end_ns`, the end of the
+    /// measurement window, even once the clock passed it: the window's
+    /// arrivals are those intended before its end, each counted once as
+    /// sent or unsent.
+    fn send_requests_before(&mut self, end_ns: u64) -> Result<usize> {
         // SEND PHASE: Send requests to ready connections
         // Rate limiting is handled by connection-level policies via pool's
         // ready_heap, or for group dispatch, by each group's arrival process
@@ -567,7 +577,8 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         // The round's first connection, until its requests went out
         let mut first_connection = None;
 
-        while let Some(pick) = self.pool.pick_send() {
+        let last_ns = end_ns.saturating_sub(1);
+        while let Some(pick) = self.pool.pick_send_at(timing::time_ns().min(last_ns)) {
             let connection_id = pick.connection_id;
             // The round's first connection sends at once when the round
             // moves on, as a kernel socket would have sent its first request;
@@ -2628,6 +2639,38 @@ mod tests {
         let factory = FakeFactory::default();
         let worker = group_worker(&factory, 1, 1000, Box::new(FixedRatePolicy::new(1000.0)));
         assert_requests_behind_a_full_socket_count_as_unsent(&factory, worker);
+    }
+
+    /// Send at 1000 arrivals/s with the clock 2 ms past the end of a 3 ms
+    /// window, as when the run loop's end check runs just before the end and
+    /// its send phase after it: the arrivals intended at and after the end,
+    /// the first exactly at it, are not the window's, so they neither go out
+    /// nor count as unsent
+    fn assert_arrivals_from_the_end_on_are_not_sent(mut worker: Worker<FakeGroup, FakeProtocol>) {
+        let start_ns = timing::time_ns() + 1_000_000;
+        let end_ns = start_ns + 3_000_000;
+        worker.anchor_schedules(start_ns);
+        timing::busy_wait_until(end_ns + 2_000_000);
+        assert_eq!(worker.send_requests_before(end_ns).unwrap(), 3);
+        worker.record_unsent(end_ns);
+        let counts = worker.stats.request_counts_global();
+        assert_eq!((counts.sent, counts.unsent), (3, 0));
+    }
+
+    #[test]
+    fn arrivals_from_the_end_of_the_window_on_are_not_sent() {
+        let factory = FakeFactory::default();
+        let worker =
+            fake_worker(&factory, 1000, Box::new(UniformPolicyScheduler::fixed_rate(1000.0)));
+        assert_arrivals_from_the_end_on_are_not_sent(worker);
+    }
+
+    #[test]
+    fn group_arrivals_from_the_end_of_the_window_on_are_not_sent() {
+        use crate::scheduler::FixedRatePolicy;
+        let factory = FakeFactory::default();
+        let worker = group_worker(&factory, 1, 1000, Box::new(FixedRatePolicy::new(1000.0)));
+        assert_arrivals_from_the_end_on_are_not_sent(worker);
     }
 
     #[test]
