@@ -2914,6 +2914,8 @@ pub(crate) mod test_support {
         pub sent_on: Vec<usize>,
         pub fail_send: bool,
         pub timeouts: Vec<Duration>,
+        /// When each poll of `timeouts` was made (`timing::time_ns`)
+        pub poll_times: Vec<u64>,
         pub tx_polls: usize,
         pub closed: bool,
         pub timestamp: Timestamp,
@@ -2946,6 +2948,7 @@ pub(crate) mod test_support {
                 sent_on: Vec::new(),
                 fail_send: false,
                 timeouts: Vec::new(),
+                poll_times: Vec::new(),
                 tx_polls: 0,
                 closed: false,
                 timestamp: Timestamp::now(),
@@ -3092,6 +3095,7 @@ pub(crate) mod test_support {
         ) -> xylem_transport::Result<()> {
             let mut io = self.io.lock().unwrap();
             io.timeouts.push(timeout);
+            io.poll_times.push(crate::timing::time_ns());
             ready.clear();
             if !io.responses.is_empty() {
                 ready.push(io.response_connection_id);

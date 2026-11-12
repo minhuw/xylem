@@ -74,6 +74,21 @@ pub struct ExperimentConfig {
     #[serde(with = "humantime_serde", default = "default_drain_timeout")]
     #[schemars(with = "String")]
     pub drain_timeout: Duration,
+    /// Busy-poll: for this many microseconds after each send and each poll
+    /// that finds a ready connection, every worker thread polls without
+    /// waiting, then waits in its poll as without it. Unset (the default)
+    /// turns it off. While spinning, a thread keeps its core at 100%.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub busy_poll_us: Option<u64>,
+}
+
+impl ExperimentConfig {
+    /// The busy-poll budget of every worker thread; see
+    /// [`xylem_core::threading::Worker::set_busy_poll`]
+    pub fn busy_poll(&self) -> Option<Duration> {
+        self.busy_poll_us.map(Duration::from_micros)
+    }
 }
 
 fn default_drain_timeout() -> Duration {
@@ -299,6 +314,11 @@ impl ProfileConfig {
         }
         if self.experiment.duration.as_secs() == 0 {
             errors.push(anyhow!("Experiment duration must be > 0"));
+        }
+        if self.experiment.busy_poll_us == Some(0) {
+            errors.push(anyhow!(
+                "experiment.busy_poll_us must be > 0; leave it unset to turn busy polling off"
+            ));
         }
         if matches!(
             self.stats.sampling_policy.as_ref(),
@@ -1174,6 +1194,28 @@ mod tests {
                     "Traffic group {index} '{name}': sampling_policy.compression must be > 0 for t-digest"
                 )
             );
+        }
+    }
+
+    #[test]
+    fn busy_poll_is_off_by_default_and_takes_a_positive_budget_in_microseconds() {
+        let path = "../tests/redis/redis-bench.toml";
+        let config = ProfileConfig::from_file_with_overrides(path, &[]).unwrap();
+        assert_eq!((config.experiment.busy_poll_us, config.experiment.busy_poll()), (None, None));
+
+        let set = ["experiment.busy_poll_us=50".to_string()];
+        let config = ProfileConfig::from_file_with_overrides(path, &set).unwrap();
+        assert_eq!(config.experiment.busy_poll(), Some(Duration::from_micros(50)));
+
+        let set = ["experiment.busy_poll_us=0".to_string()];
+        let error = ProfileConfig::from_file_with_overrides(path, &set).unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "experiment.busy_poll_us must be > 0; leave it unset to turn busy polling off"
+        );
+        for value in ["-1", "\"50us\"", "true"] {
+            let set = [format!("experiment.busy_poll_us={value}")];
+            assert!(ProfileConfig::from_file_with_overrides(path, &set).is_err(), "{value}");
         }
     }
 
@@ -2509,8 +2551,8 @@ duration = "10s""#,
             (
                 "experiment.duraton=1s",
                 "Invalid --set experiment.duraton=1s: unknown field `duraton` in experiment \
-                 (did you mean `duration`?); expected one of `description`, `drain_timeout`, \
-                 `duration`, `name`, `seed`",
+                 (did you mean `duration`?); expected one of `busy_poll_us`, `description`, \
+                 `drain_timeout`, `duration`, `name`, `seed`",
             ),
             ("experimnt.seed=1", "unknown field `experimnt` at the top level (did you mean `experiment`?)"),
             ("traffic_groups.1.traffic_policy.rat=5", "in traffic_groups[1].traffic_policy (did you mean `rate`?)"),

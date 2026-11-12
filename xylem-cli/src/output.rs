@@ -374,6 +374,10 @@ pub struct ExperimentMetadata {
     pub actual_load_loop_end_unix_us: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
+    /// The worker threads' busy-poll budget (`experiment.busy_poll_us`);
+    /// null when they did not busy-poll
+    #[serde(default)]
+    pub busy_poll_us: Option<u64>,
 }
 
 /// Target metadata
@@ -620,6 +624,8 @@ impl DetailedExperimentResults {
                 actual_load_loop_start_unix_us: tuple_stats.actual_load_loop_unix_us().map(|v| v.0),
                 actual_load_loop_end_unix_us: tuple_stats.actual_load_loop_unix_us().map(|v| v.1),
                 seed,
+                // `run_experiment` records the profile's
+                busy_poll_us: None,
             },
             target: TargetMetadata {
                 address: target_address,

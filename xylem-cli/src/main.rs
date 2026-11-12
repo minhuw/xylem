@@ -530,17 +530,19 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
             .iter()
             .map(|(group_id, _)| (*group_id, config_for_worker.traffic_groups[*group_id].on_error))
             .collect();
+        let busy_poll = config_for_worker.experiment.busy_poll();
 
-        // Helper function to wire the request dumper, request timeouts and error
-        // handling into a created worker, run it from the shared start time, and
-        // return its stats, its NIC clock calibration, if any, and its
-        // connections' local addresses.
+        // Helper function to wire the request dumper, request timeouts, error
+        // handling and busy polling into a created worker, run it from the
+        // shared start time, and return its stats, its NIC clock calibration,
+        // if any, and its connections' local addresses.
         fn run_worker<G, S>(
             mut worker: Worker<G, xylem_cli::multi_protocol::MultiProtocol, S>,
             request_dumper: Option<&Arc<xylem_core::request_dump::RequestDumper>>,
             thread_idx: usize,
             request_timeouts: &[(usize, Option<std::time::Duration>)],
             on_errors: &[(usize, xylem_core::traffic_group::OnError)],
+            busy_poll: Option<std::time::Duration>,
             start: StartTicket,
         ) -> xylem_core::Result<(S, WorkerReport)>
         where
@@ -557,6 +559,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
             for &(group_id, on_error) in on_errors {
                 worker.set_on_error(group_id, on_error);
             }
+            worker.set_busy_poll(busy_poll);
 
             worker.run_at(start.wait())?;
             let calibration = worker
@@ -586,6 +589,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
                     thread_idx,
                     &request_timeouts,
                     &on_errors,
+                    busy_poll,
                     start,
                 )
             }
@@ -607,6 +611,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
                     thread_idx,
                     &request_timeouts,
                     &on_errors,
+                    busy_poll,
                     start,
                 )
             }
@@ -644,6 +649,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
                     thread_idx,
                     &request_timeouts,
                     &on_errors,
+                    busy_poll,
                     start,
                 )
             }
@@ -678,6 +684,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
                             thread_idx,
                             &request_timeouts,
                             &on_errors,
+                            busy_poll,
                             start,
                         )
                     }
@@ -704,6 +711,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
                             thread_idx,
                             &request_timeouts,
                             &on_errors,
+                            busy_poll,
                             start,
                         )
                     }
@@ -733,6 +741,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
                             thread_idx,
                             &request_timeouts,
                             &on_errors,
+                            busy_poll,
                             start,
                         )
                     }
@@ -794,6 +803,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
         &config.traffic_groups,
         config.stats.include_records,
     );
+    detailed_results.experiment.busy_poll_us = config.experiment.busy_poll_us;
     detailed_results.nic_clock_calibration = calibrations.into_iter().flatten().collect();
     detailed_results.nic_clock_calibration.sort_by_key(|c| c.thread_id);
     detailed_results.set_connection_addrs(local_addrs);

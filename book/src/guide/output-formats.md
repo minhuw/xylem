@@ -64,6 +64,10 @@ These readings do not imply synchronization between guest and host clocks.
 Both fields are omitted if no interval was recorded or any worker's samples
 are missing, reversed, or above `2^53 - 1`.
 
+`experiment.busy_poll_us` is the profile's busy-poll budget in microseconds,
+or `null` when the worker threads did not busy-poll (see
+[busy polling](../reference/schema.md#busy-polling)).
+
 ## Request accounting
 
 Each `requests` object in JSON (global and per group) counts measurement

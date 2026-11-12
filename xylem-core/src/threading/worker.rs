@@ -67,6 +67,12 @@ pub struct Worker<G: ConnectionGroup, P: Protocol, S: StatsRecorder = TupleStats
     outbox: Outbox,
     /// Reused buffer for the requests the transport took
     sent: Vec<SentRequest>,
+    /// How long after the last I/O polls do not wait, in nanoseconds; `None`
+    /// (the default) lets every poll wait (see [`Self::set_busy_poll`])
+    busy_poll_ns: Option<u64>,
+    /// When the worker last sent or a poll reported a ready connection (a
+    /// `timing::time_ns` value)
+    last_io_ns: u64,
 }
 
 impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
@@ -160,6 +166,8 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             ready_ids: Vec::new(),
             outbox: Outbox::default(),
             sent: Vec::new(),
+            busy_poll_ns: None,
+            last_io_ns: 0,
         }
     }
 
@@ -193,6 +201,29 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
     /// [`OnError::Abort`], the run fails at the first one, warmup included.
     pub fn set_on_error(&mut self, group_id: usize, on_error: OnError) {
         self.pool.set_on_error(group_id, on_error);
+    }
+
+    /// Busy-poll for up to `budget` after the last I/O; `None` (the default)
+    /// turns busy polling off
+    ///
+    /// For `budget` after the worker last sent or a poll reported a ready
+    /// connection, from the start of the run on, the worker polls the
+    /// transport with a zero timeout instead of waiting in it, so it sees a
+    /// response without a wakeup; then its polls wait as without busy
+    /// polling, until the next send or event. The thread's core stays busy
+    /// while it spins. Deadlines are kept as without busy polling, since
+    /// every loop pass checks them, and timestamps are taken where they are
+    /// without it.
+    pub fn set_busy_poll(&mut self, budget: Option<Duration>) {
+        self.busy_poll_ns = budget.map(|budget| budget.as_nanos().min(u64::MAX as u128) as u64);
+    }
+
+    /// `timeout`, or no wait while busy polling at `now_ns`
+    fn busy_poll_timeout(&self, timeout: Duration, now_ns: u64) -> Duration {
+        match self.busy_poll_ns {
+            Some(budget) if now_ns.saturating_sub(self.last_io_ns) < budget => Duration::ZERO,
+            _ => timeout,
+        }
     }
 
     /// Set the request dumper for recording all requests
@@ -254,6 +285,8 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
 
         let duration_ns = self.config.duration.as_nanos().min(u64::MAX as u128) as u64;
         let end_ns = start_ns.saturating_add(duration_ns);
+        // Busy polling starts with the run
+        self.last_io_ns = start_ns;
 
         let loop_result = loop {
             let now_ns = timing::time_ns();
@@ -263,8 +296,10 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
                 break Ok(());
             }
 
-            if let Err(error) = self.send_requests() {
-                break Err(error);
+            match self.send_requests() {
+                Ok(0) => {}
+                Ok(_) => self.last_io_ns = now_ns,
+                Err(error) => break Err(error),
             }
 
             // RECEIVE PHASE: Poll all connections for responses (single syscall)
@@ -272,8 +307,12 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             let now_ns = timing::time_ns();
 
             let poll_timeout = self.poll_timeout(now_ns, end_ns);
+            let poll_timeout = self.busy_poll_timeout(poll_timeout, now_ns);
             if let Err(error) = self.process_responses(poll_timeout) {
                 break Err(error);
+            }
+            if !self.ready_ids.is_empty() {
+                self.last_io_ns = now_ns;
             }
             self.expire_requests(timing::time_ns());
         };
@@ -306,7 +345,8 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         }
     }
 
-    fn send_requests(&mut self) -> Result<()> {
+    /// Returns the number of requests it picked, setup requests included
+    fn send_requests(&mut self) -> Result<usize> {
         // SEND PHASE: Send requests to ready connections
         // Rate limiting is handled by connection-level policies via pool's
         // ready_heap, or for group dispatch, by each group's arrival process
@@ -408,7 +448,7 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         if sends_this_iteration > 0 {
             self.flush()?;
         }
-        Ok(())
+        Ok(sends_this_iteration)
     }
 
     /// Write what was queued since the last flush and put it on the wire,
@@ -606,8 +646,9 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
     }
 
     /// Time out the requests whose request timeout passed by `now_ns`, count
-    /// the measurement ones, and reschedule the connections they freed
-    fn expire_requests(&mut self, now_ns: u64) {
+    /// the measurement ones, and reschedule the connections they freed.
+    /// Returns whether any timed out.
+    fn expire_requests(&mut self, now_ns: u64) -> bool {
         let mut freed = Vec::new();
         let stats = &mut self.stats;
         self.pool
@@ -618,10 +659,12 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
                 tracing::debug!(connection_id, group_id, expired, "Requests timed out");
                 freed.push((connection_id, group_id));
             });
+        let expired = !freed.is_empty();
         for (connection_id, group_id) in freed {
             let protocol = self.protocols.get(&group_id).expect("Protocol not found for group_id");
             self.pool.try_schedule_connection(connection_id, protocol);
         }
+        expired
     }
 
     fn maintain_tx_queues(&mut self, now_ns: u64) {
@@ -677,7 +720,11 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
     fn drain_responses(&mut self) -> Result<()> {
         let timeout_ns = self.config.drain_timeout.as_nanos().min(u64::MAX as u128) as u64;
         let deadline_ns = timing::time_ns().saturating_add(timeout_ns);
-        while self.has_pending() {
+        // Only ready connections and timeouts end pending requests, so a
+        // poll that reports neither leaves them pending: a busy-polling
+        // drain checks every connection only when one may have finished
+        let mut pending = self.has_pending();
+        while pending {
             let now_ns = timing::time_ns();
             if now_ns >= deadline_ns {
                 break;
@@ -688,8 +735,14 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
                 .pool
                 .next_request_deadline()
                 .map_or(wait_ns, |next| wait_ns.min(next.saturating_sub(now_ns)));
-            self.process_responses(Duration::from_nanos(wait_ns))?;
-            self.expire_requests(timing::time_ns());
+            self.process_responses(self.busy_poll_timeout(Duration::from_nanos(wait_ns), now_ns))?;
+            let ready = !self.ready_ids.is_empty();
+            if ready {
+                self.last_io_ns = now_ns;
+            }
+            if self.expire_requests(timing::time_ns()) || ready {
+                pending = self.has_pending();
+            }
         }
 
         let mut timed_out = 0;
@@ -1088,6 +1141,102 @@ mod tests {
         let mut worker = fake_worker(&factory, 1, Box::new(UniformPolicyScheduler::closed_loop()));
         worker.send_requests().unwrap();
         assert_eq!(worker.poll_timeout(100, 5_000_100), Duration::from_millis(5));
+    }
+
+    #[test]
+    fn busy_poll_does_not_wait_until_its_budget_after_the_last_io_passed() {
+        let factory = FakeFactory::default();
+        let mut worker = fake_worker(&factory, 1, Box::new(UniformPolicyScheduler::closed_loop()));
+        let wait = Duration::from_millis(5);
+        worker.last_io_ns = 1_000_000_000;
+        assert_eq!(worker.busy_poll_timeout(wait, 1_000_000_000), wait, "off by default");
+        worker.set_busy_poll(Some(Duration::from_millis(1)));
+        assert_eq!(worker.busy_poll_timeout(wait, 1_000_000_000), Duration::ZERO);
+        assert_eq!(worker.busy_poll_timeout(wait, 1_000_999_999), Duration::ZERO);
+        assert_eq!(worker.busy_poll_timeout(wait, 1_001_000_000), wait);
+        worker.set_busy_poll(None);
+        assert_eq!(worker.busy_poll_timeout(wait, 1_000_000_000), wait);
+    }
+
+    #[test]
+    fn busy_poll_spins_after_each_send_then_waits_as_without_it() {
+        const MS: u64 = 1_000_000;
+        for busy_poll in [None, Some(Duration::from_millis(5))] {
+            let factory = FakeFactory::default();
+            // Sends at the start and about 15 ms after it
+            let mut worker = fake_worker(
+                &factory,
+                2,
+                Box::new(UniformPolicyScheduler::fixed_rate(1000.0 / 15.0)),
+            );
+            worker.set_busy_poll(busy_poll);
+            worker.config.duration = Duration::from_millis(25);
+            let start = timing::time_ns() + MS;
+            worker.run_at(start).unwrap();
+            assert_eq!(worker.stats.request_counts_global().sent, 2);
+            let io = factory.0.lock().unwrap();
+            // When each poll was made, from the start, and whether it waited
+            let polls: Vec<(u64, bool)> = io
+                .poll_times
+                .iter()
+                .zip(&io.timeouts)
+                .map(|(&time, timeout)| (time - start, !timeout.is_zero()))
+                .collect();
+            let spins_in = |from: u64, to: u64| {
+                polls
+                    .iter()
+                    .any(|&(time, waits)| !waits && (from * MS..to * MS).contains(&time))
+            };
+            // Without busy polling, only the millisecond before a send spins,
+            // for rate-policy precision; with it, the 5 ms after each send too
+            assert_eq!(spins_in(1, 5), busy_poll.is_some(), "{busy_poll:?}: {polls:?}");
+            assert_eq!(spins_in(17, 20), busy_poll.is_some(), "{busy_poll:?}: {polls:?}");
+            // Then polls wait again, until the next send's early wakeup
+            assert!(!spins_in(7, 13), "{busy_poll:?}: {polls:?}");
+            assert!(!spins_in(22, 25), "{busy_poll:?}: {polls:?}");
+            assert!(polls.iter().any(|&(time, waits)| waits && (7 * MS..13 * MS).contains(&time)));
+        }
+    }
+
+    #[test]
+    fn busy_poll_ends_the_window_and_the_drain_on_time() {
+        let factory = FakeFactory::default();
+        let mut worker = fake_worker(&factory, 1, Box::new(UniformPolicyScheduler::closed_loop()));
+        // A budget longer than the run: no poll waits
+        worker.set_busy_poll(Some(Duration::from_secs(3600)));
+        worker.config.duration = Duration::from_millis(10);
+        let start = timing::time_ns();
+        worker.run_at(start).unwrap();
+        let elapsed = timing::time_ns() - start;
+        assert!(factory.0.lock().unwrap().timeouts.iter().all(Duration::is_zero));
+        // The request never answered was pending until the drain deadline
+        let counts = worker.stats.request_counts_global();
+        assert_eq!((counts.sent, counts.timed_out), (1, 1));
+        assert_eq!(worker.stats.measurement_window_ns().unwrap().1, start + 10_000_000);
+        let floor = 10_000_000 + FAKE_DRAIN_TIMEOUT.as_nanos() as u64;
+        assert!((floor..floor + 1_000_000_000).contains(&elapsed), "{elapsed} ns");
+    }
+
+    #[test]
+    fn a_ready_connection_restarts_the_busy_poll() {
+        let factory = FakeFactory::default();
+        let mut worker = fake_worker(&factory, 2, Box::new(UniformPolicyScheduler::closed_loop()));
+        worker.set_busy_poll(Some(Duration::from_millis(5)));
+        worker.send_requests().unwrap();
+        worker.last_io_ns = timing::time_ns();
+        thread::sleep(Duration::from_millis(6));
+        // The budget has passed: the drain's first poll waits, and its
+        // response restarts the spin, which lasts until the budget passes
+        // again, while the second request stays pending to the deadline
+        factory.0.lock().unwrap().responses.push_back(Ok(0u64.to_le_bytes().to_vec()));
+        worker.drain_responses().unwrap();
+        let timeouts = factory.0.lock().unwrap().timeouts.clone();
+        assert!(!timeouts[0].is_zero(), "{:?}", timeouts[0]);
+        let spins = timeouts[1..].iter().take_while(|timeout| timeout.is_zero()).count();
+        assert!(spins > 0 && 1 + spins < timeouts.len(), "{spins} of {}", timeouts.len());
+        assert!(timeouts[1 + spins..].iter().all(|timeout| !timeout.is_zero()));
+        let counts = worker.stats.request_counts_global();
+        assert_eq!((counts.completed, counts.timed_out), (1, 1));
     }
 
     #[test]

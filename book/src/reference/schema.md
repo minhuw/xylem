@@ -48,6 +48,44 @@ seed = 42
   long to wait for responses that are still pending. Nothing is sent during the
   drain. Requests still pending when it ends count as `timed_out`; see
   [run phases](../guide/output-formats.md#run-phases).
+- `busy_poll_us` (integer, optional, at least 1): turn on busy polling with
+  this budget in microseconds; see [busy polling](#busy-polling). Off when
+  unset.
+
+### Busy polling
+
+By default a worker thread that has nothing to send waits in its transport's
+poll (`epoll_wait` for the kernel transports) until a connection is ready or
+its next deadline comes, so the kernel has to wake it for each response.
+With `busy_poll_us = N`, for `N` microseconds after each send and after each
+poll that finds a ready connection, the thread polls with a zero timeout
+instead, and sees a response without that wakeup. Once `N` microseconds pass
+with neither, it waits in its poll as without busy polling, until the next
+send or event. The budget counts from the start of the run too.
+
+```toml
+[experiment]
+name = "nvme-qd1"
+duration = "30s"
+busy_poll_us = 1000
+```
+
+**CPU cost: every worker thread keeps its core at 100% while it spins.** With
+a budget longer than the gaps between a thread's sends and responses, which
+is the usual case under load, that is the whole run. A smaller budget bounds
+the burn when a thread is idle, such as between widely spaced open-loop
+sends; a request whose response takes longer than the budget waits in a
+poll. Pin each thread to a core of its own (`threads`) and keep that core
+free of other work.
+
+Busy polling helps where the wakeup is a large part of the latency: one
+request in flight on a fast target, such as NVMe/TCP at queue depth 1. It
+works the same for every transport and protocol, and changes neither where
+timestamps are taken nor when sends, timeouts, the end of the window and the
+drain happen. ntcp's DPDK and AF_XDP backends already spin in their polls,
+so it changes nothing there; with TUN, ntcp drives its stack on each poll
+instead of sleeping on the device. The JSON results record the budget as
+`experiment.busy_poll_us`, `null` without busy polling.
 
 ## Transport and Target
 

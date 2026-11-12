@@ -164,6 +164,15 @@
       "description": "Experiment metadata",
       "type": "object",
       "properties": {
+        "busy_poll_us": {
+          "description": "Busy-poll: for this many microseconds after each send and each poll\nthat finds a ready connection, every worker thread polls without\nwaiting, then waits in its poll as without it. Unset (the default)\nturns it off. While spinning, a thread keeps its core at 100%.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 1
+        },
         "description": {
           "description": "Optional description",
           "type": [

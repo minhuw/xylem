@@ -472,7 +472,8 @@ const MASKED_JSON: &str = r#"{
     "description": "Output format characterization",
     "duration_secs": 1.0,
     "measured_duration_secs": #,
-    "seed": 7
+    "seed": 7,
+    "busy_poll_us": null
   },
   "target": {
     "address": "TARGET",
