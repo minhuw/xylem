@@ -268,6 +268,10 @@ impl ConnectionGroup for TcpConnectionGroup {
         self.core.poll(timeout, ready)
     }
 
+    fn local_addr(&self, conn_id: usize) -> Option<SocketAddr> {
+        self.core.get(conn_id)?.stream.local_addr().ok()
+    }
+
     #[cfg(target_os = "linux")]
     fn poll_tx_timestamps(&mut self, out: &mut Vec<crate::TxTimestampInfo>) -> Result<()> {
         // The kernel stamps the last segment sent together: cumulative
@@ -356,6 +360,21 @@ mod tests {
         for id in ids {
             assert!(group.core.conn_mut(id).unwrap().stream.nodelay().unwrap(), "connection {id}");
         }
+    }
+
+    #[test]
+    fn local_addr_is_the_address_the_peer_sees_while_open() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut group = TcpConnectionGroup::new().unwrap();
+        for _ in 0..2 {
+            let conn_id = group.add_connection(&addr).unwrap();
+            let (_, peer) = listener.accept().unwrap();
+            assert_eq!(group.local_addr(conn_id), Some(peer));
+        }
+        group.close(0).unwrap();
+        assert_eq!(group.local_addr(0), None);
+        assert_eq!(group.local_addr(99), None);
     }
 
     #[test]

@@ -181,6 +181,14 @@ fn exit_on_failed_verdict(verdict: Verdict) {
     }
 }
 
+/// What a worker thread reports besides its stats: its NIC clock
+/// calibration, if any, and its thread ID with each connection's
+/// `(group_id, connection_id, local_addr)`
+type WorkerReport = (
+    Option<output::NicClockCalibration>,
+    (usize, Vec<(usize, usize, Option<std::net::SocketAddr>)>),
+);
+
 fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict> {
     tracing::info!("Xylem latency measurement tool (config-first mode)");
     tracing::info!("Loading profile: {}", profile.display());
@@ -525,7 +533,8 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
 
         // Helper function to wire the request dumper, request timeouts and error
         // handling into a created worker, run it from the shared start time, and
-        // return its stats and its NIC clock calibration, if any.
+        // return its stats, its NIC clock calibration, if any, and its
+        // connections' local addresses.
         fn run_worker<G, S>(
             mut worker: Worker<G, xylem_cli::multi_protocol::MultiProtocol, S>,
             request_dumper: Option<&Arc<xylem_core::request_dump::RequestDumper>>,
@@ -533,7 +542,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
             request_timeouts: &[(usize, Option<std::time::Duration>)],
             on_errors: &[(usize, xylem_core::traffic_group::OnError)],
             start: StartTicket,
-        ) -> xylem_core::Result<(S, Option<output::NicClockCalibration>)>
+        ) -> xylem_core::Result<(S, WorkerReport)>
         where
             G: xylem_transport::ConnectionGroup,
             S: xylem_core::stats::StatsRecorder,
@@ -553,7 +562,8 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
             let calibration = worker
                 .clock_calibration()
                 .map(|report| output::NicClockCalibration::new(thread_idx, &report));
-            Ok((worker.into_stats(), calibration))
+            let local_addrs = (thread_idx, worker.connection_local_addrs());
+            Ok((worker.into_stats(), (calibration, local_addrs)))
         }
 
         // Select transport factory based on thread's transport
@@ -758,7 +768,8 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
             Err(e) => tracing::warn!("ntcp AF_XDP: cannot read the dropped-frame count: {e}"),
         }
     }
-    let (results, calibrations): (Vec<_>, Vec<_>) = results.into_iter().unzip();
+    let (results, reports): (Vec<_>, Vec<_>) = results.into_iter().unzip();
+    let (calibrations, local_addrs): (Vec<_>, Vec<_>) = reports.into_iter().unzip();
     let stats = xylem_core::stats::TupleStatsCollector::merge(results);
 
     // Get transport summary from traffic groups
@@ -785,6 +796,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
     );
     detailed_results.nic_clock_calibration = calibrations.into_iter().flatten().collect();
     detailed_results.nic_clock_calibration.sort_by_key(|c| c.thread_id);
+    detailed_results.set_connection_addrs(local_addrs);
     let verdict = thresholds::evaluate(&mut detailed_results, &config);
 
     tracing::debug!(

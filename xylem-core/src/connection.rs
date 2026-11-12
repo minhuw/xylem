@@ -239,6 +239,9 @@ pub struct ConnectionState<ReqId: Eq + Hash + Clone> {
     connection_id: usize,
     /// Target address
     target: SocketAddr,
+    /// Local socket address, if the transport has one (see
+    /// [`ConnectionGroup::local_addr`])
+    local_addr: Option<SocketAddr>,
     /// Maximum pending requests allowed
     max_pending_requests: usize,
     /// Primary storage: ReqId -> PendingRequest for O(1) response lookup
@@ -314,6 +317,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         Self {
             connection_id,
             target,
+            local_addr: None,
             max_pending_requests,
             pending_map: FastHashMap::with_capacity_and_hasher(
                 max_pending_requests,
@@ -359,6 +363,12 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
     /// Get target address
     pub fn target(&self) -> SocketAddr {
         self.target
+    }
+
+    /// Local socket address the connection had once open, if the transport
+    /// has one
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        self.local_addr
     }
 
     /// Get pending request count: requests sent and waiting for their
@@ -1156,6 +1166,7 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
 
                 state.dispatcher = dispatcher;
                 state.control = role == ConnectionRole::Control;
+                state.local_addr = group.local_addr(connection_id);
                 state.set_on_heap(true);
                 connection_states.insert(connection_id, state);
                 connection_ids.push(connection_id);
@@ -1819,6 +1830,19 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
             .iter()
             .filter_map(|&id| self.connection_states.get(&id).map(|s| (id, s.target())))
             .collect()
+    }
+
+    /// `(group_id, connection_id, local_addr)` of every connection, closed
+    /// ones included, by connection ID; the address is the one each had once
+    /// open, if the transport has one
+    pub fn connection_local_addrs(&self) -> Vec<(usize, usize, Option<SocketAddr>)> {
+        let mut addrs: Vec<_> = self
+            .connection_states
+            .values()
+            .map(|state| (state.group_id, state.connection_id, state.local_addr))
+            .collect();
+        addrs.sort_unstable_by_key(|&(_, connection_id, _)| connection_id);
+        addrs
     }
 
     /// Get connection count

@@ -229,6 +229,17 @@ mod tests {
     }
 
     #[test]
+    fn unix_connections_have_no_local_socket_address() {
+        let temp_dir = TempDir::new().unwrap();
+        let socket_path = temp_dir.path().join("local.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let mut group = UnixConnectionGroup::new().unwrap();
+        let conn_id = group.add_connection_path(&socket_path).unwrap();
+        let _accepted = listener.accept().unwrap();
+        assert_eq!(group.local_addr(conn_id), None);
+    }
+
+    #[test]
     fn test_unix_group_add_connection_returns_error() {
         let mut group = UnixConnectionGroup::new().unwrap();
         let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();

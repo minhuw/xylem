@@ -348,6 +348,20 @@ Each record names its connection by `group_id`, `thread_id` and
 `thread_id` (the thread's entry in `threads`) is needed to tell connections
 apart.
 
+Whatever `include_records` is, each entry of `traffic_groups` lists its
+connections in `connection_addrs`, by the same `thread_id` and
+`connection_id`, with the local socket address each had once open:
+
+```json
+"connection_addrs": [
+  { "thread_id": 0, "connection_id": 0, "local_addr": "10.0.0.2:40112" }
+]
+```
+
+`local_addr` is `null` on Unix sockets. A UDP socket is not connected, so its
+IP is the unspecified address it is bound to, `0.0.0.0` or `::`; its port is
+the source port the server sees.
+
 Each record covers one `(bucket, group_id, thread_id, connection_id)` and has
 its own `latency_sample_count`: the number of successful latencies recorded for
 that tuple after any `limited` rate. Its `percentile_sample_count` is the number

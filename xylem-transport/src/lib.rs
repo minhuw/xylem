@@ -350,6 +350,15 @@ pub trait ConnectionGroup {
         None
     }
 
+    /// The local socket address of `conn_id`, while it is open
+    ///
+    /// An unconnected socket reports the address it is bound to, which may
+    /// have an unspecified IP. The default implementation (groups without
+    /// IP sockets) returns `None`.
+    fn local_addr(&self, _conn_id: usize) -> Option<SocketAddr> {
+        None
+    }
+
     /// Number of connections in the group
     fn len(&self) -> usize;
 

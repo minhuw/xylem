@@ -381,7 +381,7 @@ impl<C: GroupSocket> GroupCore<C> {
         self.live += 1;
     }
 
-    #[cfg(test)]
+    /// A live connection
     pub(crate) fn get(&self, conn_id: usize) -> Option<&C> {
         self.connections.get(conn_id)?.as_ref()
     }

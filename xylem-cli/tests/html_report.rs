@@ -68,6 +68,7 @@ fn html_report_preserves_data_and_escapes_profile_text() {
             latency_breakdown: Default::default(),
         },
         protocol_metadata: None,
+        connection_addrs: Vec::new(),
     });
     let file = tempfile::NamedTempFile::new().unwrap();
     generate_html_report(&results, file.path().to_str().unwrap()).unwrap();

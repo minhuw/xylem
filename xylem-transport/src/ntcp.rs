@@ -1071,6 +1071,11 @@ impl<P: NtcpBackend> ConnectionGroup for NtcpConnectionGroup<P> {
         self.nic.as_ref().map(NicClock::report)
     }
 
+    fn local_addr(&self, conn_id: usize) -> Option<SocketAddr> {
+        let conn = self.slots.handle(conn_id).ok()?;
+        Some(self.network.connection_info(conn).ok()?.local)
+    }
+
     fn len(&self) -> usize {
         self.slots.len()
     }
@@ -1591,6 +1596,25 @@ mod tests {
         assert!(matches!(group.recv(99, &mut buf), Err(Error::Connection(_))));
         group.close_all().unwrap();
         assert_eq!(group.len(), 0);
+    }
+
+    #[test]
+    fn local_addr_is_each_connections_own_end_while_open() {
+        let (a, b) = link();
+        let _server = EchoServer::start(b, true, ServerClose::OnEof);
+        let mut group = client(a);
+        let first = group.add_connection(&server_addr()).unwrap();
+        let second = group.add_connection(&server_addr()).unwrap();
+        let ends = [group.local_addr(first).unwrap(), group.local_addr(second).unwrap()];
+        for end in ends {
+            assert_eq!(end.ip(), CLIENT.parse::<IpAddr>().unwrap());
+            assert_ne!(end.port(), 0);
+        }
+        assert_ne!(ends[0].port(), ends[1].port());
+        group.close(first).unwrap();
+        assert_eq!(group.local_addr(first), None);
+        assert_eq!(group.local_addr(99), None);
+        group.close_all().unwrap();
     }
 
     #[test]

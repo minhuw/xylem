@@ -168,6 +168,11 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         self.pool.connection_targets()
     }
 
+    /// See [`ConnectionPool::connection_local_addrs`]
+    pub fn connection_local_addrs(&self) -> Vec<(usize, usize, Option<SocketAddr>)> {
+        self.pool.connection_local_addrs()
+    }
+
     /// Set the request timeout of traffic group `group_id`; see
     /// [`ConnectionPool::set_request_timeout`]
     ///
@@ -2215,6 +2220,31 @@ mod tests {
             stats.aggregate_global(Duration::from_millis(100)).total_requests > 0,
             "Should have sent requests"
         );
+    }
+
+    #[test]
+    fn connections_keep_their_local_addresses_after_they_close() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = WorkerConfig {
+            target: listener.local_addr().unwrap(),
+            duration: Duration::from_millis(10),
+            conn_count: 2,
+            max_pending_per_conn: 1,
+            drain_timeout: FAKE_DRAIN_TIMEOUT,
+        };
+        let mut worker = Worker::new(
+            &TcpTransportFactory::default(),
+            FakeProtocol::default(),
+            TupleStatsCollector::default(),
+            config,
+            Box::new(UniformPolicyScheduler::closed_loop()),
+        )
+        .unwrap();
+        let peers = [listener.accept().unwrap().1, listener.accept().unwrap().1];
+        let expected = vec![(0, 0, Some(peers[0])), (0, 1, Some(peers[1]))];
+        assert_eq!(worker.connection_local_addrs(), expected);
+        worker.pool.close_all().unwrap();
+        assert_eq!(worker.connection_local_addrs(), expected);
     }
 
     #[test]

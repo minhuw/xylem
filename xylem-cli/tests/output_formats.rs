@@ -629,7 +629,14 @@ const MASKED_JSON: &str = r#"{
           "host_stack_us": null,
           "network_server_us": null
         }
-      }
+      },
+      "connection_addrs": [
+        {
+          "thread_id": 0,
+          "connection_id": 0,
+          "local_addr": "LOCAL_ADDR"
+        }
+      ]
     }
   ]
 }"#;
@@ -656,7 +663,14 @@ fn assert_json_results(
     let experiment = &json["experiment"];
     let start = experiment.get("actual_load_loop_start_unix_us");
     let end = experiment.get("actual_load_loop_end_unix_us");
-    let mut expected = MASKED_JSON.replace("TARGET", target);
+    // The connection's local address: the echo server's IP and some port
+    let local_addr = json["traffic_groups"][0]["connection_addrs"][0]["local_addr"]
+        .as_str()
+        .expect("the connection's local address");
+    let local: std::net::SocketAddr = local_addr.parse().unwrap();
+    let target_addr: std::net::SocketAddr = target.parse().unwrap();
+    assert!(local.ip() == target_addr.ip() && local.port() != 0, "{local}");
+    let mut expected = MASKED_JSON.replace("TARGET", target).replace("LOCAL_ADDR", local_addr);
     match (start, end) {
         (Some(start), Some(end)) => {
             let start = start.as_u64().expect("load-loop start must be Unix microseconds");
@@ -697,6 +711,7 @@ fn assert_json_results(
     assert_eq!(
         sorted_keys(&groups[0]),
         [
+            "connection_addrs",
             "connections",
             "dispatch",
             "id",

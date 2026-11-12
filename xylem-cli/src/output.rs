@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::fs::File;
 use std::io::Write;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 use xylem_core::stats::{
@@ -424,6 +425,20 @@ pub struct TrafficGroupResults {
     pub stats: GroupStats,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub protocol_metadata: Option<JsonValue>,
+    /// Every connection the group opened, by thread and connection ID (the
+    /// key of `records`), with its local socket address
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub connection_addrs: Vec<ConnectionAddr>,
+}
+
+/// The local socket address of one connection
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectionAddr {
+    pub thread_id: usize,
+    pub connection_id: usize,
+    /// `IP:port` the connection had once open; null without one (Unix
+    /// sockets). An unconnected UDP socket reports its unspecified bound IP.
+    pub local_addr: Option<SocketAddr>,
 }
 
 /// Per-group statistics
@@ -452,6 +467,32 @@ pub struct GroupStats {
 }
 
 impl DetailedExperimentResults {
+    /// Put each thread's `(group_id, connection_id, local_addr)` of its
+    /// connections in its group's `connection_addrs`, in thread and
+    /// connection order
+    pub fn set_connection_addrs(
+        &mut self,
+        threads: impl IntoIterator<Item = (usize, Vec<(usize, usize, Option<SocketAddr>)>)>,
+    ) {
+        for (thread_id, connections) in threads {
+            for (group_id, connection_id, local_addr) in connections {
+                let group = self
+                    .traffic_groups
+                    .iter_mut()
+                    .find(|group| group.id == group_id)
+                    .expect("a connection of a configured traffic group");
+                group.connection_addrs.push(ConnectionAddr {
+                    thread_id,
+                    connection_id,
+                    local_addr,
+                });
+            }
+        }
+        for group in &mut self.traffic_groups {
+            group.connection_addrs.sort_by_key(|addr| (addr.thread_id, addr.connection_id));
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     /// Create detailed results from tuple stats collector
     ///
@@ -563,6 +604,7 @@ impl DetailedExperimentResults {
                         ),
                     },
                     protocol_metadata: None,
+                    connection_addrs: Vec::new(),
                 };
 
                 traffic_groups.push(group_result);

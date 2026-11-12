@@ -197,6 +197,10 @@ impl ConnectionGroup for UdpConnectionGroup {
         self.core.poll(timeout, ready)
     }
 
+    fn local_addr(&self, conn_id: usize) -> Option<SocketAddr> {
+        self.core.get(conn_id)?.socket.local_addr().ok()
+    }
+
     #[cfg(target_os = "linux")]
     fn poll_tx_timestamps(&mut self, out: &mut Vec<crate::TxTimestampInfo>) -> Result<()> {
         // One stamp per datagram: exact
@@ -294,6 +298,21 @@ mod tests {
         assert!(group.core.get(0).is_some());
         assert!(group.core.get(1).is_some());
         assert!(group.core.get(99).is_none());
+    }
+
+    #[test]
+    fn local_addr_has_the_source_port_the_server_sees() {
+        let server = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        let mut group = UdpConnectionGroup::new().unwrap();
+        let conn_id = group.add_connection(&addr).unwrap();
+        group.send(conn_id, b"ping").unwrap();
+        let mut buf = [0u8; 8];
+        let (_, source) = server.recv_from(&mut buf).unwrap();
+        let local = group.local_addr(conn_id).unwrap();
+        assert_eq!(local.port(), source.port());
+        group.close(conn_id).unwrap();
+        assert_eq!(group.local_addr(conn_id), None);
     }
 
     #[test]

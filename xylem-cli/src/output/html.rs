@@ -681,6 +681,7 @@ mod optional_latency_display_tests {
                 latency_breakdown: Default::default(),
             },
             protocol_metadata: None,
+            connection_addrs: Vec::new(),
         }
     }
 
