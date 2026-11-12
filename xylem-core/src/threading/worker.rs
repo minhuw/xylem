@@ -324,6 +324,7 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
 
         // Stop sending and wait for the responses still pending
         self.drain_responses()?;
+        self.check_setup_done()?;
 
         // Close all connections
         self.pool.close_all()?;
@@ -474,11 +475,7 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
     /// now; on a connection error, close the connection
     fn write_queued(&mut self, connection_id: usize, group_id: usize) -> Result<()> {
         match self.pool.write_queued(connection_id) {
-            Err(e @ crate::Error::Connection(_)) => {
-                self.close_failed(connection_id, group_id);
-                tracing::warn!(connection_id, "Connection disconnected: {}", e);
-                Ok(())
-            }
+            Err(e @ crate::Error::Connection(_)) => self.close_failed(connection_id, group_id, e),
             result => result,
         }
     }
@@ -551,11 +548,12 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
                 }) {
                     Ok(responses) => responses,
                     Err(e @ crate::Error::Connection(_)) => {
-                        self.close_failed(connection_id, group_id);
-                        tracing::warn!(connection_id, "Connection disconnected: {}", e);
+                        self.close_failed(connection_id, group_id, e)?;
                         continue;
                     }
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        return Err(self.setup_failure(connection_id, group_id, &e).unwrap_or(e))
+                    }
                 }
             };
 
@@ -591,8 +589,7 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             match self.drain_outbox(connection_id, group_id) {
                 Ok(sent) => driven_sends |= sent,
                 Err(e @ crate::Error::Connection(_)) => {
-                    self.close_failed(connection_id, group_id);
-                    tracing::warn!(connection_id, "Connection disconnected: {}", e);
+                    self.close_failed(connection_id, group_id, e)?;
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -674,9 +671,20 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         }
     }
 
-    /// Close a connection that failed, counting its pending measurement
-    /// requests as failed
-    fn close_failed(&mut self, connection_id: usize, group_id: usize) {
+    /// Close a connection that failed with `error`, counting its pending
+    /// measurement requests as failed. A connection still in setup fails the
+    /// run instead: it never applied its load.
+    fn close_failed(
+        &mut self,
+        connection_id: usize,
+        group_id: usize,
+        error: crate::Error,
+    ) -> Result<()> {
+        if let Some(failure) = self.setup_failure(connection_id, group_id, &error) {
+            let _ = self.pool.close(connection_id);
+            return Err(failure);
+        }
+        tracing::warn!(connection_id, "Connection disconnected: {}", error);
         if let Some(state) = self.pool.get_state_mut(connection_id) {
             let failed = state.measured_pending_count() as u64;
             if failed > 0 {
@@ -689,6 +697,50 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             }
         }
         let _ = self.pool.close(connection_id);
+        Ok(())
+    }
+
+    /// The run's error for the connection or I/O `error` of `connection_id`
+    /// if the connection is still in setup, naming it; none otherwise
+    fn setup_failure(
+        &self,
+        connection_id: usize,
+        group_id: usize,
+        error: &crate::Error,
+    ) -> Option<crate::Error> {
+        let cause = match error {
+            crate::Error::Connection(cause) => cause.clone(),
+            crate::Error::Io(e) => e.to_string(),
+            _ => return None,
+        };
+        let protocol = self.protocols.get(&group_id).expect("Protocol not found for group_id");
+        protocol.setup_pending(connection_id).then(|| {
+            crate::Error::Connection(format!(
+                "Traffic group {group_id}, connection {connection_id} ({}): connection closed \
+                 during setup: {cause}",
+                protocol.name()
+            ))
+        })
+    }
+
+    /// Fail the run if a connection is still in setup: the server never
+    /// finished it, so the connection never applied its load
+    fn check_setup_done(&self) -> Result<()> {
+        for &connection_id in self.pool.connection_ids() {
+            let Some(state) = self.pool.get_state(connection_id) else {
+                continue;
+            };
+            let group_id = state.group_id();
+            let protocol = self.protocols.get(&group_id).expect("Protocol not found for group_id");
+            if protocol.setup_pending(connection_id) {
+                return Err(crate::Error::Connection(format!(
+                    "Traffic group {group_id}, connection {connection_id} ({}): connection setup \
+                     did not finish by the end of the run",
+                    protocol.name()
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Count the intended sends of every connection scheduled before the end
@@ -1288,6 +1340,83 @@ mod tests {
         assert_eq!(worker.pool.get_state(0).unwrap().pending_count(), 0);
         let counts = worker.stats.request_counts_global();
         assert_eq!((counts.sent, counts.failed, counts.timed_out), (1, 1, 0));
+    }
+
+    /// A worker whose protocol sets each connection up with one request
+    fn setup_worker(factory: &FakeFactory) -> Worker<FakeGroup, FakeProtocol> {
+        let mut worker = fake_worker(factory, 1, Box::new(UniformPolicyScheduler::closed_loop()));
+        let protocol = worker.protocols.get_mut(&0).unwrap();
+        protocol.setup = 1;
+        protocol.report_setup = true;
+        worker
+    }
+
+    #[test]
+    fn a_connection_closed_during_setup_fails_the_run_naming_it() {
+        // A closed connection is closed; an I/O error ends the run as before
+        for (error, cause, closed) in [
+            (
+                xylem_transport::Error::Connection("Connection closed by peer".into()),
+                "Connection closed by peer",
+                true,
+            ),
+            (
+                xylem_transport::Error::Io(std::io::ErrorKind::ConnectionReset.into()),
+                "connection reset",
+                false,
+            ),
+        ] {
+            let factory = FakeFactory::default();
+            let mut worker = setup_worker(&factory);
+            worker.send_requests().unwrap();
+            factory.0.lock().unwrap().responses.push_back(Err(error));
+            let error = worker.process_responses(Duration::ZERO).unwrap_err();
+            assert!(matches!(error, crate::Error::Connection(_)), "{error}");
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Connection error: Traffic group 0, connection 0 (Fake): connection closed \
+                     during setup: {cause}"
+                )
+            );
+            assert_eq!(factory.0.lock().unwrap().closed, closed);
+            assert_eq!(worker.stats.request_counts_global(), Default::default());
+        }
+    }
+
+    #[test]
+    fn a_connection_closed_after_setup_only_fails_its_requests() {
+        let factory = FakeFactory::default();
+        let mut worker = setup_worker(&factory);
+        worker.send_requests().unwrap();
+        factory.0.lock().unwrap().responses.push_back(Ok(0u64.to_le_bytes().to_vec()));
+        worker.process_responses(Duration::ZERO).unwrap();
+        worker.send_requests().unwrap();
+        factory
+            .0
+            .lock()
+            .unwrap()
+            .responses
+            .push_back(Err(xylem_transport::Error::Connection("closed".into())));
+        worker.process_responses(Duration::ZERO).unwrap();
+        assert!(factory.0.lock().unwrap().closed);
+        let counts = worker.stats.request_counts_global();
+        assert_eq!((counts.sent, counts.failed), (1, 1));
+    }
+
+    #[test]
+    fn a_run_whose_setup_never_finishes_fails_naming_the_connection() {
+        let factory = FakeFactory::default();
+        let mut worker = setup_worker(&factory);
+        worker.config.duration = Duration::from_millis(10);
+        // The setup reply never arrives
+        let error = worker.run().unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Connection error: Traffic group 0, connection 0 (Fake): connection setup did not \
+             finish by the end of the run"
+        );
+        assert_eq!(sent_requests(&factory), 1);
     }
 
     #[test]

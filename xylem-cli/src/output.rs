@@ -474,17 +474,19 @@ impl DetailedExperimentResults {
     /// Put each thread's `(group_id, connection_id, local_addr)` of its
     /// connections in its group's `connection_addrs`, in thread and
     /// connection order
+    ///
+    /// A group that recorded no requests is not in the results (see
+    /// [`Self::from_tuple_stats`]), and neither are its connections.
     pub fn set_connection_addrs(
         &mut self,
         threads: impl IntoIterator<Item = (usize, Vec<(usize, usize, Option<SocketAddr>)>)>,
     ) {
         for (thread_id, connections) in threads {
             for (group_id, connection_id, local_addr) in connections {
-                let group = self
-                    .traffic_groups
-                    .iter_mut()
-                    .find(|group| group.id == group_id)
-                    .expect("a connection of a configured traffic group");
+                let Some(group) = self.traffic_groups.iter_mut().find(|group| group.id == group_id)
+                else {
+                    continue;
+                };
                 group.connection_addrs.push(ConnectionAddr {
                     thread_id,
                     connection_id,
@@ -498,7 +500,8 @@ impl DetailedExperimentResults {
     }
 
     #[allow(clippy::too_many_arguments)]
-    /// Create detailed results from tuple stats collector
+    /// Create detailed results from tuple stats collector; a traffic group
+    /// that recorded no requests is left out
     ///
     /// # Arguments
     /// * `include_records` - Whether to include per-bucket, per-connection records
@@ -1864,5 +1867,24 @@ mod raw_record_tests {
                 assert_eq!(round_trip[field], legacy[field]);
             }
         }
+    }
+
+    #[test]
+    fn connections_of_a_group_that_recorded_nothing_stay_out_like_the_group() {
+        let groups = [group(0, SamplingPolicy::Unlimited), group(1, SamplingPolicy::Unlimited)];
+        let mut collector =
+            TupleStatsCollector::new(SamplingPolicy::Unlimited, Duration::from_secs(3600));
+        collector.record_latency(0, 0, Duration::from_micros(7));
+        // Group 1 sent nothing in the run, like a low-rate group
+        let mut results = build_results(&collector, &groups, false);
+        let ids: Vec<_> = results.traffic_groups.iter().map(|group| group.id).collect();
+        assert_eq!(ids, [0]);
+        results.set_connection_addrs([(0, vec![(0, 0, None), (1, 1, None)])]);
+        let json = serde_json::to_value(&results).unwrap();
+        assert_eq!(json["traffic_groups"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            json["traffic_groups"][0]["connection_addrs"],
+            serde_json::json!([{ "thread_id": 0, "connection_id": 0, "local_addr": null }])
+        );
     }
 }

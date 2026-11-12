@@ -63,7 +63,10 @@ pub trait Protocol: Send {
 - `setup_pending` reports a connection that is still in connection setup
   (Redis AUTH, SELECT and HELLO, the Masstree handshake). Its requests go out
   as soon as `can_send` allows, off the connection's intended send schedule,
-  which starts once setup is done.
+  which starts once setup is done. A connection error while it is true, or
+  setup still pending at the end of the run, fails the run naming the
+  connection; after setup, a connection error only closes the connection and
+  counts its pending requests as `failed`.
 - `connection_roles` lets a session span connections. For a group with
   `load` connections per thread it returns the connections to open, in
   order: exactly `load` `Load` connections, which carry the traffic policy
