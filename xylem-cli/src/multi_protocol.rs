@@ -16,6 +16,7 @@ pub enum MultiProtocol {
     Masstree(xylem_protocols::MasstreeProtocol),
     Dns(xylem_protocols::DnsProtocol),
     NvmeTcp(xylem_protocols::NvmeTcpProtocol),
+    ClickHouse(xylem_protocols::ClickHouseProtocol),
 }
 
 impl MultiProtocol {
@@ -92,6 +93,9 @@ impl MultiProtocol {
             ProtocolConfig::NvmeTcp(nvme_config) => Self::NvmeTcp(
                 xylem_protocols::NvmeTcpProtocol::from_config(nvme_config, max_pending, seed)?,
             ),
+            ProtocolConfig::ClickHouse(ch_config) => {
+                Self::ClickHouse(xylem_protocols::ClickHouseProtocol::from_config(ch_config, seed)?)
+            }
             ProtocolConfig::XylemEcho(_echo_config) => create_xylem_echo_protocol(),
         };
         Ok(protocol)
@@ -131,6 +135,7 @@ impl Protocol for MultiProtocol {
                 let (conn, stream) = request.request_id;
                 Request::new(request.data, (conn, u64::from(stream)), request.metadata)
             }
+            MultiProtocol::ClickHouse(p) => p.next_request(conn_id),
         }
     }
 
@@ -157,6 +162,7 @@ impl Protocol for MultiProtocol {
             MultiProtocol::Http2(p) | MultiProtocol::Grpc(p) => Ok(p
                 .parse_response(conn_id, data)?
                 .map_id(|(conn, stream)| (conn, u64::from(stream)))),
+            MultiProtocol::ClickHouse(p) => p.parse_response(conn_id, data),
         }
     }
 
@@ -171,6 +177,7 @@ impl Protocol for MultiProtocol {
             MultiProtocol::Dns(p) => p.name(),
             MultiProtocol::NvmeTcp(p) => p.name(),
             MultiProtocol::Http2(p) | MultiProtocol::Grpc(p) => p.name(),
+            MultiProtocol::ClickHouse(p) => p.name(),
         }
     }
 
@@ -185,6 +192,7 @@ impl Protocol for MultiProtocol {
             MultiProtocol::Dns(p) => p.reset(),
             MultiProtocol::NvmeTcp(p) => p.reset(),
             MultiProtocol::Http2(p) | MultiProtocol::Grpc(p) => p.reset(),
+            MultiProtocol::ClickHouse(p) => p.reset(),
         }
     }
 
@@ -199,6 +207,7 @@ impl Protocol for MultiProtocol {
             MultiProtocol::Dns(p) => p.can_send(conn_id),
             MultiProtocol::NvmeTcp(p) => p.can_send(conn_id),
             MultiProtocol::Http2(p) | MultiProtocol::Grpc(p) => p.can_send(conn_id),
+            MultiProtocol::ClickHouse(p) => p.can_send(conn_id),
         }
     }
 
@@ -213,6 +222,7 @@ impl Protocol for MultiProtocol {
             MultiProtocol::Dns(p) => p.setup_pending(conn_id),
             MultiProtocol::NvmeTcp(p) => p.setup_pending(conn_id),
             MultiProtocol::Http2(p) | MultiProtocol::Grpc(p) => p.setup_pending(conn_id),
+            MultiProtocol::ClickHouse(p) => p.setup_pending(conn_id),
         }
     }
 
@@ -227,6 +237,7 @@ impl Protocol for MultiProtocol {
             MultiProtocol::Dns(p) => p.connection_roles(load),
             MultiProtocol::NvmeTcp(p) => p.connection_roles(load),
             MultiProtocol::Http2(p) | MultiProtocol::Grpc(p) => p.connection_roles(load),
+            MultiProtocol::ClickHouse(p) => p.connection_roles(load),
         }
     }
 
@@ -241,6 +252,7 @@ impl Protocol for MultiProtocol {
             MultiProtocol::Dns(p) => p.bind_connections(conn_ids),
             MultiProtocol::NvmeTcp(p) => p.bind_connections(conn_ids),
             MultiProtocol::Http2(p) | MultiProtocol::Grpc(p) => p.bind_connections(conn_ids),
+            MultiProtocol::ClickHouse(p) => p.bind_connections(conn_ids),
         }
     }
 
@@ -255,6 +267,7 @@ impl Protocol for MultiProtocol {
             MultiProtocol::Dns(p) => p.drain_outbox(conn_id, outbox),
             MultiProtocol::NvmeTcp(p) => p.drain_outbox(conn_id, outbox),
             MultiProtocol::Http2(p) | MultiProtocol::Grpc(p) => p.drain_outbox(conn_id, outbox),
+            MultiProtocol::ClickHouse(p) => p.drain_outbox(conn_id, outbox),
         }
     }
 }

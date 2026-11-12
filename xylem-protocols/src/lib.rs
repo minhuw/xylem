@@ -7,6 +7,7 @@ pub use xylem_common::{
     ConnectionRole, ErrorReply, Outbox, Parsed, Protocol, Request, RequestMeta,
 };
 
+pub mod clickhouse;
 pub mod configs;
 pub mod dns;
 pub mod http;
@@ -19,6 +20,7 @@ pub mod workload;
 pub mod xylem_echo;
 
 // Re-export commonly used types
+pub use clickhouse::{ClickHouseConfig, ClickHouseProtocol};
 pub use configs::{
     CommandValueSizeConfig, HttpConfig, InsertPhaseConfig, KeysConfig, MasstreeCommandParams,
     MasstreeConfig, MasstreeOperationsConfig, MasstreeScanConfig, MemcachedCommandParams,

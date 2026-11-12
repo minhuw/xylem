@@ -208,12 +208,13 @@ enum ProtocolKind {
     Masstree,
     Dns,
     NvmeTcp,
+    ClickHouse,
     XylemEcho,
 }
 
 /// Every accepted traffic group protocol name. The invalid-protocol error lists
 /// the names in this order.
-const PROTOCOLS: [(&str, ProtocolKind); 10] = [
+const PROTOCOLS: [(&str, ProtocolKind); 11] = [
     ("redis", ProtocolKind::Redis),
     ("memcached-binary", ProtocolKind::MemcachedBinary),
     ("memcached-ascii", ProtocolKind::MemcachedAscii),
@@ -223,6 +224,7 @@ const PROTOCOLS: [(&str, ProtocolKind); 10] = [
     ("masstree", ProtocolKind::Masstree),
     ("dns", ProtocolKind::Dns),
     ("nvme-tcp", ProtocolKind::NvmeTcp),
+    ("clickhouse", ProtocolKind::ClickHouse),
     ("xylem-echo", ProtocolKind::XylemEcho), // Test protocol
 ];
 
@@ -239,6 +241,7 @@ pub enum ProtocolConfig {
     Masstree(xylem_protocols::MasstreeConfig),
     Dns(xylem_protocols::DnsConfig),
     NvmeTcp(xylem_protocols::NvmeTcpConfig),
+    ClickHouse(xylem_protocols::ClickHouseConfig),
     XylemEcho(xylem_protocols::XylemEchoConfig),
 }
 
@@ -534,6 +537,15 @@ impl ProfileConfig {
                     group.name,
                     group.max_pending_per_connection,
                     xylem_protocols::nvme_tcp::MAX_QUEUE_DEPTH
+                ));
+            }
+            if protocol == ProtocolKind::ClickHouse && group.max_pending_per_connection != 1 {
+                errors.push(anyhow!(
+                    "Traffic group {} '{}' max_pending_per_connection is {}, but the ClickHouse \
+                     native protocol runs one query at a time per connection; set it to 1",
+                    i,
+                    group.name,
+                    group.max_pending_per_connection
                 ));
             }
 
@@ -914,6 +926,22 @@ fn parse_protocol_config(
             })?;
             Ok(ProtocolConfig::NvmeTcp(config))
         }
+        ProtocolKind::ClickHouse => {
+            // A query has no default: an omitted protocol_config lacks it
+            let empty = serde_json::Value::Object(Default::default());
+            let pc = pc.unwrap_or(&empty);
+            let config: xylem_protocols::ClickHouseConfig =
+                parse_config_value(pc, "ClickHouse", group_idx, group_name)
+                    .map_err(|e| anyhow::anyhow!(redact_auth(Some(pc), &e.to_string())))?;
+            // Check the queries, and that password_env is set
+            config.validate().and_then(|()| config.resolve_password()).with_context(|| {
+                format!(
+                    "Traffic group {} '{}' has invalid ClickHouse protocol_config",
+                    group_idx, group_name
+                )
+            })?;
+            Ok(ProtocolConfig::ClickHouse(config))
+        }
         ProtocolKind::XylemEcho => {
             let config = parse_typed_config(pc, "XylemEcho", group_idx, group_name)?;
             Ok(ProtocolConfig::XylemEcho(config))
@@ -921,8 +949,8 @@ fn parse_protocol_config(
     }
 }
 
-/// The secret values under a protocol_config's `auth`: every string in it,
-/// except a username
+/// The secret values of a protocol_config: every string under its `auth`
+/// (Redis), except a username, and its `password` (ClickHouse)
 fn auth_secrets(pc: Option<&serde_json::Value>) -> Vec<String> {
     fn collect(value: &serde_json::Value, secrets: &mut Vec<String>) {
         match value {
@@ -936,24 +964,29 @@ fn auth_secrets(pc: Option<&serde_json::Value>) -> Vec<String> {
         }
     }
     let mut secrets = Vec::new();
-    if let Some(auth) = pc.and_then(|pc| pc.get("auth")) {
-        collect(auth, &mut secrets);
+    for key in ["auth", "password"] {
+        if let Some(value) = pc.and_then(|pc| pc.get(key)) {
+            collect(value, &mut secrets);
+        }
     }
     secrets
 }
 
-/// `message` without the secret values of `pc`'s `auth`. Parse errors can
-/// quote a value, for example when `auth` is a string instead of a table.
+/// `message` without the secret values of `pc`. Parse errors can quote a
+/// value, for example when `auth` is a string instead of a table.
 fn redact_auth(pc: Option<&serde_json::Value>, message: &str) -> String {
     auth_secrets(pc).iter().fold(message.to_string(), |message, secret| {
         message.replace(secret.as_str(), "<redacted>")
     })
 }
 
-/// A copy of a protocol_config that is safe to log: the secret values of its
-/// `auth` are replaced
+/// A copy of a protocol_config that is safe to log: its `password` and the
+/// secret values of its `auth` are replaced
 pub fn redacted_protocol_config(pc: &serde_json::Value) -> serde_json::Value {
     let mut pc = pc.clone();
+    if let Some(password) = pc.get_mut("password") {
+        *password = serde_json::Value::String("<redacted>".to_string());
+    }
     if let Some(auth) = pc.get_mut("auth") {
         *auth = match auth {
             serde_json::Value::Object(fields) => serde_json::Value::Object(
@@ -1681,6 +1714,90 @@ file = "results/test.json"
         // Stream transports have no request timeout
         let config = udp_profile("memcached-ascii", "tcp", "").unwrap();
         assert_eq!(config.traffic_groups[0].effective_request_timeout(), None);
+    }
+
+    #[test]
+    fn clickhouse_protocol_config_is_checked() {
+        let profile = |transport: &str, extra: &str| {
+            let profile = format!(
+                r#"
+[experiment]
+name = "clickhouse"
+duration = "1s"
+
+[[traffic_groups]]
+name = "main"
+protocol = "clickhouse"
+target = "127.0.0.1:9000"
+transport = "{transport}"
+threads = [0]
+connections_per_thread = 2
+{extra}
+
+[traffic_groups.traffic_policy]
+type = "closed-loop"
+
+[output]
+format = "json"
+file = "results/test.json"
+"#
+            );
+            let mut config: ProfileConfig = toml::from_str(&profile).unwrap();
+            config.validate().map(|()| config).map_err(|error| format!("{error:#}"))
+        };
+        let config = profile(
+            "tcp",
+            r#"max_pending_per_connection = 1
+protocol_config = { queries = [{ sql = "SELECT 1", weight = 2 }, { sql = "SELECT 2" }], user = "bench", settings = { max_threads = 1 } }"#,
+        )
+        .unwrap();
+        let [ProtocolConfig::ClickHouse(clickhouse)] = &config.protocol_configs[..] else {
+            panic!("{:?}", config.protocol_configs);
+        };
+        assert_eq!(clickhouse.user, "bench");
+        assert_eq!(clickhouse.weighted_queries().unwrap().len(), 2);
+
+        for (transport, extra, expected) in [
+            ("tcp", "max_pending_per_connection = 1", "needs a query or queries"),
+            (
+                "tcp",
+                "protocol_config = { query = \"SELECT 1\" }",
+                "max_pending_per_connection is 10, but the ClickHouse native protocol runs one \
+                 query at a time per connection; set it to 1",
+            ),
+            (
+                "tcp",
+                "max_pending_per_connection = 1\nprotocol_config = { query = \"SELECT 1\", compression = true }",
+                "unknown field `compression`",
+            ),
+            (
+                "tcp",
+                "max_pending_per_connection = 1\nprotocol_config = { query = \"SELECT 1\", password_env = \"XYLEM_CONFIG_TEST_UNSET\" }",
+                "environment variable XYLEM_CONFIG_TEST_UNSET is not set",
+            ),
+            (
+                "udp",
+                "max_pending_per_connection = 1\nprotocol_config = { query = \"SELECT 1\" }",
+                "protocol 'clickhouse' does not support transport 'udp'",
+            ),
+        ] {
+            let error = profile(transport, extra).unwrap_err();
+            assert!(error.contains(expected), "{extra}: {error}");
+        }
+
+        // The password never shows in errors or logs
+        let error = profile(
+            "tcp",
+            "max_pending_per_connection = 1\nprotocol_config = { query = \"SELECT 1\", password = [\"s3cret\"] }",
+        )
+        .unwrap_err();
+        assert!(error.contains("invalid ClickHouse protocol_config"), "{error}");
+        assert!(!error.contains("s3cret"), "{error}");
+        let pc = serde_json::json!({ "query": "SELECT 1", "password": "s3cret" });
+        assert_eq!(
+            redacted_protocol_config(&pc),
+            serde_json::json!({ "query": "SELECT 1", "password": "<redacted>" })
+        );
     }
 
     #[test]
@@ -3236,7 +3353,7 @@ protocol_config = {}
             format!("{err:#}").contains(
                 "Invalid protocol 'redis-cluster' for traffic group 0 'main'. Valid options: \
                  redis, memcached-binary, memcached-ascii, http, http2, grpc, masstree, dns, \
-                 nvme-tcp, xylem-echo. \
+                 nvme-tcp, clickhouse, xylem-echo. \
                  Redis Cluster support was removed"
             ),
             "{err:#}"

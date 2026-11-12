@@ -11,6 +11,7 @@ Xylem supports multiple application protocols for different types of RPC workloa
 - **[Memcached](./protocols/memcached.md)** - Memcached protocol for caching
 - **[DNS](./protocols/dns.md)** - DNS queries over TCP (RFC 7766 framing) or UDP
 - **[NVMe/TCP](./protocols/nvme-tcp.md)** - NVM reads and writes against an NVMe over Fabrics target
+- **[ClickHouse](./protocols/clickhouse.md)** - SQL queries over the ClickHouse native TCP protocol
 
 ## Protocol Selection
 

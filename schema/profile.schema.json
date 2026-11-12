@@ -1024,7 +1024,7 @@
           "default": "count"
         },
         "protocol": {
-          "description": "Protocol for this group (redis, memcached-binary, memcached-ascii, http, http2, grpc, masstree, dns, nvme-tcp, xylem-echo)",
+          "description": "Protocol for this group (redis, memcached-binary, memcached-ascii, http, http2, grpc, masstree, dns, nvme-tcp, clickhouse, xylem-echo)",
           "type": "string"
         },
         "protocol_config": {

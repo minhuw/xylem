@@ -85,8 +85,9 @@ pub trait Protocol: Send {
 - `name` returns the protocol name, and `reset` clears per-connection state.
 
 The core engine decides when to send; the protocol decides what to send. The
-Redis, Memcached, HTTP, HTTP/2, gRPC, Masstree, DNS and NVMe/TCP protocols have a
-`from_config` constructor that builds them from their `protocol_config` section.
+Redis, Memcached, HTTP, HTTP/2, gRPC, Masstree, DNS, NVMe/TCP and ClickHouse
+protocols have a `from_config` constructor that builds them from their
+`protocol_config` section.
 
 ## Protocol Design
 
@@ -106,6 +107,8 @@ The following protocol implementations are available:
   streams and bare in UDP datagrams
 - **NVMe/TCP** - NVM reads and writes on the I/O queues of NVMe over Fabrics
   controllers
+- **ClickHouse** - SQL queries over the native TCP protocol, one at a time
+  per connection, with results streamed by column type without decoding
 - **Xylem Echo** - Echo protocol for testing xylem itself
 
 Detailed documentation for each protocol is available in the [Protocols](../guide/protocols.md) section of the User Guide.

@@ -9,7 +9,7 @@ Each traffic group must specify its own `protocol` and `target`:
 ```toml
 [[traffic_groups]]
 name = "main"
-protocol = "redis"  # or "http", "http2", "grpc", "memcached-binary", "memcached-ascii", "masstree", "dns", "nvme-tcp", "xylem-echo"
+protocol = "redis"  # or "http", "http2", "grpc", "memcached-binary", "memcached-ascii", "masstree", "dns", "nvme-tcp", "clickhouse", "xylem-echo"
 target = "127.0.0.1:6379"
 threads = [0, 1, 2, 3]
 connections_per_thread = 10
@@ -46,6 +46,7 @@ threads = [2, 3]
 - **memcached-ascii** - Memcached text protocol
 - **dns** - DNS queries (see [DNS Protocol](../protocols/dns.md))
 - **nvme-tcp** - NVMe over Fabrics on TCP (see [NVMe/TCP Protocol](../protocols/nvme-tcp.md))
+- **clickhouse** - ClickHouse native protocol queries (see [ClickHouse Protocol](../protocols/clickhouse.md))
 - **xylem-echo** - Echo protocol (testing/development only)
 
 See the [Architecture - Protocol Layer](../../architecture/protocols.md) for implementation details.
