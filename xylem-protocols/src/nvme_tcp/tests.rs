@@ -471,11 +471,23 @@ fn verify_mode_prefills_then_reads_back_the_pattern_at_queue_depth() {
         ..Default::default()
     };
     let mut harness = Harness::new(config, 4, target, 2);
+    // The I/O queues preload from the start, before the namespace is known
+    let preloading = |protocol: &NvmeTcpProtocol| {
+        let mut queues: Vec<_> = protocol.queues.iter().collect();
+        queues.sort_by_key(|(&conn, _)| conn);
+        queues
+            .iter()
+            .map(|(&conn, _)| protocol.preload_pending(conn))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(preloading(&harness.protocol), [false, true, true], "the admin queue does not");
     harness.set_up().unwrap();
+    assert_eq!(preloading(&harness.protocol), [false, true, true]);
 
     // 64 LBAs of 512 bytes are 8 blocks of 4096: 8 prefill writes, in
     // capsule and unmeasured, then nothing until the last one completes
     let completed = harness.round(4).unwrap();
+    assert_eq!(preloading(&harness.protocol), [false, false, false]);
     assert_eq!(completed.len(), 8);
     assert_eq!(harness.measured_sent, 0);
     assert_eq!(harness.target.storage.len(), 64);

@@ -193,6 +193,11 @@ impl Protocol for MemcachedAsciiProtocol {
         })
     }
 
+    fn preload_pending(&self, _conn_id: usize) -> bool {
+        // The connections share the insert phase
+        self.is_in_insert_phase()
+    }
+
     fn name(&self) -> &'static str {
         "memcached-ascii"
     }

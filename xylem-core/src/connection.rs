@@ -279,8 +279,9 @@ pub struct ConnectionState<ReqId: Eq + Hash + Clone> {
     /// Index of the pool's group dispatcher that sends on this connection;
     /// `None` when the connection follows its own policy
     dispatcher: Option<usize>,
-    /// Whether the connection was last scheduled for connection setup: it is
-    /// on the heap as ready now and sends without consulting its policy
+    /// Whether the connection was last scheduled for connection setup or
+    /// preload: it is on the heap as ready now and sends without consulting
+    /// its policy
     in_setup: bool,
     /// How long a request may stay pending before it times out; `None` waits forever
     request_timeout: Option<Duration>,
@@ -1031,6 +1032,8 @@ pub struct ConnectionPool<G: ConnectionGroup, ReqId: Eq + Hash + Clone> {
     staged: Vec<usize>,
     /// Requests the transport took since the last [`Self::take_sent`]
     sent: Vec<SentRequest>,
+    /// See [`Self::set_preloading`]
+    preloading: bool,
 }
 
 impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionPool<G, ReqId> {
@@ -1208,7 +1211,21 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
             next_deadline_ns: None,
             staged: Vec::new(),
             sent: Vec::new(),
+            preloading: false,
         })
+    }
+
+    /// Start or end preload (see [`Protocol::preload_pending`]): while it
+    /// runs, [`Self::try_schedule_connection`] schedules only connections
+    /// in setup or with preload left, off their schedules, and holds the
+    /// others until preload ends and their schedules are anchored again
+    pub fn set_preloading(&mut self, preloading: bool) {
+        self.preloading = preloading;
+    }
+
+    /// Whether preload runs; see [`Self::set_preloading`]
+    pub fn is_preloading(&self) -> bool {
+        self.preloading
     }
 
     /// Whether the connections carry datagrams (see [`ConnectionGroup::is_datagram`])
@@ -1671,12 +1688,13 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
     ///
     /// Maintains the invariant: on_heap == true ⟺ connection can send (pipeline not full AND protocol ready).
     ///
-    /// A connection whose protocol reports [`Protocol::setup_pending`] is
-    /// ready at once, off its schedule, so its setup requests go out as soon
-    /// as it can send. Any other connection waits for its policy's next
-    /// wakeup, which starts its schedule if setup restarted it, or for a
-    /// group-dispatched connection, joins the back of its dispatcher's idle
-    /// list.
+    /// A connection whose protocol reports [`Protocol::setup_pending`], or
+    /// during preload [`Protocol::preload_pending`], is ready at once, off
+    /// its schedule, so its setup and preload requests go out as soon as it
+    /// can send. During preload, no other connection is scheduled. Any other
+    /// connection waits for its policy's next wakeup, which starts its
+    /// schedule if setup restarted it, or for a group-dispatched connection,
+    /// joins the back of its dispatcher's idle list.
     ///
     /// The heap stores ALL connections that can send, including rate-limited connections
     /// with future send times. This allows us to peek at the earliest ready time for
@@ -1718,7 +1736,12 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
             // Add to heap regardless of next_send_time
             // - Connection setup or closed-loop (None): ready immediately
             // - Rate-limited (Some(future)): will be popped when time arrives
-            state.in_setup = protocol.setup_pending(connection_id);
+            state.in_setup = protocol.setup_pending(connection_id)
+                || (self.preloading && protocol.preload_pending(connection_id));
+            if self.preloading && !state.in_setup {
+                // Held until the measured run starts
+                return false;
+            }
             if let (Some(dispatcher), false) = (state.dispatcher, state.in_setup) {
                 state.set_on_heap(true);
                 self.dispatchers[dispatcher].push_idle(connection_id, current_time_ns);

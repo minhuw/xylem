@@ -36,9 +36,30 @@ phases:
    `Traffic group 0, connection 0 (clickhouse): connection closed during
    setup: Connection closed by peer` or `Traffic group 0, connection 0
    (redis): connection setup did not finish within the setup timeout (10s)`.
+
+   **Preload** (an `insert_phase`, NVMe/TCP `verify`) is warmup that must
+   be done before anything is measured. If any traffic group has some, every
+   thread first sends its setup and preload requests as fast as its pipeline
+   allows, off every schedule, and holds every other request. Once a thread
+   has no setup or preload left and every reply has arrived, it waits for
+   the others; the measurement phase starts shortly after the last thread
+   finished, at one time all threads share, so no measured request reaches
+   the server before the data the preload wrote. The connections of a thread
+   share its insert phase: one connection's measured requests wait for the
+   replies to the others' inserts. An error reply to a preload request
+   (whatever `on_error` says), a connection the server closes, or a request
+   that times out during preload fails the run like a setup failure, such as
+   `Traffic group 0, connection 1 (redis): connection closed during preload:
+   Connection closed by peer` or `Traffic group 0, connection 1
+   (memcached-ascii): error reply SERVER_ERROR during preload: ...`. Preload
+   takes as long as its data takes to write, so it has no time limit of its
+   own; but a thread that receives nothing for `experiment.setup_timeout`
+   while it preloads fails the run (`preload received nothing within the
+   setup timeout (10s)`).
 2. **Measurement**: from the first measured request to `experiment.duration`
-   after the start. Only responses that arrive in this window count toward
-   throughput.
+   after the start, or after the end of preload if there is one. Every
+   rate-driven schedule and the stats' time buckets count from that start
+   too. Only responses that arrive in this window count toward throughput.
 3. **Drain**: sending stops, and the run waits up to
    `experiment.drain_timeout` (default 1 s) until no request is pending.
    Requests completed during the drain contribute their latency to the
@@ -65,8 +86,9 @@ The JSON `experiment` object may also contain
 `actual_load_loop_start_unix_us` and `actual_load_loop_end_unix_us`: wall-clock
 microseconds since the Unix epoch on the machine running xylem. They give the
 earliest worker load-loop start and latest end, including gaps between worker
-loops. Each worker's sampling starts after the shared start wait and ends
-before the drain; protocol setup or warmup inside the loop may be included.
+loops. Each worker's sampling starts after the shared start wait, or after
+preload when there is one, and ends before the drain; connection setup
+inside the loop may be included when nothing preloads.
 These readings do not imply synchronization between guest and host clocks.
 Both fields are omitted if no interval was recorded or any worker's samples
 are missing, reversed, or above `2^53 - 1`.

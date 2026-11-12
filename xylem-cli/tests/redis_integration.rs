@@ -15,6 +15,11 @@ mod common;
 
 /// Get Redis stats using INFO command
 fn get_redis_commands(addr: SocketAddr) -> Result<u64, Box<dyn std::error::Error>> {
+    redis_info_stat(addr, "total_commands_processed")
+}
+
+/// The counter `name` of the server's `INFO stats`
+fn redis_info_stat(addr: SocketAddr, name: &str) -> Result<u64, Box<dyn std::error::Error>> {
     let mut stream = TcpStream::connect(addr)?;
     stream.write_all(b"*2\r\n$4\r\nINFO\r\n$5\r\nstats\r\n")?;
     let mut reader = BufReader::new(stream);
@@ -35,8 +40,8 @@ fn get_redis_commands(addr: SocketAddr) -> Result<u64, Box<dyn std::error::Error
     let info = String::from_utf8(body)?;
     let value = info
         .lines()
-        .find_map(|line| line.strip_prefix("total_commands_processed:"))
-        .ok_or("INFO stats missing total_commands_processed")?;
+        .find_map(|line| line.strip_prefix(name)?.strip_prefix(':'))
+        .ok_or_else(|| format!("INFO stats missing {name}"))?;
     Ok(value.trim().parse()?)
 }
 
@@ -333,4 +338,38 @@ fn test_redis_closed_loop_minimal() {
         actual_rate > 100.0,
         "Even minimal pipelining should achieve at least 100 req/s, got {actual_rate:.2}"
     );
+}
+
+/// Measured requests start only once every connection of every thread has
+/// its insert-phase reply: none misses a key the insert phase set
+///
+/// Several connections share a thread's insert phase, and the keys are fewer
+/// than the requests in flight, so other connections' first requests go out
+/// with the insert SETs. Each SET is a megabyte that Redis reads over several
+/// passes of its event loop, while it answers a small request at once: one
+/// that reached a key before its SET would miss.
+#[test]
+fn redis_measures_only_after_every_insert_reply() {
+    let redis = common::redis::RedisGuard::new().expect("Failed to start Redis");
+    let before = redis_info_stat(redis.addr(), "keyspace_misses").unwrap();
+    let json = common::run_profile(serde_json::json!({
+        "experiment": { "name": "redis-insert-barrier", "duration": "1s", "seed": 7 },
+        "traffic_groups": [{
+            "name": "strlen", "threads": [0, 1], "connections_per_thread": 4,
+            "max_pending_per_connection": 16, "target": redis.addr().to_string(),
+            "protocol": "redis", "traffic_policy": { "type": "closed-loop" },
+            "protocol_config": {
+                "keys": { "strategy": "round-robin", "max": 12, "value_size": 16,
+                    "prefix": "barrier:" },
+                "insert_phase": { "value_size": 1_000_000 },
+                "operations": { "strategy": "weighted", "commands": [{ "name": "custom",
+                    "weight": 1.0, "params": { "template": "STRLEN __key__" } }] },
+            },
+        }],
+    }));
+    let requests = &json["global"]["requests"];
+    assert!(requests["completed"].as_u64().unwrap() > 100, "{requests}");
+    assert_eq!(requests["errors"], 0, "{requests}");
+    let misses = redis_info_stat(redis.addr(), "keyspace_misses").unwrap() - before;
+    assert_eq!(misses, 0, "requests reached keys the insert phase had not set yet");
 }

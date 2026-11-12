@@ -15,10 +15,12 @@ pub use worker::{Worker, WorkerConfig, DEFAULT_DRAIN_TIMEOUT, DEFAULT_SETUP_TIME
 pub use xylem_common::{ConnectionRole, ErrorReply, Outbox, Parsed, Protocol, RequestMeta};
 
 /// How long after the last thread reaches the start gate the run starts, so
-/// every thread is awake and spinning by then
+/// every thread is awake and spinning by then; the same for the measured run
+/// after the last thread finished preloading
 const START_DELAY_NS: u64 = 10_000_000;
 
-/// Start gate shared by the threads of a run
+/// Start gate shared by the threads of a run, and the barrier they meet at
+/// when they preload
 struct StartGate {
     state: Mutex<GateState>,
     released: Condvar,
@@ -29,21 +31,42 @@ struct GateState {
     outstanding: usize,
     /// The start time, once the last ticket arrived
     start_ns: Option<u64>,
+    /// Whether a thread that waited has preload work
+    preload: bool,
+    /// Threads that have not finished preloading
+    preloading: usize,
+    /// A thread dropped out before it finished preloading
+    abandoned: bool,
+    /// The start of the measured run, once the last thread finished preloading
+    measure_ns: Option<u64>,
 }
 
 impl StartGate {
     fn tickets(count: usize) -> Vec<StartTicket> {
         let gate = Arc::new(Self {
-            state: Mutex::new(GateState { outstanding: count, start_ns: None }),
+            state: Mutex::new(GateState {
+                outstanding: count,
+                start_ns: None,
+                preload: false,
+                preloading: count,
+                abandoned: false,
+                measure_ns: None,
+            }),
             released: Condvar::new(),
         });
         (0..count).map(|_| StartTicket { gate: Some(Arc::clone(&gate)) }).collect()
     }
 
-    /// Count a ticket in; the last one sets the start time and wakes the rest
-    fn arrive(&self) -> std::sync::MutexGuard<'_, GateState> {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+    fn lock(&self) -> std::sync::MutexGuard<'_, GateState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Count a ticket in, with or without preload work; the last one sets
+    /// the start time and wakes the rest
+    fn arrive(&self, preload: bool) -> std::sync::MutexGuard<'_, GateState> {
+        let mut state = self.lock();
         state.outstanding -= 1;
+        state.preload |= preload;
         if state.outstanding == 0 {
             state.start_ns = Some(crate::timing::time_ns().saturating_add(START_DELAY_NS));
             self.released.notify_all();
@@ -64,12 +87,30 @@ pub struct StartTicket {
 impl StartTicket {
     /// Wait until every thread has arrived; returns the shared start time, a
     /// `timing::time_ns` value shortly in the future
-    pub fn wait(mut self) -> u64 {
+    ///
+    /// The thread has no preload work: if another thread does, this one
+    /// counts as done preloading.
+    pub fn wait(self) -> u64 {
+        let (start_ns, preload) = self.wait_for_run(false);
+        if let Some(mut preload) = preload {
+            preload.arrive();
+        }
+        start_ns
+    }
+
+    /// Wait until every thread has arrived, telling them whether this one
+    /// has preload work (see [`crate::threading::Protocol::preload_pending`]);
+    /// returns the shared start time and, if any thread has preload work,
+    /// this thread's place at the preload barrier
+    pub fn wait_for_run(mut self, preload: bool) -> (u64, Option<PreloadTicket>) {
         let gate = self.gate.take().expect("a ticket arrives once");
-        let mut state = gate.arrive();
+        let mut state = gate.arrive(preload);
         loop {
             if let Some(start_ns) = state.start_ns {
-                return start_ns;
+                let preload = state.preload;
+                drop(state);
+                let ticket = PreloadTicket { gate, arrived: false };
+                return (start_ns, preload.then_some(ticket));
             }
             state = gate.released.wait(state).unwrap_or_else(PoisonError::into_inner);
         }
@@ -77,10 +118,66 @@ impl StartTicket {
 }
 
 impl Drop for StartTicket {
-    /// A thread that never waits must not hold up the others
+    /// A thread that never waits must not hold up the others, nor let them
+    /// measure without its preload
     fn drop(&mut self) {
         if let Some(gate) = self.gate.take() {
-            drop(gate.arrive());
+            gate.arrive(false).abandoned = true;
+        }
+    }
+}
+
+/// What a thread's [`PreloadTicket`] finds at the preload barrier
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreloadWait {
+    /// Some thread is still preloading
+    Waiting,
+    /// Every thread finished preloading; the measured run starts at this
+    /// `timing::time_ns` value, shortly in the future and the same for all
+    Start(u64),
+    /// A thread failed before it finished preloading: the run fails, and no
+    /// thread measures
+    Abandoned,
+}
+
+/// A thread's place at the preload barrier of a run whose threads preload;
+/// see [`StartTicket::wait_for_run`]
+///
+/// Dropping it before [`Self::arrive`] abandons the barrier for every thread.
+pub struct PreloadTicket {
+    gate: Arc<StartGate>,
+    arrived: bool,
+}
+
+impl PreloadTicket {
+    /// Count this thread's preload as finished, once; the last thread to
+    /// finish sets the start of the measured run
+    pub fn arrive(&mut self) {
+        if std::mem::replace(&mut self.arrived, true) {
+            return;
+        }
+        let mut state = self.gate.lock();
+        state.preloading -= 1;
+        if state.preloading == 0 {
+            state.measure_ns = Some(crate::timing::time_ns().saturating_add(START_DELAY_NS));
+        }
+    }
+
+    /// Whether every thread finished preloading, without waiting
+    pub fn poll(&self) -> PreloadWait {
+        let state = self.gate.lock();
+        match state.measure_ns {
+            _ if state.abandoned => PreloadWait::Abandoned,
+            Some(start_ns) => PreloadWait::Start(start_ns),
+            None => PreloadWait::Waiting,
+        }
+    }
+}
+
+impl Drop for PreloadTicket {
+    fn drop(&mut self) {
+        if !self.arrived {
+            self.gate.lock().abandoned = true;
         }
     }
 }
@@ -296,6 +393,72 @@ mod tests {
             .unwrap();
         assert!(starts.iter().all(|&start| start == starts[0]), "{starts:?}");
         assert!(starts[0] >= before + 15_000_000 + START_DELAY_NS, "after the last arrival");
+    }
+
+    #[test]
+    fn threads_measure_from_one_time_after_the_last_finished_preloading() {
+        let runtime = ThreadingRuntime::new(3);
+        let starts = runtime
+            .run_workers_with_start(|thread_id, start| {
+                // Only thread 0 preloads, and finishes last
+                let (_, preload) = start.wait_for_run(thread_id == 0);
+                let mut preload = preload.expect("a thread preloads, so all wait for it");
+                if thread_id == 0 {
+                    thread::sleep(Duration::from_millis(20));
+                    assert_eq!(preload.poll(), PreloadWait::Waiting);
+                }
+                let finished = crate::timing::time_ns();
+                preload.arrive();
+                loop {
+                    match preload.poll() {
+                        PreloadWait::Start(start_ns) => return Ok((thread_id, finished, start_ns)),
+                        PreloadWait::Waiting => thread::yield_now(),
+                        PreloadWait::Abandoned => panic!("no thread failed"),
+                    }
+                }
+            })
+            .unwrap();
+        let measure_ns = starts[0].2;
+        assert!(starts.iter().all(|&(_, _, start_ns)| start_ns == measure_ns), "{starts:?}");
+        let last_finished = starts.iter().map(|&(_, finished, _)| finished).max().unwrap();
+        assert_eq!(last_finished, starts[0].1);
+        assert!(measure_ns >= last_finished + START_DELAY_NS);
+    }
+
+    #[test]
+    fn no_thread_waits_for_preload_when_none_preloads() {
+        let runtime = ThreadingRuntime::new(2);
+        let preloads = runtime
+            .run_workers_with_start(|_, start| Ok(start.wait_for_run(false).1.is_none()))
+            .unwrap();
+        assert_eq!(preloads, [true, true]);
+    }
+
+    #[test]
+    fn a_thread_that_fails_before_it_finished_preloading_abandons_the_barrier() {
+        let runtime = ThreadingRuntime::new(3);
+        let result = runtime.run_workers_with_start(|thread_id, start| match thread_id {
+            // Fails before the start, and while preloading
+            0 => Err(crate::Error::Other("failed to connect".into())),
+            1 => {
+                let (_, preload) = start.wait_for_run(true);
+                drop(preload);
+                Err(crate::Error::Other("failed while preloading".into()))
+            }
+            _ => {
+                let (_, mut preload) = start.wait_for_run(false);
+                let preload = preload.as_mut().expect("thread 1 preloads");
+                preload.arrive();
+                while preload.poll() == PreloadWait::Waiting {
+                    thread::yield_now();
+                }
+                assert_eq!(preload.poll(), PreloadWait::Abandoned);
+                Ok(())
+            }
+        });
+        assert!(
+            matches!(result, Err(crate::Error::Other(message)) if message == "failed to connect")
+        );
     }
 
     #[test]

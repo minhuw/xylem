@@ -53,6 +53,11 @@ impl InsertPhaseState {
         }
     }
 
+    /// Check if every key has been handed out
+    pub fn is_complete(&self) -> bool {
+        self.inserted >= self.key_count
+    }
+
     /// Get next key to insert, returns None if insert phase is complete
     pub fn next_key(&mut self) -> Option<u64> {
         if self.inserted >= self.key_count {
@@ -404,6 +409,11 @@ impl Protocol for RedisProtocol {
 
     fn setup_pending(&self, conn_id: usize) -> bool {
         !self.setup.is_empty() && self.conn_setup.state(conn_id) != SetupState::Done
+    }
+
+    fn preload_pending(&self, _conn_id: usize) -> bool {
+        // The connections share the insert phase
+        self.insert_phase.as_ref().is_some_and(|insert| !insert.is_complete())
     }
 
     fn name(&self) -> &'static str {

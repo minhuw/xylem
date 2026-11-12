@@ -95,7 +95,9 @@ every byte on the wire both ways, PDU headers included (a 4 KiB read is a
 With `verify = true` every write carries a pattern fixed by its LBA alone,
 and every read must return the pattern of its LBAs, or the run fails naming
 the first LBA and byte that differ. Before any measured command each thread
-writes the whole range once (warmup writes, not measured). Writes of the mix
+writes the whole range once (warmup writes, not measured), as
+[preload](../output-formats.md#run-phases): no thread measures until every
+thread's prefill writes have completed. Writes of the mix
 rewrite the same pattern, so reads and writes can share the range. Prefer a
 small `lba_count`: every thread writes all of it, and checking the data
 costs CPU.

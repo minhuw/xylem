@@ -214,7 +214,11 @@ mod tests {
         complete_step(&mut protocol, 0, 2, HELLO, HELLO_REPLY);
 
         let insert = b"*3\r\n$3\r\nSET\r\n$5\r\nkey:7\r\n$3\r\nxxx\r\n";
+        // The connections share the insert phase: once connection 0 took
+        // its one key, neither has preload left
+        assert!(protocol.preload_pending(0) && protocol.preload_pending(1));
         assert_eq!(protocol.next_request(0), Request::warmup(insert.to_vec(), (0, 3)));
+        assert!(!protocol.preload_pending(0) && !protocol.preload_pending(1));
         let get = b"*2\r\n$3\r\nGET\r\n$5\r\nkey:7\r\n";
         assert_eq!(protocol.next_request(0), Request::measurement(get.to_vec(), (0, 4)));
         // Pipelined RESP3 replies match in order

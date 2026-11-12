@@ -295,9 +295,11 @@ fn memcached_binary_runs_every_operation_in_a_mix() {
 
 /// Incr on the stored non-numeric values is an error reply of each codec's kind
 ///
-/// One connection: the insert phase is shared by a thread's connections, so
-/// with two, one connection's incr can reach a key before the other's SET of
-/// it and miss. On one connection every SET is ahead of every incr.
+/// Two connections share the thread's insert phase, and the keys are fewer
+/// than the requests in flight, so incrs go out with the insert SETs, on the
+/// other connection than the SET of their key. Measurement waits for the
+/// replies to both connections' SETs, so no incr reaches a key before its
+/// large SET and misses.
 #[test]
 fn memcached_incr_of_a_non_numeric_value_is_an_error_reply() {
     let memcached = common::memcached::MemcachedGuard::new().expect("Failed to start Memcached");
@@ -306,14 +308,14 @@ fn memcached_incr_of_a_non_numeric_value_is_an_error_reply() {
     {
         let before = memcached.stats();
         let config = serde_json::json!({
-            "keys": { "strategy": "round-robin", "max": 10, "value_size": 4,
+            "keys": { "strategy": "round-robin", "max": 12, "value_size": 4,
                 "prefix": format!("{protocol}:") },
-            "insert_phase": {},
+            "insert_phase": { "value_size": 500_000 },
             "operation": "incr",
         });
         let target = memcached.addr().to_string();
         let mut profile = memcached_profile(protocol, target, "tcp", config);
-        profile["traffic_groups"][0]["connections_per_thread"] = 1.into();
+        profile["traffic_groups"][0]["max_pending_per_connection"] = 16.into();
         let json = common::run_profile(profile);
         let requests = &json["global"]["requests"];
         let completed = requests["completed"].as_u64().unwrap();

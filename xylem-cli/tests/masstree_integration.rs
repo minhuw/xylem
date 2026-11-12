@@ -495,3 +495,129 @@ fn stackbench_mtd_runs_every_operation_in_a_mix() {
     assert!(requests["completed"].as_u64().unwrap() > 10, "{requests}");
     assert_eq!(requests["errors"], 0, "{requests}");
 }
+
+/// The length of the MessagePack value at the start of `data`, `None` while
+/// it is incomplete. Covers what Masstree answers with: integers, booleans,
+/// nil, strings, binaries, arrays and maps.
+fn msgpack_len(data: &[u8]) -> Option<usize> {
+    let byte = *data.first()?;
+    let be = |at: usize, n: usize| {
+        data.get(at..at + n)
+            .map(|b| b.iter().fold(0usize, |v, &x| v << 8 | usize::from(x)))
+    };
+    // (header bytes, payload bytes, elements that follow)
+    let (header, payload, elements) = match byte {
+        0x00..=0x7f | 0xe0..=0xff | 0xc0 | 0xc2 | 0xc3 => (1, 0, 0),
+        0xa0..=0xbf => (1, usize::from(byte & 0x1f), 0),
+        0x90..=0x9f => (1, 0, usize::from(byte & 0x0f)),
+        0x80..=0x8f => (1, 0, 2 * usize::from(byte & 0x0f)),
+        0xcc | 0xd0 => (2, 0, 0),
+        0xcd | 0xd1 => (3, 0, 0),
+        0xce | 0xd2 | 0xca => (5, 0, 0),
+        0xcf | 0xd3 | 0xcb => (9, 0, 0),
+        0xd9 | 0xc4 => (2, be(1, 1)?, 0),
+        0xda | 0xc5 => (3, be(1, 2)?, 0),
+        0xdb | 0xc6 => (5, be(1, 4)?, 0),
+        0xdc => (3, 0, be(1, 2)?),
+        0xdd => (5, 0, be(1, 4)?),
+        0xde => (3, 0, 2 * be(1, 2)?),
+        0xdf => (5, 0, 2 * be(1, 4)?),
+        other => panic!("unexpected MessagePack marker {other:#04x}"),
+    };
+    let mut len = header + payload;
+    if data.len() < len {
+        return None;
+    }
+    for _ in 0..elements {
+        len += msgpack_len(&data[len..])?;
+    }
+    Some(len)
+}
+
+/// A proxy to Masstree at `upstream` that counts the PUT responses it relays
+/// whose result is Inserted (`[seq, 7, 1]`): PUTs that found no key
+fn masstree_put_insert_counter(
+    upstream: std::net::SocketAddr,
+) -> (std::net::SocketAddr, std::sync::Arc<std::sync::atomic::AtomicU64>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let inserted = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counter = std::sync::Arc::clone(&inserted);
+    std::thread::spawn(move || {
+        for client in listener.incoming() {
+            let client = client.unwrap();
+            let server = std::net::TcpStream::connect(upstream).unwrap();
+            client.set_nodelay(true).unwrap();
+            server.set_nodelay(true).unwrap();
+            let mut client_rx = client.try_clone().unwrap();
+            let mut server_tx = server.try_clone().unwrap();
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut client_rx, &mut server_tx);
+                let _ = server_tx.shutdown(std::net::Shutdown::Write);
+            });
+            let counter = std::sync::Arc::clone(&counter);
+            std::thread::spawn(move || relay_counting_put_inserts(server, client, &counter));
+        }
+    });
+    (addr, inserted)
+}
+
+/// Relay Masstree's responses from `server` to `client`, counting the PUT
+/// responses whose result is Inserted in `counter`
+fn relay_counting_put_inserts(
+    mut server: std::net::TcpStream,
+    mut client: std::net::TcpStream,
+    counter: &std::sync::atomic::AtomicU64,
+) {
+    use std::io::{Read, Write};
+    let (mut pending, mut buf) = (Vec::new(), vec![0; 1 << 16]);
+    while let Ok(n @ 1..) = server.read(&mut buf) {
+        if client.write_all(&buf[..n]).is_err() {
+            break;
+        }
+        pending.extend_from_slice(&buf[..n]);
+        let mut at = 0;
+        while let Some(len) = msgpack_len(&pending[at..]) {
+            // Past the array header and the sequence number
+            let response = &pending[at..at + len];
+            let seq = msgpack_len(&response[1..]).expect("a whole response");
+            if response[1 + seq..].starts_with(&[7, 1]) {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            at += len;
+        }
+        pending.drain(..at);
+    }
+    let _ = client.shutdown(std::net::Shutdown::Both);
+}
+
+/// Measured requests start only once every connection of every thread has
+/// its insert-phase reply: none misses a key the insert phase set
+///
+/// Several connections share a thread's insert phase, and the keys are fewer
+/// than the requests in flight, so other connections' first requests go out
+/// with the insert SETs. Each SET is large and a PUT small: a PUT that
+/// reached a key before its SET would insert it rather than update it.
+#[test]
+fn masstree_measures_only_after_every_insert_reply() {
+    let masstree = common::masstree::MasstreeGuard::new().expect("Failed to start Masstree");
+    let (proxy, inserted) = masstree_put_insert_counter(masstree.addr());
+    let json = common::run_profile(serde_json::json!({
+        "experiment": { "name": "masstree-insert-barrier", "duration": "1s", "seed": 7 },
+        "traffic_groups": [{
+            "name": "put", "threads": [0, 1], "connections_per_thread": 4,
+            "max_pending_per_connection": 16, "target": proxy.to_string(),
+            "protocol": "masstree", "traffic_policy": { "type": "closed-loop" },
+            "protocol_config": {
+                "keys": { "strategy": "round-robin", "max": 12, "value_size": 16 },
+                "insert_phase": { "value_size": 1_000_000 },
+                "operation": "put",
+            },
+        }],
+    }));
+    let requests = &json["global"]["requests"];
+    assert!(requests["completed"].as_u64().unwrap() > 100, "{requests}");
+    assert_eq!(requests["errors"], 0, "{requests}");
+    let inserted = inserted.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(inserted, 0, "PUTs reached keys the insert phase had not set yet");
+}

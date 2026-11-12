@@ -52,7 +52,10 @@ seed = 42
   connection may take to set up, counted from the start of its connect, so it
   includes the connect and the wait for the other threads to open theirs.
   A connection whose protocol setup (such as Redis AUTH, the ClickHouse
-  Hello or the HTTP/2 preface) has not finished by then fails the run; see
+  Hello or the HTTP/2 preface) has not finished by then fails the run. It
+  also bounds preload (such as an `insert_phase`): a thread that receives
+  nothing for this long while it preloads fails the run, however long the
+  whole preload takes; see
   [run phases](../guide/output-formats.md#run-phases).
 - `busy_poll_us` (integer, optional, at least 1): turn on busy polling with
   this budget in microseconds; see [busy polling](#busy-polling). Off when

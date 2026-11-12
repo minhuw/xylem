@@ -67,6 +67,19 @@ per request, in place of `keys.value_size`; see
 [Value Size Configuration](../configuration/workload.md#value-size-configuration).
 With `per_command`, `set`, `add` and `replace` take their own sizes.
 
+## Insert Phase
+
+`insert_phase` SETs keys before anything is measured: `key_count` keys
+(default: the keyspace size of `keys`, required for sequential keys), drawn
+like the measured keys, with values of `value_size` bytes (default
+`keys.value_size`). Redis takes the same section, and so does Masstree,
+which inserts keys 0 to `key_count - 1`. Each thread
+inserts all of them, and its connections share the work. The inserts are
+[preload](../output-formats.md#run-phases): they go out as fast as the
+pipelines allow, and no thread measures until every insert of every thread
+has its reply, so a measured request never reaches a key before its SET. An
+insert's error reply fails the run.
+
 ## Error Replies
 
 An error reply completes its request and counts in `requests.errors`, with

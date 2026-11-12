@@ -10,6 +10,7 @@
 use crate::connection::{ConnectionPool, SentRequest, TrafficGroupConfig};
 use crate::request_dump::RequestDumper;
 use crate::stats::{StatsRecorder, TupleStatsCollector, UNSENT_WALK_CAP};
+use crate::threading::{PreloadTicket, PreloadWait, StartTicket};
 use crate::timing;
 use crate::traffic_group::OnError;
 use crate::Result;
@@ -17,7 +18,7 @@ use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use xylem_common::{ConnectionRole, FastHashMap, Outbox, Protocol};
+use xylem_common::{ConnectionRole, FastHashMap, Outbox, Parsed, Protocol};
 use xylem_transport::{ConnectionGroup, TransportFactory};
 
 fn unix_time_us() -> Option<u64> {
@@ -49,6 +50,42 @@ pub const DEFAULT_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// ([`StatsRecorder::prepare`]): making the next time bucket's map of
 /// entries for 1000 connections takes up to 30 us in a release build
 const PREPARE_SLACK_NS: u64 = 200_000;
+
+/// How long a thread that finished preloading waits in a poll for the
+/// others to finish
+const PRELOAD_BARRIER_POLL: Duration = Duration::from_millis(1);
+
+/// How long after a worker that runs alone finished preloading its
+/// measured run starts, so its schedules are anchored before their start
+const ALONE_START_DELAY_NS: u64 = 1_000_000;
+
+/// Where a worker that preloads (see [`Protocol::preload_pending`]) waits
+/// until it may measure
+enum PreloadBarrier {
+    /// The worker runs alone: it measures shortly after its own preload is
+    /// done
+    Alone(Option<u64>),
+    /// The worker's thread waits for the run's other threads
+    Shared(PreloadTicket),
+}
+
+impl PreloadBarrier {
+    fn arrive(&mut self) {
+        match self {
+            Self::Alone(start_ns) => {
+                *start_ns = Some(timing::time_ns().saturating_add(ALONE_START_DELAY_NS));
+            }
+            Self::Shared(ticket) => ticket.arrive(),
+        }
+    }
+
+    fn poll(&self) -> PreloadWait {
+        match self {
+            Self::Alone(start_ns) => start_ns.map_or(PreloadWait::Waiting, PreloadWait::Start),
+            Self::Shared(ticket) => ticket.poll(),
+        }
+    }
+}
 
 /// Worker with connection pooling and request pipelining
 ///
@@ -224,7 +261,10 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
     /// connection; [`DEFAULT_SETUP_TIMEOUT`] by default
     ///
     /// The timeout includes the connect and the wait for the run's start,
-    /// before which no setup request goes out.
+    /// before which no setup request goes out. It also fails the run when
+    /// the worker, preloading (see [`Protocol::preload_pending`]), receives
+    /// nothing for `timeout`: preload takes as long as there is data to
+    /// load, but no reply should take that long.
     pub fn set_setup_timeout(&mut self, timeout: Duration) {
         self.setup_timeout = timeout;
     }
@@ -289,31 +329,64 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
     /// group interleave across threads, and it is the epoch of the stats' time
     /// buckets. Nothing is sent before it. A connection still setting up
     /// starts its schedule once setup is done.
+    ///
+    /// If a connection has preload work (see [`Protocol::preload_pending`]),
+    /// the worker preloads from `start_ns` on, and the measured run, its
+    /// schedules and its time buckets start once preload is done instead.
     pub fn run_at(&mut self, start_ns: u64) -> Result<()> {
-        self.run_at_with_clock(start_ns, unix_time_us)
+        let preload = self.has_preload().then_some(PreloadBarrier::Alone(None));
+        self.run_at_with_clock(start_ns, preload, unix_time_us)
+    }
+
+    /// Wait at the start gate with the run's other threads, then run from
+    /// the start time they share; see [`Self::run_at`]
+    ///
+    /// If a connection of any thread has preload work (see
+    /// [`Protocol::preload_pending`]), every thread preloads from the shared
+    /// start on, and the measured run starts at one time shortly after the
+    /// last thread finished: its schedules, its time buckets and
+    /// `experiment.duration` count from there. If another thread fails
+    /// first, this one returns without measuring, and the run's error is
+    /// the other thread's.
+    pub fn run_with_start(&mut self, start: StartTicket) -> Result<()> {
+        let (start_ns, preload) = start.wait_for_run(self.has_preload());
+        self.run_at_with_clock(start_ns, preload.map(PreloadBarrier::Shared), unix_time_us)
     }
 
     // A supplied wall clock lets tests exercise unusable samples at loop exit.
     fn run_at_with_clock(
         &mut self,
         start_ns: u64,
+        preload: Option<PreloadBarrier>,
         mut wall_clock_us: impl FnMut() -> Option<u64>,
     ) -> Result<()> {
-        self.stats.start_measurement(start_ns);
+        self.pool.set_preloading(preload.is_some());
         self.anchor_schedules(start_ns);
         self.arm_setup_deadlines();
-        let now_ns = timing::time_ns();
-        if start_ns.saturating_sub(now_ns) > 2_000_000 {
-            // Sleep until shortly before the start, then spin to it
-            std::thread::sleep(Duration::from_nanos(start_ns - now_ns - 1_000_000));
-        }
-        timing::busy_wait_until(start_ns);
+        wait_until(start_ns);
+        // Busy polling starts with the run
+        self.last_io_ns = start_ns;
+        let start_ns = match preload {
+            None => start_ns,
+            Some(barrier) => {
+                let preloaded = self.preload(barrier);
+                self.pool.set_preloading(false);
+                let Some(measure_ns) = preloaded? else {
+                    // Another thread failed; its error is the run's
+                    self.pool.close_all()?;
+                    return Ok(());
+                };
+                self.anchor_schedules(measure_ns);
+                wait_until(measure_ns);
+                self.last_io_ns = measure_ns;
+                measure_ns
+            }
+        };
+        self.stats.start_measurement(start_ns);
         let actual_start_us = wall_clock_us();
 
         let duration_ns = self.config.duration.as_nanos().min(u64::MAX as u128) as u64;
         let end_ns = start_ns.saturating_add(duration_ns);
-        // Busy polling starts with the run
-        self.last_io_ns = start_ns;
 
         let loop_result = loop {
             let now_ns = timing::time_ns();
@@ -342,7 +415,9 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
                 self.last_io_ns = now_ns;
             }
             let now_ns = timing::time_ns();
-            self.expire_requests(now_ns);
+            if let Err(error) = self.expire_requests(now_ns) {
+                break Err(error);
+            }
             if let Err(error) = self.check_setup_deadlines(now_ns) {
                 break Err(error);
             }
@@ -370,6 +445,98 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         self.pool.close_all()?;
 
         Ok(())
+    }
+
+    /// Whether a connection has preload work; see [`Protocol::preload_pending`]
+    fn has_preload(&self) -> bool {
+        self.pool.connection_ids().iter().any(|&connection_id| {
+            self.pool.get_state(connection_id).is_some_and(|state| {
+                let protocol =
+                    self.protocols.get(&state.group_id()).expect("Protocol not found for group_id");
+                protocol.preload_pending(connection_id)
+            })
+        })
+    }
+
+    /// Whether every connection is done with setup and preload, with no
+    /// reply pending
+    fn preload_done(&self) -> bool {
+        self.preloading_connection().is_none()
+    }
+
+    /// The first connection still in setup or preload, or with a reply
+    /// pending, and its group
+    fn preloading_connection(&self) -> Option<(usize, usize)> {
+        self.pool.connection_ids().iter().find_map(|&connection_id| {
+            let state = self.pool.get_state(connection_id)?;
+            let group_id = state.group_id();
+            let protocol = self.protocols.get(&group_id).expect("Protocol not found for group_id");
+            let busy = state.pending_count() > 0
+                || protocol.setup_pending(connection_id)
+                || protocol.preload_pending(connection_id);
+            busy.then_some((connection_id, group_id))
+        })
+    }
+
+    /// Preload: send every connection's setup and preload requests, off its
+    /// schedule, and hold every other request, until this worker has none of
+    /// them left nor a reply pending and `barrier` lets it measure
+    ///
+    /// Returns the start of the measured run, or `None` if another thread
+    /// failed first. Receiving nothing for the setup timeout while preload
+    /// is left fails the run.
+    fn preload(&mut self, mut barrier: PreloadBarrier) -> Result<Option<u64>> {
+        let stall_ns = self.setup_timeout.as_nanos().min(u64::MAX as u128) as u64;
+        let mut last_data_ns = timing::time_ns();
+        let mut arrived = false;
+        loop {
+            let now_ns = timing::time_ns();
+            if !arrived && self.preload_done() {
+                barrier.arrive();
+                arrived = true;
+            }
+            let wait_end_ns = if arrived {
+                match barrier.poll() {
+                    PreloadWait::Start(start_ns) => return Ok(Some(start_ns)),
+                    PreloadWait::Abandoned => return Ok(None),
+                    PreloadWait::Waiting => {}
+                }
+                now_ns.saturating_add(PRELOAD_BARRIER_POLL.as_nanos() as u64)
+            } else {
+                let stall_end_ns = last_data_ns.saturating_add(stall_ns);
+                if now_ns >= stall_end_ns {
+                    return Err(self.preload_stalled());
+                }
+                stall_end_ns
+            };
+
+            if self.send_requests()? > 0 {
+                self.last_io_ns = now_ns;
+            }
+            let poll_timeout = self.poll_timeout(now_ns, wait_end_ns);
+            self.process_responses(self.busy_poll_timeout(poll_timeout, now_ns))?;
+            let now_ns = timing::time_ns();
+            if !self.ready_ids.is_empty() {
+                self.last_io_ns = now_ns;
+                last_data_ns = now_ns;
+            }
+            self.expire_requests(now_ns)?;
+            self.check_setup_deadlines(now_ns)?;
+        }
+    }
+
+    /// The run's error for a preload that received nothing for the setup
+    /// timeout, naming a connection still in it
+    fn preload_stalled(&self) -> crate::Error {
+        let (connection_id, group_id) =
+            self.preloading_connection().expect("a connection is still preloading");
+        let protocol = self.protocols.get(&group_id).expect("Protocol not found for group_id");
+        crate::Error::Connection(format!(
+            "Traffic group {group_id}, connection {connection_id} ({}): preload received nothing \
+             within the setup timeout ({:?})",
+            protocol.name(),
+            self.setup_timeout
+        ))
     }
 
     /// Anchor every connection's schedule at `start_ns` and reschedule the
@@ -415,6 +582,20 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             }
             let state = self.pool.get_state(connection_id).expect("Connection state not found");
             let group_id = state.group_id();
+            let preloading = self.pool.is_preloading();
+            if preloading {
+                // The protocol's state may have changed since the connection
+                // was scheduled: another connection may have taken the last
+                // of a shared insert phase
+                let protocol =
+                    self.protocols.get(&group_id).expect("Protocol not found for group_id");
+                if !protocol.setup_pending(connection_id)
+                    && !protocol.preload_pending(connection_id)
+                {
+                    // Held until the measured run starts
+                    continue;
+                }
+            }
 
             let request = {
                 let protocol =
@@ -425,6 +606,12 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
                 return Err(crate::Error::Protocol(format!(
                     "Traffic group {group_id}, connection {connection_id}: the protocol sent a \
                      request that is no setup request on a control connection"
+                )));
+            }
+            if preloading && !request.metadata.is_warmup {
+                return Err(crate::Error::Protocol(format!(
+                    "Traffic group {group_id}, connection {connection_id}: the protocol sent a \
+                     measurement request during preload"
                 )));
             }
 
@@ -448,8 +635,12 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
                 // Queue the request (track warmup status for response
                 // handling); it is sent, and its stats recorded, when the
                 // transport takes it. An open-loop request's latency starts
-                // at its intended send time.
-                let intended_ns = self.pool.intended_send_time(pick);
+                // at its intended send time. Preload follows no schedule.
+                let intended_ns = if preloading {
+                    None
+                } else {
+                    self.pool.intended_send_time(pick)
+                };
                 self.pool.queue_request(
                     connection_id,
                     &request.data,
@@ -459,7 +650,9 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
                 )?;
 
                 // Advance the policy's schedule
-                self.pool.on_request_sent(pick, timing::time_ns());
+                if !preloading {
+                    self.pool.on_request_sent(pick, timing::time_ns());
+                }
             }
 
             // Try to re-add connection to heap if it still has capacity
@@ -584,8 +777,11 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             let responses = {
                 let protocol =
                     self.protocols.get_mut(&group_id).expect("Protocol not found for group_id");
+                let preloading = self.pool.is_preloading();
                 match self.pool.recv_responses(connection_id, |data| {
-                    protocol.parse_response(connection_id, data).map_err(Into::into)
+                    let name = protocol.name();
+                    let parsed = protocol.parse_response(connection_id, data);
+                    reject_preload_error(preloading, parsed, group_id, connection_id, name)
                 }) {
                     Ok(responses) => responses,
                     Err(e @ crate::Error::Connection(_)) => {
@@ -677,7 +873,10 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         let len = self.outbox.data.len();
         self.outbox.data.clear();
         sent?;
-        if self.pool.get_state(connection_id).is_some_and(|state| !state.is_control()) {
+        // Before the measured run, nothing is recorded
+        if !self.pool.is_preloading()
+            && self.pool.get_state(connection_id).is_some_and(|state| !state.is_control())
+        {
             self.stats.record_tx_bytes(group_id, connection_id, len);
         }
         Ok(true)
@@ -685,8 +884,9 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
 
     /// Time out the requests whose request timeout passed by `now_ns`, count
     /// the measurement ones, and reschedule the connections they freed.
-    /// Returns whether any timed out.
-    fn expire_requests(&mut self, now_ns: u64) -> bool {
+    /// Returns whether any timed out; during preload, one timing out fails
+    /// the run, since its data may not have arrived.
+    fn expire_requests(&mut self, now_ns: u64) -> Result<bool> {
         let mut freed = Vec::new();
         let stats = &mut self.stats;
         self.pool
@@ -695,14 +895,24 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
                     stats.record_timed_out(group_id, connection_id, measured);
                 }
                 tracing::debug!(connection_id, group_id, expired, "Requests timed out");
-                freed.push((connection_id, group_id));
+                freed.push((connection_id, group_id, expired));
             });
+        if let (true, Some(&(connection_id, group_id, expired))) =
+            (self.pool.is_preloading(), freed.first())
+        {
+            let protocol = self.protocols.get(&group_id).expect("Protocol not found for group_id");
+            return Err(crate::Error::Connection(format!(
+                "Traffic group {group_id}, connection {connection_id} ({}): {expired} \
+                 request(s) timed out during preload",
+                protocol.name()
+            )));
+        }
         let expired = !freed.is_empty();
-        for (connection_id, group_id) in freed {
+        for (connection_id, group_id, _) in freed {
             let protocol = self.protocols.get(&group_id).expect("Protocol not found for group_id");
             self.pool.try_schedule_connection(connection_id, protocol);
         }
-        expired
+        Ok(expired)
     }
 
     fn maintain_tx_queues(&mut self, now_ns: u64) {
@@ -755,13 +965,18 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             _ => return None,
         };
         let protocol = self.protocols.get(&group_id).expect("Protocol not found for group_id");
-        protocol.setup_pending(connection_id).then(|| {
-            crate::Error::Connection(format!(
-                "Traffic group {group_id}, connection {connection_id} ({}): connection closed \
-                 during setup: {cause}",
-                protocol.name()
-            ))
-        })
+        let phase = if protocol.setup_pending(connection_id) {
+            "setup"
+        } else if self.pool.is_preloading() {
+            "preload"
+        } else {
+            return None;
+        };
+        Some(crate::Error::Connection(format!(
+            "Traffic group {group_id}, connection {connection_id} ({}): connection closed during \
+             {phase}: {cause}",
+            protocol.name()
+        )))
     }
 
     /// Give every connection in setup its setup deadline: the setup timeout
@@ -878,7 +1093,7 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             if ready {
                 self.last_io_ns = now_ns;
             }
-            if self.expire_requests(timing::time_ns()) || ready {
+            if self.expire_requests(timing::time_ns())? || ready {
                 pending = self.has_pending();
             }
         }
@@ -947,6 +1162,39 @@ impl<P: Protocol, S: StatsRecorder> Worker<xylem_transport::UnixConnectionGroup,
     }
 }
 
+/// `parsed`, or the run's error if it is an error reply during preload:
+/// preload must fill the server, so an error reply to it fails the run,
+/// whatever `on_error` says
+fn reject_preload_error<'a, Id>(
+    preloading: bool,
+    parsed: anyhow::Result<Parsed<'a, Id>>,
+    group_id: usize,
+    connection_id: usize,
+    protocol: &str,
+) -> Result<Parsed<'a, Id>> {
+    match parsed? {
+        Parsed::Complete { error: Some(error), .. } if preloading => {
+            Err(crate::Error::Protocol(format!(
+                "Traffic group {group_id}, connection {connection_id} ({protocol}): error reply \
+                 {} during preload: {}",
+                error.kind.escape_debug(),
+                error.message.escape_debug()
+            )))
+        }
+        parsed => Ok(parsed),
+    }
+}
+
+/// Wait until `time_ns` (a `timing::time_ns` value): sleep until shortly
+/// before it, then spin to it
+fn wait_until(time_ns: u64) {
+    let now_ns = timing::time_ns();
+    if time_ns.saturating_sub(now_ns) > 2_000_000 {
+        std::thread::sleep(Duration::from_nanos(time_ns - now_ns - 1_000_000));
+    }
+    timing::busy_wait_until(time_ns);
+}
+
 /// The connection roles each group's protocol asks for, by group ID, given
 /// `(group_id, load connections)` for every group of the worker
 fn connection_roles<P: Protocol>(
@@ -987,6 +1235,9 @@ mod tests {
         /// Report setup through `Protocol::setup_pending`, so it goes out
         /// off the schedule
         report_setup: bool,
+        /// Requests with a lower ID are preload requests, which every
+        /// connection draws from
+        preload: u64,
         /// Responses to these requests are error replies of the given kind
         errors: HashMap<u64, &'static str>,
         /// Bytes each request carries after its 8-byte ID
@@ -1003,7 +1254,7 @@ mod tests {
                 self.setup_pending = true;
                 return Request::setup(id.to_le_bytes().to_vec(), id);
             }
-            if id < self.warmup {
+            if id < self.warmup || id < self.preload {
                 return Request::new(id.to_le_bytes().to_vec(), id, RequestMeta::warmup());
             }
             let mut data = id.to_le_bytes().to_vec();
@@ -1036,6 +1287,10 @@ mod tests {
 
         fn setup_pending(&self, _: usize) -> bool {
             self.report_setup && (self.setup_pending || self.next_id < self.setup)
+        }
+
+        fn preload_pending(&self, _: usize) -> bool {
+            self.next_id < self.preload
         }
 
         fn name(&self) -> &'static str {
@@ -1592,6 +1847,188 @@ mod tests {
         assert!(worker.setup_deadlines.is_empty());
     }
 
+    /// A worker whose protocol preloads with one request
+    fn preload_worker(factory: &FakeFactory) -> Worker<FakeGroup, FakeProtocol> {
+        let mut worker = fake_worker(factory, 1, Box::new(UniformPolicyScheduler::closed_loop()));
+        worker.protocols.get_mut(&0).unwrap().preload = 1;
+        worker.config.duration = Duration::from_millis(10);
+        worker
+    }
+
+    #[test]
+    fn an_error_reply_during_preload_fails_the_run_whatever_on_error_says() {
+        let factory = FakeFactory::default();
+        let mut worker = preload_worker(&factory);
+        worker.protocols.get_mut(&0).unwrap().errors.insert(0, "NOT_STORED");
+        factory.0.lock().unwrap().responses.push_back(Ok(0u64.to_le_bytes().to_vec()));
+        let error = worker.run().unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Protocol error: Traffic group 0, connection 0 (Fake): error reply NOT_STORED during \
+             preload: test error"
+        );
+        assert_eq!(sent_requests(&factory), 1, "nothing measured went out");
+    }
+
+    #[test]
+    fn a_connection_closed_during_preload_fails_the_run_naming_it() {
+        let factory = FakeFactory::default();
+        let mut worker = preload_worker(&factory);
+        let closed = xylem_transport::Error::Connection("Connection closed by peer".into());
+        factory.0.lock().unwrap().responses.push_back(Err(closed));
+        let error = worker.run().unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Connection error: Traffic group 0, connection 0 (Fake): connection closed during \
+             preload: Connection closed by peer"
+        );
+        assert!(factory.0.lock().unwrap().closed);
+    }
+
+    #[test]
+    fn a_preload_that_receives_nothing_for_the_setup_timeout_fails_the_run() {
+        let factory = FakeFactory::default();
+        let mut worker = preload_worker(&factory);
+        worker.config.duration = Duration::from_secs(10);
+        worker.set_setup_timeout(Duration::from_millis(20));
+        // The preload reply never arrives
+        let started = std::time::Instant::now();
+        let error = worker.run().unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        assert_eq!(
+            error.to_string(),
+            "Connection error: Traffic group 0, connection 0 (Fake): preload received nothing \
+             within the setup timeout (20ms)"
+        );
+        assert_eq!(sent_requests(&factory), 1);
+    }
+
+    #[test]
+    fn a_preload_request_timing_out_fails_the_run() {
+        let factory = FakeFactory::default();
+        let mut worker = preload_worker(&factory);
+        worker.set_request_timeout(0, Some(Duration::from_millis(5)));
+        let error = worker.run().unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Connection error: Traffic group 0, connection 0 (Fake): 1 request(s) timed out \
+             during preload"
+        );
+    }
+
+    #[test]
+    fn preload_requests_are_neither_measured_nor_scheduled() {
+        let factory = FakeFactory::default();
+        // One request every 10 ms: preload goes out at once, off the schedule
+        let scheduler = Box::new(UniformPolicyScheduler::fixed_rate(100.0));
+        let mut worker = fake_worker(&factory, 4, scheduler);
+        worker.protocols.get_mut(&0).unwrap().preload = 3;
+        worker.config.duration = Duration::from_millis(25);
+        let replies = (0u64..3).map(|id| Ok(id.to_le_bytes().to_vec()));
+        factory.0.lock().unwrap().responses.extend(replies);
+        let mut samples = [Some(100), Some(200)].into_iter();
+        let preload = Some(PreloadBarrier::Alone(None));
+        worker
+            .run_at_with_clock(timing::time_ns(), preload, || {
+                if samples.len() == 2 {
+                    // The window starts once preload is done
+                    assert_eq!(sent_requests(&factory), 3);
+                    assert!(factory.0.lock().unwrap().responses.is_empty());
+                }
+                samples.next().expect("the wall clock is sampled exactly twice")
+            })
+            .unwrap();
+        let counts = worker.stats.request_counts_global();
+        // Requests 3, 4 and 5 at 0, 10 and 20 ms into the measured run
+        assert_eq!(counts.sent, 3, "{counts:?}");
+        assert_eq!(sent_requests(&factory), 6);
+    }
+
+    /// When a request with an ID arrived at a server, and when its reply left
+    type ServerLog = Arc<std::sync::Mutex<Vec<(u64, std::time::Instant, std::time::Instant)>>>;
+
+    /// A server that records each request in a [`ServerLog`], and replies to
+    /// the IDs below `slow` only after `delay`
+    fn recording_echo_server(
+        listener: TcpListener,
+        connections: usize,
+        slow: u64,
+        delay: Duration,
+    ) -> ServerLog {
+        let log = ServerLog::default();
+        for _ in 0..connections {
+            let socket = listener.accept().unwrap().0;
+            let log = Arc::clone(&log);
+            thread::spawn(move || echo_recording(socket, &log, slow, delay));
+        }
+        log
+    }
+
+    fn echo_recording(
+        mut socket: std::net::TcpStream,
+        log: &ServerLog,
+        slow: u64,
+        delay: Duration,
+    ) {
+        let mut id = [0u8; 8];
+        while socket.read_exact(&mut id).is_ok() {
+            let received = std::time::Instant::now();
+            if u64::from_le_bytes(id) < slow {
+                thread::sleep(delay);
+            }
+            if socket.write_all(&id).is_err() {
+                break;
+            }
+            let entry = (u64::from_le_bytes(id), received, std::time::Instant::now());
+            log.lock().unwrap().push(entry);
+        }
+    }
+
+    #[test]
+    fn measurement_waits_for_every_preload_reply_of_every_thread() {
+        // Two threads of two connections, whose protocols each preload two
+        // requests, which the server answers slowly. Without the barrier,
+        // a connection that drew no preload request would measure at once.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = listener.local_addr().unwrap();
+        let runtime = crate::threading::ThreadingRuntime::new(2);
+        let server =
+            thread::spawn(move || recording_echo_server(listener, 4, 2, Duration::from_millis(30)));
+        let windows = runtime
+            .run_workers_with_start(move |_, start| {
+                let mut stats = TupleStatsCollector::default();
+                stats.register_group_policy(0, SamplingPolicy::Unlimited);
+                let protocol = FakeProtocol { preload: 2, ..Default::default() };
+                let config = WorkerConfig {
+                    target,
+                    duration: Duration::from_millis(20),
+                    conn_count: 2,
+                    max_pending_per_conn: 4,
+                    drain_timeout: DEFAULT_DRAIN_TIMEOUT,
+                };
+                let factory = TcpTransportFactory::default();
+                let mut worker = Worker::with_closed_loop(&factory, protocol, stats, config)?;
+                worker.run_with_start(start)?;
+                Ok(worker.stats.actual_load_loop_unix_us())
+            })
+            .unwrap();
+        let log = server.join().unwrap();
+        let log = log.lock().unwrap();
+        let last_preload_reply = log.iter().filter(|e| e.0 < 2).map(|e| e.2).max().unwrap();
+        let first_measured = log.iter().filter(|e| e.0 >= 2).map(|e| e.1).min().unwrap();
+        assert_eq!(log.iter().filter(|e| e.0 < 2).count(), 4, "each thread preloads");
+        assert!(first_measured > last_preload_reply, "measured before every preload reply");
+        // Both threads measured, from one start after preload
+        let unix_us = |instant: std::time::Instant| {
+            let ago = std::time::Instant::now() - instant;
+            unix_time_us().unwrap() - ago.as_micros() as u64
+        };
+        for window in windows {
+            let (start_us, _) = window.expect("the thread measured");
+            assert!(start_us >= unix_us(last_preload_reply), "the window starts after preload");
+        }
+    }
+
     #[test]
     fn disconnect_keeps_collecting_other_connections() {
         let factory = FakeFactory::default();
@@ -1879,7 +2316,7 @@ mod tests {
         let start = timing::time_ns() + 1_000_000;
         let mut samples = [Some(100), Some(200)].into_iter();
         worker
-            .run_at_with_clock(start, || {
+            .run_at_with_clock(start, None, || {
                 assert!(timing::time_ns() >= start, "the shared wait completed");
                 assert!(factory.0.lock().unwrap().sent.is_empty());
                 samples.next().expect("the wall clock is sampled exactly twice")
@@ -1900,7 +2337,7 @@ mod tests {
         worker.config.drain_timeout = Duration::from_secs(1);
         let mut samples = [Some(100), Some(200)].into_iter();
         worker
-            .run_at_with_clock(timing::time_ns(), || {
+            .run_at_with_clock(timing::time_ns(), None, || {
                 let io = factory.0.lock().unwrap();
                 assert!(io.timeouts.is_empty(), "the drain has not polled yet");
                 assert_eq!(io.responses.len(), 1, "the response is still pending");
@@ -1966,7 +2403,7 @@ mod tests {
         worker.stats.record_tx_bytes(0, 0, 0);
         let mut samples = [start_sample, end_sample].into_iter();
         let mut clock_calls = 0;
-        let result = worker.run_at_with_clock(timing::time_ns(), || {
+        let result = worker.run_at_with_clock(timing::time_ns(), None, || {
             let io = factory.0.lock().unwrap();
             assert!(!io.closed);
             if clock_calls == 0 {
@@ -2487,7 +2924,7 @@ mod tests {
         let wait = worker.poll_timeout(now, now + 10_000_000_000);
         assert!(wait <= Duration::from_millis(20), "{wait:?}");
         thread::sleep(Duration::from_millis(25));
-        worker.expire_requests(timing::time_ns());
+        worker.expire_requests(timing::time_ns()).unwrap();
         let counts = worker.stats.request_counts_global();
         assert_eq!((counts.sent, counts.timed_out, counts.completed), (1, 1, 0));
 
@@ -2546,7 +2983,7 @@ mod tests {
         worker.set_request_timeout(0, Some(Duration::from_millis(1)));
         worker.send_requests().unwrap();
         thread::sleep(Duration::from_millis(5));
-        worker.expire_requests(timing::time_ns());
+        worker.expire_requests(timing::time_ns()).unwrap();
         factory.0.lock().unwrap().responses.push_back(Ok(0u64.to_le_bytes().to_vec()));
         worker.process_responses(Duration::ZERO).unwrap();
         let counts = worker.stats.request_counts_global();

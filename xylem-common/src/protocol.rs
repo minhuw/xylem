@@ -238,6 +238,28 @@ pub trait Protocol: Send {
         false
     }
 
+    /// Check if the connection's next request, once its setup is done, is a
+    /// preload request: warmup that fills the server before measurement,
+    /// such as an insert phase's SETs
+    ///
+    /// While any connection of any thread reports it, no thread measures.
+    /// The worker sends preload and setup requests as soon as `can_send`
+    /// allows, off every schedule, holds every other request, and starts the
+    /// measured run, every schedule and the measured window once every
+    /// connection of every thread has neither setup nor preload left nor a
+    /// reply pending. So true must mean that the next request will be a
+    /// warmup request, from the connection's setup on; a measurement request
+    /// in its place fails the run. It may turn false on any request of the
+    /// group, which is how connections share one insert phase. A connection
+    /// error, an error reply, or a timed-out request during preload fails
+    /// the run, and so does a thread that gets no data for the setup timeout
+    /// while preloading.
+    ///
+    /// Default implementation returns false: no preload.
+    fn preload_pending(&self, _conn_id: usize) -> bool {
+        false
+    }
+
     /// The roles of the connections to open for a traffic group whose
     /// threads each have `load` connections (`connections_per_thread`), in
     /// the order to open them

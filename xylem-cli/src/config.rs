@@ -77,7 +77,8 @@ pub struct ExperimentConfig {
     /// Longest time a connection may take to set up (default 10s), counted
     /// from the start of its connect: a connection whose protocol setup
     /// (such as Redis AUTH or the HTTP/2 preface) has not finished by then
-    /// fails the run
+    /// fails the run. Also the longest a thread may receive nothing while
+    /// it preloads (such as an insert phase)
     #[serde(with = "humantime_serde", default = "default_setup_timeout")]
     #[schemars(with = "String")]
     pub setup_timeout: Duration,

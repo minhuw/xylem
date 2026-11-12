@@ -937,6 +937,19 @@ impl Protocol for NvmeTcpProtocol {
         self.queues.get(&conn_id).is_some_and(|queue| queue.step != Step::Done)
     }
 
+    fn preload_pending(&self, conn_id: usize) -> bool {
+        // Verify mode's prefill, on the I/O queues, until every block is
+        // handed out; before the namespace is known, all of it is left
+        let io_queue = self.queues.get(&conn_id).is_some_and(|queue| queue.qid != 0);
+        io_queue
+            && self.config.verify
+            && match (self.layout, &self.prefill) {
+                (None, _) => true,
+                (Some(layout), Some(prefill)) => prefill.next < layout.blocks,
+                (Some(_), None) => false,
+            }
+    }
+
     fn drain_outbox(&mut self, conn_id: usize, outbox: &mut Outbox) {
         if let Some(queue) = self.queues.get_mut(&conn_id) {
             if outbox.data.is_empty() {

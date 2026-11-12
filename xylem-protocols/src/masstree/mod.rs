@@ -126,30 +126,22 @@ pub struct InsertPhaseState {
     next_key: u64,
     /// Value size for inserts
     value_size: usize,
-    /// Whether insert phase is complete
-    complete: bool,
 }
 
 impl InsertPhaseState {
     /// Create new insert phase state
     pub fn new(key_count: u64, value_size: usize) -> Self {
-        Self {
-            key_count,
-            next_key: 0,
-            value_size,
-            complete: false,
-        }
+        Self { key_count, next_key: 0, value_size }
     }
 
-    /// Check if insert phase is complete
+    /// Check if every key has been handed out
     pub fn is_complete(&self) -> bool {
-        self.complete
+        self.next_key >= self.key_count
     }
 
     /// Get next key to insert, returns None if insert phase is complete
     pub fn next_key(&mut self) -> Option<u64> {
-        if self.next_key >= self.key_count {
-            self.complete = true;
+        if self.is_complete() {
             None
         } else {
             let key = self.next_key;
@@ -578,6 +570,11 @@ impl Protocol for MasstreeProtocol {
     fn setup_pending(&self, conn_id: usize) -> bool {
         // The handshake is the connection's setup
         !self.is_handshake_done(conn_id)
+    }
+
+    fn preload_pending(&self, _conn_id: usize) -> bool {
+        // The connections share the insert phase
+        self.insert_phase.as_ref().is_some_and(|insert| !insert.is_complete())
     }
 }
 
@@ -1231,6 +1228,8 @@ mod tests {
 
         // Insert phase requests should be warmup and SET operations
         for i in 0..10 {
+            // Every connection shares the insert phase
+            assert!(proto.preload_pending(0) && proto.preload_pending(1));
             let request = proto.next_request(0);
             assert!(request.metadata.is_warmup, "Insert phase request {} should be warmup", i);
             assert!(!request.metadata.is_setup, "Insert phase request {} is not setup", i);
@@ -1240,6 +1239,7 @@ mod tests {
         }
 
         // After insert phase, requests should not be warmup
+        assert!(!proto.preload_pending(0) && !proto.preload_pending(1));
         let request_after = proto.next_request(0);
         assert!(
             !request_after.metadata.is_warmup,

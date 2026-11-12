@@ -564,7 +564,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
             worker.set_busy_poll(experiment.busy_poll());
             worker.set_setup_timeout(experiment.setup_timeout);
 
-            worker.run_at(start.wait())?;
+            worker.run_with_start(start)?;
             let calibration = worker
                 .clock_calibration()
                 .map(|report| output::NicClockCalibration::new(thread_idx, &report));

@@ -205,7 +205,7 @@
           "minimum": 0
         },
         "setup_timeout": {
-          "description": "Longest time a connection may take to set up (default 10s), counted\nfrom the start of its connect: a connection whose protocol setup\n(such as Redis AUTH or the HTTP/2 preface) has not finished by then\nfails the run",
+          "description": "Longest time a connection may take to set up (default 10s), counted\nfrom the start of its connect: a connection whose protocol setup\n(such as Redis AUTH or the HTTP/2 preface) has not finished by then\nfails the run. Also the longest a thread may receive nothing while\nit preloads (such as an insert phase)",
           "type": "string",
           "default": "10s"
         }

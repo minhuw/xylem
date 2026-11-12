@@ -226,6 +226,21 @@ impl Protocol for MultiProtocol {
         }
     }
 
+    fn preload_pending(&self, conn_id: usize) -> bool {
+        match self {
+            MultiProtocol::Redis(p) => p.preload_pending(conn_id),
+            MultiProtocol::MemcachedBinary(p) => p.preload_pending(conn_id),
+            MultiProtocol::MemcachedAscii(p) => p.preload_pending(conn_id),
+            MultiProtocol::Http(p) => p.preload_pending(conn_id),
+            MultiProtocol::XylemEcho(p) => p.preload_pending(conn_id),
+            MultiProtocol::Masstree(p) => p.preload_pending(conn_id),
+            MultiProtocol::Dns(p) => p.preload_pending(conn_id),
+            MultiProtocol::NvmeTcp(p) => p.preload_pending(conn_id),
+            MultiProtocol::Http2(p) | MultiProtocol::Grpc(p) => p.preload_pending(conn_id),
+            MultiProtocol::ClickHouse(p) => p.preload_pending(conn_id),
+        }
+    }
+
     fn connection_roles(&self, load: usize) -> Vec<ConnectionRole> {
         match self {
             MultiProtocol::Redis(p) => p.connection_roles(load),

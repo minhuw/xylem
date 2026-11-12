@@ -28,6 +28,10 @@ pub trait Protocol: Send {
         false
     }
 
+    fn preload_pending(&self, _conn_id: usize) -> bool {
+        false
+    }
+
     fn connection_roles(&self, load: usize) -> Vec<ConnectionRole> {
         vec![ConnectionRole::Load; load]
     }
@@ -67,6 +71,17 @@ pub trait Protocol: Send {
   setup still pending at the end of the run, fails the run naming the
   connection; after setup, a connection error only closes the connection and
   counts its pending requests as `failed`.
+- `preload_pending` reports a connection whose next request, after setup, is
+  preload: warmup that fills the server before measurement, such as the
+  memcached, Redis and Masstree insert phase or NVMe/TCP verify mode's
+  prefill. It may turn false on another connection's request, so the
+  connections of a group can share one insert phase. If any connection of
+  any thread reports it at the start, the worker preloads first: it sends
+  setup and preload requests off every schedule and holds the others; once a
+  thread has no setup, preload or reply left, it waits for the other
+  threads, and the measured run starts at one time after the last finished.
+  An error reply, a connection error or a timed-out request during preload
+  fails the run.
 - `connection_roles` lets a session span connections. For a group with
   `load` connections per thread it returns the connections to open, in
   order: exactly `load` `Load` connections, which carry the traffic policy
