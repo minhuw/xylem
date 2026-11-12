@@ -132,8 +132,8 @@ resp = 3                         # HELLO 3
 **`auth`** authenticates the connection. With only a password, Xylem sends `AUTH <password>`, which checks the server's `requirepass`. Add a username for a Redis 6+ ACL user, and Xylem sends `AUTH <username> <password>`. To keep the password out of the profile, name an environment variable instead with `password_env`; Xylem reads it when the run starts and stops with an error naming the variable if it is not set. Set exactly one of `password` and `password_env`:
 
 ```toml
-auth = { username = "bench", password = "secret" }
-auth = { username = "bench", password_env = "REDIS_PASSWORD" }
+[traffic_groups.protocol_config]
+auth = { username = "bench", password_env = "REDIS_PASSWORD" }  # or password = "secret"
 ```
 
 **`db`** selects a logical database with `SELECT <db>`. Without it, connections stay in the server's default database 0. The server decides how many databases exist (16 by default).

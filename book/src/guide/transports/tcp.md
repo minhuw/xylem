@@ -1,6 +1,7 @@
 # TCP Transport
 
-> **Note:** This page is TODO. Configuration details need validation against actual implementation.
+`transport = "tcp"` (the default) opens each connection to the numeric
+`"ip:port"` or `"[ipv6]:port"` in `target`.
 
 ## Socket options
 

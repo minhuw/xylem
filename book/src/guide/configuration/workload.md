@@ -292,5 +292,5 @@ rate = 0.01
 ## See Also
 
 - [Redis Protocol](../protocols/redis.md) - Redis-specific operations
-- [Traffic Groups](./traffic-groups.md) - Traffic group configuration
+- [Traffic Groups](../../reference/schema.md#traffic-groups) - Traffic group configuration
 - [Configuration Schema](../../reference/schema.md) - Complete reference

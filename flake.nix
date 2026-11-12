@@ -124,6 +124,7 @@
             # Additional utilities
             pkgs.tokei # Code statistics
             pkgs.just # Command runner
+            pkgs.mdbook # The book under book/
           ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
             # Profiling, for flamegraph
             pkgs.perf

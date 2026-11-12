@@ -79,6 +79,9 @@ jobs:
       - name: Check formatting
         run: nix develop --command cargo fmt --all -- --check
 
+      - name: Build the book
+        run: nix develop --command mdbook build book
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest

@@ -1,5 +1,5 @@
-# Docker picks a free host port for every service; the test guard reads them
-# back with `docker compose port <service> <port>`
+# Docker picks a free host port for every service; `docker compose port
+# <service> <port>` shows it
 services:
   redis:
     image: redis:7-alpine

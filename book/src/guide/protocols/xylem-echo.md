@@ -1,10 +1,10 @@
 # Xylem Echo Protocol
 
-> **Note**: This is a testing and development protocol, not intended for production use.
-
-> **TODO**: This page requires validation of TOML configuration format and protocol-specific details.
-
-The xylem-echo protocol is used for testing and development purposes. Full documentation will be added once the TOML configuration format is validated.
+`protocol = "xylem-echo"` loads `xylem-echo-server`, to test Xylem's own
+measurement. A request is 16 bytes, `[request_id: u64][delay_us: u64]`
+(little-endian), and the server echoes it after `delay_us` microseconds.
+Xylem always sends a delay of 0. `protocol_config` takes no keys and may be
+left out.
 
 ## Transports and the echo server
 

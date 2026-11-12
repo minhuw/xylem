@@ -433,6 +433,11 @@ install: build-release
     cp target/release/{{BINARY_NAME}} ~/.cargo/bin/
     @echo "✅ xylem installed! You can run it with: xylem"
 
+# Build the book (book/src) into book/book
+book:
+    @echo "📖 Building the book..."
+    mdbook build book
+
 # Generate/update JSON Schema for configuration files
 schema:
     @echo "📋 Generating JSON Schema..."

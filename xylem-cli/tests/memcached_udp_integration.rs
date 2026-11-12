@@ -1,6 +1,6 @@
 //! memcached over UDP through the real CLI
 //!
-//! Uses the UDP port published by the Docker Compose memcached fixture.
+//! Uses the Docker Compose memcached fixture, over UDP at its container address.
 //! Each test populates keys in the insert phase and then runs GETs, so the
 //! responses carry values: 4 KiB values span three datagrams, 32 KiB ones 24.
 

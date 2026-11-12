@@ -358,11 +358,10 @@ Masstree trades peak throughput for stronger consistency guarantees. Application
 SCAN performance depends on how much data you're fetching. With `operation = "scan"`, the `scan` table sets it:
 
 ```toml
-# Small scans (10 records)
-scan = { count = 10, fields = ["0", "1"] }  # Only essential fields
-
-# Large scans (1000 records)
-scan = { count = 1000 }  # All fields
+[traffic_groups.protocol_config]
+operation = "scan"
+scan = { count = 10, fields = ["0", "1"] }  # 10 records, columns 0 and 1
+# scan = { count = 1000 } returns 1000 records with every column
 ```
 
 Measure:
@@ -377,11 +376,9 @@ Tuning SCAN is about balancing batch size (larger = more efficient) vs latency (
 Checkpoints serialize the database to disk, consuming time and I/O resources. The rate of the checkpoint group sets how often they run:
 
 ```toml
-# Frequent checkpoints (high durability, low throughput)
-traffic_policy = { type = "fixed-rate", rate = 10.0 }  # 10 per second
-
-# Rare checkpoints (high throughput, lower durability)
-traffic_policy = { type = "fixed-rate", rate = 0.1 }  # One every 10 seconds
+[[traffic_groups]]
+protocol_config = { operation = "checkpoint" }
+traffic_policy = { type = "fixed-rate", rate = 0.1 }  # one every 10 seconds; 10.0 is ten a second
 ```
 
 Measure:

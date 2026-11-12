@@ -2,8 +2,7 @@ services:
   nginx:
     image: nginx:alpine
     container_name: xylem-test-nginx
-    # Docker picks a free host port; the test guard reads it back with
-    # `docker compose port nginx 80`
+    # Docker picks a free host port; `docker compose port nginx 80` shows it
     ports:
       - "127.0.0.1::80"
     volumes:
