@@ -45,7 +45,8 @@ replies by request ID:
 | `dns` | one bare DNS message per datagram (no 2-byte length); truncated responses count as error kind `TC` |
 | `xylem-echo` | one 16-byte request per datagram, for `xylem-echo-server`'s UDP listener |
 
-`redis`, `http`, `masstree` and `nvme-tcp` with `transport = "udp"` fail validation.
+`redis`, `http`, `http2`, `grpc`, `masstree` and `nvme-tcp` with `transport = "udp"`
+fail validation.
 
 ```toml
 [[traffic_groups]]

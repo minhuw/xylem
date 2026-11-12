@@ -9,7 +9,7 @@ Each traffic group must specify its own `protocol` and `target`:
 ```toml
 [[traffic_groups]]
 name = "main"
-protocol = "redis"  # or "http", "memcached-binary", "memcached-ascii", "masstree", "dns", "nvme-tcp", "xylem-echo"
+protocol = "redis"  # or "http", "http2", "grpc", "memcached-binary", "memcached-ascii", "masstree", "dns", "nvme-tcp", "xylem-echo"
 target = "127.0.0.1:6379"
 threads = [0, 1, 2, 3]
 connections_per_thread = 10
@@ -40,6 +40,8 @@ threads = [2, 3]
 
 - **redis** - Redis Serialization Protocol (RESP)
 - **http** - HTTP/1.1
+- **http2** - HTTP/2 over cleartext, prior knowledge (see [HTTP/2 Protocol](../protocols/http2.md))
+- **grpc** - gRPC unary calls (see [gRPC Protocol](../protocols/grpc.md))
 - **memcached-binary** - Memcached binary protocol
 - **memcached-ascii** - Memcached text protocol
 - **dns** - DNS queries (see [DNS Protocol](../protocols/dns.md))

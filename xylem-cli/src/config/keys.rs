@@ -194,6 +194,8 @@ fn protocol_schema(protocol: ProtocolKind) -> Schema {
             Schema::of::<xylem_protocols::MemcachedConfig>()
         }
         ProtocolKind::Http => Schema::of::<xylem_protocols::HttpConfig>(),
+        ProtocolKind::Http2 => Schema::of::<xylem_protocols::Http2Config>(),
+        ProtocolKind::Grpc => Schema::of::<xylem_protocols::GrpcConfig>(),
         ProtocolKind::Masstree => Schema::of::<xylem_protocols::MasstreeConfig>(),
         ProtocolKind::Dns => Schema::of::<xylem_protocols::DnsConfig>(),
         ProtocolKind::NvmeTcp => Schema::of::<xylem_protocols::NvmeTcpConfig>(),

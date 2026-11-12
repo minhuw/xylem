@@ -17,7 +17,7 @@ use std::collections::HashMap;
 
 /// The three digits of every status code below 600, so the kind of an error
 /// reply is a static string
-static STATUS_DIGITS: [[u8; 3]; 600] = {
+pub(crate) static STATUS_DIGITS: [[u8; 3]; 600] = {
     let mut digits = [[0; 3]; 600];
     let mut code = 0;
     while code < 600 {

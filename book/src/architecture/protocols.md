@@ -85,8 +85,8 @@ pub trait Protocol: Send {
 - `name` returns the protocol name, and `reset` clears per-connection state.
 
 The core engine decides when to send; the protocol decides what to send. The
-Redis, Memcached, HTTP, Masstree, DNS and NVMe/TCP protocols have a `from_config` constructor
-that builds them from their `protocol_config` section.
+Redis, Memcached, HTTP, HTTP/2, gRPC, Masstree, DNS and NVMe/TCP protocols have a
+`from_config` constructor that builds them from their `protocol_config` section.
 
 ## Protocol Design
 
@@ -98,6 +98,8 @@ The following protocol implementations are available:
 
 - **Redis** - RESP (Redis Serialization Protocol) for key-value operations
 - **HTTP** - HTTP/1.1 for web service testing
+- **HTTP/2 and gRPC** - Cleartext HTTP/2 with concurrent streams, flow
+  control and HPACK, and gRPC unary calls on top of it
 - **Memcached** - Binary and text protocol variants for cache testing
 - **Masstree** - MessagePack-based protocol for the Masstree key-value store
 - **DNS** - Standard queries with one question, length-prefixed on byte

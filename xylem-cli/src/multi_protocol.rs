@@ -10,6 +10,8 @@ pub enum MultiProtocol {
     MemcachedBinary(xylem_protocols::memcached::MemcachedBinaryProtocol),
     MemcachedAscii(xylem_protocols::memcached::MemcachedAsciiProtocol),
     Http(xylem_protocols::http::HttpProtocol),
+    Http2(xylem_protocols::Http2Protocol),
+    Grpc(xylem_protocols::Http2Protocol),
     XylemEcho(xylem_protocols::xylem_echo::XylemEchoProtocol),
     Masstree(xylem_protocols::MasstreeProtocol),
     Dns(xylem_protocols::DnsProtocol),
@@ -19,7 +21,8 @@ pub enum MultiProtocol {
 impl MultiProtocol {
     /// Construct a traffic group's protocol from the protocol_config that
     /// `ProfileConfig::validate` parsed. HTTP sends `target` as the Host header
-    /// unless the config sets `host`. Memcached frames its datagrams, and
+    /// unless the config sets `host`, and HTTP/2 and gRPC as `:authority`
+    /// unless the config sets `authority`, or "localhost" over "unix". Memcached frames its datagrams, and
     /// DNS sends bare messages instead of length-prefixed ones, when the
     /// group's `transport` is "udp". NVMe/TCP sizes its I/O queues to
     /// `max_pending`, the group's `max_pending_per_connection`.
@@ -31,6 +34,12 @@ impl MultiProtocol {
         seed: Option<u64>,
     ) -> Result<Self> {
         let udp = transport == "udp";
+        // A socket path is no authority
+        let authority = if transport == "unix" {
+            "localhost"
+        } else {
+            target
+        };
         let protocol = match config {
             ProtocolConfig::Redis(redis_config) => {
                 Self::Redis(xylem_protocols::RedisProtocol::from_config(redis_config, seed)?)
@@ -60,6 +69,12 @@ impl MultiProtocol {
                 http_config.host.get_or_insert_with(|| target.to_string());
                 Self::Http(xylem_protocols::HttpProtocol::from_config(&http_config)?)
             }
+            ProtocolConfig::Http2(http2_config) => {
+                Self::Http2(xylem_protocols::Http2Protocol::from_config(http2_config, authority)?)
+            }
+            ProtocolConfig::Grpc(grpc_config) => Self::Grpc(
+                xylem_protocols::Http2Protocol::grpc_from_config(grpc_config, authority)?,
+            ),
             ProtocolConfig::Masstree(mt_config) => {
                 Self::Masstree(xylem_protocols::MasstreeProtocol::from_config(mt_config, seed)?)
             }
@@ -111,6 +126,11 @@ impl Protocol for MultiProtocol {
                 let (conn, tag) = request.request_id;
                 Request::new(request.data, (conn, u64::from(tag)), request.metadata)
             }
+            MultiProtocol::Http2(p) | MultiProtocol::Grpc(p) => {
+                let request = p.next_request(conn_id);
+                let (conn, stream) = request.request_id;
+                Request::new(request.data, (conn, u64::from(stream)), request.metadata)
+            }
         }
     }
 
@@ -134,6 +154,9 @@ impl Protocol for MultiProtocol {
             MultiProtocol::NvmeTcp(p) => {
                 Ok(p.parse_response(conn_id, data)?.map_id(|(conn, tag)| (conn, u64::from(tag))))
             }
+            MultiProtocol::Http2(p) | MultiProtocol::Grpc(p) => Ok(p
+                .parse_response(conn_id, data)?
+                .map_id(|(conn, stream)| (conn, u64::from(stream)))),
         }
     }
 
@@ -147,6 +170,7 @@ impl Protocol for MultiProtocol {
             MultiProtocol::Masstree(p) => p.name(),
             MultiProtocol::Dns(p) => p.name(),
             MultiProtocol::NvmeTcp(p) => p.name(),
+            MultiProtocol::Http2(p) | MultiProtocol::Grpc(p) => p.name(),
         }
     }
 
@@ -160,6 +184,7 @@ impl Protocol for MultiProtocol {
             MultiProtocol::Masstree(p) => p.reset(),
             MultiProtocol::Dns(p) => p.reset(),
             MultiProtocol::NvmeTcp(p) => p.reset(),
+            MultiProtocol::Http2(p) | MultiProtocol::Grpc(p) => p.reset(),
         }
     }
 
@@ -173,6 +198,7 @@ impl Protocol for MultiProtocol {
             MultiProtocol::Masstree(p) => p.can_send(conn_id),
             MultiProtocol::Dns(p) => p.can_send(conn_id),
             MultiProtocol::NvmeTcp(p) => p.can_send(conn_id),
+            MultiProtocol::Http2(p) | MultiProtocol::Grpc(p) => p.can_send(conn_id),
         }
     }
 
@@ -186,6 +212,7 @@ impl Protocol for MultiProtocol {
             MultiProtocol::Masstree(p) => p.setup_pending(conn_id),
             MultiProtocol::Dns(p) => p.setup_pending(conn_id),
             MultiProtocol::NvmeTcp(p) => p.setup_pending(conn_id),
+            MultiProtocol::Http2(p) | MultiProtocol::Grpc(p) => p.setup_pending(conn_id),
         }
     }
 
@@ -199,6 +226,7 @@ impl Protocol for MultiProtocol {
             MultiProtocol::Masstree(p) => p.connection_roles(load),
             MultiProtocol::Dns(p) => p.connection_roles(load),
             MultiProtocol::NvmeTcp(p) => p.connection_roles(load),
+            MultiProtocol::Http2(p) | MultiProtocol::Grpc(p) => p.connection_roles(load),
         }
     }
 
@@ -212,6 +240,7 @@ impl Protocol for MultiProtocol {
             MultiProtocol::Masstree(p) => p.bind_connections(conn_ids),
             MultiProtocol::Dns(p) => p.bind_connections(conn_ids),
             MultiProtocol::NvmeTcp(p) => p.bind_connections(conn_ids),
+            MultiProtocol::Http2(p) | MultiProtocol::Grpc(p) => p.bind_connections(conn_ids),
         }
     }
 
@@ -225,6 +254,7 @@ impl Protocol for MultiProtocol {
             MultiProtocol::Masstree(p) => p.drain_outbox(conn_id, outbox),
             MultiProtocol::Dns(p) => p.drain_outbox(conn_id, outbox),
             MultiProtocol::NvmeTcp(p) => p.drain_outbox(conn_id, outbox),
+            MultiProtocol::Http2(p) | MultiProtocol::Grpc(p) => p.drain_outbox(conn_id, outbox),
         }
     }
 }

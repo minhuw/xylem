@@ -16,6 +16,8 @@
 - [Protocols](./guide/protocols.md)
   - [Redis Protocol](./guide/protocols/redis.md)
   - [HTTP Protocol](./guide/protocols/http.md)
+  - [HTTP/2 Protocol](./guide/protocols/http2.md)
+  - [gRPC Protocol](./guide/protocols/grpc.md)
   - [Memcached Protocol](./guide/protocols/memcached.md)
   - [Masstree Protocol](./guide/protocols/masstree.md)
   - [DNS Protocol](./guide/protocols/dns.md)

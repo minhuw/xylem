@@ -203,6 +203,8 @@ enum ProtocolKind {
     MemcachedBinary,
     MemcachedAscii,
     Http,
+    Http2,
+    Grpc,
     Masstree,
     Dns,
     NvmeTcp,
@@ -211,11 +213,13 @@ enum ProtocolKind {
 
 /// Every accepted traffic group protocol name. The invalid-protocol error lists
 /// the names in this order.
-const PROTOCOLS: [(&str, ProtocolKind); 8] = [
+const PROTOCOLS: [(&str, ProtocolKind); 10] = [
     ("redis", ProtocolKind::Redis),
     ("memcached-binary", ProtocolKind::MemcachedBinary),
     ("memcached-ascii", ProtocolKind::MemcachedAscii),
     ("http", ProtocolKind::Http),
+    ("http2", ProtocolKind::Http2),
+    ("grpc", ProtocolKind::Grpc),
     ("masstree", ProtocolKind::Masstree),
     ("dns", ProtocolKind::Dns),
     ("nvme-tcp", ProtocolKind::NvmeTcp),
@@ -230,6 +234,8 @@ pub enum ProtocolConfig {
     MemcachedBinary(xylem_protocols::MemcachedConfig),
     MemcachedAscii(xylem_protocols::MemcachedConfig),
     Http(xylem_protocols::HttpConfig),
+    Http2(xylem_protocols::Http2Config),
+    Grpc(xylem_protocols::GrpcConfig),
     Masstree(xylem_protocols::MasstreeConfig),
     Dns(xylem_protocols::DnsConfig),
     NvmeTcp(xylem_protocols::NvmeTcpConfig),
@@ -854,6 +860,31 @@ fn parse_protocol_config(
         ProtocolKind::Http => {
             let config = parse_typed_config(pc, "HTTP", group_idx, group_name)?;
             Ok(ProtocolConfig::Http(config))
+        }
+        ProtocolKind::Http2 => {
+            let config: xylem_protocols::Http2Config =
+                parse_typed_config(pc, "HTTP/2", group_idx, group_name)?;
+            config.validate().with_context(|| {
+                format!(
+                    "Traffic group {} '{}' has invalid HTTP/2 protocol_config",
+                    group_idx, group_name
+                )
+            })?;
+            Ok(ProtocolConfig::Http2(config))
+        }
+        ProtocolKind::Grpc => {
+            // call has no default: an omitted protocol_config lacks it
+            let empty = serde_json::Value::Object(Default::default());
+            let config: xylem_protocols::GrpcConfig =
+                parse_config_value(pc.unwrap_or(&empty), "gRPC", group_idx, group_name)?;
+            // Reads the request messages, so a missing file fails here
+            config.validate().with_context(|| {
+                format!(
+                    "Traffic group {} '{}' has invalid gRPC protocol_config",
+                    group_idx, group_name
+                )
+            })?;
+            Ok(ProtocolConfig::Grpc(config))
         }
         ProtocolKind::Masstree => {
             let config = parse_typed_config(pc, "Masstree", group_idx, group_name)?;
@@ -1713,6 +1744,75 @@ protocol_config = { subnqn = "nqn.test", block_size = 65536, read_percent = 70 }
         ] {
             let error = profile(transport, extra).unwrap_err();
             assert!(error.contains(expected), "{extra}: {error}");
+        }
+    }
+
+    #[test]
+    fn http2_and_grpc_protocol_configs_are_checked() {
+        let profile = |protocol: &str, transport: &str, extra: &str| {
+            let profile = format!(
+                r#"
+[experiment]
+name = "h2"
+duration = "1s"
+
+[[traffic_groups]]
+name = "main"
+protocol = "{protocol}"
+target = "127.0.0.1:50051"
+transport = "{transport}"
+threads = [0]
+connections_per_thread = 2
+{extra}
+
+[traffic_groups.traffic_policy]
+type = "closed-loop"
+
+[output]
+format = "json"
+file = "results/test.json"
+"#
+            );
+            let mut config: ProfileConfig = toml::from_str(&profile).unwrap();
+            config.validate().map(|()| config).map_err(|error| format!("{error:#}"))
+        };
+        let config = profile("http2", "tcp", "").unwrap();
+        let [ProtocolConfig::Http2(http2)] = &config.protocol_configs[..] else {
+            panic!("{:?}", config.protocol_configs);
+        };
+        assert_eq!((http2.method.as_str(), http2.path.as_str()), ("GET", "/"));
+        let config = profile(
+            "grpc",
+            "tcp",
+            r#"protocol_config = { call = "a.B/C", request_hex = "0a00", metadata = { x-k = "v" } }"#,
+        )
+        .unwrap();
+        let [ProtocolConfig::Grpc(grpc)] = &config.protocol_configs[..] else {
+            panic!("{:?}", config.protocol_configs);
+        };
+        assert_eq!(grpc.messages().unwrap(), [vec![0, 0, 0, 0, 2, 0x0a, 0]]);
+
+        for (protocol, transport, extra, expected) in [
+            (
+                "http2",
+                "tcp",
+                r#"protocol_config = { method = "PATCH" }"#,
+                "Unknown HTTP/2 method",
+            ),
+            ("http2", "tcp", r#"protocol_config = { host = "x" }"#, "host"),
+            ("http2", "udp", "", "protocol 'http2' does not support transport 'udp'"),
+            ("grpc", "tcp", "", "missing field `call`"),
+            ("grpc", "tcp", r#"protocol_config = { call = "Say" }"#, "full method name"),
+            (
+                "grpc",
+                "tcp",
+                r#"protocol_config = { call = "a.B/C", request_file = "/nonexistent/x.bin" }"#,
+                "Cannot read gRPC request_file",
+            ),
+            ("grpc", "udp", r#"protocol_config = { call = "a.B/C" }"#, "does not support"),
+        ] {
+            let error = profile(protocol, transport, extra).unwrap_err();
+            assert!(error.contains(expected), "{protocol} {extra}: {error}");
         }
     }
 
@@ -3135,7 +3235,8 @@ protocol_config = {}
         assert!(
             format!("{err:#}").contains(
                 "Invalid protocol 'redis-cluster' for traffic group 0 'main'. Valid options: \
-                 redis, memcached-binary, memcached-ascii, http, masstree, dns, nvme-tcp, xylem-echo. \
+                 redis, memcached-binary, memcached-ascii, http, http2, grpc, masstree, dns, \
+                 nvme-tcp, xylem-echo. \
                  Redis Cluster support was removed"
             ),
             "{err:#}"

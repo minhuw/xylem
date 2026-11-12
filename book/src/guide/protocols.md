@@ -6,6 +6,8 @@ Xylem supports multiple application protocols for different types of RPC workloa
 
 - **[Redis](./protocols/redis.md)** - Redis protocol for key-value operations
 - **[HTTP](./protocols/http.md)** - HTTP/1.1 protocol for web services
+- **[HTTP/2](./protocols/http2.md)** - Cleartext HTTP/2 with prior knowledge (h2c)
+- **[gRPC](./protocols/grpc.md)** - gRPC unary calls with raw protobuf request messages
 - **[Memcached](./protocols/memcached.md)** - Memcached protocol for caching
 - **[DNS](./protocols/dns.md)** - DNS queries over TCP (RFC 7766 framing) or UDP
 - **[NVMe/TCP](./protocols/nvme-tcp.md)** - NVM reads and writes against an NVMe over Fabrics target

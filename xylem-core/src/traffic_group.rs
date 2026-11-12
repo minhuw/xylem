@@ -27,7 +27,7 @@ use std::time::Duration;
 pub struct TrafficGroupConfig {
     /// Group name for identification
     pub name: String,
-    /// Protocol for this group (redis, memcached-binary, memcached-ascii, http, masstree, dns, nvme-tcp, xylem-echo)
+    /// Protocol for this group (redis, memcached-binary, memcached-ascii, http, http2, grpc, masstree, dns, nvme-tcp, xylem-echo)
     pub protocol: String,
     /// Target address for this group (e.g., "127.0.0.1:6379" or "/var/run/redis.sock")
     pub target: String,

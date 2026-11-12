@@ -10,6 +10,7 @@ pub use xylem_common::{
 pub mod configs;
 pub mod dns;
 pub mod http;
+pub mod http2;
 pub mod masstree;
 pub mod memcached;
 pub mod nvme_tcp;
@@ -28,6 +29,7 @@ pub use configs::{
 pub use dns::{DnsConfig, DnsFraming, DnsProtocol};
 pub use http::HttpMethod;
 pub use http::HttpProtocol;
+pub use http2::{GrpcConfig, Http2Config, Http2Protocol};
 pub use masstree::{MasstreeOp, MasstreeProtocol, ResultCode};
 pub use memcached::{MemcachedAsciiProtocol, MemcachedBinaryProtocol};
 pub use nvme_tcp::{NvmeAccess, NvmeTcpConfig, NvmeTcpProtocol};
