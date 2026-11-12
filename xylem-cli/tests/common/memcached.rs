@@ -1,16 +1,15 @@
 //! Memcached test fixture
 //!
-//! Each guard starts its own compose project on host ports Docker picks and
-//! tears it down on drop.
+//! Each guard starts its own compose project and tears it down on drop; the
+//! server is reached at its container's address.
 
-use super::compose::{addr, answers, ComposeSpec, ComposeStack};
+use super::compose::{answers_at, ComposeSpec, ComposeStack};
 use std::net::SocketAddr;
 /// Guard for Memcached in a compose project of its own, torn down on drop
 pub struct MemcachedGuard {
     /// Held for its drop, which tears the project down
     _stack: ComposeStack,
-    port: u16,
-    udp_port: u16,
+    addr: SocketAddr,
 }
 
 impl MemcachedGuard {
@@ -22,33 +21,19 @@ impl MemcachedGuard {
             build_images: false,
             is_ready: |stack| {
                 stack
-                    .published_port("memcached", 11211, "tcp")
-                    .is_some_and(|port| answers(port, b"stats\r\n", b"STAT"))
-                    && stack.published_port("memcached", 11211, "udp").is_some()
+                    .container_addr("memcached", 11211)
+                    .is_some_and(|addr| answers_at(addr, b"stats\r\n", b"STAT"))
             },
         })?;
-        let port = stack
-            .published_port("memcached", 11211, "tcp")
-            .ok_or("Memcached TCP port not published")?;
-        let udp_port = stack
-            .published_port("memcached", 11211, "udp")
-            .ok_or("Memcached UDP port not published")?;
-        Ok(Self { _stack: stack, port, udp_port })
+        let addr = stack
+            .container_addr("memcached", 11211)
+            .ok_or("Memcached has no container address")?;
+        Ok(Self { _stack: stack, addr })
     }
 
-    /// Host port Docker published for the TCP service
-    pub fn get_port(&self) -> u16 {
-        self.port
-    }
-
-    /// Host port Docker published for the UDP service
-    pub fn get_udp_port(&self) -> u16 {
-        self.udp_port
-    }
-
-    /// `127.0.0.1:<get_port()>`
+    /// Address of the TCP service, and of the UDP service on the same port
     pub fn addr(&self) -> SocketAddr {
-        addr(self.port)
+        self.addr
     }
 
     /// The server's `stats` counters by name

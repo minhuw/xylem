@@ -1,9 +1,9 @@
 //! Masstree test fixture
 //!
-//! Each guard starts its own compose project on host ports Docker picks and
-//! tears it down on drop.
+//! Each guard starts its own compose project and tears it down on drop; the
+//! server is reached at its container's address.
 
-use super::compose::{addr, ComposeSpec, ComposeStack};
+use super::compose::{ComposeSpec, ComposeStack};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
@@ -11,7 +11,7 @@ use std::time::Duration;
 pub struct MasstreeGuard {
     /// Held for its drop, which tears the project down
     _stack: ComposeStack,
-    port: u16,
+    addr: SocketAddr,
     address: String,
 }
 
@@ -23,29 +23,24 @@ impl MasstreeGuard {
             compose_file: "tests/masstree/docker-compose.test.yml",
             build_images: true,
             is_ready: |stack| {
-                stack.published_port("masstree", 2117, "tcp").is_some_and(|port| {
-                    TcpStream::connect_timeout(&addr(port), Duration::from_millis(500)).is_ok()
+                stack.container_addr("masstree", 2117).is_some_and(|addr| {
+                    TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok()
                 })
             },
         })?;
-        let port = stack
-            .published_port("masstree", 2117, "tcp")
-            .ok_or("Masstree port not published")?;
+        let addr = stack
+            .container_addr("masstree", 2117)
+            .ok_or("Masstree has no container address")?;
         Ok(Self {
             _stack: stack,
-            port,
-            address: addr(port).to_string(),
+            addr,
+            address: addr.to_string(),
         })
     }
 
-    /// Host port Docker published for the TCP service
-    pub fn get_port(&self) -> u16 {
-        self.port
-    }
-
-    /// `127.0.0.1:<get_port()>`
+    /// Address of the TCP service
     pub fn addr(&self) -> SocketAddr {
-        addr(self.port)
+        self.addr
     }
 
     /// [`Self::addr`] as a string

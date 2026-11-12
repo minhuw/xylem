@@ -9,8 +9,15 @@ use std::process::Command;
 
 mod common;
 
+use std::net::SocketAddr;
+
 /// Run a one-second memcached profile over UDP and return its JSON results
-fn run_udp(port: u16, protocol: &str, value_size: usize, prefix: &str) -> serde_json::Value {
+fn run_udp(
+    target: SocketAddr,
+    protocol: &str,
+    value_size: usize,
+    prefix: &str,
+) -> serde_json::Value {
     let dir = tempfile::tempdir().unwrap();
     let profile = dir.path().join("profile.toml");
     let results = dir.path().join("results.json");
@@ -18,7 +25,7 @@ fn run_udp(port: u16, protocol: &str, value_size: usize, prefix: &str) -> serde_
         "experiment": { "name": "memcached-udp", "duration": "1s", "seed": 1 },
         "traffic_groups": [{
             "name": "udp", "threads": [0], "connections_per_thread": 2,
-            "max_pending_per_connection": 4, "target": format!("127.0.0.1:{port}"),
+            "max_pending_per_connection": 4, "target": target.to_string(),
             "transport": "udp", "protocol": protocol,
             "traffic_policy": { "type": "closed-loop" },
             "protocol_config": {
@@ -69,25 +76,13 @@ fn assert_udp_run(json: &serde_json::Value, min_bytes_per_response: f64) {
 #[test]
 fn memcached_ascii_udp_reassembles_multi_datagram_values() {
     let memcached = common::memcached::MemcachedGuard::new().expect("Failed to start Memcached");
-    assert_udp_run(
-        &run_udp(memcached.get_udp_port(), "memcached-ascii", 4096, "udp-ascii-4k:"),
-        4096.0,
-    );
-    assert_udp_run(
-        &run_udp(memcached.get_udp_port(), "memcached-ascii", 32768, "udp-ascii-32k:"),
-        32768.0,
-    );
+    assert_udp_run(&run_udp(memcached.addr(), "memcached-ascii", 4096, "udp-ascii-4k:"), 4096.0);
+    assert_udp_run(&run_udp(memcached.addr(), "memcached-ascii", 32768, "udp-ascii-32k:"), 32768.0);
 }
 
 #[test]
 fn memcached_binary_udp_reassembles_multi_datagram_values() {
     let memcached = common::memcached::MemcachedGuard::new().expect("Failed to start Memcached");
-    assert_udp_run(
-        &run_udp(memcached.get_udp_port(), "memcached-binary", 4096, "udp-bin-4k:"),
-        4096.0,
-    );
-    assert_udp_run(
-        &run_udp(memcached.get_udp_port(), "memcached-binary", 32768, "udp-bin-32k:"),
-        32768.0,
-    );
+    assert_udp_run(&run_udp(memcached.addr(), "memcached-binary", 4096, "udp-bin-4k:"), 4096.0);
+    assert_udp_run(&run_udp(memcached.addr(), "memcached-binary", 32768, "udp-bin-32k:"), 32768.0);
 }

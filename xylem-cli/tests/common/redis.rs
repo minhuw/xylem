@@ -1,16 +1,16 @@
 //! Redis test fixture
 //!
-//! Each guard starts its own compose project on host ports Docker picks and
-//! tears it down on drop.
+//! Each guard starts its own compose project and tears it down on drop; the
+//! server is reached at its container's address.
 
-use super::compose::{addr, answers, ComposeSpec, ComposeStack};
+use super::compose::{answers_at, ComposeSpec, ComposeStack};
 use std::net::SocketAddr;
 
 /// Guard for Redis in a compose project of its own, torn down on drop
 pub struct RedisGuard {
     /// Held for its drop, which tears the project down
     _stack: ComposeStack,
-    port: u16,
+    addr: SocketAddr,
 }
 
 impl RedisGuard {
@@ -22,23 +22,16 @@ impl RedisGuard {
             build_images: false,
             is_ready: |stack| {
                 stack
-                    .published_port("redis", 6379, "tcp")
-                    .is_some_and(|port| answers(port, b"PING\r\n", b"+PONG"))
+                    .container_addr("redis", 6379)
+                    .is_some_and(|addr| answers_at(addr, b"PING\r\n", b"+PONG"))
             },
         })?;
-        let port = stack
-            .published_port("redis", 6379, "tcp")
-            .ok_or("Redis host port not published")?;
-        Ok(Self { _stack: stack, port })
+        let addr = stack.container_addr("redis", 6379).ok_or("Redis has no container address")?;
+        Ok(Self { _stack: stack, addr })
     }
 
-    /// Host port Docker published for the TCP service
-    pub fn get_port(&self) -> u16 {
-        self.port
-    }
-
-    /// `127.0.0.1:<get_port()>`
+    /// Address of the TCP service
     pub fn addr(&self) -> SocketAddr {
-        addr(self.port)
+        self.addr
     }
 }

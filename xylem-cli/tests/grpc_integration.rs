@@ -27,7 +27,7 @@ fn run(target: &str, transport: &str, protocol_config: serde_json::Value) -> ser
 
 fn targets(guard: &H2cGuard) -> [(String, &'static str); 2] {
     [
-        (format!("127.0.0.1:{}", guard.port()), "tcp"),
+        (guard.addr().to_string(), "tcp"),
         (guard.socket().display().to_string(), "unix"),
     ]
 }
@@ -64,11 +64,7 @@ fn grpc_unary_calls_over_tcp_and_unix() {
 fn grpc_statuses_are_error_replies() {
     let server = H2cGuard::grpc().expect("Failed to start the gRPC server");
     for (call, kind) in [("xylem.Test/Fail", "14"), ("xylem.Test/Absent", "12")] {
-        let json = run(
-            &format!("127.0.0.1:{}", server.port()),
-            "tcp",
-            serde_json::json!({ "call": call }),
-        );
+        let json = run(&server.addr().to_string(), "tcp", serde_json::json!({ "call": call }));
         let requests = &json["global"]["requests"];
         assert!(count(&json, "completed") > 100, "{requests}");
         assert_eq!(count(&json, "errors"), count(&json, "completed"), "{requests}");
@@ -108,7 +104,7 @@ fn grpc_tensorflow_serving_predict() {
     assert!(status.success(), "tfs-predict-request.py failed");
     let server = common::tfs::TfsGuard::new(&model).expect("Failed to start TF Serving");
     let json = run(
-        &format!("127.0.0.1:{}", server.port()),
+        &server.addr().to_string(),
         "tcp",
         serde_json::json!({
             "call": "tensorflow.serving.PredictionService/Predict",

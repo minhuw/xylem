@@ -1,11 +1,15 @@
 //! Docker compose fixture shared by the service guards
 //!
 //! Every Docker-based test stack is started, awaited, and torn down here. Each
-//! stack runs as its own compose project under a fresh random name and
-//! publishes its ports on host ports Docker picks, so concurrent tests never
-//! share a server or clash on a port. A guard names its compose file and a
-//! readiness probe; this module runs `up -d`, polls the probe, and runs
-//! `down -v` on drop for the project it created.
+//! stack runs as its own compose project under a fresh random name, so
+//! concurrent tests never share a server. No stack publishes a host port:
+//! tests reach each service at its container's address on the project
+//! network, so no `docker-proxy` relays their traffic. An override file pins
+//! every container to the CPUs the test process may run on, so a test run
+//! under `taskset` keeps its servers on the same CPUs. A guard names its
+//! compose file and a readiness probe; this module runs `up -d`, looks up the
+//! container addresses, polls the probe, and runs `down -v` on drop for the
+//! project it created.
 
 use std::io::Read;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
@@ -40,32 +44,44 @@ trait FixtureRuntime: Send + Sync {
     fn preflight(&self) -> Result<(), Box<dyn std::error::Error>>;
     /// Whether `project` already owns resources of `kind` (container, network, volume)
     fn occupied(&self, kind: &str, project: &str) -> Result<bool, String>;
+    /// Names of the services the compose files define
+    fn services(
+        &self,
+        files: &[PathBuf],
+        project: &str,
+        env: &[(String, String)],
+    ) -> Result<Vec<String>, String>;
     fn compose(
         &self,
-        file: &Path,
+        files: &[PathBuf],
         project: &str,
         env: &[(String, String)],
         args: &[&str],
     ) -> std::io::Result<bool>;
-    fn port(
+    /// IPv4 address of `service`'s container on the network `network`
+    fn ip(
         &self,
-        file: &Path,
+        files: &[PathBuf],
         project: &str,
         env: &[(String, String)],
         service: &str,
-        port: u16,
-        protocol: &str,
-    ) -> Option<u16>;
+        network: &str,
+    ) -> Result<Ipv4Addr, String>;
     fn report(&self, message: &str);
 }
 
 /// A ready Docker compose project, torn down on drop
 pub struct ComposeStack {
-    compose_file: PathBuf,
+    /// The fixture's compose file, then the override that pins its containers
+    files: Vec<PathBuf>,
     project: String,
     /// Variables the compose file interpolates
     env: Vec<(String, String)>,
+    /// Container address of each service on the project network
+    ips: Vec<(String, Ipv4Addr)>,
     runtime: Box<dyn FixtureRuntime>,
+    /// Holds the override file, removed after `down`
+    _override_dir: tempfile::TempDir,
     /// Set once `up` may have created resources that `down` must remove
     cleanup_armed: bool,
 }
@@ -77,8 +93,9 @@ impl ComposeStack {
     ///
     /// Returns error if the compose file does not exist, Docker or docker
     /// compose is not available, the fresh project name is already in use,
-    /// the images fail to build, the stack fails to start, or it does not
-    /// become ready within 30 seconds.
+    /// the images fail to build, the stack fails to start, a container has
+    /// no address on the project network, or the stack does not become
+    /// ready within 30 seconds.
     pub fn start(spec: &ComposeSpec) -> Result<Self, Box<dyn std::error::Error>> {
         Self::start_with_env(spec, Vec::new())
     }
@@ -99,6 +116,7 @@ impl ComposeStack {
             compose_file,
             new_project()?,
             env,
+            &allowed_cpus()?,
             Box::new(DockerRuntime),
             PROBE_ATTEMPTS,
             PROBE_INTERVAL,
@@ -106,24 +124,32 @@ impl ComposeStack {
     }
 
     // The same lifecycle runs against Docker and against the offline fake.
+    #[allow(clippy::too_many_arguments)]
     fn start_with(
         spec: &ComposeSpec,
         compose_file: PathBuf,
         project: String,
         env: Vec<(String, String)>,
+        cpus: &str,
         runtime: Box<dyn FixtureRuntime>,
         attempts: u32,
         interval: Duration,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         runtime.preflight()?;
+        ensure_vacant(&*runtime, &project)?;
+        let services = runtime.services(std::slice::from_ref(&compose_file), &project, &env)?;
+        let override_dir = tempfile::tempdir()?;
+        let override_file = override_dir.path().join("cpuset.yml");
+        std::fs::write(&override_file, cpuset_override(&services, cpus))?;
         let mut stack = Self {
-            compose_file,
+            files: vec![compose_file, override_file],
             project,
             env,
+            ips: Vec::new(),
             runtime,
+            _override_dir: override_dir,
             cleanup_armed: false,
         };
-        ensure_vacant(&*stack.runtime, &stack.project)?;
         if spec.build_images && !stack.run(&["build"])? {
             return Err(format!("Failed to build {} Docker image", spec.name).into());
         }
@@ -131,6 +157,15 @@ impl ComposeStack {
         stack.cleanup_armed = true;
         if !stack.run(&["up", "-d"])? {
             return Err(format!("Failed to start {} with docker compose", spec.name).into());
+        }
+        // Compose names the network it creates for the project `<project>_default`
+        let network = format!("{}_default", stack.project);
+        for service in services {
+            let ip = stack
+                .runtime
+                .ip(&stack.files, &stack.project, &stack.env, &service, &network)
+                .map_err(|e| format!("{}: {e}", spec.name))?;
+            stack.ips.push((service, ip));
         }
         for _ in 0..attempts {
             if (spec.is_ready)(&stack) {
@@ -142,7 +177,7 @@ impl ComposeStack {
     }
 
     fn run(&self, args: &[&str]) -> std::io::Result<bool> {
-        self.runtime.compose(&self.compose_file, &self.project, &self.env, args)
+        self.runtime.compose(&self.files, &self.project, &self.env, args)
     }
 
     /// The value of the compose file variable `name`, if the stack sets it
@@ -150,13 +185,14 @@ impl ComposeStack {
         self.env.iter().find(|(key, _)| key == name).map(|(_, value)| value.as_str())
     }
 
-    /// Host port Docker published on 127.0.0.1 for `service`'s container `port`
+    /// `service`'s container `port` at the container's own address on the
+    /// project network, which the host reaches without Docker's port
+    /// forwarding
     ///
-    /// Returns `None` if the service is not running or is not published on
-    /// exactly one loopback address.
-    pub fn published_port(&self, service: &str, port: u16, protocol: &str) -> Option<u16> {
-        self.runtime
-            .port(&self.compose_file, &self.project, &self.env, service, port, protocol)
+    /// Returns `None` if the compose file defines no service `service`.
+    pub fn container_addr(&self, service: &str, port: u16) -> Option<SocketAddr> {
+        let (_, ip) = self.ips.iter().find(|(name, _)| name == service)?;
+        Some(SocketAddrV4::new(*ip, port).into())
     }
 }
 
@@ -192,6 +228,28 @@ fn ensure_vacant(runtime: &dyn FixtureRuntime, project: &str) -> Result<(), Stri
         }
     }
     Ok(())
+}
+
+/// Compose override that gives every service in `services` the cpuset `cpus`
+fn cpuset_override(services: &[String], cpus: &str) -> String {
+    let mut yaml = String::from("services:\n");
+    for service in services {
+        yaml += &format!("  \"{service}\":\n    cpuset: \"{cpus}\"\n");
+    }
+    yaml
+}
+
+/// The CPUs this process may run on, as Linux lists them (`1,3,5` or `0-63`)
+fn allowed_cpus() -> Result<String, String> {
+    let status = std::fs::read_to_string("/proc/self/status")
+        .map_err(|e| format!("could not read the allowed CPUs: {e}"))?;
+    parse_allowed_cpus(&status).ok_or_else(|| "no Cpus_allowed_list in /proc/self/status".into())
+}
+
+fn parse_allowed_cpus(status: &str) -> Option<String> {
+    let list = status.lines().find_map(|line| line.strip_prefix("Cpus_allowed_list:"))?.trim();
+    (!list.is_empty() && list.bytes().all(|c| c.is_ascii_digit() || c == b',' || c == b'-'))
+        .then(|| list.to_string())
 }
 
 /// The local Docker daemon, reached through the user's own Docker configuration
@@ -237,14 +295,38 @@ impl FixtureRuntime for DockerRuntime {
         Ok(!output.stdout.is_empty())
     }
 
+    fn services(
+        &self,
+        files: &[PathBuf],
+        project: &str,
+        env: &[(String, String)],
+    ) -> Result<Vec<String>, String> {
+        let output = compose_command(COMPOSE, files, project, &["config", "--services"])
+            .envs(env.iter().map(|(name, value)| (name, value)))
+            .output()
+            .map_err(|e| format!("could not list the compose services: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "could not list the compose services: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        let services: Vec<String> =
+            String::from_utf8_lossy(&output.stdout).lines().map(str::to_string).collect();
+        if services.is_empty() {
+            return Err("the compose file defines no services".into());
+        }
+        Ok(services)
+    }
+
     fn compose(
         &self,
-        file: &Path,
+        files: &[PathBuf],
         project: &str,
         env: &[(String, String)],
         args: &[&str],
     ) -> std::io::Result<bool> {
-        compose_command(COMPOSE, file, project, args)
+        compose_command(COMPOSE, files, project, args)
             .envs(env.iter().map(|(name, value)| (name, value)))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -252,30 +334,38 @@ impl FixtureRuntime for DockerRuntime {
             .map(|s| s.success())
     }
 
-    fn port(
+    fn ip(
         &self,
-        file: &Path,
+        files: &[PathBuf],
         project: &str,
         env: &[(String, String)],
         service: &str,
-        port: u16,
-        protocol: &str,
-    ) -> Option<u16> {
-        let target = port.to_string();
-        let output = compose_command(
-            COMPOSE,
-            file,
-            project,
-            &["port", "--protocol", protocol, service, &target],
-        )
-        .envs(env.iter().map(|(name, value)| (name, value)))
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+        network: &str,
+    ) -> Result<Ipv4Addr, String> {
+        let output = compose_command(COMPOSE, files, project, &["ps", "--quiet", service])
+            .envs(env.iter().map(|(name, value)| (name, value)))
+            .stderr(Stdio::null())
+            .output()
+            .map_err(|e| format!("could not find the {service} container: {e}"))?;
+        let containers = String::from_utf8_lossy(&output.stdout);
+        let [container] = containers.split_whitespace().collect::<Vec<_>>()[..] else {
+            return Err(format!("{service} does not run in exactly one container: {containers:?}"));
+        };
+        let output = Command::new("docker")
+            .args([
+                "inspect",
+                "--format",
+                "{{range $name, $net := .NetworkSettings.Networks}}{{println $name $net.IPAddress}}{{end}}",
+                container,
+            ])
+            .stderr(Stdio::null())
+            .output()
+            .map_err(|e| format!("could not inspect the {service} container: {e}"))?;
         if !output.status.success() {
-            return None;
+            return Err(format!("could not inspect the {service} container"));
         }
-        parse_published_port(std::str::from_utf8(&output.stdout).ok()?)
+        parse_network_ip(&String::from_utf8_lossy(&output.stdout), network)
+            .ok_or_else(|| format!("{service} has no IPv4 address on network {network}"))
     }
 
     fn report(&self, message: &str) {
@@ -291,34 +381,34 @@ fn new_project() -> std::io::Result<String> {
     Ok(format!("xylemtest{suffix}"))
 }
 
-/// `<cmd> -p <project> -f <file> <args>`
-fn compose_command(cmd: &[&str], file: &Path, project: &str, args: &[&str]) -> Command {
+/// `<cmd> -p <project> -f <file>... <args>`
+fn compose_command(cmd: &[&str], files: &[PathBuf], project: &str, args: &[&str]) -> Command {
     let mut command = Command::new(cmd[0]);
-    command.args(&cmd[1..]).arg("-p").arg(project).arg("-f").arg(file).args(args);
+    command.args(&cmd[1..]).arg("-p").arg(project);
+    for file in files {
+        command.arg("-f").arg(file);
+    }
+    command.args(args);
     command
 }
 
-fn parse_published_port(output: &str) -> Option<u16> {
-    // Reject non-loopback, multiple bindings and malformed output rather than guessing.
-    let address: SocketAddr = output.trim().parse().ok()?;
-    match address {
-        SocketAddr::V4(addr) if *addr.ip() == Ipv4Addr::LOCALHOST && addr.port() != 0 => {
-            Some(addr.port())
-        }
-        _ => None,
-    }
+/// The IPv4 address on `network` from `<network> <address>` lines, one per
+/// network of the container
+fn parse_network_ip(output: &str, network: &str) -> Option<Ipv4Addr> {
+    // Reject a missing, empty or malformed address rather than guessing.
+    let mut addresses = output.lines().filter_map(|line| {
+        let (name, address) = line.trim().split_once(' ')?;
+        (name == network).then_some(address)
+    });
+    let address = addresses.next()?.parse().ok()?;
+    addresses.next().is_none().then_some(address)
 }
 
-/// `127.0.0.1:<port>`
-pub fn addr(port: u16) -> SocketAddr {
-    SocketAddrV4::new(Ipv4Addr::LOCALHOST, port).into()
-}
-
-/// Whether the server on `127.0.0.1:<port>` answers `request` with a reply
+/// Whether the server at `address` answers `request` with a reply
 /// containing `expected` within its first 1024 bytes
-pub fn answers(port: u16, request: &[u8], expected: &[u8]) -> bool {
+pub fn answers_at(address: SocketAddr, request: &[u8], expected: &[u8]) -> bool {
     use std::io::Write;
-    let Ok(mut stream) = TcpStream::connect_timeout(&addr(port), Duration::from_secs(1)) else {
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_secs(1)) else {
         return false;
     };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
@@ -346,36 +436,57 @@ pub fn answers(port: u16, request: &[u8], expected: &[u8]) -> bool {
 mod tests {
     use super::*;
     #[test]
-    fn parses_only_one_loopback_binding() {
-        assert_eq!(parse_published_port("127.0.0.1:32768\n"), Some(32768));
+    fn parses_only_one_address_on_the_project_network() {
+        let output = "bridge 172.17.0.5\nxylemtest1_default 172.18.0.2\n";
+        assert_eq!(
+            parse_network_ip(output, "xylemtest1_default"),
+            Some(Ipv4Addr::new(172, 18, 0, 2))
+        );
         for invalid in [
-            "0.0.0.0:1234",
-            "127.0.0.1:0",
-            "127.0.0.1:12\n127.0.0.1:13",
-            "[::1]:1234",
-            "garbage",
+            "xylemtest1_default \n",
+            "xylemtest1_default\n",
+            "xylemtest1_default garbage\n",
+            "xylemtest1_default fe80::1\n",
+            "xylemtest1_default 172.18.0.2\nxylemtest1_default 172.18.0.3\n",
+            "xylemtest10_default 172.18.0.2\n",
+            "",
         ] {
-            assert_eq!(parse_published_port(invalid), None);
+            assert_eq!(parse_network_ip(invalid, "xylemtest1_default"), None, "{invalid:?}");
         }
     }
     #[test]
+    fn parses_the_allowed_cpu_list() {
+        let status = "Name:\txylem\nCpus_allowed:\taaaa\nCpus_allowed_list:\t1,3,5,7-9\n";
+        assert_eq!(parse_allowed_cpus(status).as_deref(), Some("1,3,5,7-9"));
+        assert_eq!(parse_allowed_cpus("Cpus_allowed_list:\t\n"), None);
+        assert_eq!(parse_allowed_cpus("Name:\txylem\n"), None);
+        assert!(allowed_cpus().is_ok());
+    }
+    #[test]
+    fn override_pins_every_service() {
+        assert_eq!(
+            cpuset_override(&["redis".into(), "redis-acl".into()], "1,3"),
+            "services:\n  \"redis\":\n    cpuset: \"1,3\"\n  \"redis-acl\":\n    cpuset: \"1,3\"\n"
+        );
+    }
+    #[test]
     fn every_operation_has_own_project() {
+        let files = [PathBuf::from("fixture.yml"), PathBuf::from("cpuset.yml")];
         for args in [
-            &["build"][..],
+            &["config", "--services"][..],
+            &["build"],
             &["up", "-d"],
-            &["port", "--protocol", "tcp", "redis", "6379"],
+            &["ps", "--quiet", "redis"],
             &["down", "-v"],
         ] {
-            let command = compose_command(
-                &["docker", "compose"],
-                Path::new("fixture.yml"),
-                "xylemtest123",
-                args,
-            );
+            let command = compose_command(&["docker", "compose"], &files, "xylemtest123", args);
             let actual: Vec<_> =
                 command.get_args().map(|s| s.to_string_lossy().into_owned()).collect();
-            assert_eq!(&actual[..5], ["compose", "-p", "xylemtest123", "-f", "fixture.yml"]);
-            assert_eq!(&actual[5..], args);
+            assert_eq!(
+                &actual[..7],
+                ["compose", "-p", "xylemtest123", "-f", "fixture.yml", "-f", "cpuset.yml"]
+            );
+            assert_eq!(&actual[7..], args);
         }
     }
     #[test]
@@ -397,8 +508,11 @@ mod tests {
         collision_at: Option<usize>,
         failure_at: Option<usize>,
         up_fails: bool,
+        ip_fails: bool,
         down_fails: bool,
         down_unexecuted: bool,
+        /// The override file as `up` saw it
+        override_yaml: Option<String>,
     }
     struct FakeRuntime(Arc<Mutex<FakeState>>);
     impl FixtureRuntime for FakeRuntime {
@@ -419,33 +533,52 @@ mod tests {
             }
             Ok(false)
         }
+        fn services(
+            &self,
+            files: &[PathBuf],
+            project: &str,
+            _: &[(String, String)],
+        ) -> Result<Vec<String>, String> {
+            assert_eq!(files, [PathBuf::from("fixture.yml")]);
+            self.0.lock().unwrap().events.push(format!("services {project}"));
+            Ok(vec!["redis".into(), "nginx".into()])
+        }
         fn compose(
             &self,
-            _: &Path,
+            files: &[PathBuf],
             project: &str,
             _: &[(String, String)],
             args: &[&str],
         ) -> std::io::Result<bool> {
             let mut s = self.0.lock().unwrap();
+            assert_eq!(files.len(), 2);
+            assert_eq!(files[0], PathBuf::from("fixture.yml"));
             s.events.push(format!("compose {project} {}", args.join(" ")));
             match args[0] {
                 "build" => Ok(true),
-                "up" => Ok(!s.up_fails),
+                "up" => {
+                    s.override_yaml = Some(std::fs::read_to_string(&files[1]).unwrap());
+                    Ok(!s.up_fails)
+                }
                 "down" if s.down_unexecuted => Err(std::io::Error::other("fake execution failure")),
                 "down" => Ok(!s.down_fails),
                 _ => panic!("unexpected command"),
             }
         }
-        fn port(
+        fn ip(
             &self,
-            _: &Path,
-            _: &str,
+            _: &[PathBuf],
+            project: &str,
             _: &[(String, String)],
-            _: &str,
-            _: u16,
-            _: &str,
-        ) -> Option<u16> {
-            panic!("unexpected port lookup")
+            service: &str,
+            network: &str,
+        ) -> Result<Ipv4Addr, String> {
+            let mut s = self.0.lock().unwrap();
+            s.events.push(format!("ip {project} {service} {network}"));
+            if s.ip_fails {
+                return Err("no address".into());
+            }
+            Ok(Ipv4Addr::new(10, 0, 0, if service == "redis" { 2 } else { 3 }))
         }
         fn report(&self, message: &str) {
             self.0.lock().unwrap().events.push(format!("report {message}"));
@@ -467,6 +600,7 @@ mod tests {
             PathBuf::from("fixture.yml"),
             "xylemtestfresh".into(),
             Vec::new(),
+            "1,3",
             Box::new(FakeRuntime(state)),
             2,
             Duration::ZERO,
@@ -486,6 +620,39 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_ready_stack_pins_and_addresses_every_service() {
+        let state = Arc::new(Mutex::new(FakeState::default()));
+        let stack = test_start(state.clone(), true, |stack| {
+            stack.container_addr("redis", 6379) == Some("10.0.0.2:6379".parse().unwrap())
+                && stack.container_addr("nginx", 80) == Some("10.0.0.3:80".parse().unwrap())
+                && stack.container_addr("memcached", 11211).is_none()
+        })
+        .unwrap();
+        drop(stack);
+        let state = state.lock().unwrap();
+        assert_eq!(
+            state.override_yaml.as_deref(),
+            Some(cpuset_override(&["redis".into(), "nginx".into()], "1,3").as_str())
+        );
+        let steps: Vec<_> = state
+            .events
+            .iter()
+            .filter(|e| !e.starts_with("lookup ") && *e != "preflight")
+            .cloned()
+            .collect();
+        assert_eq!(
+            steps,
+            [
+                "services xylemtestfresh",
+                "compose xylemtestfresh build",
+                "compose xylemtestfresh up -d",
+                "ip xylemtestfresh redis xylemtestfresh_default",
+                "ip xylemtestfresh nginx xylemtestfresh_default",
+                "compose xylemtestfresh down -v",
+            ]
+        );
+    }
+    #[test]
     fn lifecycle_collision_or_lookup_failure_never_starts_or_cleans() {
         for n in 1..=3 {
             for fail in [false, true] {
@@ -501,9 +668,10 @@ mod tests {
         }
     }
     #[test]
-    fn lifecycle_failed_up_and_readiness_cleanup_only_owned_project() {
-        for up_fails in [false, true] {
-            let state = Arc::new(Mutex::new(FakeState { up_fails, ..Default::default() }));
+    fn lifecycle_failed_up_address_and_readiness_cleanup_only_owned_project() {
+        for (up_fails, ip_fails) in [(false, false), (true, false), (false, true)] {
+            let state =
+                Arc::new(Mutex::new(FakeState { up_fails, ip_fails, ..Default::default() }));
             assert!(test_start(state.clone(), false, not_ready).is_err());
             assert_eq!(
                 commands(&state.lock().unwrap()),

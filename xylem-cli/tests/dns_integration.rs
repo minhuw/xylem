@@ -9,8 +9,14 @@ use std::process::Command;
 
 mod common;
 
+use std::net::SocketAddr;
+
 /// Run a one-second DNS profile and return its JSON results
-fn run_dns(port: u16, transport: &str, protocol_config: serde_json::Value) -> serde_json::Value {
+fn run_dns(
+    target: SocketAddr,
+    transport: &str,
+    protocol_config: serde_json::Value,
+) -> serde_json::Value {
     let dir = tempfile::tempdir().unwrap();
     let profile = dir.path().join("profile.toml");
     let results = dir.path().join("results.json");
@@ -18,7 +24,7 @@ fn run_dns(port: u16, transport: &str, protocol_config: serde_json::Value) -> se
         "experiment": { "name": "dns", "duration": "1s", "seed": 1 },
         "traffic_groups": [{
             "name": "knot", "threads": [0], "connections_per_thread": 2,
-            "max_pending_per_connection": 16, "target": format!("127.0.0.1:{port}"),
+            "max_pending_per_connection": 16, "target": target.to_string(),
             "transport": transport, "protocol": "dns",
             "traffic_policy": { "type": "closed-loop" },
             "protocol_config": protocol_config
@@ -54,7 +60,7 @@ fn dns_tcp_pipelined_query_mix_completes() {
     // The names and types knot_client.py checks, NXDOMAIN included, and the
     // 3.4 KB TXT RRset, which arrives over several reads
     let json = run_dns(
-        knot.get_port(),
+        knot.addr(),
         "tcp",
         serde_json::json!({
             "names": [
@@ -88,7 +94,7 @@ fn dns_rcodes_are_error_replies_by_name() {
     let knot = common::knot::KnotGuard::new().expect("Failed to start Knot");
     // Knot answers NXDOMAIN in its zones and REFUSED outside them
     let json = run_dns(
-        knot.get_port(),
+        knot.addr(),
         "tcp",
         serde_json::json!({
             "names": [{ "name": "absent.example.test." }, { "name": "www.example.org." }],
@@ -110,7 +116,7 @@ fn dns_udp_counts_truncated_responses() {
     // Without EDNS a UDP response holds 512 bytes: bulk.example.test's TXT
     // RRset comes back truncated, text.example.test's does not
     let json = run_dns(
-        knot.get_udp_port(),
+        knot.addr(),
         "udp",
         serde_json::json!({
             "names": [{ "name": "text.example.test." }, { "name": "bulk.example.test." }],

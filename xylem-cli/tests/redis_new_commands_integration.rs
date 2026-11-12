@@ -9,7 +9,7 @@
 //! - ACL-enabled Redis
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::process::Command;
 use xylem_protocols::redis::{RedisOp, RedisProtocol};
 use xylem_protocols::{CommandTemplate, FixedCommandSelector};
@@ -56,12 +56,17 @@ impl CliRun {
 /// Run the xylem CLI for one second against `port` with a GET/SET mix on
 /// two threads of two pipelined connections each. `protocol_config` is
 /// TOML for `[traffic_groups.protocol_config]`; `envs` are set for the run.
-fn run_xylem(port: u16, protocol_config: &str, envs: &[(&str, &str)]) -> CliRun {
-    run_xylem_group(port, "", protocol_config, envs)
+fn run_xylem(target: SocketAddr, protocol_config: &str, envs: &[(&str, &str)]) -> CliRun {
+    run_xylem_group(target, "", protocol_config, envs)
 }
 
 /// [`run_xylem`] with `group`, TOML keys of the traffic group itself
-fn run_xylem_group(port: u16, group: &str, protocol_config: &str, envs: &[(&str, &str)]) -> CliRun {
+fn run_xylem_group(
+    target: SocketAddr,
+    group: &str,
+    protocol_config: &str,
+    envs: &[(&str, &str)],
+) -> CliRun {
     let dir = tempfile::tempdir().unwrap();
     let results_path = dir.path().join("results.json");
     let profile = format!(
@@ -74,7 +79,7 @@ seed = 1
 [[traffic_groups]]
 name = "setup"
 protocol = "redis"
-target = "127.0.0.1:{port}"
+target = "{target}"
 threads = [0, 1]
 connections_per_thread = 2
 max_pending_per_connection = 4
@@ -145,7 +150,7 @@ fn test_auth_simple_password() {
     // Without auth, every request gets a NOAUTH error reply: by default the
     // run counts them, none in the latency, and with on_error = "abort" the
     // first one fails the run
-    let run = run_xylem(redis.get_port(), &keys, &[]);
+    let run = run_xylem(redis.addr(), &keys, &[]);
     assert!(run.success, "{}", run.output);
     let global = &run.results.as_ref().unwrap()["global"];
     let requests = &global["requests"];
@@ -154,13 +159,13 @@ fn test_auth_simple_password() {
     assert_eq!(requests["errors_by_kind"]["NOAUTH"], requests["errors"], "{requests}");
     assert_eq!(global["latency"]["sample_count"], 0);
     assert!(run.output.contains("NOAUTH"), "{}", run.output);
-    let run = run_xylem_group(redis.get_port(), r#"on_error = "abort""#, &keys, &[]);
+    let run = run_xylem_group(redis.addr(), r#"on_error = "abort""#, &keys, &[]);
     assert!(!run.success, "{}", run.output);
     assert!(run.output.contains("NOAUTH"), "{}", run.output);
 
     // A wrong password fails setup, naming the step but not the password
     let config = format!("auth = {{ password = \"wrong-{password}-x\" }}\n{keys}");
-    let run = run_xylem(redis.get_port(), &config, &[]);
+    let run = run_xylem(redis.addr(), &config, &[]);
     assert!(!run.success, "{}", run.output);
     assert!(
         run.output.contains("Redis connection setup failed: AUTH on connection"),
@@ -172,7 +177,7 @@ fn test_auth_simple_password() {
 
     // The right password authenticates every connection before the workload
     let config = format!("auth = {{ password = \"{password}\" }}\n{keys}");
-    let run = run_xylem(redis.get_port(), &config, &[]);
+    let run = run_xylem(redis.addr(), &config, &[]);
     assert!(run.success, "{}", run.output);
     assert!(run.completed() > 0);
     assert!(!run.output.contains(password), "{}", run.output);
@@ -189,13 +194,13 @@ fn test_auth_acl_username_password() {
     let config = format!(
         "auth = {{ username = \"{username}\", password_env = \"XYLEM_TEST_REDIS_PASSWORD\" }}\n{keys}"
     );
-    let run = run_xylem(redis.get_port(), &config, &[("XYLEM_TEST_REDIS_PASSWORD", password)]);
+    let run = run_xylem(redis.addr(), &config, &[("XYLEM_TEST_REDIS_PASSWORD", password)]);
     assert!(run.success, "{}", run.output);
     assert!(run.completed() > 0);
     assert!(!run.output.contains(password), "{}", run.output);
 
     // An unset variable fails validation, naming the variable
-    let run = run_xylem(redis.get_port(), &config, &[]);
+    let run = run_xylem(redis.addr(), &config, &[]);
     assert!(!run.success);
     assert!(
         run.output.contains("environment variable XYLEM_TEST_REDIS_PASSWORD is not set"),
@@ -205,7 +210,7 @@ fn test_auth_acl_username_password() {
 
     // An unknown user fails setup
     let config = format!("auth = {{ username = \"nobody\", password = \"{password}\" }}\n{keys}");
-    let run = run_xylem(redis.get_port(), &config, &[]);
+    let run = run_xylem(redis.addr(), &config, &[]);
     assert!(!run.success);
     assert!(run.output.contains("AUTH on connection"), "{}", run.output);
     assert!(run.output.contains("WRONGPASS"), "{}", run.output);
@@ -217,13 +222,13 @@ fn test_auth_acl_username_password() {
 fn test_select_database() {
     let redis = common::redis_auth::RedisAuthGuard::new().expect("Failed to start Redis with auth");
     let password = redis.get_password();
-    let port = redis.get_port().to_string();
-    let cli: &[&str] = &["-p", &port, "-a", password];
+    let (host, port) = (redis.addr().ip().to_string(), redis.addr().port().to_string());
+    let cli: &[&str] = &["-h", &host, "-p", &port, "-a", password];
     let prefix = "select-test:";
 
     // AUTH then SELECT: the workload's SETs land in database 5 only
     let config = format!("auth = {{ password = \"{password}\" }}\ndb = 5\n{}", keys_config(prefix));
-    let run = run_xylem(redis.get_port(), &config, &[]);
+    let run = run_xylem(redis.addr(), &config, &[]);
     assert!(run.success, "{}", run.output);
     assert!(existing_keys(cli, 5, prefix) > 0, "SETs land in database 5");
     assert_eq!(existing_keys(cli, 0, prefix), 0, "database 0 is untouched");
@@ -231,7 +236,7 @@ fn test_select_database() {
     // An out-of-range database fails setup at SELECT
     let config =
         format!("auth = {{ password = \"{password}\" }}\ndb = 99\n{}", keys_config(prefix));
-    let run = run_xylem(redis.get_port(), &config, &[]);
+    let run = run_xylem(redis.addr(), &config, &[]);
     assert!(!run.success);
     assert!(run.output.contains("SELECT on connection"), "{}", run.output);
     assert!(run.output.contains("DB index is out of range"), "{}", run.output);
@@ -242,8 +247,7 @@ fn test_select_database() {
 fn test_hello_resp2() {
     let redis = common::redis::RedisGuard::new().expect("Failed to start Redis");
     // resp = 2 is the default protocol and sends no HELLO
-    let run =
-        run_xylem(redis.get_port(), &format!("resp = 2\n{}", keys_config("resp2-test:")), &[]);
+    let run = run_xylem(redis.addr(), &format!("resp = 2\n{}", keys_config("resp2-test:")), &[]);
     assert!(run.success, "{}", run.output);
     assert!(run.completed() > 0);
     println!("✓ RESP2 run: {} requests", run.completed());
@@ -261,11 +265,11 @@ fn test_hello_resp3() {
          insert_phase = {{ key_count = 50 }}\n{}",
         keys_config("resp3-test:")
     );
-    let run = run_xylem(redis.get_port(), &config, &[]);
+    let run = run_xylem(redis.addr(), &config, &[]);
     assert!(run.success, "{}", run.output);
     assert!(run.completed() > 0);
-    let port = redis.get_port().to_string();
-    let cli: &[&str] = &["-p", &port, "--user", username, "-a", password];
+    let (host, port) = (redis.addr().ip().to_string(), redis.addr().port().to_string());
+    let cli: &[&str] = &["-h", &host, "-p", &port, "--user", username, "-a", password];
     assert!(existing_keys(cli, 2, "resp3-test:") > 0, "keys land in database 2");
     println!("✓ RESP3 run: {} requests", run.completed());
 }

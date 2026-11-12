@@ -17,7 +17,7 @@ fn run(
 ) -> serde_json::Value {
     let target = match transport {
         "unix" => guard.socket().display().to_string(),
-        _ => format!("127.0.0.1:{}", guard.port()),
+        _ => guard.addr().to_string(),
     };
     common::run_profile(serde_json::json!({
         "experiment": { "name": protocol, "duration": "1s", "seed": 1 },

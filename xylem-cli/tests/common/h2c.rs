@@ -1,10 +1,11 @@
 //! Cleartext HTTP/2 test fixtures: nginx with h2c, and a gRPC server
 //!
-//! Each guard starts its own compose project on host ports Docker picks and
-//! tears it down on drop. The server also listens on a Unix socket in a
+//! Each guard starts its own compose project and tears it down on drop; the
+//! server is reached at its container's address. It also listens on a Unix socket in a
 //! temporary directory of the guard's, mounted at `/sock`.
 
-use super::compose::{answers, ComposeSpec, ComposeStack};
+use super::compose::{answers_at, ComposeSpec, ComposeStack};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 /// The client connection preface and an empty SETTINGS frame
@@ -21,7 +22,7 @@ pub struct H2cGuard {
     /// Holds the Unix socket; removed after the project
     _sockets: tempfile::TempDir,
     socket: PathBuf,
-    port: u16,
+    addr: SocketAddr,
 }
 
 impl H2cGuard {
@@ -66,15 +67,15 @@ impl H2cGuard {
         let sockets = tempfile::tempdir()?;
         let env = vec![("XYLEM_SOCKET_DIR".to_string(), sockets.path().display().to_string())];
         let stack = ComposeStack::start_with_env(spec, env)?;
-        let port = stack
-            .published_port(service, port, "tcp")
-            .ok_or_else(|| format!("{} host port not published", spec.name))?;
+        let addr = stack
+            .container_addr(service, port)
+            .ok_or_else(|| format!("{} has no container address", spec.name))?;
         let socket = sockets.path().join(socket);
         Ok(Self {
             _stack: stack,
             _sockets: sockets,
             socket,
-            port,
+            addr,
         })
     }
 
@@ -85,13 +86,13 @@ impl H2cGuard {
         };
         Path::new(dir).join(socket).exists()
             && stack
-                .published_port(service, port, "tcp")
-                .is_some_and(|port| answers(port, PREFACE, SETTINGS))
+                .container_addr(service, port)
+                .is_some_and(|addr| answers_at(addr, PREFACE, SETTINGS))
     }
 
-    /// Host port Docker published for the TCP listener
-    pub fn port(&self) -> u16 {
-        self.port
+    /// Address of the TCP listener
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
     }
 
     /// Path of the server's Unix socket

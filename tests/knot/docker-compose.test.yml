@@ -4,6 +4,3 @@ services:
     command: ["knotd", "-c", "/config/knot.conf"]
     volumes:
       - ./:/config:ro
-    ports:
-      - "127.0.0.1::53"
-      - "127.0.0.1::53/udp"

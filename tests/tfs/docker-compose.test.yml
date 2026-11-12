@@ -5,8 +5,5 @@ services:
     image: tensorflow/serving:2.21.0
     environment:
       MODEL_NAME: ranking
-    ports:
-      - "127.0.0.1::8500"
-      - "127.0.0.1::8501"
     volumes:
       - ${XYLEM_TFS_MODEL:?}:/models/ranking:ro

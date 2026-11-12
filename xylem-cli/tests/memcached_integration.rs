@@ -336,7 +336,7 @@ fn memcached_operations_over_udp() {
                     "prefix": format!("udp-{protocol}:") } },
             ] },
         });
-        let target = format!("127.0.0.1:{}", memcached.get_udp_port());
+        let target = memcached.addr().to_string();
         let json = common::run_profile(memcached_profile(protocol, target, "udp", config));
         let requests = &json["global"]["requests"];
         let count = |key: &str| requests[key].as_u64().unwrap();

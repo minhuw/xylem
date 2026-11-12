@@ -4,13 +4,14 @@
 //! project of its own, serving a SavedModel base directory of the host as
 //! model "ranking", and tears it down on drop.
 
-use super::compose::{answers, ComposeSpec, ComposeStack};
+use super::compose::{answers_at, ComposeSpec, ComposeStack};
+use std::net::SocketAddr;
 
 /// Guard for TF Serving, torn down on drop
 pub struct TfsGuard {
     /// Held for its drop, which tears the project down
     _stack: ComposeStack,
-    port: u16,
+    addr: SocketAddr,
 }
 
 impl TfsGuard {
@@ -23,21 +24,20 @@ impl TfsGuard {
                 build_images: false,
                 // The gRPC port opens before the model loads; REST reports it
                 is_ready: |stack| {
-                    stack.published_port("tfs", 8501, "tcp").is_some_and(|port| {
-                        answers(port, b"GET /v1/models/ranking HTTP/1.0\r\n\r\n", b"AVAILABLE")
+                    stack.container_addr("tfs", 8501).is_some_and(|addr| {
+                        answers_at(addr, b"GET /v1/models/ranking HTTP/1.0\r\n\r\n", b"AVAILABLE")
                     })
                 },
             },
             vec![("XYLEM_TFS_MODEL".to_string(), model.to_string())],
         )?;
-        let port = stack
-            .published_port("tfs", 8500, "tcp")
-            .ok_or("TF Serving port not published")?;
-        Ok(Self { _stack: stack, port })
+        let addr =
+            stack.container_addr("tfs", 8500).ok_or("TF Serving has no container address")?;
+        Ok(Self { _stack: stack, addr })
     }
 
-    /// Host port Docker published for gRPC
-    pub fn port(&self) -> u16 {
-        self.port
+    /// Address of the gRPC service
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
     }
 }

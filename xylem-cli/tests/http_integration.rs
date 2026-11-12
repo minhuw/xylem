@@ -32,7 +32,7 @@ fn test_http_get_single_thread() {
 
     println!("Running HTTP GET single-threaded test...");
 
-    let target_addr = SocketAddr::from(([127, 0, 0, 1], nginx.get_port()));
+    let target_addr = nginx.addr();
     let duration = Duration::from_secs(2);
 
     let protocol = xylem_protocols::http::HttpProtocol::new(
@@ -92,7 +92,7 @@ fn test_http_post_single_thread() {
 
     println!("Running HTTP POST single-threaded test...");
 
-    let target_addr = SocketAddr::from(([127, 0, 0, 1], nginx.get_port()));
+    let target_addr = nginx.addr();
     let duration = Duration::from_secs(2);
 
     let protocol = xylem_protocols::http::HttpProtocol::new(
@@ -138,7 +138,7 @@ fn test_http_multi_thread() {
 
     println!("Running HTTP multi-threaded test...");
 
-    let target_addr = SocketAddr::from(([127, 0, 0, 1], nginx.get_port()));
+    let target_addr = nginx.addr();
     let duration = Duration::from_secs(2);
     let num_threads = 4;
 
@@ -211,7 +211,7 @@ fn test_http_rate_limited() {
 
     println!("Running HTTP rate-limited test...");
 
-    let target_addr = SocketAddr::from(([127, 0, 0, 1], nginx.get_port()));
+    let target_addr = nginx.addr();
     let duration = Duration::from_secs(2);
     let target_rate = 500.0; // 500 req/s
 
@@ -263,7 +263,7 @@ fn test_http_put_request() {
 
     println!("Running HTTP PUT test...");
 
-    let target_addr = SocketAddr::from(([127, 0, 0, 1], nginx.get_port()));
+    let target_addr = nginx.addr();
     let duration = Duration::from_secs(2);
 
     let protocol = xylem_protocols::http::HttpProtocol::new(
@@ -308,7 +308,7 @@ fn test_http_pipelined() {
 
     println!("Running HTTP pipelined test...");
 
-    let target_addr = SocketAddr::from(([127, 0, 0, 1], nginx.get_port()));
+    let target_addr = nginx.addr();
     let duration = Duration::from_secs(2);
 
     let protocol = xylem_protocols::http::HttpProtocol::new(
@@ -382,7 +382,7 @@ fn fetch_one(target_addr: SocketAddr, path: &str) -> Vec<u8> {
 /// full wire bytes were counted
 fn run_chunked(max_pending_per_conn: usize) {
     let nginx = common::nginx::NginxGuard::new().expect("Failed to start nginx");
-    let target_addr = SocketAddr::from(([127, 0, 0, 1], nginx.get_port()));
+    let target_addr = nginx.addr();
     let duration = Duration::from_secs(2);
 
     // nginx frames this keep-alive response with chunked encoding, in several

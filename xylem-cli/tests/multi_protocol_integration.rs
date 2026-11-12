@@ -80,10 +80,9 @@ fn run_multi_protocol_test(
 ) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Running multi-protocol integration test...");
 
-    // Docker publishes each service on a free host port
-    let redis_addr = SocketAddr::from(([127, 0, 0, 1], services.redis_port()));
-    let memcached_addr = SocketAddr::from(([127, 0, 0, 1], services.memcached_port()));
-    let http_addr = SocketAddr::from(([127, 0, 0, 1], services.http_port()));
+    let redis_addr = services.redis_addr();
+    let memcached_addr = services.memcached_addr();
+    let http_addr = services.http_addr();
 
     let duration = Duration::from_secs(2);
 
