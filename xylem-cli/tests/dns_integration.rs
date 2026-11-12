@@ -137,3 +137,60 @@ fn dns_udp_counts_truncated_responses() {
     assert_eq!(truncated, count(&json, "errors"), "{requests}");
     assert!(truncated > 0 && truncated < count(&json, "completed"), "{requests}");
 }
+
+#[test]
+fn dns_tcp_query_pairs_keep_name_and_type_together() {
+    let knot = common::knot::KnotGuard::new().expect("Failed to start Knot");
+    // The (name, type) pairs knot_client.py checks, as one weighted mix: of
+    // them only absent.example.test is NXDOMAIN
+    let json = run_dns(
+        knot.addr(),
+        "tcp",
+        serde_json::json!({
+            "queries": [
+                { "name": "absent.example.test.", "qtype": "A" },
+                { "name": "www.example.test.", "qtype": "AAAA" },
+                { "name": "alias.example.test.", "qtype": "A" },
+                { "pattern": "h{key}.wild.example.test.", "qtype": "A",
+                  "keys": { "strategy": "random", "max": 1000 } },
+                { "name": "www.other.invalid.", "qtype": "A" },
+                { "name": "text.example.test.", "qtype": "TXT", "weight": 3 }
+            ],
+            "edns": { "udp_size": 1232, "dnssec_ok": false }
+        }),
+    );
+    let requests = &json["global"]["requests"];
+    let completed = count(&json, "completed");
+    assert!(completed > 1000, "{requests}");
+    assert_eq!(count(&json, "sent"), completed, "{requests}");
+    assert_eq!(count(&json, "failed"), 0, "{requests}");
+    let nxdomain = requests["errors_by_kind"]["NXDOMAIN"].as_u64().unwrap();
+    assert_eq!(nxdomain, count(&json, "errors"), "{requests}");
+    // 1 of 8 by weight
+    assert!((completed / 16..completed / 5).contains(&nxdomain), "{requests}");
+}
+
+#[test]
+fn dns_udp_query_pairs_draw_name_and_type_together() {
+    let knot = common::knot::KnotGuard::new().expect("Failed to start Knot");
+    // Only bulk.example.test's TXT RRset is truncated without EDNS. As a
+    // pair it is half of the queries; drawn independently of its name, TXT
+    // would be asked of bulk in a quarter of them.
+    let json = run_dns(
+        knot.addr(),
+        "udp",
+        serde_json::json!({
+            "queries": [
+                { "name": "bulk.example.test.", "qtype": "TXT" },
+                { "name": "text.example.test.", "qtype": "A" }
+            ]
+        }),
+    );
+    let requests = &json["global"]["requests"];
+    let completed = count(&json, "completed");
+    assert!(completed > 100, "{requests}");
+    assert_eq!(count(&json, "failed"), 0, "{requests}");
+    let truncated = requests["errors_by_kind"]["TC"].as_u64().unwrap();
+    assert_eq!(truncated, count(&json, "errors"), "{requests}");
+    assert!((completed * 2 / 5..completed * 3 / 5).contains(&truncated), "{requests}");
+}

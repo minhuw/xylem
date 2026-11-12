@@ -1967,6 +1967,7 @@ file = "results/test.json"
             config.validate().map_err(|error| format!("{error:#}"))
         };
         profile(r#"{ names = [{ name = "a.test." }], qtypes = [{ qtype = "MX" }] }"#).unwrap();
+        profile(r#"{ queries = [{ name = "a.test.", qtype = "MX", weight = 2 }] }"#).unwrap();
         for (protocol_config, expected) in [
             ("{}", "names must list at least one entry"),
             (r#"{ names = [{ name = "a..test" }] }"#, "empty label"),
@@ -1977,6 +1978,15 @@ file = "results/test.json"
             (r#"{ names = [{ pattern = "{key}.test" }] }"#, "a pattern needs keys"),
             (r#"{ names = [{ name = "a.test" }], edns = { udp_size = 100 } }"#, ">= 512"),
             (r#"{ names = [{ name = "a.test" }], nxdomain = "ignore" }"#, "unknown variant"),
+            (
+                r#"{ queries = [{ name = "a.test", qtype = "A" }], qtypes = [{ qtype = "A" }] }"#,
+                "set either queries, or names and qtypes",
+            ),
+            (r#"{ queries = [{ name = "a.test" }] }"#, "missing field `qtype`"),
+            (
+                r#"{ queries = [{ name = "a.test", qtype = "A", type = "A" }] }"#,
+                "unknown field",
+            ),
         ] {
             let error = profile(protocol_config).unwrap_err();
             assert!(error.contains(expected), "{protocol_config}: {error}");

@@ -1,8 +1,10 @@
 //! DNS queries (RFC 1035) over a byte stream or datagrams
 //!
 //! Every request is a standard query (opcode QUERY) with one question in
-//! class IN, optionally with an EDNS(0) OPT record. Its 16-bit message ID is
-//! its request ID, unique among the connection's queries in flight.
+//! class IN, optionally with an EDNS(0) OPT record. Its name and type are
+//! drawn independently, or together as a pair ([`DnsConfig::queries`]). Its
+//! 16-bit message ID is its request ID, unique among the connection's
+//! queries in flight.
 //!
 //! # Framing
 //!
@@ -41,9 +43,10 @@ pub mod wire;
 
 pub use config::{
     DnsConfig, DnsEdnsConfig, DnsKeysConfig, DnsNameConfig, DnsNxdomain, DnsQtypeConfig,
+    DnsQueryConfig,
 };
 
-use crate::workload::KeyGeneration;
+use crate::workload::{CommandSelector, KeyGeneration, WeightedCommandSelector};
 use crate::{ErrorReply, Parsed, Protocol, Request};
 use anyhow::{bail, ensure, Context, Result};
 use rand::rngs::SmallRng;
@@ -121,6 +124,17 @@ fn check_weights(weights: &[f64], what: &str) -> Result<()> {
     Ok(())
 }
 
+/// How each query's question is drawn
+enum Questions {
+    /// A name and a type, independently
+    Independent { names: Mix<NameSource>, qtypes: Mix<u16> },
+    /// One of `pairs`, by its index from `selector`
+    Pairs {
+        pairs: Vec<(NameSource, u16)>,
+        selector: WeightedCommandSelector<usize>,
+    },
+}
+
 /// A query in flight
 #[derive(Debug)]
 struct InFlight {
@@ -139,8 +153,8 @@ struct Connection {
 
 /// DNS query load
 pub struct DnsProtocol {
-    names: Mix<NameSource>,
-    qtypes: Mix<u16>,
+    questions: Questions,
+    /// Draws the names and types of `Questions::Independent`
     rng: SmallRng,
     /// Header flags of every query
     flags: u16,
@@ -157,24 +171,43 @@ impl DnsProtocol {
         config.validate()?;
         let seed_for = |component: &str| seed.map(|seed| derive_seed(seed, component));
 
-        let mut names = Vec::with_capacity(config.names.len());
-        for (index, entry) in config.names.iter().enumerate() {
-            let source = match parse_name(entry)? {
+        let source = |parsed: ParsedName, component: String| -> Result<NameSource> {
+            Ok(match parsed {
                 ParsedName::Fixed(name) => NameSource::Fixed(name),
                 ParsedName::Pattern { before, after, keys } => NameSource::Pattern {
                     before: before.to_string(),
                     after: after.to_string(),
-                    keys: keys
-                        .to_keys_config()
-                        .to_key_gen(seed_for(&format!("dns_name_{index}")))?,
+                    keys: keys.to_keys_config().to_key_gen(seed_for(&component))?,
                 },
-            };
-            names.push((source, entry.weight));
-        }
-        let mut qtypes = Vec::with_capacity(config.qtypes.len());
-        for entry in &config.qtypes {
-            qtypes.push((wire::parse_qtype(&entry.qtype)?, entry.weight));
-        }
+            })
+        };
+
+        let questions = if config.queries.is_empty() {
+            let mut names = Vec::with_capacity(config.names.len());
+            for (index, entry) in config.names.iter().enumerate() {
+                let parsed = parse_name(entry.name(), entry.pattern(), entry.keys.as_ref())?;
+                names.push((source(parsed, format!("dns_name_{index}"))?, entry.weight));
+            }
+            let mut qtypes = Vec::new();
+            for entry in config.qtypes.clone().unwrap_or_else(config::default_qtypes) {
+                qtypes.push((wire::parse_qtype(&entry.qtype)?, entry.weight));
+            }
+            Questions::Independent {
+                names: Mix::new(names, "names")?,
+                qtypes: Mix::new(qtypes, "qtypes")?,
+            }
+        } else {
+            let mut pairs = Vec::with_capacity(config.queries.len());
+            let mut weights = Vec::with_capacity(config.queries.len());
+            for (index, entry) in config.queries.iter().enumerate() {
+                let parsed = parse_name(entry.name(), entry.pattern(), entry.keys.as_ref())?;
+                let name = source(parsed, format!("dns_query_{index}"))?;
+                pairs.push((name, wire::parse_qtype(&entry.qtype)?));
+                weights.push((index, entry.weight));
+            }
+            let selector = WeightedCommandSelector::with_seed(weights, seed_for("dns_queries"))?;
+            Questions::Pairs { pairs, selector }
+        };
         let edns = config.edns.as_ref().map(|edns| Edns {
             udp_size: edns.udp_size,
             dnssec_ok: edns.dnssec_ok,
@@ -184,8 +217,7 @@ impl DnsProtocol {
             None => SmallRng::from_os_rng(),
         };
         Ok(Self {
-            names: Mix::new(names, "names")?,
-            qtypes: Mix::new(qtypes, "qtypes")?,
+            questions,
             rng,
             flags: if config.recursion_desired {
                 wire::FLAG_RD
@@ -228,16 +260,38 @@ fn allocate_id(connection: &mut Connection, framing: DnsFraming) -> u16 {
 }
 
 impl DnsConfig {
-    /// Check every name, type, weight and the EDNS settings
+    /// Check every name, type, weight and the EDNS settings, and that
+    /// `queries` comes without `names` and `qtypes`
     pub fn validate(&self) -> Result<()> {
-        for (index, entry) in self.names.iter().enumerate() {
-            parse_name(entry).with_context(|| format!("Invalid DNS names[{index}]"))?;
+        if self.queries.is_empty() {
+            ensure!(
+                !self.names.is_empty(),
+                "DNS names must list at least one entry, or set queries"
+            );
+            for (index, entry) in self.names.iter().enumerate() {
+                parse_name(entry.name(), entry.pattern(), entry.keys.as_ref())
+                    .with_context(|| format!("Invalid DNS names[{index}]"))?;
+            }
+            let weights: Vec<f64> = self.names.iter().map(|entry| entry.weight).collect();
+            check_weights(&weights, "names")?;
+            let qtypes = self.qtypes.clone().unwrap_or_else(config::default_qtypes);
+            for entry in &qtypes {
+                wire::parse_qtype(&entry.qtype)?;
+            }
+            check_weights(&qtypes.iter().map(|entry| entry.weight).collect::<Vec<_>>(), "qtypes")?;
+        } else {
+            ensure!(
+                self.names.is_empty() && self.qtypes.is_none(),
+                "DNS queries replace names and qtypes: set either queries, or names and qtypes"
+            );
+            for (index, entry) in self.queries.iter().enumerate() {
+                parse_name(entry.name(), entry.pattern(), entry.keys.as_ref())
+                    .and_then(|_| wire::parse_qtype(&entry.qtype))
+                    .with_context(|| format!("Invalid DNS queries[{index}]"))?;
+            }
+            let weights: Vec<f64> = self.queries.iter().map(|entry| entry.weight).collect();
+            check_weights(&weights, "queries")?;
         }
-        check_weights(&self.names.iter().map(|entry| entry.weight).collect::<Vec<_>>(), "names")?;
-        for entry in &self.qtypes {
-            wire::parse_qtype(&entry.qtype)?;
-        }
-        check_weights(&self.qtypes.iter().map(|entry| entry.weight).collect::<Vec<_>>(), "qtypes")?;
         if let Some(edns) = &self.edns {
             ensure!(
                 edns.udp_size >= 512,
@@ -261,10 +315,34 @@ enum ParsedName<'a> {
     },
 }
 
-/// Check `entry`: a valid name, or a pattern that makes valid names with
-/// valid keys
-fn parse_name(entry: &DnsNameConfig) -> Result<ParsedName<'_>> {
-    match (&entry.name, &entry.pattern, &entry.keys) {
+impl DnsNameConfig {
+    fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    fn pattern(&self) -> Option<&str> {
+        self.pattern.as_deref()
+    }
+}
+
+impl DnsQueryConfig {
+    fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    fn pattern(&self) -> Option<&str> {
+        self.pattern.as_deref()
+    }
+}
+
+/// Check a name entry: a valid `name`, or a `pattern` that makes valid
+/// names with valid `keys`
+fn parse_name<'a>(
+    name: Option<&str>,
+    pattern: Option<&'a str>,
+    keys: Option<&'a DnsKeysConfig>,
+) -> Result<ParsedName<'a>> {
+    match (name, pattern, keys) {
         (Some(name), None, None) => Ok(ParsedName::Fixed(wire::encode_name(name)?)),
         (None, Some(pattern), Some(keys)) => {
             let Some((before, after)) = pattern.split_once(KEY_PLACEHOLDER) else {
@@ -311,8 +389,15 @@ impl Protocol for DnsProtocol {
     type RequestId = (usize, u16);
 
     fn next_request(&mut self, conn_id: usize) -> Request<Self::RequestId> {
-        let name = self.names.pick(&mut self.rng).next_name();
-        let qtype = *self.qtypes.pick(&mut self.rng);
+        let (name, qtype) = match &mut self.questions {
+            Questions::Independent { names, qtypes } => {
+                (names.pick(&mut self.rng).next_name(), *qtypes.pick(&mut self.rng))
+            }
+            Questions::Pairs { pairs, selector } => {
+                let (source, qtype) = &mut pairs[selector.next_command()];
+                (source.next_name(), *qtype)
+            }
+        };
         let connection = self.connections.entry(conn_id).or_default();
         let id = allocate_id(connection, self.framing);
 
@@ -408,8 +493,14 @@ impl Protocol for DnsProtocol {
 
     fn reset(&mut self) {
         self.connections.clear();
-        for source in &mut self.names.items {
-            source.reset();
+        match &mut self.questions {
+            Questions::Independent { names, .. } => {
+                names.items.iter_mut().for_each(NameSource::reset)
+            }
+            Questions::Pairs { pairs, selector } => {
+                pairs.iter_mut().for_each(|(source, _)| source.reset());
+                selector.reset();
+            }
         }
     }
 }
@@ -430,10 +521,12 @@ mod tests {
                     weight: 1.0,
                 })
                 .collect(),
-            qtypes: qtypes
-                .iter()
-                .map(|qtype| DnsQtypeConfig { qtype: qtype.to_string(), weight: 1.0 })
-                .collect(),
+            qtypes: Some(
+                qtypes
+                    .iter()
+                    .map(|qtype| DnsQtypeConfig { qtype: qtype.to_string(), weight: 1.0 })
+                    .collect(),
+            ),
             ..DnsConfig::default()
         }
     }
@@ -783,7 +876,7 @@ mod tests {
     fn weighted_mixes_follow_their_weights() {
         let mut config = config(&["a.test", "b.test"], &["A", "AAAA"]);
         config.names[0].weight = 3.0;
-        config.qtypes[1].weight = 0.0;
+        config.qtypes.as_mut().unwrap()[1].weight = 0.0;
         let mut dns = DnsProtocol::from_config(&config, Some(3)).unwrap();
         let mut a_names = 0;
         for _ in 0..4000 {
@@ -810,6 +903,110 @@ mod tests {
         assert_eq!(run(), run());
     }
 
+    fn query(name: &str, qtype: &str, weight: f64) -> DnsQueryConfig {
+        DnsQueryConfig {
+            name: Some(name.to_string()),
+            pattern: None,
+            keys: None,
+            qtype: qtype.to_string(),
+            weight,
+        }
+    }
+
+    fn queries(queries: Vec<DnsQueryConfig>) -> DnsConfig {
+        DnsConfig { queries, ..DnsConfig::default() }
+    }
+
+    /// The name's first label and the type of a query message
+    fn question(query: &[u8]) -> (String, u16) {
+        let label = &query[13..13 + query[12] as usize];
+        let at = query.len() - 4;
+        (
+            String::from_utf8(label.to_vec()).unwrap(),
+            u16::from_be_bytes([query[at], query[at + 1]]),
+        )
+    }
+
+    #[test]
+    fn queries_draw_name_and_type_together() {
+        let config = queries(vec![query("a.test", "A", 3.0), query("b.test", "AAAA", 1.0)]);
+        let mut dns = DnsProtocol::from_config(&config, Some(5)).unwrap();
+        let mut a_names = 0;
+        for _ in 0..4000 {
+            let request = dns.next_request(0);
+            let (label, qtype) = question(message(&request));
+            match label.as_str() {
+                "a" => {
+                    assert_eq!(qtype, 1);
+                    a_names += 1;
+                }
+                "b" => assert_eq!(qtype, 28),
+                other => panic!("{other}"),
+            }
+            let data = framed(&reply(message(&request), 0, 0));
+            dns.parse_response(0, &data).unwrap();
+        }
+        assert!((2800..3200).contains(&a_names), "{a_names}");
+    }
+
+    #[test]
+    fn query_patterns_fill_in_generated_keys() {
+        let mut entry = query("unused", "TXT", 1.0);
+        entry.name = None;
+        entry.pattern = Some("h{key}.test".to_string());
+        entry.keys = Some(DnsKeysConfig::RoundRobin { max: 2 });
+        let mut dns = DnsProtocol::from_config(&queries(vec![entry]), Some(1)).unwrap();
+        for key in [0, 1, 0] {
+            let request = dns.next_request(0);
+            assert_eq!(question(message(&request)), (format!("h{key}"), 16));
+        }
+        dns.reset();
+        assert_eq!(question(message(&dns.next_request(0))).0, "h0", "reset restarts the keys");
+    }
+
+    #[test]
+    fn seeded_query_draws_are_reproducible() {
+        let run = || {
+            let config = queries(vec![
+                query("a.test", "A", 1.0),
+                query("b.test", "MX", 2.0),
+                query("c.test", "TXT", 1.0),
+            ]);
+            let mut dns = DnsProtocol::from_config(&config, Some(11)).unwrap();
+            (0..50).map(|conn| dns.next_request(conn).data).collect::<Vec<_>>()
+        };
+        assert_eq!(run(), run());
+    }
+
+    #[test]
+    fn invalid_queries_are_rejected() {
+        let error = |config: DnsConfig| format!("{:#}", config.validate().unwrap_err());
+        let mut with_names = queries(vec![query("a.test", "A", 1.0)]);
+        with_names.names = config(&["b.test"], &[]).names;
+        assert!(error(with_names).contains("set either queries, or names and qtypes"));
+        let mut with_qtypes = queries(vec![query("a.test", "A", 1.0)]);
+        with_qtypes.qtypes = Some(Vec::new());
+        assert!(error(with_qtypes).contains("set either queries, or names and qtypes"));
+        let mut without_keys = query("a.test", "A", 1.0);
+        without_keys.name = None;
+        without_keys.pattern = Some("{key}.test".to_string());
+        for (entries, expected) in [
+            (vec![query("a.test", "AXFR", 1.0)], "queries[0]: DNS qtype 'AXFR'"),
+            (vec![query("a.test", "BOGUS", 1.0)], "Unknown DNS qtype 'BOGUS'"),
+            (vec![query("a..test", "A", 1.0)], "empty label"),
+            (
+                vec![query("a.test", "A", 1.0), without_keys],
+                "queries[1]: a pattern needs keys",
+            ),
+            (vec![query("a.test", "A", 0.0)], "queries weights must not all be zero"),
+            (vec![query("a.test", "A", f64::INFINITY)], "must be finite"),
+        ] {
+            let message = error(queries(entries));
+            assert!(message.contains(expected), "{message}");
+        }
+        assert!(error(DnsConfig::default()).contains("names must list at least one entry"));
+    }
+
     #[test]
     fn config_parses_from_json() {
         let config: DnsConfig = serde_json::from_value(serde_json::json!({
@@ -824,17 +1021,30 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(config.names.len(), 2);
-        assert_eq!(config.qtypes[1].weight, 1.0);
+        assert_eq!(config.qtypes.as_ref().unwrap()[1].weight, 1.0);
         assert_eq!(config.nxdomain, DnsNxdomain::Success);
         assert!(DnsProtocol::from_config(&config, None).is_ok());
 
         let defaults: DnsConfig =
             serde_json::from_value(serde_json::json!({ "names": [{ "name": "a.test" }] })).unwrap();
         assert!(defaults.recursion_desired);
-        assert_eq!(defaults.qtypes.len(), 1);
-        assert_eq!(defaults.qtypes[0].qtype, "A");
+        let request = DnsProtocol::from_config(&defaults, None).unwrap().next_request(0);
+        assert_eq!(
+            &message(&request)[message(&request).len() - 4..],
+            &[0, 1, 0, 1],
+            "A by default"
+        );
         assert!(defaults.edns.is_none());
         assert_eq!(defaults.nxdomain, DnsNxdomain::Error);
+        let pairs: DnsConfig = serde_json::from_value(serde_json::json!({
+            "queries": [
+                { "name": "www.example.test.", "qtype": "A", "weight": 4 },
+                { "pattern": "h{key}.test", "keys": { "strategy": "random", "max": 9 }, "qtype": "TXT" }
+            ]
+        }))
+        .unwrap();
+        assert_eq!((pairs.queries.len(), pairs.queries[1].weight), (2, 1.0));
+        assert!(DnsProtocol::from_config(&pairs, None).is_ok());
         let edns: DnsConfig =
             serde_json::from_value(serde_json::json!({ "names": [], "edns": {} })).unwrap();
         assert_eq!(edns.edns.unwrap().udp_size, 1232);

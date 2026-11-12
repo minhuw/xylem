@@ -5,8 +5,9 @@ use serde::{Deserialize, Serialize};
 
 /// DNS protocol configuration
 ///
-/// Each query asks one question: a name drawn from `names` and a type drawn
-/// from `qtypes`, independently and each by weight, in class IN.
+/// Each query asks one question in class IN: a name drawn from `names` and a
+/// type drawn from `qtypes`, independently and each by weight, or a (name,
+/// type) pair drawn from `queries` by weight.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -16,8 +17,12 @@ pub struct DnsConfig {
     pub names: Vec<DnsNameConfig>,
     /// Query types, each drawn with probability weight / total weight
     /// (default: A only)
-    #[serde(default = "default_qtypes")]
-    pub qtypes: Vec<DnsQtypeConfig>,
+    #[serde(default)]
+    pub qtypes: Option<Vec<DnsQtypeConfig>>,
+    /// Questions as (name, type) pairs, each drawn with probability
+    /// weight / total weight; instead of `names` and `qtypes`
+    #[serde(default)]
+    pub queries: Vec<DnsQueryConfig>,
     /// Set the RD (recursion desired) flag (default: true, as dig and
     /// dnspython do)
     #[serde(default = "default_recursion_desired")]
@@ -46,6 +51,28 @@ pub struct DnsNameConfig {
     /// Key generator for `pattern`
     #[serde(default)]
     pub keys: Option<DnsKeysConfig>,
+    /// Relative weight (default: 1)
+    #[serde(default = "default_weight")]
+    pub weight: f64,
+}
+
+/// One entry of the question mix: a fixed `name` or a `pattern`, as in
+/// [`DnsNameConfig`], and its `qtype`
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct DnsQueryConfig {
+    /// A fixed name, such as "www.example.test." (the final dot is optional)
+    #[serde(default)]
+    pub name: Option<String>,
+    /// A name with one "{key}", such as "host{key}.example.test."
+    #[serde(default)]
+    pub pattern: Option<String>,
+    /// Key generator for `pattern`
+    #[serde(default)]
+    pub keys: Option<DnsKeysConfig>,
+    /// Type mnemonic or "TYPE<n>", as in [`DnsQtypeConfig`]
+    pub qtype: String,
     /// Relative weight (default: 1)
     #[serde(default = "default_weight")]
     pub weight: f64,
@@ -139,7 +166,8 @@ impl Default for DnsConfig {
     fn default() -> Self {
         Self {
             names: Vec::new(),
-            qtypes: default_qtypes(),
+            qtypes: None,
+            queries: Vec::new(),
             recursion_desired: default_recursion_desired(),
             edns: None,
             nxdomain: DnsNxdomain::default(),
@@ -147,7 +175,8 @@ impl Default for DnsConfig {
     }
 }
 
-fn default_qtypes() -> Vec<DnsQtypeConfig> {
+/// The type mix without `qtypes`: A only
+pub(super) fn default_qtypes() -> Vec<DnsQtypeConfig> {
     vec![DnsQtypeConfig {
         qtype: "A".to_string(),
         weight: default_weight(),

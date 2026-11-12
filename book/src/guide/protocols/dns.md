@@ -3,7 +3,7 @@
 `protocol = "dns"` sends standard DNS queries (RFC 1035) for load against
 authoritative or recursive servers, over `tcp`, `unix`, `ntcp` and `udp`.
 Each query asks one question in class IN; its name and type are drawn
-independently from weighted mixes.
+independently from weighted mixes, or together from a weighted list of pairs.
 
 ```toml
 [experiment]
@@ -44,7 +44,7 @@ file = "results/knot-tcp.json"
 
 ## Queries
 
-- `names` (required): each entry is either a fixed `name` or a `pattern`
+- `names` (required without `queries`): each entry is either a fixed `name` or a `pattern`
   with one `{key}`, which each query replaces with a decimal key from `keys`.
   `keys` takes the strategies of the key-value protocols without their value
   size and prefix: `sequential` (`start`), `random` (`max`), `round-robin`
@@ -56,6 +56,18 @@ file = "results/knot-tcp.json"
   NSEC, DNSKEY, SVCB, HTTPS, CAA, ANY, or any other type as `TYPE<n>`
   (RFC 3597). Default: A only.
 - `recursion_desired`: the RD flag, default true as with dig and dnspython.
+- `queries`: (name, qtype) pairs instead of `names` and `qtypes`, which
+  it excludes. Each entry is a `name` or a `pattern` with `keys`, as in
+  `names`, a `qtype`, and a `weight` (default 1):
+
+  ```toml
+  [traffic_groups.protocol_config]
+  queries = [
+    { name = "www.example.test.", qtype = "A", weight = 4 },
+    { name = "www.example.test.", qtype = "AAAA" },
+    { pattern = "h{key}.wild.example.test.", qtype = "A", keys = { strategy = "random", max = 1000 } },
+  ]
+  ```
 - `edns`: adds an EDNS(0) OPT record (RFC 6891) with the UDP payload size
   `udp_size` (512 to 65535, default 1232) and the DO bit `dnssec_ok`.
 
