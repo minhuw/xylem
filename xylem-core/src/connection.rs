@@ -450,6 +450,24 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         }
     }
 
+    /// Stop measuring the queued open-loop measurement requests whose last
+    /// byte the transport has not taken, and count them: they never went out
+    ///
+    /// Their bytes stay queued, so a partly written request still finishes,
+    /// but they no longer count as sent when they go out, nor do their
+    /// responses count. Closed-loop requests have no intended time and are
+    /// not counted.
+    pub fn abandon_unsent(&mut self) -> u64 {
+        let mut abandoned = 0;
+        for request in &mut self.unsent {
+            if request.intended_ns.is_some() && !request.is_warmup && !request.is_setup {
+                request.is_warmup = true;
+                abandoned += 1;
+            }
+        }
+        abandoned
+    }
+
     /// Mark the connection closed and drop its pending and queued requests
     fn close(&mut self) {
         self.closed = true;
@@ -1720,6 +1738,19 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         }
     }
 
+    /// Stop measuring the open-loop requests still queued on every
+    /// connection (see [`ConnectionState::abandon_unsent`]), calling
+    /// `on_abandoned(connection_id, group_id, count)` for each connection
+    /// with some
+    pub fn abandon_unsent(&mut self, mut on_abandoned: impl FnMut(usize, usize, u64)) {
+        for state in self.connection_states.values_mut() {
+            let abandoned = state.abandon_unsent();
+            if abandoned > 0 {
+                on_abandoned(state.connection_id, state.group_id, abandoned);
+            }
+        }
+    }
+
     /// Count each connection's intended sends from its next intended time up
     /// to `end_ns`, walking at most `cap` per connection
     ///
@@ -2874,6 +2905,9 @@ pub(crate) mod test_support {
         pub flushes: Vec<usize>,
         /// Most bytes each `try_send` takes; `None` takes all
         pub accept_limit: Option<usize>,
+        /// Bytes `try_send` takes in all, like a socket the peer stopped
+        /// reading; `None` takes all
+        pub capacity: Option<usize>,
         /// Connections with write interest: `poll` reports them, and
         /// `try_send` takes bytes on them, only while `writable` is set
         pub write_interest: Vec<usize>,
@@ -2898,6 +2932,7 @@ pub(crate) mod test_support {
                 datagram: false,
                 flushes: Vec::new(),
                 accept_limit: None,
+                capacity: None,
                 write_interest: Vec::new(),
                 writable: false,
             }
@@ -2963,12 +2998,19 @@ pub(crate) mod test_support {
             conn_id: usize,
             data: &[u8],
         ) -> xylem_transport::Result<SendProgress> {
-            let io = self.io.lock().unwrap();
+            let mut io = self.io.lock().unwrap();
             // A connection waiting to become writable takes nothing until it is
             let blocked = io.write_interest.contains(&conn_id) && !io.writable;
             let limit = if blocked { Some(0) } else { io.accept_limit };
-            drop(io);
+            let limit = match (limit, io.capacity) {
+                (Some(limit), Some(capacity)) => Some(limit.min(capacity)),
+                (limit, capacity) => limit.or(capacity),
+            };
             let accepted = limit.map_or(data.len(), |limit| limit.min(data.len()));
+            if let Some(capacity) = &mut io.capacity {
+                *capacity -= accepted;
+            }
+            drop(io);
             if accepted == 0 && !data.is_empty() {
                 self.check(conn_id)?;
                 let timestamp = self.io.lock().unwrap().now();

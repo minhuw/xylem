@@ -629,18 +629,29 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
     /// Close a connection that failed, counting its pending measurement
     /// requests as failed
     fn close_failed(&mut self, connection_id: usize, group_id: usize) {
-        if let Some(state) = self.pool.get_state(connection_id) {
+        if let Some(state) = self.pool.get_state_mut(connection_id) {
             let failed = state.measured_pending_count() as u64;
             if failed > 0 {
                 self.stats.record_failed(group_id, connection_id, failed);
+            }
+            // Requests it had not sent yet never go out
+            let unsent = state.abandon_unsent();
+            if unsent > 0 {
+                self.stats.record_unsent(group_id, connection_id, unsent, false);
             }
         }
         let _ = self.pool.close(connection_id);
     }
 
     /// Count the intended sends of every connection scheduled before the end
-    /// of the window that were never sent
+    /// of the window that were never sent: those its schedule had not
+    /// reached, and those still queued behind bytes the transport did not
+    /// take, which stop counting as sent if they go out later
     fn record_unsent(&mut self, end_ns: u64) {
+        let stats = &mut self.stats;
+        self.pool.abandon_unsent(|connection_id, group_id, unsent| {
+            stats.record_unsent(group_id, connection_id, unsent, false);
+        });
         for (group_id, connection_id, count, capped) in
             self.pool.count_unsent(end_ns, UNSENT_WALK_CAP)
         {
@@ -1667,6 +1678,91 @@ mod tests {
         let counts = worker.stats.request_counts_global();
         assert_eq!((counts.sent, counts.unsent, counts.unsent_capped), (1, 49, false));
         assert_eq!(worker.stats.request_counts(0).unsent, 49);
+    }
+
+    /// Run `worker` at 1000 arrivals/s for 50 ms against a peer that reads 84
+    /// bytes, 10.5 requests, and then nothing: each of the 50 arrivals of the
+    /// window counts once, as sent or unsent
+    fn assert_requests_behind_a_full_socket_count_as_unsent(
+        factory: &FakeFactory,
+        mut worker: Worker<FakeGroup, FakeProtocol>,
+    ) {
+        factory.0.lock().unwrap().capacity = Some(84);
+        worker.config.duration = Duration::from_millis(50);
+        worker.run_at(timing::time_ns() + 5_000_000).unwrap();
+        let counts = worker.stats.request_counts_global();
+        assert_eq!((counts.sent, counts.unsent, counts.unsent_capped), (10, 40, false));
+        // The sent ones got no reply; the rest never went out, even partly
+        assert_eq!((counts.completed, counts.timed_out, counts.failed), (0, 10, 0));
+    }
+
+    #[test]
+    fn requests_queued_behind_a_full_socket_at_the_end_count_as_unsent() {
+        let factory = FakeFactory::default();
+        let worker =
+            fake_worker(&factory, 1000, Box::new(UniformPolicyScheduler::fixed_rate(1000.0)));
+        assert_requests_behind_a_full_socket_count_as_unsent(&factory, worker);
+    }
+
+    #[test]
+    fn group_arrivals_queued_behind_a_full_socket_at_the_end_count_as_unsent() {
+        use crate::scheduler::FixedRatePolicy;
+        let factory = FakeFactory::default();
+        let worker = group_worker(&factory, 1, 1000, Box::new(FixedRatePolicy::new(1000.0)));
+        assert_requests_behind_a_full_socket_count_as_unsent(&factory, worker);
+    }
+
+    #[test]
+    fn a_request_unsent_at_the_end_that_goes_out_later_is_not_measured() {
+        let factory = FakeFactory::default();
+        let mut worker =
+            fake_worker(&factory, 1000, Box::new(UniformPolicyScheduler::fixed_rate(1000.0)));
+        let io = factory.0.clone();
+        io.lock().unwrap().capacity = Some(4);
+        let start_ns = worker.pool.get_state(0).unwrap().intended_send_time().unwrap();
+        worker.send_requests().unwrap();
+        assert!(worker.pool.get_state(0).unwrap().is_write_blocked());
+        worker.record_unsent(start_ns + 1);
+        let counts = worker.stats.request_counts_global();
+        assert_eq!((counts.sent, counts.unsent), (0, 1));
+
+        // Its rest goes out in the drain, and its reply arrives: neither counts
+        {
+            let mut io = io.lock().unwrap();
+            io.capacity = None;
+            io.writable = true;
+            io.responses.push_back(Ok(0u64.to_le_bytes().to_vec()));
+        }
+        worker.drain_responses().unwrap();
+        assert_eq!(sent_requests(&factory), 1);
+        let counts = worker.stats.request_counts_global();
+        assert_eq!((counts.sent, counts.unsent, counts.completed, counts.timed_out), (0, 1, 0, 0));
+    }
+
+    #[test]
+    fn requests_queued_on_a_failed_connection_count_as_unsent() {
+        let factory = FakeFactory::default();
+        let mut worker =
+            fake_worker(&factory, 1000, Box::new(UniformPolicyScheduler::fixed_rate(100.0)));
+        factory.0.lock().unwrap().capacity = Some(12);
+        let start_ns = worker.pool.get_state(0).unwrap().intended_send_time().unwrap();
+        timing::busy_wait_until(start_ns + 10_000_000);
+        worker.send_requests().unwrap();
+        let counts = worker.stats.request_counts_global();
+        assert_eq!(counts.sent, 1);
+
+        factory
+            .0
+            .lock()
+            .unwrap()
+            .responses
+            .push_back(Err(xylem_transport::Error::Connection("closed".into())));
+        worker.process_responses(Duration::ZERO).unwrap();
+        let counts = worker.stats.request_counts_global();
+        assert_eq!((counts.sent, counts.failed, counts.unsent), (1, 1, 1));
+        // The failed connection's schedule counts on from after them
+        worker.record_unsent(start_ns + 20_000_001);
+        assert_eq!(worker.stats.request_counts_global().unsent, 2);
     }
 
     /// A worker whose `connections` connections share the arrivals of `policy`

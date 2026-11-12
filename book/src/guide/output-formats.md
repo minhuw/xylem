@@ -96,6 +96,10 @@ requests; warmup requests are excluded:
   that failed keep counting their schedule. A connection's schedule starts
   once it can send after setup, so a connection still setting up at the end
   counts none, and the slots before a connection's start are not unsent.
+  Requests already queued but not yet written in full, behind a socket that
+  took no more bytes, count as unsent too when the window ends or their
+  connection fails. They stay unsent if they go out during the drain, and
+  their responses are not counted.
 - `unsent_capped`: whether that walk stopped at its cap on some connection, so
   `unsent` is a lower bound.
 
