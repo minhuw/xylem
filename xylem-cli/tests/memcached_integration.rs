@@ -294,12 +294,17 @@ fn memcached_binary_runs_every_operation_in_a_mix() {
 }
 
 /// Incr on the stored non-numeric values is an error reply of each codec's kind
+///
+/// One connection: the insert phase is shared by a thread's connections, so
+/// with two, one connection's incr can reach a key before the other's SET of
+/// it and miss. On one connection every SET is ahead of every incr.
 #[test]
 fn memcached_incr_of_a_non_numeric_value_is_an_error_reply() {
     let memcached = common::memcached::MemcachedGuard::new().expect("Failed to start Memcached");
     for (protocol, kind) in
         [("memcached-ascii", "CLIENT_ERROR"), ("memcached-binary", "DELTA_BADVAL")]
     {
+        let before = memcached.stats();
         let config = serde_json::json!({
             "keys": { "strategy": "round-robin", "max": 10, "value_size": 4,
                 "prefix": format!("{protocol}:") },
@@ -307,12 +312,17 @@ fn memcached_incr_of_a_non_numeric_value_is_an_error_reply() {
             "operation": "incr",
         });
         let target = memcached.addr().to_string();
-        let json = common::run_profile(memcached_profile(protocol, target, "tcp", config));
+        let mut profile = memcached_profile(protocol, target, "tcp", config);
+        profile["traffic_groups"][0]["connections_per_thread"] = 1.into();
+        let json = common::run_profile(profile);
         let requests = &json["global"]["requests"];
         let completed = requests["completed"].as_u64().unwrap();
         assert!(completed > 100, "{requests}");
         assert_eq!(requests["errors"], completed, "{requests}");
         assert_eq!(requests["errors_by_kind"], serde_json::json!({ kind: completed }));
+        let after = memcached.stats();
+        let misses = after["incr_misses"] - before.get("incr_misses").copied().unwrap_or(0);
+        assert_eq!(misses, 0, "{protocol}: incr reached keys the insert phase had not set");
     }
 }
 
