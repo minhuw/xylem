@@ -1,0 +1,11 @@
+services:
+  grpc:
+    image: xylem-test-grpc:latest
+    build: .
+    # Docker picks a free host port; the test guard reads it back with
+    # `docker compose port grpc 50051`
+    ports:
+      - "127.0.0.1::50051"
+    volumes:
+      # The test's directory for the Unix socket
+      - ${XYLEM_SOCKET_DIR:?}:/sock

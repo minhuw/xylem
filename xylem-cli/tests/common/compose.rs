@@ -40,11 +40,18 @@ trait FixtureRuntime: Send + Sync {
     fn preflight(&self) -> Result<(), Box<dyn std::error::Error>>;
     /// Whether `project` already owns resources of `kind` (container, network, volume)
     fn occupied(&self, kind: &str, project: &str) -> Result<bool, String>;
-    fn compose(&self, file: &Path, project: &str, args: &[&str]) -> std::io::Result<bool>;
+    fn compose(
+        &self,
+        file: &Path,
+        project: &str,
+        env: &[(String, String)],
+        args: &[&str],
+    ) -> std::io::Result<bool>;
     fn port(
         &self,
         file: &Path,
         project: &str,
+        env: &[(String, String)],
         service: &str,
         port: u16,
         protocol: &str,
@@ -56,6 +63,8 @@ trait FixtureRuntime: Send + Sync {
 pub struct ComposeStack {
     compose_file: PathBuf,
     project: String,
+    /// Variables the compose file interpolates
+    env: Vec<(String, String)>,
     runtime: Box<dyn FixtureRuntime>,
     /// Set once `up` may have created resources that `down` must remove
     cleanup_armed: bool,
@@ -71,6 +80,15 @@ impl ComposeStack {
     /// the images fail to build, the stack fails to start, or it does not
     /// become ready within 30 seconds.
     pub fn start(spec: &ComposeSpec) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::start_with_env(spec, Vec::new())
+    }
+
+    /// [`Self::start`] with variables for the compose file to interpolate,
+    /// such as a host directory to mount
+    pub fn start_with_env(
+        spec: &ComposeSpec,
+        env: Vec<(String, String)>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().ok_or("No parent directory")?;
         let compose_file = root.join(spec.compose_file);
         if !compose_file.exists() {
@@ -80,6 +98,7 @@ impl ComposeStack {
             spec,
             compose_file,
             new_project()?,
+            env,
             Box::new(DockerRuntime),
             PROBE_ATTEMPTS,
             PROBE_INTERVAL,
@@ -91,6 +110,7 @@ impl ComposeStack {
         spec: &ComposeSpec,
         compose_file: PathBuf,
         project: String,
+        env: Vec<(String, String)>,
         runtime: Box<dyn FixtureRuntime>,
         attempts: u32,
         interval: Duration,
@@ -99,6 +119,7 @@ impl ComposeStack {
         let mut stack = Self {
             compose_file,
             project,
+            env,
             runtime,
             cleanup_armed: false,
         };
@@ -121,7 +142,12 @@ impl ComposeStack {
     }
 
     fn run(&self, args: &[&str]) -> std::io::Result<bool> {
-        self.runtime.compose(&self.compose_file, &self.project, args)
+        self.runtime.compose(&self.compose_file, &self.project, &self.env, args)
+    }
+
+    /// The value of the compose file variable `name`, if the stack sets it
+    pub fn env(&self, name: &str) -> Option<&str> {
+        self.env.iter().find(|(key, _)| key == name).map(|(_, value)| value.as_str())
     }
 
     /// Host port Docker published on 127.0.0.1 for `service`'s container `port`
@@ -129,7 +155,8 @@ impl ComposeStack {
     /// Returns `None` if the service is not running or is not published on
     /// exactly one loopback address.
     pub fn published_port(&self, service: &str, port: u16, protocol: &str) -> Option<u16> {
-        self.runtime.port(&self.compose_file, &self.project, service, port, protocol)
+        self.runtime
+            .port(&self.compose_file, &self.project, &self.env, service, port, protocol)
     }
 }
 
@@ -210,8 +237,15 @@ impl FixtureRuntime for DockerRuntime {
         Ok(!output.stdout.is_empty())
     }
 
-    fn compose(&self, file: &Path, project: &str, args: &[&str]) -> std::io::Result<bool> {
+    fn compose(
+        &self,
+        file: &Path,
+        project: &str,
+        env: &[(String, String)],
+        args: &[&str],
+    ) -> std::io::Result<bool> {
         compose_command(COMPOSE, file, project, args)
+            .envs(env.iter().map(|(name, value)| (name, value)))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
@@ -222,6 +256,7 @@ impl FixtureRuntime for DockerRuntime {
         &self,
         file: &Path,
         project: &str,
+        env: &[(String, String)],
         service: &str,
         port: u16,
         protocol: &str,
@@ -233,6 +268,7 @@ impl FixtureRuntime for DockerRuntime {
             project,
             &["port", "--protocol", protocol, service, &target],
         )
+        .envs(env.iter().map(|(name, value)| (name, value)))
         .stderr(Stdio::null())
         .output()
         .ok()?;
@@ -383,7 +419,13 @@ mod tests {
             }
             Ok(false)
         }
-        fn compose(&self, _: &Path, project: &str, args: &[&str]) -> std::io::Result<bool> {
+        fn compose(
+            &self,
+            _: &Path,
+            project: &str,
+            _: &[(String, String)],
+            args: &[&str],
+        ) -> std::io::Result<bool> {
             let mut s = self.0.lock().unwrap();
             s.events.push(format!("compose {project} {}", args.join(" ")));
             match args[0] {
@@ -394,7 +436,15 @@ mod tests {
                 _ => panic!("unexpected command"),
             }
         }
-        fn port(&self, _: &Path, _: &str, _: &str, _: u16, _: &str) -> Option<u16> {
+        fn port(
+            &self,
+            _: &Path,
+            _: &str,
+            _: &[(String, String)],
+            _: &str,
+            _: u16,
+            _: &str,
+        ) -> Option<u16> {
             panic!("unexpected port lookup")
         }
         fn report(&self, message: &str) {
@@ -416,6 +466,7 @@ mod tests {
             &spec,
             PathBuf::from("fixture.yml"),
             "xylemtestfresh".into(),
+            Vec::new(),
             Box::new(FakeRuntime(state)),
             2,
             Duration::ZERO,

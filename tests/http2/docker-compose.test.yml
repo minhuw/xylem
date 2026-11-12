@@ -1,0 +1,17 @@
+services:
+  nginx:
+    image: nginx:alpine
+    # The Unix socket must be connectable from the host, and /big holds
+    # 300 KB
+    command:
+      - sh
+      - -c
+      - head -c 300000 /dev/zero > /srv/big.bin && umask 000 && exec nginx -g 'daemon off;'
+    # Docker picks a free host port; the test guard reads it back with
+    # `docker compose port nginx 80`
+    ports:
+      - "127.0.0.1::80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      # The test's directory for the Unix socket
+      - ${XYLEM_SOCKET_DIR:?}:/sock

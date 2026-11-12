@@ -69,6 +69,17 @@ test-http:
     @echo "🌐 Running HTTP integration tests..."
     cargo nextest run --profile integration -E 'binary(http_integration)'
 
+# Run HTTP/2 integration tests (nginx with h2c)
+test-http2:
+    @echo "🌐 Running HTTP/2 integration tests..."
+    cargo nextest run --profile integration -E 'binary(http2_integration)'
+
+# Run gRPC integration tests (a grpcio server; XYLEM_TFS_MODEL and
+# XYLEM_TFS_REQUESTS add TF Serving's Predict)
+test-grpc:
+    @echo "🌐 Running gRPC integration tests..."
+    cargo nextest run --profile integration -E 'binary(grpc_integration)'
+
 # Run Masstree integration tests
 test-masstree:
     @echo "🌲 Running Masstree integration tests..."

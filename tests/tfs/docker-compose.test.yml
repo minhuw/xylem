@@ -1,0 +1,12 @@
+# TF Serving with the SavedModel base directory XYLEM_TFS_MODEL as model
+# "ranking": gRPC on 8500, REST (for the readiness probe) on 8501
+services:
+  tfs:
+    image: tensorflow/serving:2.21.0
+    environment:
+      MODEL_NAME: ranking
+    ports:
+      - "127.0.0.1::8500"
+      - "127.0.0.1::8501"
+    volumes:
+      - ${XYLEM_TFS_MODEL:?}:/models/ranking:ro
