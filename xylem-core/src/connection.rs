@@ -805,14 +805,16 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
 
     /// Spare tail of the receive buffer for the transport to read into
     ///
-    /// Always offers at least `MAX_PAYLOAD` bytes, so a datagram transport
-    /// never truncates a response. Grows the buffer only when needed.
+    /// Offers `MAX_PAYLOAD` bytes: enough that a datagram transport never
+    /// truncates a response, and no more once a partial frame grew the
+    /// buffer, so a parser streaming a long response never takes more than
+    /// that in one step. Grows the buffer only when needed.
     fn recv_spare(&mut self) -> &mut [u8] {
         let needed = self.recv_len + MAX_PAYLOAD;
         if self.recv_buffer.len() < needed {
             self.recv_buffer.resize(needed, 0);
         }
-        &mut self.recv_buffer[self.recv_len..]
+        &mut self.recv_buffer[self.recv_len..needed]
     }
 
     /// Process `len` bytes the transport read into `recv_spare()`
@@ -1922,6 +1924,21 @@ mod tests {
         );
         assert!(state.buffered().is_empty());
         assert_eq!(state.pending_count(), 0);
+    }
+
+    #[test]
+    fn reads_get_max_payload_bytes_once_a_partial_frame_grew_the_buffer() {
+        let mut state = state();
+        let ts = Timestamp::now();
+        state.record_send(1, ts, Duration::ZERO, tx(0, 1), false);
+        let data = frame(1, 16);
+        assert!(state.process_recv(&data[..10], ts, parse_frame).unwrap().is_empty());
+        assert_eq!(state.recv_spare().len(), MAX_PAYLOAD);
+        assert_eq!(state.process_recv(&data[10..], ts, parse_frame).unwrap()[0].id, 1);
+        // The buffer is larger now, but a read still gets MAX_PAYLOAD bytes,
+        // so a step streaming a read's data stays within the frame limit
+        assert!(state.recv_buffer.len() > MAX_PAYLOAD);
+        assert_eq!(state.recv_spare().len(), MAX_PAYLOAD);
     }
 
     #[test]
