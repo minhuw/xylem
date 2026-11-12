@@ -20,9 +20,10 @@ mod common;
 const RATE: f64 = 4000.0;
 const DURATION_SECS: f64 = 4.0;
 /// Largest late-send fraction of an open-loop run: the default
-/// `validity.max_late_send_ratio`. A release build stays near 0.1%; the
-/// debug build these tests run stalls once for ~25 ms in either dispatch
-/// mode, which makes ~0.7% of the sends late.
+/// `validity.max_late_send_ratio`. A release build stays near 0.01%; the
+/// debug build these tests run takes up to ~0.5 ms to set up each
+/// connection's stats at the start and at each second of the run, which
+/// makes ~0.3% of the sends late.
 const MAX_LATE: f64 = 0.01;
 
 /// The worker thread's CPU: the last one, since CPU 0 tends to be the busiest

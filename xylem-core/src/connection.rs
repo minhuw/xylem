@@ -327,7 +327,10 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
                 Default::default(),
             ),
             tx_pending_queue: VecDeque::with_capacity(max_pending_requests),
-            recv_buffer: Vec::new(),
+            // Sized as the pool opens the connection, not at its first read:
+            // the first reads of every connection come together at the start
+            // of the run, where growing each buffer made sends late
+            recv_buffer: vec![0; MAX_PAYLOAD],
             recv_len: 0,
             closed: false,
             opened_ns: 0,
