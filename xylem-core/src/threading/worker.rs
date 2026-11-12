@@ -975,6 +975,8 @@ mod tests {
         report_setup: bool,
         /// Responses to these requests are error replies of the given kind
         errors: HashMap<u64, &'static str>,
+        /// Bytes each request carries after its 8-byte ID
+        padding: usize,
     }
 
     impl Protocol for FakeProtocol {
@@ -990,7 +992,9 @@ mod tests {
             if id < self.warmup {
                 return Request::new(id.to_le_bytes().to_vec(), id, RequestMeta::warmup());
             }
-            Request::measurement(id.to_le_bytes().to_vec(), id)
+            let mut data = id.to_le_bytes().to_vec();
+            data.resize(8 + self.padding, 0);
+            Request::measurement(data, id)
         }
 
         fn parse_response<'a>(
@@ -1101,6 +1105,22 @@ mod tests {
         assert_eq!(io.sent_on, [0, 1, 2, 0]);
         let sizes: Vec<usize> = io.sent.iter().map(Vec::len).collect();
         assert_eq!(sizes, [8, 16, 16, 8]);
+    }
+
+    #[test]
+    fn a_round_writes_its_queue_once_it_holds_a_write_batch() {
+        let factory = FakeFactory::default();
+        let mut worker = fake_worker(&factory, 8, Box::new(UniformPolicyScheduler::closed_loop()));
+        // Four requests fill a write batch
+        let batch = crate::connection::WRITE_BATCH_BYTES;
+        worker.protocols.get_mut(&0).unwrap().padding = batch / 4 - 8;
+        worker.send_requests().unwrap();
+        let io = factory.0.lock().unwrap();
+        let sizes: Vec<usize> = io.sent.iter().map(Vec::len).collect();
+        assert_eq!(sizes, [batch, batch]);
+        assert_eq!(io.flushes, [2]);
+        drop(io);
+        assert_eq!(worker.stats.request_counts_global().sent, 8);
     }
 
     #[test]
