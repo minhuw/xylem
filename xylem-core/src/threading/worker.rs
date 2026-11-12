@@ -45,6 +45,11 @@ pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 /// Default for [`Worker::set_setup_timeout`]
 pub const DEFAULT_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Time to the next send that lets the stats do work ahead of recording
+/// ([`StatsRecorder::prepare`]): making a time bucket's entry takes about
+/// 40 us in a release build and 100 us in a debug build
+const PREPARE_SLACK_NS: u64 = 200_000;
+
 /// Worker with connection pooling and request pipelining
 ///
 /// Uses `ConnectionGroup` internally for efficient I/O multiplexing.
@@ -340,6 +345,15 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             self.expire_requests(now_ns);
             if let Err(error) = self.check_setup_deadlines(now_ns) {
                 break Err(error);
+            }
+            if self.ready_ids.is_empty()
+                && !self.pool.has_ready(now_ns)
+                && self
+                    .pool
+                    .peek_next_ready_time()
+                    .is_none_or(|next| next > now_ns.saturating_add(PREPARE_SLACK_NS))
+            {
+                self.stats.prepare(now_ns);
             }
         };
         let actual_end_us = wall_clock_us();

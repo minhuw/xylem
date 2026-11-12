@@ -9,6 +9,7 @@ use super::requests::{RequestCounts, SendLagStats, SendLagSummary, LATE_SEND_THR
 use super::AggregatedStats;
 use hdrhistogram::Histogram;
 use sketches_ddsketch::{Config as DDSketchConfig, DDSketch};
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::time::Duration;
 use tdigest::TDigest;
@@ -231,6 +232,33 @@ impl LatencyStorage {
             }
         };
         Self { quantiles, moments: Moments::default() }
+    }
+
+    /// Empty storage configured like this one; `None` for the policies
+    /// whose new storage costs little. An auto-resizing HDR histogram gets
+    /// counts up to twice the largest latency this one holds, so latencies
+    /// up to that do not make it grow; its range sets only how many counts it
+    /// holds, not where values go. The range follows the latencies, not this
+    /// one's range, which could hold more counts than they need.
+    fn empty_like(&self) -> Option<Self> {
+        let Quantiles::HdrHistogram { hist, .. } = &self.quantiles else {
+            return None;
+        };
+        let hist = if hist.is_auto_resize() {
+            let high = hist.max().max(hist.low()).saturating_mul(2);
+            Histogram::new_with_bounds(hist.low(), high, hist.sigfig())
+                .map(|mut wider| {
+                    wider.auto(true);
+                    wider
+                })
+                .unwrap_or_else(|_| Histogram::new_from(hist))
+        } else {
+            Histogram::new_from(hist)
+        };
+        Some(Self {
+            quantiles: Quantiles::HdrHistogram { hist, clamped: 0 },
+            moments: Moments::default(),
+        })
     }
 
     /// Record a latency sample
@@ -458,6 +486,17 @@ impl StatsEntry {
         }
     }
 
+    /// An empty entry whose latency storage is like this one's; see
+    /// [`LatencyStorage::empty_like`]
+    fn empty_like(&self) -> Option<Self> {
+        Some(Self {
+            request_count: 0,
+            tx_bytes: 0,
+            rx_bytes: 0,
+            latency: self.latency.empty_like()?,
+        })
+    }
+
     /// Record a latency sample
     pub fn record_latency(&mut self, latency: Duration) {
         self.request_count += 1;
@@ -548,6 +587,20 @@ impl ActualLoadLoop {
     }
 }
 
+/// Entries made ahead of the time bucket that will need them; see
+/// [`TupleStatsCollector::prepare_next_bucket`]
+#[derive(Default)]
+struct NextBucket {
+    /// An entry per (group, connection), with the bucket it was made for
+    entries: FastHashMap<(usize, usize), (u64, StatsEntry)>,
+    /// The global entry, with the bucket it was made for
+    global: Option<(u64, StatsEntry)>,
+    /// Keys of the entries created that no entry was made after yet
+    pending: Vec<StatsKey>,
+    /// The bucket whose entries the entries map has room for
+    reserved: u64,
+}
+
 /// Tuple-keyed statistics collector
 ///
 /// Stores statistics keyed by (time_bucket, group_id, thread_id, connection_id) for flexible
@@ -563,6 +616,8 @@ pub struct TupleStatsCollector {
     /// Independent global storage per bucket, recorded with the global policy.
     /// This avoids trying to convert incompatible group sketches during aggregation.
     global_entries: FastHashMap<u64, StatsEntry>,
+    /// Empty entries made for the next bucket, which no aggregation sees
+    next_bucket: NextBucket,
     /// Global sampling policy for latency storage (used for global aggregation)
     sampling_policy: SamplingPolicy,
     /// Per-group sampling policies (used for per-group aggregation)
@@ -605,6 +660,7 @@ impl TupleStatsCollector {
             entries: FastHashMap::default(),
             thread_id: 0,
             global_entries: FastHashMap::default(),
+            next_bucket: NextBucket::default(),
             sampling_policy,
             group_sampling_policies: FastHashMap::default(),
             bucket_duration_ns: bucket_duration.as_nanos() as u64,
@@ -631,6 +687,7 @@ impl TupleStatsCollector {
             entries: FastHashMap::default(),
             thread_id: 0,
             global_entries: FastHashMap::default(),
+            next_bucket: NextBucket::default(),
             sampling_policy,
             group_sampling_policies: FastHashMap::default(),
             bucket_duration_ns: bucket_duration.as_nanos() as u64,
@@ -701,12 +758,75 @@ impl TupleStatsCollector {
             thread_id: self.thread_id,
             connection_id,
         };
-        let entry = self.entries.entry(key).or_insert_with(|| StatsEntry::new(policy));
-        let global = self
-            .global_entries
-            .entry(time_bucket)
-            .or_insert_with(|| StatsEntry::new(&self.sampling_policy));
+        let next_bucket = &mut self.next_bucket;
+        let entry = match self.entries.entry(key) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(slot) => {
+                next_bucket.pending.push(slot.key().clone());
+                let entry = match next_bucket.entries.remove(&(group_id, connection_id)) {
+                    Some((bucket, entry)) if bucket == time_bucket => entry,
+                    _ => StatsEntry::new(policy),
+                };
+                slot.insert(entry)
+            }
+        };
+        let global = self.global_entries.entry(time_bucket).or_insert_with(|| {
+            match next_bucket.global.take() {
+                Some((bucket, entry)) if bucket == time_bucket => entry,
+                _ => StatsEntry::new(&self.sampling_policy),
+            }
+        });
         (entry, global)
+    }
+
+    /// Make one of the entries the next time bucket will need, while the
+    /// worker has time to spare; returns whether it made one.
+    ///
+    /// A connection's first event in a bucket creates its entry there. An
+    /// HDR histogram zeroes its whole range of counts when it is made and
+    /// when it grows, about 90 KiB of fresh memory for latencies of 1 ms,
+    /// which delays the sends due then; at a bucket boundary every
+    /// connection does it within milliseconds, and the map of entries grows
+    /// by rehashing every entry of every bucket. In the second half of a
+    /// bucket this makes room in the map for as many entries as this bucket
+    /// has, then makes the next bucket's global entry, then an entry for
+    /// each connection with one in this bucket, sized like it. Recording
+    /// takes an entry made ahead only in the bucket it was made for, and it
+    /// is empty, so what is recorded does not change. Only HDR histograms
+    /// are made ahead; the other storage costs little to create.
+    pub fn prepare_next_bucket(&mut self, now_ns: u64) -> bool {
+        let since_start = now_ns.saturating_sub(self.experiment_start_ns);
+        if self.measurement_end_ns.is_some()
+            || since_start % self.bucket_duration_ns < self.bucket_duration_ns / 2
+        {
+            return false;
+        }
+        let bucket = since_start / self.bucket_duration_ns;
+        let next_bucket = &mut self.next_bucket;
+        if next_bucket.reserved <= bucket {
+            self.entries.reserve(next_bucket.pending.len());
+            next_bucket.reserved = bucket + 1;
+            return true;
+        }
+        if !matches!(next_bucket.global, Some((next, _)) if next > bucket) {
+            if let Some(entry) = self.global_entries.get(&bucket).and_then(StatsEntry::empty_like) {
+                next_bucket.global = Some((bucket + 1, entry));
+                return true;
+            }
+        }
+        while let Some(key) = next_bucket.pending.pop() {
+            // An entry of a past bucket is no guide to the next one
+            if key.time_bucket != bucket {
+                continue;
+            }
+            if let Some(entry) = self.entries.get(&key).and_then(StatsEntry::empty_like) {
+                next_bucket
+                    .entries
+                    .insert((key.group_id, key.connection_id), (bucket + 1, entry));
+                return true;
+            }
+        }
+        false
     }
 
     /// Record latency independently under the group and global sampling policies.
@@ -1133,6 +1253,7 @@ impl TupleStatsCollector {
             entries: FastHashMap::default(),
             thread_id: 0,
             global_entries: FastHashMap::default(),
+            next_bucket: NextBucket::default(),
             sampling_policy: first.sampling_policy.clone(),
             group_sampling_policies: FastHashMap::default(),
             bucket_duration_ns: first.bucket_duration_ns,
@@ -2628,6 +2749,176 @@ mod tests {
         // Group and global totals still include both threads.
         assert_eq!(merged.aggregate_global(Duration::from_secs(1)).total_requests, 10);
         assert_eq!(merged.aggregate_by_group(Duration::from_secs(1))[&0].total_requests, 10);
+    }
+
+    const BUCKET: Duration = Duration::from_millis(200);
+
+    /// A collector 120 ms into its first 200 ms bucket: past its middle.
+    /// The clock starts with the process, so this waits until its start can
+    /// move back four buckets ([`advance`]).
+    fn collector_past_middle(policy: SamplingPolicy) -> TupleStatsCollector {
+        while crate::timing::time_ns() < 1_000_000_000 {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let start = crate::timing::time_ns() - 120_000_000;
+        TupleStatsCollector::with_start_time(policy, BUCKET, start)
+    }
+
+    /// Move the collector's clock `buckets` buckets on
+    fn advance(collector: &mut TupleStatsCollector, buckets: u64) {
+        collector.experiment_start_ns -= buckets * BUCKET.as_nanos() as u64;
+    }
+
+    /// Record on connections 0 and 1 of group 0: bytes, latencies around
+    /// `base_us` and an error reply
+    fn record_traffic(collector: &mut TupleStatsCollector, base_us: u64) {
+        for connection in 0..2 {
+            collector.record_tx_bytes(0, connection, 64);
+            for i in 0..100 {
+                let latency = base_us + i * 37 + connection as u64 * 500;
+                collector.record_latency(0, connection, Duration::from_micros(latency));
+            }
+            collector.record_error_reply(0, connection, "ERR", Duration::from_micros(base_us));
+            collector.record_rx_bytes(0, connection, 128);
+        }
+    }
+
+    /// Every aggregation and time series of group 0, for comparison
+    fn outputs(collector: &TupleStatsCollector) -> String {
+        let duration = Duration::from_secs(1);
+        let mut connections: Vec<_> =
+            collector.aggregate_by_connection(0, duration).into_iter().collect();
+        connections.sort_by_key(|(id, _)| *id);
+        let series: Vec<_> = (0..2)
+            .map(|connection| collector.time_series_by_connection(0, 0, connection))
+            .collect();
+        format!(
+            "{:?}\n{:?}\n{connections:?}\n{:?}\n{:?}\n{series:?}\n{:?}",
+            collector.aggregate_global(duration),
+            collector.aggregate_by_group(duration)[&0],
+            collector.time_series_global(),
+            collector.time_series_by_group(0),
+            collector.time_buckets(),
+        )
+    }
+
+    fn hdr_high(entry: &StatsEntry) -> u64 {
+        match &entry.latency.quantiles {
+            Quantiles::HdrHistogram { hist, .. } => hist.high(),
+            _ => panic!("not an HDR histogram"),
+        }
+    }
+
+    #[test]
+    fn entries_made_ahead_change_nothing_recorded() {
+        let mut ahead = collector_past_middle(SamplingPolicy::default());
+        let mut plain = collector_past_middle(SamplingPolicy::default());
+        plain.experiment_start_ns = ahead.experiment_start_ns;
+        for collector in [&mut ahead, &mut plain] {
+            record_traffic(collector, 1_000);
+        }
+        // Room in the map, the global entry, then one per connection
+        let now = crate::timing::time_ns();
+        let capacity = ahead.entries.capacity();
+        assert!(ahead.prepare_next_bucket(now));
+        assert!(ahead.entries.capacity() >= 4 && ahead.entries.capacity() >= capacity);
+        for _ in 0..3 {
+            assert!(ahead.prepare_next_bucket(now));
+        }
+        assert!(!ahead.prepare_next_bucket(now));
+        let key = |time_bucket, connection_id| StatsKey {
+            time_bucket,
+            group_id: 0,
+            thread_id: 0,
+            connection_id,
+        };
+        for connection in 0..2 {
+            let (bucket, entry) = &ahead.next_bucket.entries[&(0, connection)];
+            assert_eq!(*bucket, 1);
+            let current = match &ahead.entries[&key(0, connection)].latency.quantiles {
+                Quantiles::HdrHistogram { hist, .. } => hist.max(),
+                _ => unreachable!(),
+            };
+            assert_eq!(hdr_high(entry), 2 * current);
+        }
+        // They are no entries of the next bucket until it records
+        plain.first_record_ns = ahead.first_record_ns;
+        assert_eq!(outputs(&ahead), outputs(&plain));
+
+        // The next bucket takes them, sized like the last, and grows them
+        // for longer latencies
+        for collector in [&mut ahead, &mut plain] {
+            advance(collector, 1);
+            record_traffic(collector, 2_000);
+            advance(collector, 1);
+            record_traffic(collector, 30_000);
+        }
+        assert!(ahead.next_bucket.entries.is_empty() && ahead.next_bucket.global.is_none());
+        assert_eq!(outputs(&ahead), outputs(&plain));
+    }
+
+    #[test]
+    fn entries_are_made_ahead_only_late_in_a_bucket_with_hdr_storage() {
+        // The first half of a bucket
+        let start = crate::timing::time_ns();
+        let mut early =
+            TupleStatsCollector::with_start_time(SamplingPolicy::default(), BUCKET, start);
+        record_traffic(&mut early, 1_000);
+        assert!(!early.prepare_next_bucket(start));
+
+        // Storage that costs little to make gets room in the map only
+        let mut samples = collector_past_middle(SamplingPolicy::Unlimited);
+        record_traffic(&mut samples, 1_000);
+        assert!(samples.prepare_next_bucket(crate::timing::time_ns()));
+        assert!(!samples.prepare_next_bucket(crate::timing::time_ns()));
+        assert!(samples.next_bucket.entries.is_empty() && samples.next_bucket.global.is_none());
+
+        // The drain after the window
+        let mut drained = collector_past_middle(SamplingPolicy::default());
+        record_traffic(&mut drained, 1_000);
+        drained.end_measurement(crate::timing::time_ns());
+        assert!(!drained.prepare_next_bucket(crate::timing::time_ns()));
+    }
+
+    #[test]
+    fn entries_made_ahead_keep_the_range_of_steady_latencies() {
+        let mut collector = collector_past_middle(SamplingPolicy::default());
+        let mut highs = Vec::new();
+        for bucket in 0..4 {
+            record_traffic(&mut collector, 1_000);
+            while collector.prepare_next_bucket(crate::timing::time_ns()) {}
+            let key = StatsKey {
+                time_bucket: bucket,
+                group_id: 0,
+                thread_id: 0,
+                connection_id: 0,
+            };
+            highs.push(hdr_high(&collector.entries[&key]));
+            advance(&mut collector, 1);
+        }
+        // Made from the latencies, not from the last range, which would
+        // double the range at each bucket
+        assert!(highs[1] > highs[0], "{highs:?}");
+        assert_eq!(highs[1..], [highs[1]; 3], "{highs:?}");
+    }
+
+    #[test]
+    fn an_entry_made_ahead_for_a_bucket_that_passed_is_not_taken() {
+        let mut ahead = collector_past_middle(SamplingPolicy::default());
+        let mut plain = collector_past_middle(SamplingPolicy::default());
+        plain.experiment_start_ns = ahead.experiment_start_ns;
+        for collector in [&mut ahead, &mut plain] {
+            record_traffic(collector, 1_000);
+        }
+        while ahead.prepare_next_bucket(crate::timing::time_ns()) {}
+        // Nothing recorded in bucket 1; bucket 2 makes its own entries
+        for collector in [&mut ahead, &mut plain] {
+            advance(collector, 2);
+            record_traffic(collector, 3_000);
+        }
+        assert!(ahead.next_bucket.entries.is_empty() && ahead.next_bucket.global.is_none());
+        plain.first_record_ns = ahead.first_record_ns;
+        assert_eq!(outputs(&ahead), outputs(&plain));
     }
 
     #[test]

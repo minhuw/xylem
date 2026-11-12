@@ -82,6 +82,13 @@ pub trait StatsRecorder: Send {
     /// Record a worker load-loop interval in Unix microseconds, including missing samples.
     fn record_actual_load_loop_samples(&mut self, _start_us: Option<u64>, _end_us: Option<u64>) {}
 
+    /// Do some of the work that recording will need soon, at `now_ns` (a
+    /// `timing::time_ns` value); returns whether there was any. The worker
+    /// calls it while no send is due for a while.
+    fn prepare(&mut self, _now_ns: u64) -> bool {
+        false
+    }
+
     /// Record a measurement request that was sent, with its lag behind its
     /// intended send time (`None` for a closed-loop request)
     fn record_sent(&mut self, _group_id: usize, _connection_id: usize, _lag: Option<Duration>) {}
@@ -151,6 +158,10 @@ impl StatsRecorder for TupleStatsCollector {
 
     fn record_actual_load_loop_samples(&mut self, start_us: Option<u64>, end_us: Option<u64>) {
         TupleStatsCollector::record_actual_load_loop_samples(self, start_us, end_us);
+    }
+
+    fn prepare(&mut self, now_ns: u64) -> bool {
+        self.prepare_next_bucket(now_ns)
     }
 
     fn record_sent(&mut self, group_id: usize, _connection_id: usize, lag: Option<Duration>) {
