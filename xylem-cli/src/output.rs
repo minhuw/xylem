@@ -533,7 +533,6 @@ impl DetailedExperimentResults {
         let mut records: Vec<StatsRecord> = if include_records {
             tuple_stats
                 .entries()
-                .iter()
                 .map(|(key, entry)| {
                     let width_secs = tuple_stats.bucket_width(key.time_bucket).as_secs_f64();
                     let total_bytes = (entry.tx_bytes + entry.rx_bytes) as f64;
@@ -1709,7 +1708,7 @@ mod raw_record_tests {
         collector.record_latency(4, 3, Duration::from_micros(9));
 
         let results = build_results(&collector, &groups, true);
-        assert_eq!(results.records.len(), collector.entries().len());
+        assert_eq!(results.records.len(), collector.entries().count());
         assert!(results.global.latency.sample_count > 0);
         assert!(results.traffic_groups[4].stats.latency.sample_count > 0);
         for (key, entry) in collector.entries() {

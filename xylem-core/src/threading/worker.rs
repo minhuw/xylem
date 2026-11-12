@@ -46,8 +46,8 @@ pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 pub const DEFAULT_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Time to the next send that lets the stats do work ahead of recording
-/// ([`StatsRecorder::prepare`]): making a time bucket's entry takes about
-/// 40 us in a release build and 100 us in a debug build
+/// ([`StatsRecorder::prepare`]): making the next time bucket's map of
+/// entries for 1000 connections takes up to 30 us in a release build
 const PREPARE_SLACK_NS: u64 = 200_000;
 
 /// Worker with connection pooling and request pipelining
@@ -1195,7 +1195,15 @@ mod tests {
         assert_eq!(global(&worker).latency_sample_count, 1);
         assert_eq!(worker.stats.error_latency(0).latency_sample_count, 2);
         assert_eq!(worker.stats.error_latency_global().latency_sample_count, 2);
-        assert_eq!(worker.stats.entries().values().map(|entry| entry.rx_bytes).sum::<u64>(), 24);
+        assert_eq!(
+            worker
+                .stats
+                .entries()
+                .map(|(_, entry)| entry)
+                .map(|entry| entry.rx_bytes)
+                .sum::<u64>(),
+            24
+        );
         // Like the latency, the breakdown leaves the error replies out
         assert_eq!(worker.stats.latency_breakdown_global().service.sample_count, 1);
         assert_eq!(worker.stats.latency_breakdown(0).service.sample_count, 1);
@@ -1249,7 +1257,15 @@ mod tests {
             worker.config.duration = Duration::ZERO;
             worker.run().unwrap();
             assert_eq!(global(&worker).total_requests, 1);
-            assert_eq!(worker.stats.entries().values().map(|entry| entry.rx_bytes).sum::<u64>(), 8);
+            assert_eq!(
+                worker
+                    .stats
+                    .entries()
+                    .map(|(_, entry)| entry)
+                    .map(|entry| entry.rx_bytes)
+                    .sum::<u64>(),
+                8
+            );
             assert!(factory.0.lock().unwrap().closed);
             assert!(worker.pool.get_state(0).unwrap().is_closed());
             assert_eq!(worker.pool.get_state(0).unwrap().pending_count(), 0);
@@ -1613,7 +1629,15 @@ mod tests {
         worker.process_responses(Duration::ZERO).unwrap();
         worker.run().unwrap();
         assert_eq!(worker.stats.aggregate_global(Duration::from_secs(1)).total_requests, 1);
-        assert_eq!(worker.stats.entries().values().map(|entry| entry.rx_bytes).sum::<u64>(), 8);
+        assert_eq!(
+            worker
+                .stats
+                .entries()
+                .map(|(_, entry)| entry)
+                .map(|entry| entry.rx_bytes)
+                .sum::<u64>(),
+            8
+        );
         assert_eq!(worker.stats.request_counts_global().failed, 1);
         assert_eq!(factory.0.lock().unwrap().timeouts.len(), 2);
         assert!(!worker.has_pending());
@@ -1653,7 +1677,15 @@ mod tests {
         let stats = global(&worker);
         assert_eq!(stats.total_requests, 1);
         assert_eq!(stats.latency_sample_count, 2);
-        assert_eq!(worker.stats.entries().values().map(|entry| entry.rx_bytes).sum::<u64>(), 8);
+        assert_eq!(
+            worker
+                .stats
+                .entries()
+                .map(|(_, entry)| entry)
+                .map(|entry| entry.rx_bytes)
+                .sum::<u64>(),
+            8
+        );
         let points = worker.stats.time_series_global();
         assert_eq!(points.iter().map(|p| p.request_count).sum::<u64>(), 1);
         let counts = worker.stats.request_counts_global();
@@ -1727,9 +1759,18 @@ mod tests {
         assert_eq!(dumper.total_records(), measured as u64);
         factory.0.lock().unwrap().responses.push_back(Ok(2u64.to_le_bytes().to_vec()));
         worker.process_responses(Duration::ZERO).unwrap();
-        let tx_bytes: u64 = worker.stats.entries().values().map(|entry| entry.tx_bytes).sum();
+        let tx_bytes: u64 =
+            worker.stats.entries().map(|(_, entry)| entry).map(|entry| entry.tx_bytes).sum();
         assert_eq!(tx_bytes, 8 * measured as u64);
-        assert_eq!(worker.stats.entries().values().map(|entry| entry.rx_bytes).sum::<u64>(), 8);
+        assert_eq!(
+            worker
+                .stats
+                .entries()
+                .map(|(_, entry)| entry)
+                .map(|entry| entry.rx_bytes)
+                .sum::<u64>(),
+            8
+        );
         assert_eq!(global(&worker).latency_sample_count, 1);
     }
 
@@ -2462,7 +2503,15 @@ mod tests {
         assert_eq!((counts.completed, counts.timed_out, counts.late_responses), (1, 1, 1));
         assert_eq!(global(&worker).latency_sample_count, 1, "the late response has no latency");
         // Every received datagram counts toward the received bytes
-        assert_eq!(worker.stats.entries().values().map(|entry| entry.rx_bytes).sum::<u64>(), 16);
+        assert_eq!(
+            worker
+                .stats
+                .entries()
+                .map(|(_, entry)| entry)
+                .map(|entry| entry.rx_bytes)
+                .sum::<u64>(),
+            16
+        );
     }
 
     #[test]
@@ -2603,7 +2652,8 @@ mod tests {
         assert_eq!(counts.sent, counts.completed + counts.timed_out, "{counts:?}");
         assert_eq!((counts.failed, counts.late_responses), (0, 0), "{counts:?}");
         // Each response's bytes are its datagrams, duplicates included
-        let rx: u64 = worker.stats.entries().values().map(|entry| entry.rx_bytes).sum();
+        let rx: u64 =
+            worker.stats.entries().map(|(_, entry)| entry).map(|entry| entry.rx_bytes).sum();
         assert!(rx >= counts.completed * 4000, "{rx}");
     }
 
@@ -2894,7 +2944,7 @@ mod tests {
         // Only the load connections' requests are measured
         let counts = worker.stats.request_counts_global();
         assert_eq!(counts.sent, 2);
-        assert!(worker.stats.entries().keys().all(|key| key.connection_id != 0));
+        assert!(worker.stats.entries().map(|(key, _)| key).all(|key| key.connection_id != 0));
     }
 
     #[test]
@@ -2932,9 +2982,10 @@ mod tests {
         assert_eq!((counts.sent, counts.completed), (3, 1));
         let global = worker.stats.aggregate_global(Duration::from_secs(1));
         assert_eq!(global.latency_sample_count, 1);
-        let entries = worker.stats.entries();
-        assert_eq!(entries.values().map(|entry| entry.rx_bytes).sum::<u64>(), 12);
-        assert_eq!(entries.values().map(|entry| entry.tx_bytes).sum::<u64>(), 3 * 8 + 4);
+        let rx_bytes: u64 = worker.stats.entries().map(|(_, entry)| entry.rx_bytes).sum();
+        assert_eq!(rx_bytes, 12);
+        let tx_bytes: u64 = worker.stats.entries().map(|(_, entry)| entry.tx_bytes).sum();
+        assert_eq!(tx_bytes, 3 * 8 + 4);
     }
 
     #[test]
@@ -2987,7 +3038,8 @@ mod tests {
         assert!(io.lock().unwrap().write_interest.is_empty());
         let counts = worker.stats.request_counts_global();
         assert_eq!((counts.sent, counts.completed), (3, 1));
-        let tx_bytes: u64 = worker.stats.entries().values().map(|entry| entry.tx_bytes).sum();
+        let tx_bytes: u64 =
+            worker.stats.entries().map(|(_, entry)| entry).map(|entry| entry.tx_bytes).sum();
         assert_eq!(tx_bytes, 3 * 8 + 20);
     }
 

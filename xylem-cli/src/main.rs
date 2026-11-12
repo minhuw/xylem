@@ -427,6 +427,9 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
         // Connection IDs restart at 0 on every thread; the thread ID keeps
         // per-connection statistics apart when the collectors are merged.
         stats.set_thread_id(thread_idx);
+        // Without records, groups whose policy merges exactly keep one
+        // total each instead of entries per time bucket and connection.
+        stats.set_keep_records(config_for_worker.stats.include_records);
 
         // Register per-group sampling policies for independent aggregation
         for (group_id, _) in groups_for_thread.iter() {

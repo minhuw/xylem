@@ -63,7 +63,7 @@ fn test_masstree_get_single_thread() {
     // Verify we got some requests through
     assert!(global.total_requests > 0, "Should have completed some requests");
     assert!(
-        stats.entries().values().any(|entry| entry.latency.count() > 0),
+        stats.entries().map(|(_, entry)| entry).any(|entry| entry.latency.count() > 0),
         "Should have collected latency samples"
     );
 
@@ -368,7 +368,7 @@ fn test_masstree_pipelined() {
     // Verify we got some requests through
     assert!(global.total_requests > 0, "Should have completed some requests");
     assert!(
-        stats.entries().values().any(|entry| entry.latency.count() > 0),
+        stats.entries().map(|(_, entry)| entry).any(|entry| entry.latency.count() > 0),
         "Should have collected latency samples"
     );
 

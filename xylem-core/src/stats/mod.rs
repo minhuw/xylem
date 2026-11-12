@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 pub mod breakdown;
+#[cfg(test)]
+mod legacy_tuple_collector;
 pub mod policy;
 pub mod requests;
 pub mod tuple_collector;

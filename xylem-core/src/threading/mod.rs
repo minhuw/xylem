@@ -255,7 +255,14 @@ mod tests {
         for (i, stats) in results.iter().enumerate() {
             let global = stats.aggregate_global(Duration::from_secs(1));
             assert_eq!(global.total_requests, 1);
-            assert_eq!(stats.entries().values().map(|entry| entry.latency.count()).sum::<u64>(), 1);
+            assert_eq!(
+                stats
+                    .entries()
+                    .map(|(_, entry)| entry)
+                    .map(|entry| entry.latency.count())
+                    .sum::<u64>(),
+                1
+            );
             assert_eq!(global.latency_p50, Duration::from_micros(i as u64 * 10));
         }
     }

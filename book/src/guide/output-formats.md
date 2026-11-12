@@ -354,6 +354,16 @@ include_records = true
 bucket_duration = "1s"
 ```
 
+Records cost memory for every bucket of every connection for the whole run;
+with the default HDR histogram an entry keeps only the histogram bins it
+recorded (60 s at 1000 connections and 4000 req/s: about 90 MB). Without
+records, a group whose `sampling_policy` is `hdr-histogram`, `unlimited` or
+`none` keeps one total per worker thread instead, so its memory does not grow
+with the number of buckets or connections (`unlimited` still keeps every
+latency). Other policies keep an entry per bucket
+and connection either way: their merged estimate depends on how the latencies
+were split.
+
 Each record names its connection by `group_id`, `thread_id` and
 `connection_id`. Connection IDs restart at 0 on every worker thread, so
 `thread_id` (the thread's entry in `threads`) is needed to tell connections

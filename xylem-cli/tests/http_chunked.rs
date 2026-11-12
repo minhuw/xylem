@@ -81,8 +81,10 @@ fn chunked_responses_count_their_full_wire_bytes() {
     for max_pending in [1, 8] {
         let (result, stats) = run_worker(addr, Duration::from_millis(500), max_pending);
         result.expect("Worker should complete without errors");
-        let requests: u64 = stats.entries().values().map(|entry| entry.request_count).sum();
-        let rx_bytes: u64 = stats.entries().values().map(|entry| entry.rx_bytes).sum();
+        let requests: u64 =
+            stats.entries().map(|(_, entry)| entry).map(|entry| entry.request_count).sum();
+        let rx_bytes: u64 =
+            stats.entries().map(|(_, entry)| entry).map(|entry| entry.rx_bytes).sum();
         assert!(requests > 0, "Should have completed requests (max_pending {max_pending})");
         assert_eq!(rx_bytes, requests * response.len() as u64, "max_pending {max_pending}");
     }

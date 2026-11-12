@@ -74,7 +74,7 @@ fn test_http_get_single_thread() {
     // Verify we got some requests through
     assert!(global.total_requests > 0, "Should have completed some requests");
     assert!(
-        stats.entries().values().any(|entry| entry.latency.count() > 0),
+        stats.entries().map(|(_, entry)| entry).any(|entry| entry.latency.count() > 0),
         "Should have collected latency samples"
     );
 
@@ -296,7 +296,7 @@ fn test_http_put_request() {
     println!("  Total requests: {}", global.total_requests);
     println!(
         "  Total bytes sent: {}",
-        stats.entries().values().map(|entry| entry.tx_bytes).sum::<u64>()
+        stats.entries().map(|(_, entry)| entry).map(|entry| entry.tx_bytes).sum::<u64>()
     );
 
     assert!(global.total_requests > 0, "Should have completed PUT requests");
@@ -416,8 +416,9 @@ fn run_chunked(max_pending_per_conn: usize) {
 
     let stats = worker.into_stats();
     let global = stats.aggregate_global(duration);
-    let requests: u64 = stats.entries().values().map(|entry| entry.request_count).sum();
-    let rx_bytes: u64 = stats.entries().values().map(|entry| entry.rx_bytes).sum();
+    let requests: u64 =
+        stats.entries().map(|(_, entry)| entry).map(|entry| entry.request_count).sum();
+    let rx_bytes: u64 = stats.entries().map(|(_, entry)| entry).map(|entry| entry.rx_bytes).sum();
     println!("Results (max pending {max_pending_per_conn}):");
     println!("  Total requests: {}", global.total_requests);
     println!(
