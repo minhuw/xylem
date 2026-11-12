@@ -74,6 +74,13 @@ pub struct ExperimentConfig {
     #[serde(with = "humantime_serde", default = "default_drain_timeout")]
     #[schemars(with = "String")]
     pub drain_timeout: Duration,
+    /// Longest time a connection may take to set up (default 10s), counted
+    /// from the start of its connect: a connection whose protocol setup
+    /// (such as Redis AUTH or the HTTP/2 preface) has not finished by then
+    /// fails the run
+    #[serde(with = "humantime_serde", default = "default_setup_timeout")]
+    #[schemars(with = "String")]
+    pub setup_timeout: Duration,
     /// Busy-poll: for this many microseconds after each send and each poll
     /// that finds a ready connection, every worker thread polls without
     /// waiting, then waits in its poll as without it. Unset (the default)
@@ -93,6 +100,10 @@ impl ExperimentConfig {
 
 fn default_drain_timeout() -> Duration {
     xylem_core::threading::DEFAULT_DRAIN_TIMEOUT
+}
+
+fn default_setup_timeout() -> Duration {
+    xylem_core::threading::DEFAULT_SETUP_TIMEOUT
 }
 
 /// Re-export KeysConfig from xylem-protocols for use in config files
@@ -323,6 +334,9 @@ impl ProfileConfig {
         }
         if self.experiment.duration.as_secs() == 0 {
             errors.push(anyhow!("Experiment duration must be > 0"));
+        }
+        if self.experiment.setup_timeout.is_zero() {
+            errors.push(anyhow!("experiment.setup_timeout must be > 0"));
         }
         if self.experiment.busy_poll_us == Some(0) {
             errors.push(anyhow!(
@@ -1281,6 +1295,21 @@ mod tests {
             let set = [format!("experiment.busy_poll_us={value}")];
             assert!(ProfileConfig::from_file_with_overrides(path, &set).is_err(), "{value}");
         }
+    }
+
+    #[test]
+    fn setup_timeout_defaults_to_ten_seconds_and_must_be_positive() {
+        let path = "../tests/redis/redis-bench.toml";
+        let config = ProfileConfig::from_file_with_overrides(path, &[]).unwrap();
+        assert_eq!(config.experiment.setup_timeout, Duration::from_secs(10));
+
+        let set = ["experiment.setup_timeout=\"250ms\"".to_string()];
+        let config = ProfileConfig::from_file_with_overrides(path, &set).unwrap();
+        assert_eq!(config.experiment.setup_timeout, Duration::from_millis(250));
+
+        let set = ["experiment.setup_timeout=\"0s\"".to_string()];
+        let error = ProfileConfig::from_file_with_overrides(path, &set).unwrap_err().to_string();
+        assert_eq!(error, "experiment.setup_timeout must be > 0");
     }
 
     #[test]
@@ -2779,7 +2808,7 @@ duration = "10s""#,
                 "experiment.duraton=1s",
                 "Invalid --set experiment.duraton=1s: unknown field `duraton` in experiment \
                  (did you mean `duration`?); expected one of `busy_poll_us`, `description`, \
-                 `drain_timeout`, `duration`, `name`, `seed`",
+                 `drain_timeout`, `duration`, `name`, `seed`, `setup_timeout`",
             ),
             ("experimnt.seed=1", "unknown field `experimnt` at the top level (did you mean `experiment`?)"),
             ("traffic_groups.1.traffic_policy.rat=5", "in traffic_groups[1].traffic_policy (did you mean `rate`?)"),

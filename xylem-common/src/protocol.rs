@@ -228,8 +228,9 @@ pub trait Protocol: Send {
     /// connection does not wait for its intended send times to set up. Its
     /// schedule starts once setup is done. Return true only while the next
     /// request will be a setup request or a setup reply is pending. A
-    /// connection error while it is true, or a true at the end of the run,
-    /// fails the run.
+    /// connection error while it is true, a true once the setup timeout
+    /// after the connection's connect passed, or a true at the end of the
+    /// run, fails the run.
     ///
     /// Default implementation returns false: any setup requests wait for the
     /// connection's intended send times like other requests.

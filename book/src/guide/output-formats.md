@@ -29,11 +29,13 @@ phases:
 1. **Warmup**: connection setup (such as Redis AUTH or the Masstree
    handshake) and requests a protocol marks as warmup, such as an insert
    phase. They are excluded from every statistic and count. A connection the
-   server closes during setup, or whose setup has not finished when the run
-   ends, fails the run (exit status 1, no result files) with an error naming
-   its traffic group, connection and protocol, such as `Traffic group 0,
-   connection 0 (clickhouse): connection closed during setup: Connection
-   closed by peer`.
+   server closes during setup, or whose setup has not finished
+   `experiment.setup_timeout` (default 10 s) after its connect started or
+   when the run ends, fails the run at once (exit status 1, no result files)
+   with an error naming its traffic group, connection and protocol, such as
+   `Traffic group 0, connection 0 (clickhouse): connection closed during
+   setup: Connection closed by peer` or `Traffic group 0, connection 0
+   (redis): connection setup did not finish within the setup timeout (10s)`.
 2. **Measurement**: from the first measured request to `experiment.duration`
    after the start. Only responses that arrive in this window count toward
    throughput.

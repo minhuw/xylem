@@ -1,7 +1,8 @@
 //! Servers that drop or never answer connection setup (a ClickHouse Hello,
 //! Redis AUTH, the masstree handshake, NVMe/TCP ICReq, the HTTP/2 preface)
-//! fail the run with an error naming the connection, through the real CLI.
-//! The servers are stubs in the test: no Docker.
+//! fail the run with an error naming the connection, through the real CLI:
+//! a silent server at the end of the run, or once `experiment.setup_timeout`
+//! passed. The servers are stubs in the test: no Docker.
 use std::io::Read;
 use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
@@ -9,7 +10,7 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// What the stub server does with each connection it accepts
 #[derive(Clone, Copy)]
@@ -77,17 +78,19 @@ impl Drop for StubServer {
 }
 
 /// Run one connection of `protocol` with `protocol_config` and
-/// `traffic_policy` against `target` for a second, with JSON results in `dir`
+/// `traffic_policy` against `target` with `experiment` (its `duration` and
+/// any other keys), with JSON results in `dir`
 fn run_cli(
     protocol: &str,
     protocol_config: serde_json::Value,
     traffic_policy: serde_json::Value,
+    experiment: serde_json::Value,
     target: SocketAddr,
     dir: &Path,
 ) -> Output {
     let profile = dir.join("profile.toml");
-    let config = serde_json::json!({
-        "experiment": { "name": "setup-failure", "duration": "1s", "seed": 7 },
+    let mut config = serde_json::json!({
+        "experiment": { "name": "setup-failure", "seed": 7 },
         "traffic_groups": [{
             "name": "stub", "threads": [0], "connections_per_thread": 1,
             "max_pending_per_connection": 1, "target": target.to_string(),
@@ -96,6 +99,9 @@ fn run_cli(
         }],
         "output": { "format": "json", "file": dir.join("results.json") }
     });
+    for (key, value) in experiment.as_object().expect("experiment keys") {
+        config["experiment"][key] = value.clone();
+    }
     std::fs::write(&profile, toml::to_string(&config).unwrap()).unwrap();
     Command::new(env!("CARGO_BIN_EXE_xylem"))
         .arg("-P")
@@ -117,15 +123,29 @@ fn setup_protocols() -> [(&'static str, serde_json::Value); 5] {
     ]
 }
 
-/// Run every setup protocol against a server doing `stub`, and check that
-/// each run fails with exit 1 and an error ending in `failure`, without
-/// results
-fn assert_setup_fails(stub: Stub, failure: &str) {
+/// Run every setup protocol with `experiment` against a server doing `stub`,
+/// and check that each run fails with exit 1 and an error ending in
+/// `failure`, without results; returns how long each run took
+fn assert_setup_fails(
+    stub: Stub,
+    experiment: serde_json::Value,
+    failure: &str,
+) -> Vec<(&'static str, Duration)> {
+    let mut elapsed = Vec::new();
     for (protocol, protocol_config) in setup_protocols() {
         let server = StubServer::start(stub);
         let dir = tempfile::tempdir().unwrap();
         let closed_loop = serde_json::json!({ "type": "closed-loop" });
-        let output = run_cli(protocol, protocol_config, closed_loop, server.addr, dir.path());
+        let started = Instant::now();
+        let output = run_cli(
+            protocol,
+            protocol_config,
+            closed_loop,
+            experiment.clone(),
+            server.addr,
+            dir.path(),
+        );
+        elapsed.push((protocol, started.elapsed()));
         drop(server);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(output.status.code(), Some(1), "{protocol}: {stderr}");
@@ -136,21 +156,49 @@ fn assert_setup_fails(stub: Stub, failure: &str) {
         assert!(stderr.contains(&error), "{protocol}: {stderr}");
         assert!(!dir.path().join("results.json").exists(), "{protocol}: {stderr}");
     }
+    elapsed
+}
+
+/// A second's run, ending long before the default setup timeout
+fn one_second() -> serde_json::Value {
+    serde_json::json!({ "duration": "1s" })
 }
 
 #[test]
 fn a_server_closing_before_reading_setup_fails_the_run() {
-    assert_setup_fails(Stub::CloseAtOnce, "connection closed during setup: ");
+    assert_setup_fails(Stub::CloseAtOnce, one_second(), "connection closed during setup: ");
 }
 
 #[test]
 fn a_server_closing_after_reading_setup_fails_the_run() {
-    assert_setup_fails(Stub::CloseAfterHello, "connection closed during setup: ");
+    assert_setup_fails(Stub::CloseAfterHello, one_second(), "connection closed during setup: ");
 }
 
 #[test]
 fn a_server_never_answering_setup_fails_the_run() {
-    assert_setup_fails(Stub::Silent, "connection setup did not finish by the end of the run");
+    assert_setup_fails(
+        Stub::Silent,
+        one_second(),
+        "connection setup did not finish by the end of the run",
+    );
+}
+
+/// A minute's run against a silent server fails once its 300 ms setup
+/// timeout passed, not at the end of the run
+#[test]
+fn a_server_never_answering_setup_fails_the_run_at_the_setup_timeout() {
+    let experiment = serde_json::json!({ "duration": "60s", "setup_timeout": "300ms" });
+    let elapsed = assert_setup_fails(
+        Stub::Silent,
+        experiment,
+        "connection setup did not finish within the setup timeout (300ms)",
+    );
+    for (protocol, elapsed) in elapsed {
+        // The timeout counts from the connect, which the process start
+        // precedes; the bound leaves a debug binary's startup room
+        assert!(elapsed >= Duration::from_millis(300), "{protocol}: {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(5), "{protocol}: {elapsed:?}");
+    }
 }
 
 /// A rate-driven group that sends nothing in the run (no setup, a rate far
@@ -162,7 +210,8 @@ fn a_group_that_sends_nothing_makes_the_run_invalid() {
     let dir = tempfile::tempdir().unwrap();
     // Seed 7 draws its first arrival long after the end of the run
     let rare = serde_json::json!({ "type": "poisson", "rate": 0.001 });
-    let output = run_cli("http", serde_json::json!({}), rare, server.addr, dir.path());
+    let output =
+        run_cli("http", serde_json::json!({}), rare, one_second(), server.addr, dir.path());
     drop(server);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(3), "{stderr}");

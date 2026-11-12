@@ -48,6 +48,12 @@ seed = 42
   long to wait for responses that are still pending. Nothing is sent during the
   drain. Requests still pending when it ends count as `timed_out`; see
   [run phases](../guide/output-formats.md#run-phases).
+- `setup_timeout` (string, default `"10s"`, more than zero): how long a
+  connection may take to set up, counted from the start of its connect, so it
+  includes the connect and the wait for the other threads to open theirs.
+  A connection whose protocol setup (such as Redis AUTH, the ClickHouse
+  Hello or the HTTP/2 preface) has not finished by then fails the run; see
+  [run phases](../guide/output-formats.md#run-phases).
 - `busy_poll_us` (integer, optional, at least 1): turn on busy polling with
   this budget in microseconds; see [busy polling](#busy-polling). Off when
   unset.

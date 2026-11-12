@@ -13,7 +13,7 @@ use crate::stats::{StatsRecorder, TupleStatsCollector, UNSENT_WALK_CAP};
 use crate::timing;
 use crate::traffic_group::OnError;
 use crate::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -41,6 +41,9 @@ pub struct WorkerConfig {
 
 /// Default for [`WorkerConfig::drain_timeout`]
 pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Default for [`Worker::set_setup_timeout`]
+pub const DEFAULT_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Worker with connection pooling and request pipelining
 ///
@@ -73,6 +76,12 @@ pub struct Worker<G: ConnectionGroup, P: Protocol, S: StatsRecorder = TupleStats
     /// When the worker last sent or a poll reported a ready connection (a
     /// `timing::time_ns` value)
     last_io_ns: u64,
+    /// See [`Self::set_setup_timeout`]
+    setup_timeout: Duration,
+    /// `(deadline_ns, connection_id)` of the connections in setup at the
+    /// start of the run, in deadline order. Entries of connections whose
+    /// setup finished are pruned once their deadline passes.
+    setup_deadlines: VecDeque<(u64, usize)>,
 }
 
 impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
@@ -168,6 +177,8 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             sent: Vec::new(),
             busy_poll_ns: None,
             last_io_ns: 0,
+            setup_timeout: DEFAULT_SETUP_TIMEOUT,
+            setup_deadlines: VecDeque::new(),
         }
     }
 
@@ -201,6 +212,16 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
     /// [`OnError::Abort`], the run fails at the first one, warmup included.
     pub fn set_on_error(&mut self, group_id: usize, on_error: OnError) {
         self.pool.set_on_error(group_id, on_error);
+    }
+
+    /// Fail the run when a connection's setup (see [`Protocol::setup_pending`])
+    /// has not finished `timeout` after the pool started to open the
+    /// connection; [`DEFAULT_SETUP_TIMEOUT`] by default
+    ///
+    /// The timeout includes the connect and the wait for the run's start,
+    /// before which no setup request goes out.
+    pub fn set_setup_timeout(&mut self, timeout: Duration) {
+        self.setup_timeout = timeout;
     }
 
     /// Busy-poll for up to `budget` after the last I/O; `None` (the default)
@@ -275,6 +296,7 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
     ) -> Result<()> {
         self.stats.start_measurement(start_ns);
         self.anchor_schedules(start_ns);
+        self.arm_setup_deadlines();
         let now_ns = timing::time_ns();
         if start_ns.saturating_sub(now_ns) > 2_000_000 {
             // Sleep until shortly before the start, then spin to it
@@ -314,7 +336,11 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             if !self.ready_ids.is_empty() {
                 self.last_io_ns = now_ns;
             }
-            self.expire_requests(timing::time_ns());
+            let now_ns = timing::time_ns();
+            self.expire_requests(now_ns);
+            if let Err(error) = self.check_setup_deadlines(now_ns) {
+                break Err(error);
+            }
         };
         let actual_end_us = wall_clock_us();
         self.stats.record_actual_load_loop_samples(actual_start_us, actual_end_us);
@@ -480,11 +506,12 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         }
     }
 
-    /// Bound every receive wait by the experiment deadline and the next
-    /// request timeout. A closed-loop entry has no timestamp, so test
-    /// readiness before interpreting an empty peek.
+    /// Bound every receive wait by the experiment deadline, the next
+    /// request timeout and the next setup deadline. A closed-loop entry has
+    /// no timestamp, so test readiness before interpreting an empty peek.
     fn poll_timeout(&self, now_ns: u64, end_ns: u64) -> Duration {
         let end_ns = self.pool.next_request_deadline().map_or(end_ns, |next| next.min(end_ns));
+        let end_ns = self.setup_deadlines.front().map_or(end_ns, |&(next, _)| next.min(end_ns));
         let remaining_ns = end_ns.saturating_sub(now_ns);
         let wait_ns = if self.pool.has_ready(now_ns) {
             0
@@ -721,6 +748,51 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
                 protocol.name()
             ))
         })
+    }
+
+    /// Give every connection in setup its setup deadline: the setup timeout
+    /// after the pool started to open it
+    fn arm_setup_deadlines(&mut self) {
+        self.setup_deadlines.clear();
+        let timeout_ns = self.setup_timeout.as_nanos().min(u64::MAX as u128) as u64;
+        for &connection_id in self.pool.connection_ids() {
+            let Some(state) = self.pool.get_state(connection_id) else {
+                continue;
+            };
+            let protocol =
+                self.protocols.get(&state.group_id()).expect("Protocol not found for group_id");
+            if protocol.setup_pending(connection_id) {
+                let deadline_ns = state.opened_ns().saturating_add(timeout_ns);
+                self.setup_deadlines.push_back((deadline_ns, connection_id));
+            }
+        }
+        // The pool opens its connections in ID order, one after the other
+        debug_assert!(self.setup_deadlines.iter().is_sorted_by_key(|&(deadline, _)| deadline));
+    }
+
+    /// Fail the run if a connection whose setup deadline passed by `now_ns`
+    /// is still in setup
+    fn check_setup_deadlines(&mut self, now_ns: u64) -> Result<()> {
+        while let Some(&(deadline_ns, connection_id)) = self.setup_deadlines.front() {
+            if deadline_ns > now_ns {
+                break;
+            }
+            self.setup_deadlines.pop_front();
+            let Some(state) = self.pool.get_state(connection_id) else {
+                continue;
+            };
+            let group_id = state.group_id();
+            let protocol = self.protocols.get(&group_id).expect("Protocol not found for group_id");
+            if protocol.setup_pending(connection_id) {
+                return Err(crate::Error::Connection(format!(
+                    "Traffic group {group_id}, connection {connection_id} ({}): connection setup \
+                     did not finish within the setup timeout ({:?})",
+                    protocol.name(),
+                    self.setup_timeout
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Fail the run if a connection is still in setup: the server never
@@ -1417,6 +1489,57 @@ mod tests {
              finish by the end of the run"
         );
         assert_eq!(sent_requests(&factory), 1);
+    }
+
+    #[test]
+    fn a_setup_that_outlasts_the_setup_timeout_fails_the_run_at_once() {
+        let factory = FakeFactory::default();
+        let mut worker = setup_worker(&factory);
+        worker.config.duration = Duration::from_secs(10);
+        worker.set_setup_timeout(Duration::from_millis(20));
+        // The setup reply never arrives
+        let started = std::time::Instant::now();
+        let error = worker.run().unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        assert_eq!(
+            error.to_string(),
+            "Connection error: Traffic group 0, connection 0 (Fake): connection setup did not \
+             finish within the setup timeout (20ms)"
+        );
+        assert_eq!(sent_requests(&factory), 1);
+    }
+
+    #[test]
+    fn the_setup_timeout_counts_from_the_connect() {
+        let factory = FakeFactory::default();
+        let mut worker = setup_worker(&factory);
+        worker.set_setup_timeout(Duration::from_millis(5));
+        let opened_ns = worker.pool.get_state(0).unwrap().opened_ns();
+        worker.arm_setup_deadlines();
+        assert_eq!(worker.setup_deadlines, [(opened_ns + 5_000_000, 0)]);
+        worker.check_setup_deadlines(opened_ns + 4_999_999).unwrap();
+        worker.check_setup_deadlines(opened_ns + 5_000_000).unwrap_err();
+    }
+
+    #[test]
+    fn a_finished_setup_outlives_its_setup_deadline() {
+        let factory = FakeFactory::default();
+        let mut worker = setup_worker(&factory);
+        worker.config.duration = Duration::from_millis(30);
+        worker.set_setup_timeout(Duration::from_millis(1));
+        factory.0.lock().unwrap().responses.push_back(Ok(0u64.to_le_bytes().to_vec()));
+        worker.run().unwrap();
+        assert!(worker.setup_deadlines.is_empty());
+        assert!(worker.stats.request_counts_global().sent > 0);
+    }
+
+    #[test]
+    fn a_connection_without_setup_has_no_setup_deadline() {
+        let factory = FakeFactory::default();
+        let scheduler = Box::new(UniformPolicyScheduler::closed_loop());
+        let mut worker = fake_worker(&factory, 1, scheduler);
+        worker.arm_setup_deadlines();
+        assert!(worker.setup_deadlines.is_empty());
     }
 
     #[test]

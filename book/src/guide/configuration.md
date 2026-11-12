@@ -105,7 +105,7 @@ line:
 ```text
 Error: Failed to parse config file: profile.toml
   Caused by: The profile has 2 errors:
-  - unknown field `durationn` in experiment (did you mean `duration`?); expected one of `busy_poll_us`, `description`, `drain_timeout`, `duration`, `name`, `seed`
+  - unknown field `durationn` in experiment (did you mean `duration`?); expected one of `busy_poll_us`, `description`, `drain_timeout`, `duration`, `name`, `seed`, `setup_timeout`
   - unknown field `valu_size` in traffic_groups[0].protocol_config.keys (did you mean `value_size`?); expected one of `n`, `prefix`, `strategy`, `theta`, `value_size`
 ```
 

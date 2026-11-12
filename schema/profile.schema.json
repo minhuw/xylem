@@ -203,6 +203,11 @@
           "format": "uint64",
           "default": null,
           "minimum": 0
+        },
+        "setup_timeout": {
+          "description": "Longest time a connection may take to set up (default 10s), counted\nfrom the start of its connect: a connection whose protocol setup\n(such as Redis AUTH or the HTTP/2 preface) has not finished by then\nfails the run",
+          "type": "string",
+          "default": "10s"
         }
       },
       "additionalProperties": false,

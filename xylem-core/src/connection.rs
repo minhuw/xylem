@@ -256,6 +256,9 @@ pub struct ConnectionState<ReqId: Eq + Hash + Clone> {
     recv_len: usize,
     /// Whether connection is closed
     closed: bool,
+    /// When the pool started to open the connection (a `timing::time_ns`
+    /// value), before its connect
+    opened_ns: u64,
     /// Traffic policy for this connection
     policy: Box<dyn Policy>,
     /// Traffic group ID this connection belongs to
@@ -327,6 +330,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
             recv_buffer: Vec::new(),
             recv_len: 0,
             closed: false,
+            opened_ns: 0,
             policy,
             group_id,
             on_heap: false,
@@ -390,6 +394,12 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
     /// Check if connection is closed
     pub fn is_closed(&self) -> bool {
         self.closed
+    }
+
+    /// When the pool started to open the connection, before its connect (a
+    /// `timing::time_ns` value)
+    pub fn opened_ns(&self) -> u64 {
+        self.opened_ns
     }
 
     /// Get the traffic group ID
@@ -1132,6 +1142,7 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
             }
             let mut load_index = 0;
             for &role in group_roles {
+                let opened_ns = crate::timing::time_ns();
                 let (connection_id, address) = add_connection(&mut group, &target)?;
                 // A control connection takes no arrivals of the group's
                 // dispatcher: it sends its setup requests off the heap
@@ -1164,6 +1175,7 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
                     group_id,
                 );
 
+                state.opened_ns = opened_ns;
                 state.dispatcher = dispatcher;
                 state.control = role == ConnectionRole::Control;
                 state.local_addr = group.local_addr(connection_id);
