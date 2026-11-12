@@ -18,7 +18,7 @@ impl MemcachedGuard {
         let stack = ComposeStack::start(&ComposeSpec {
             name: "Memcached",
             compose_file: "tests/memcached/docker-compose.test.yml",
-            build_images: false,
+            image: None,
             is_ready: |stack| {
                 stack
                     .container_addr("memcached", 11211)

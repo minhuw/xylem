@@ -1,8 +1,4 @@
-# Every test project shares one image tag, so repeated builds reuse it instead
-# of leaving a new image per project
+# The test fixture builds the image with plain `docker build` under this tag
 services:
   masstree:
-    build:
-      context: .
-      dockerfile: Dockerfile
     image: xylem-test-masstree:latest

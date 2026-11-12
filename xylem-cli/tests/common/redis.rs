@@ -19,7 +19,7 @@ impl RedisGuard {
         let stack = ComposeStack::start(&ComposeSpec {
             name: "Redis",
             compose_file: "tests/redis/docker-compose.test.yml",
-            build_images: false,
+            image: None,
             is_ready: |stack| {
                 stack
                     .container_addr("redis", 6379)

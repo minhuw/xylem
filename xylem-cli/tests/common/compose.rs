@@ -9,12 +9,17 @@
 //! under `taskset` keeps its servers on the same CPUs. A guard names its
 //! compose file and a readiness probe; this module runs `up -d`, looks up the
 //! container addresses, polls the probe, and runs `down -v` on drop for the
-//! project it created.
+//! project it created. Images built from the repository's Dockerfiles are
+//! built with plain `docker build` under a fixed tag, once per test process:
+//! a compose build labels the image with its project, which gives every
+//! build a new image ID and leaves the previous one dangling.
 
 use std::io::Read;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
+use std::sync::{Mutex, PoisonError};
 use std::thread;
 use std::time::Duration;
 
@@ -27,16 +32,27 @@ const PROBE_ATTEMPTS: u32 = 60;
 /// Pause between readiness probes
 const PROBE_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Lines of a failed command's stderr kept in the error
+const STDERR_LINES: usize = 40;
+
 /// Description of one Docker compose test stack
 pub struct ComposeSpec {
     /// Service name used in error messages
     pub name: &'static str,
     /// Compose file path relative to the workspace root
     pub compose_file: &'static str,
-    /// Run `build` before `up -d` so the image is rebuilt from its Dockerfile
-    pub build_images: bool,
+    /// Image to build before `up -d`, which the compose file names in `image:`
+    pub image: Option<ImageBuild>,
     /// Returns true once every service in the stack answers requests
     pub is_ready: fn(&ComposeStack) -> bool,
+}
+
+/// A test image built from a Dockerfile in the repository
+pub struct ImageBuild {
+    /// Tag the image is built under
+    pub tag: &'static str,
+    /// Build context relative to the workspace root
+    pub context: &'static str,
 }
 
 /// Docker operations the fixture needs, so the lifecycle can be tested offline
@@ -51,13 +67,23 @@ trait FixtureRuntime: Send + Sync {
         project: &str,
         env: &[(String, String)],
     ) -> Result<Vec<String>, String>;
+    /// Host paths the compose files bind-mount into containers
+    fn bind_sources(
+        &self,
+        files: &[PathBuf],
+        project: &str,
+        env: &[(String, String)],
+    ) -> Result<Vec<PathBuf>, String>;
+    /// Build the image `tag` from the Dockerfile in `context`
+    fn build(&self, tag: &str, context: &Path) -> Result<(), String>;
+    /// Run compose with `args`; the error carries the end of its stderr
     fn compose(
         &self,
         files: &[PathBuf],
         project: &str,
         env: &[(String, String)],
         args: &[&str],
-    ) -> std::io::Result<bool>;
+    ) -> Result<(), String>;
     /// IPv4 address of `service`'s container on the network `network`
     fn ip(
         &self,
@@ -93,7 +119,8 @@ impl ComposeStack {
     ///
     /// Returns error if the compose file does not exist, Docker or docker
     /// compose is not available, the fresh project name is already in use,
-    /// the images fail to build, the stack fails to start, a container has
+    /// a file of the repository the stack mounts is not world-readable, the
+    /// image fails to build, the stack fails to start, a container has
     /// no address on the project network, or the stack does not become
     /// ready within 30 seconds.
     pub fn start(spec: &ComposeSpec) -> Result<Self, Box<dyn std::error::Error>> {
@@ -113,6 +140,7 @@ impl ComposeStack {
         }
         Self::start_with(
             spec,
+            root,
             compose_file,
             new_project()?,
             env,
@@ -127,6 +155,7 @@ impl ComposeStack {
     #[allow(clippy::too_many_arguments)]
     fn start_with(
         spec: &ComposeSpec,
+        root: &Path,
         compose_file: PathBuf,
         project: String,
         env: Vec<(String, String)>,
@@ -138,6 +167,17 @@ impl ComposeStack {
         runtime.preflight()?;
         ensure_vacant(&*runtime, &project)?;
         let services = runtime.services(std::slice::from_ref(&compose_file), &project, &env)?;
+        // Mounts the test itself supplies, such as a socket directory, live outside the workspace
+        for source in runtime.bind_sources(std::slice::from_ref(&compose_file), &project, &env)? {
+            if source.starts_with(root) {
+                ensure_world_readable(spec.name, &source)?;
+            }
+        }
+        if let Some(image) = &spec.image {
+            runtime
+                .build(image.tag, &root.join(image.context))
+                .map_err(|e| format!("Failed to build {} Docker image: {e}", spec.name))?;
+        }
         let override_dir = tempfile::tempdir()?;
         let override_file = override_dir.path().join("cpuset.yml");
         std::fs::write(&override_file, cpuset_override(&services, cpus))?;
@@ -150,14 +190,11 @@ impl ComposeStack {
             _override_dir: override_dir,
             cleanup_armed: false,
         };
-        if spec.build_images && !stack.run(&["build"])? {
-            return Err(format!("Failed to build {} Docker image", spec.name).into());
-        }
         // `up` can create resources even when it fails.
         stack.cleanup_armed = true;
-        if !stack.run(&["up", "-d"])? {
-            return Err(format!("Failed to start {} with docker compose", spec.name).into());
-        }
+        stack
+            .run(&["up", "-d"])
+            .map_err(|e| format!("Failed to start {} with docker compose: {e}", spec.name))?;
         // Compose names the network it creates for the project `<project>_default`
         let network = format!("{}_default", stack.project);
         for service in services {
@@ -176,7 +213,7 @@ impl ComposeStack {
         Err(format!("{} failed to become ready", spec.name).into())
     }
 
-    fn run(&self, args: &[&str]) -> std::io::Result<bool> {
+    fn run(&self, args: &[&str]) -> Result<(), String> {
         self.runtime.compose(&self.files, &self.project, &self.env, args)
     }
 
@@ -208,16 +245,48 @@ impl Drop for ComposeStack {
     }
 }
 
-fn cleanup_message(project: &str, action: &str, result: std::io::Result<bool>) -> Option<String> {
-    match result {
-        Ok(true) => None,
-        Ok(false) => Some(format!(
-            "ERROR: {action} failed for Compose project {project}; resources may remain"
+fn cleanup_message(project: &str, action: &str, result: Result<(), String>) -> Option<String> {
+    result.err().map(|error| {
+        format!(
+            "ERROR: {action} failed for Compose project {project}: {error}; resources may remain"
+        )
+    })
+}
+
+/// Refuse a mount that a container's unprivileged user could not read
+///
+/// A checkout under a restrictive umask leaves fixture files readable by
+/// their owner only, and the server then fails in a way that looks like a
+/// readiness timeout.
+fn ensure_world_readable(name: &str, source: &Path) -> Result<(), String> {
+    match unreadable(source) {
+        Ok(None) => Ok(()),
+        Ok(Some(path)) => Err(format!(
+            "{name}: {} is not world-readable, so its container cannot read it; the tests were \
+             checked out under a restrictive umask; run chmod -R a+rX tests",
+            path.display()
         )),
-        Err(error) => Some(format!(
-            "ERROR: {action} could not run for Compose project {project}: {error}; resources may remain"
-        )),
+        Err(e) => Err(format!("{name}: could not check the mount {}: {e}", source.display())),
     }
+}
+
+/// The first path at or under `path` that other users cannot read: a file
+/// without `o+r` or a directory without `o+rx`
+fn unreadable(path: &Path) -> std::io::Result<Option<PathBuf>> {
+    let metadata = std::fs::metadata(path)?;
+    let mode = metadata.permissions().mode();
+    if !metadata.is_dir() {
+        return Ok((mode & 0o004 == 0).then(|| path.to_path_buf()));
+    }
+    if mode & 0o005 != 0o005 {
+        return Ok(Some(path.to_path_buf()));
+    }
+    for entry in std::fs::read_dir(path)? {
+        if let Some(found) = unreadable(&entry?.path())? {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
 }
 
 /// Refuse a project name that already owns resources, which `down -v` would remove
@@ -254,6 +323,9 @@ fn parse_allowed_cpus(status: &str) -> Option<String> {
 
 /// The local Docker daemon, reached through the user's own Docker configuration
 struct DockerRuntime;
+
+/// Tags this process has built
+static BUILT: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 impl FixtureRuntime for DockerRuntime {
     fn preflight(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -319,19 +391,48 @@ impl FixtureRuntime for DockerRuntime {
         Ok(services)
     }
 
+    fn bind_sources(
+        &self,
+        files: &[PathBuf],
+        project: &str,
+        env: &[(String, String)],
+    ) -> Result<Vec<PathBuf>, String> {
+        let output = compose_command(COMPOSE, files, project, &["config", "--format", "json"])
+            .envs(env.iter().map(|(name, value)| (name, value)))
+            .output();
+        let config = command_output("docker compose config", output)?;
+        parse_bind_sources(&config).ok_or_else(|| "could not parse the compose config".into())
+    }
+
+    fn build(&self, tag: &str, context: &Path) -> Result<(), String> {
+        // Held through the build, so concurrent tests wait for it instead of building again
+        let mut built = BUILT.lock().unwrap_or_else(PoisonError::into_inner);
+        if built.iter().any(|t| t == tag) {
+            return Ok(());
+        }
+        // Plain progress puts a failed step's output in stderr
+        let output = Command::new("docker")
+            .args(["build", "--progress", "plain", "--tag", tag])
+            .arg(context)
+            .stdout(Stdio::null())
+            .output();
+        command_output("docker build", output)?;
+        built.push(tag.to_string());
+        Ok(())
+    }
+
     fn compose(
         &self,
         files: &[PathBuf],
         project: &str,
         env: &[(String, String)],
         args: &[&str],
-    ) -> std::io::Result<bool> {
-        compose_command(COMPOSE, files, project, args)
+    ) -> Result<(), String> {
+        let output = compose_command(COMPOSE, files, project, args)
             .envs(env.iter().map(|(name, value)| (name, value)))
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
+            .output();
+        command_output(&format!("docker compose {}", args.join(" ")), output).map(drop)
     }
 
     fn ip(
@@ -371,6 +472,33 @@ impl FixtureRuntime for DockerRuntime {
     fn report(&self, message: &str) {
         eprintln!("{message}");
     }
+}
+
+/// The stdout of a command that succeeded, or why `what` failed with the
+/// last `STDERR_LINES` lines of its stderr
+fn command_output(what: &str, output: std::io::Result<Output>) -> Result<String, String> {
+    let output = output.map_err(|e| format!("could not run {what}: {e}"))?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let lines: Vec<&str> = stderr.lines().collect();
+    let tail = lines[lines.len().saturating_sub(STDERR_LINES)..].join("\n");
+    Err(format!("{what} exited with {}; stderr:\n{tail}", output.status))
+}
+
+/// Host paths of the bind mounts in `docker compose config --format json` output
+fn parse_bind_sources(config: &str) -> Option<Vec<PathBuf>> {
+    let config: serde_json::Value = serde_json::from_str(config).ok()?;
+    let mut sources = Vec::new();
+    for service in config.get("services")?.as_object()?.values() {
+        for volume in service.get("volumes").and_then(|v| v.as_array()).into_iter().flatten() {
+            if volume.get("type")?.as_str()? == "bind" {
+                sources.push(PathBuf::from(volume.get("source")?.as_str()?));
+            }
+        }
+    }
+    Some(sources)
 }
 
 /// Fresh compose project name, `xylemtest` and 32 random hex digits
@@ -510,7 +638,8 @@ mod tests {
         up_fails: bool,
         ip_fails: bool,
         down_fails: bool,
-        down_unexecuted: bool,
+        build_fails: bool,
+        bind_sources: Vec<PathBuf>,
         /// The override file as `up` saw it
         override_yaml: Option<String>,
     }
@@ -543,27 +672,46 @@ mod tests {
             self.0.lock().unwrap().events.push(format!("services {project}"));
             Ok(vec!["redis".into(), "nginx".into()])
         }
+        fn bind_sources(
+            &self,
+            files: &[PathBuf],
+            _: &str,
+            _: &[(String, String)],
+        ) -> Result<Vec<PathBuf>, String> {
+            assert_eq!(files, [PathBuf::from("fixture.yml")]);
+            Ok(self.0.lock().unwrap().bind_sources.clone())
+        }
+        fn build(&self, tag: &str, context: &Path) -> Result<(), String> {
+            let mut s = self.0.lock().unwrap();
+            s.events.push(format!("build {tag} {}", context.display()));
+            if s.build_fails {
+                return Err("fake build stderr".into());
+            }
+            Ok(())
+        }
         fn compose(
             &self,
             files: &[PathBuf],
             project: &str,
             _: &[(String, String)],
             args: &[&str],
-        ) -> std::io::Result<bool> {
+        ) -> Result<(), String> {
             let mut s = self.0.lock().unwrap();
             assert_eq!(files.len(), 2);
             assert_eq!(files[0], PathBuf::from("fixture.yml"));
             s.events.push(format!("compose {project} {}", args.join(" ")));
-            match args[0] {
-                "build" => Ok(true),
+            let fails = match args[0] {
                 "up" => {
                     s.override_yaml = Some(std::fs::read_to_string(&files[1]).unwrap());
-                    Ok(!s.up_fails)
+                    s.up_fails
                 }
-                "down" if s.down_unexecuted => Err(std::io::Error::other("fake execution failure")),
-                "down" => Ok(!s.down_fails),
+                "down" => s.down_fails,
                 _ => panic!("unexpected command"),
+            };
+            if fails {
+                return Err(format!("fake {} stderr", args[0]));
             }
+            Ok(())
         }
         fn ip(
             &self,
@@ -589,14 +737,26 @@ mod tests {
         build: bool,
         ready: fn(&ComposeStack) -> bool,
     ) -> Result<ComposeStack, Box<dyn std::error::Error>> {
+        test_start_in(Path::new("/workspace"), state, build, ready)
+    }
+    fn test_start_in(
+        root: &Path,
+        state: Arc<Mutex<FakeState>>,
+        build: bool,
+        ready: fn(&ComposeStack) -> bool,
+    ) -> Result<ComposeStack, Box<dyn std::error::Error>> {
         let spec = ComposeSpec {
             name: "fake",
             compose_file: "unused",
-            build_images: build,
+            image: build.then_some(ImageBuild {
+                tag: "fake:latest",
+                context: "tests/fake",
+            }),
             is_ready: ready,
         };
         ComposeStack::start_with(
             &spec,
+            root,
             PathBuf::from("fixture.yml"),
             "xylemtestfresh".into(),
             Vec::new(),
@@ -616,7 +776,12 @@ mod tests {
         panic!("readiness panic")
     }
     fn commands(state: &FakeState) -> Vec<String> {
-        state.events.iter().filter(|s| s.starts_with("compose ")).cloned().collect()
+        state
+            .events
+            .iter()
+            .filter(|s| s.starts_with("compose ") || s.starts_with("build "))
+            .cloned()
+            .collect()
     }
 
     #[test]
@@ -644,7 +809,7 @@ mod tests {
             steps,
             [
                 "services xylemtestfresh",
-                "compose xylemtestfresh build",
+                "build fake:latest /workspace/tests/fake",
                 "compose xylemtestfresh up -d",
                 "ip xylemtestfresh redis xylemtestfresh_default",
                 "ip xylemtestfresh nginx xylemtestfresh_default",
@@ -680,31 +845,105 @@ mod tests {
         }
     }
     #[test]
-    fn lifecycle_teardown_failure_is_reported_during_unwind() {
-        for unexecuted in [false, true] {
-            let state = Arc::new(Mutex::new(FakeState {
-                down_fails: true,
-                down_unexecuted: unexecuted,
+    fn lifecycle_failed_build_and_up_carry_stderr() {
+        let state = Arc::new(Mutex::new(FakeState { build_fails: true, ..Default::default() }));
+        let error = test_start(state.clone(), true, ready).err().unwrap().to_string();
+        assert_eq!(error, "Failed to build fake Docker image: fake build stderr");
+        // Nothing was started, so nothing is torn down
+        assert_eq!(commands(&state.lock().unwrap()), ["build fake:latest /workspace/tests/fake"]);
+
+        let state = Arc::new(Mutex::new(FakeState { up_fails: true, ..Default::default() }));
+        let error = test_start(state, false, ready).err().unwrap().to_string();
+        assert_eq!(error, "Failed to start fake with docker compose: fake up stderr");
+    }
+    #[test]
+    fn lifecycle_refuses_unreadable_workspace_mounts_before_starting() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("tests/fake");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("server.conf");
+        std::fs::write(&file, "").unwrap();
+        // A socket directory of the test's own, outside the workspace
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(outside.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state = |sources: &[&Path]| {
+            Arc::new(Mutex::new(FakeState {
+                bind_sources: sources.iter().map(|p| p.to_path_buf()).collect(),
                 ..Default::default()
-            }));
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _ = test_start(state.clone(), false, panic_ready);
-            }));
-            assert!(result.is_err());
-            let state = state.lock().unwrap();
-            assert_eq!(
-                commands(&state),
-                ["compose xylemtestfresh up -d", "compose xylemtestfresh down -v"]
-            );
-            let expected = if unexecuted {
-                "compose teardown could not run"
-            } else {
-                "compose teardown failed"
-            };
-            assert!(state
-                .events
-                .iter()
-                .any(|e| e.contains(expected) && e.contains("xylemtestfresh")));
+            }))
+        };
+        for mode in [0o644, 0o604] {
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
+            let fine = state(&[&file, &dir, outside.path()]);
+            assert!(test_start_in(root.path(), fine, true, ready).is_ok());
         }
+        for (mode, source) in [(0o600, &file), (0o640, &file), (0o600, &dir)] {
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
+            let refused = state(&[outside.path(), source]);
+            let error = test_start_in(root.path(), refused.clone(), true, ready)
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(error.contains(&file.display().to_string()), "{error}");
+            assert!(error.contains("restrictive umask; run chmod -R a+rX tests"), "{error}");
+            assert!(commands(&refused.lock().unwrap()).is_empty());
+        }
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        for mode in [0o700, 0o751] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+            let error = test_start_in(root.path(), state(&[&dir]), true, ready)
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(error.contains(&format!("{} is not world-readable", dir.display())), "{error}");
+        }
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    #[test]
+    fn lifecycle_teardown_failure_is_reported_during_unwind() {
+        let state = Arc::new(Mutex::new(FakeState { down_fails: true, ..Default::default() }));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = test_start(state.clone(), false, panic_ready);
+        }));
+        assert!(result.is_err());
+        let state = state.lock().unwrap();
+        assert_eq!(
+            commands(&state),
+            ["compose xylemtestfresh up -d", "compose xylemtestfresh down -v"]
+        );
+        assert!(state.events.iter().any(|e| e.contains(
+            "compose teardown failed for Compose project xylemtestfresh: fake down stderr"
+        )));
+    }
+    #[test]
+    fn failed_command_keeps_the_end_of_its_stderr() {
+        let script = format!("seq 1 {}; seq 1 100 >&2; exit 3", STDERR_LINES);
+        let output = Command::new("sh").args(["-c", &script]).output();
+        let error = command_output("the script", output).unwrap_err();
+        let expected: Vec<String> = (61..=100).map(|n| n.to_string()).collect();
+        assert_eq!(
+            error,
+            format!("the script exited with exit status: 3; stderr:\n{}", expected.join("\n"))
+        );
+        let output = Command::new("sh").args(["-c", "echo out"]).output();
+        assert_eq!(command_output("echo", output).unwrap(), "out\n");
+        let error = command_output("nothing", Command::new("/nonexistent").output()).unwrap_err();
+        assert!(error.starts_with("could not run nothing: "), "{error}");
+    }
+    #[test]
+    fn parses_bind_sources_from_the_compose_config() {
+        let config = r#"{"services": {
+            "nginx": {"volumes": [
+                {"type": "bind", "source": "/w/tests/nginx/nginx.conf", "target": "/etc/nginx/nginx.conf"},
+                {"type": "volume", "source": "data", "target": "/data"}
+            ]},
+            "redis": {"command": ["redis-server"]}
+        }}"#;
+        assert_eq!(
+            parse_bind_sources(config),
+            Some(vec![PathBuf::from("/w/tests/nginx/nginx.conf")])
+        );
+        assert_eq!(parse_bind_sources("{}"), None);
+        assert_eq!(parse_bind_sources("not json"), None);
     }
 }

@@ -27,7 +27,7 @@ impl KnotGuard {
         let stack = ComposeStack::start(&ComposeSpec {
             name: "Knot DNS",
             compose_file: "tests/knot/docker-compose.test.yml",
-            build_images: false,
+            image: None,
             is_ready: |stack| {
                 stack
                     .container_addr("knot", 53)

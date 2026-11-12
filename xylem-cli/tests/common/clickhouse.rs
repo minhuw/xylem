@@ -32,7 +32,7 @@ impl ClickHouseGuard {
         let stack = ComposeStack::start(&ComposeSpec {
             name: "ClickHouse",
             compose_file: "tests/clickhouse/docker-compose.test.yml",
-            build_images: false,
+            image: None,
             is_ready: |stack| {
                 // The server listens once the table is loaded; the marker is
                 // in the result only, not in the query's exception

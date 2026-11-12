@@ -4,7 +4,7 @@
 //! server is reached at its container's address. It also listens on a Unix socket in a
 //! temporary directory of the guard's, mounted at `/sock`.
 
-use super::compose::{answers_at, ComposeSpec, ComposeStack};
+use super::compose::{answers_at, ComposeSpec, ComposeStack, ImageBuild};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -32,7 +32,7 @@ impl H2cGuard {
             &ComposeSpec {
                 name: "nginx (h2c)",
                 compose_file: "tests/http2/docker-compose.test.yml",
-                build_images: false,
+                image: None,
                 is_ready: |stack| Self::ready(stack, "nginx", 80, "nginx.sock"),
             },
             "nginx",
@@ -44,12 +44,14 @@ impl H2cGuard {
     /// The gRPC server of `tests/grpc/server.py`: methods Echo, Big and Fail
     /// of service xylem.Test
     pub fn grpc() -> Result<Self, Box<dyn std::error::Error>> {
-        // Compose builds the image if it is missing
         Self::start(
             &ComposeSpec {
                 name: "gRPC server",
                 compose_file: "tests/grpc/docker-compose.test.yml",
-                build_images: false,
+                image: Some(ImageBuild {
+                    tag: "xylem-test-grpc:latest",
+                    context: "tests/grpc",
+                }),
                 is_ready: |stack| Self::ready(stack, "grpc", 50051, "grpc.sock"),
             },
             "grpc",

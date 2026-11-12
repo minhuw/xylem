@@ -19,7 +19,7 @@ impl RedisAclGuard {
         let stack = ComposeStack::start(&ComposeSpec {
             name: "Redis (ACL)",
             compose_file: "tests/redis-acl/docker-compose.test.yml",
-            build_images: false,
+            image: None,
             is_ready: |stack| {
                 stack.container_addr("redis-acl", 6379).is_some_and(|addr| {
                     answers_at(addr, b"AUTH testuser testpassword\r\nPING\r\n", b"+PONG")

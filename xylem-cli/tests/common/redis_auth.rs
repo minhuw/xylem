@@ -19,7 +19,7 @@ impl RedisAuthGuard {
         let stack = ComposeStack::start(&ComposeSpec {
             name: "Redis (password)",
             compose_file: "tests/redis-auth/docker-compose.test.yml",
-            build_images: false,
+            image: None,
             is_ready: |stack| {
                 stack.container_addr("redis-auth", 6379).is_some_and(|addr| {
                     answers_at(addr, b"AUTH testpassword\r\nPING\r\n", b"+PONG")

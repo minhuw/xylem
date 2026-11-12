@@ -38,7 +38,7 @@ impl MultiProtocolGuard {
         let stack = ComposeStack::start(&ComposeSpec {
             name: "Multi-protocol services",
             compose_file: "tests/multi-protocol/docker-compose.test.yml",
-            build_images: false,
+            image: None,
             is_ready: |stack| {
                 Addrs::of(stack).is_some_and(|a| {
                     answers_at(a.redis, b"PING\r\n", b"+PONG")

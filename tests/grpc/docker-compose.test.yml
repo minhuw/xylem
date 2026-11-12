@@ -1,7 +1,7 @@
+# The test fixture builds the image with plain `docker build` under this tag
 services:
   grpc:
     image: xylem-test-grpc:latest
-    build: .
     volumes:
       # The test's directory for the Unix socket
       - ${XYLEM_SOCKET_DIR:?}:/sock

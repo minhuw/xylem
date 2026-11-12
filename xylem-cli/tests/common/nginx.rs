@@ -18,7 +18,7 @@ impl NginxGuard {
         let stack = ComposeStack::start(&ComposeSpec {
             name: "Nginx",
             compose_file: "tests/nginx/docker-compose.test.yml",
-            build_images: false,
+            image: None,
             is_ready: |stack| stack.container_addr("nginx", 80).is_some_and(Self::is_nginx_ready),
         })?;
         let addr = stack.container_addr("nginx", 80).ok_or("Nginx has no container address")?;

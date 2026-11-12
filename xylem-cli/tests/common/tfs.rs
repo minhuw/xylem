@@ -21,7 +21,7 @@ impl TfsGuard {
             &ComposeSpec {
                 name: "TF Serving",
                 compose_file: "tests/tfs/docker-compose.test.yml",
-                build_images: false,
+                image: None,
                 // The gRPC port opens before the model loads; REST reports it
                 is_ready: |stack| {
                     stack.container_addr("tfs", 8501).is_some_and(|addr| {

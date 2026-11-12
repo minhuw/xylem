@@ -3,7 +3,7 @@
 //! Each guard starts its own compose project and tears it down on drop; the
 //! server is reached at its container's address.
 
-use super::compose::{ComposeSpec, ComposeStack};
+use super::compose::{ComposeSpec, ComposeStack, ImageBuild};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
@@ -21,7 +21,10 @@ impl MasstreeGuard {
         let stack = ComposeStack::start(&ComposeSpec {
             name: "Masstree",
             compose_file: "tests/masstree/docker-compose.test.yml",
-            build_images: true,
+            image: Some(ImageBuild {
+                tag: "xylem-test-masstree:latest",
+                context: "tests/masstree",
+            }),
             is_ready: |stack| {
                 stack.container_addr("masstree", 2117).is_some_and(|addr| {
                     TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok()
