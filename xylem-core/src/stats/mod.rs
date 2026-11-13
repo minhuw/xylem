@@ -66,6 +66,22 @@ pub trait StatsRecorder: Send {
     ) {
     }
 
+    /// Record a request completed by a successful response of `bytes`
+    /// bytes: [`Self::record_rx_bytes`], [`Self::record_latency`] and
+    /// [`Self::record_breakdown`] of it in one call
+    fn record_response(
+        &mut self,
+        group_id: usize,
+        connection_id: usize,
+        bytes: usize,
+        latency: Duration,
+        breakdown: &LatencyBreakdown,
+    ) {
+        self.record_rx_bytes(group_id, connection_id, bytes);
+        self.record_latency(group_id, connection_id, latency);
+        self.record_breakdown(group_id, connection_id, breakdown);
+    }
+
     /// Record transmitted bytes
     fn record_tx_bytes(&mut self, group_id: usize, connection_id: usize, bytes: usize);
 
@@ -140,6 +156,24 @@ impl StatsRecorder for TupleStatsCollector {
         breakdown: &LatencyBreakdown,
     ) {
         TupleStatsCollector::record_breakdown(self, group_id, breakdown);
+    }
+
+    fn record_response(
+        &mut self,
+        group_id: usize,
+        connection_id: usize,
+        bytes: usize,
+        latency: Duration,
+        breakdown: &LatencyBreakdown,
+    ) {
+        TupleStatsCollector::record_response(
+            self,
+            group_id,
+            connection_id,
+            bytes,
+            latency,
+            breakdown,
+        );
     }
 
     fn record_tx_bytes(&mut self, group_id: usize, connection_id: usize, bytes: usize) {

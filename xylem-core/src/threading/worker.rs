@@ -809,15 +809,22 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
                 if response.is_warmup {
                     continue;
                 }
-                self.stats.record_rx_bytes(group_id, connection_id, response.bytes_consumed);
                 match response.error {
                     // An error reply's latency stays out of the latency
                     // distribution and of the breakdown alike
-                    None => {
-                        self.stats.record_latency(group_id, connection_id, response.latency);
-                        self.stats.record_breakdown(group_id, connection_id, &response.breakdown);
-                    }
+                    None => self.stats.record_response(
+                        group_id,
+                        connection_id,
+                        response.bytes_consumed,
+                        response.latency,
+                        &response.breakdown,
+                    ),
                     Some(kind) => {
+                        self.stats.record_rx_bytes(
+                            group_id,
+                            connection_id,
+                            response.bytes_consumed,
+                        );
                         let kind = self.pool.error_kind(connection_id, kind);
                         self.stats.record_error_reply(
                             group_id,

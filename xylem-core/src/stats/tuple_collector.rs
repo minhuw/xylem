@@ -1113,6 +1113,32 @@ impl TupleStatsCollector {
         }
     }
 
+    /// Record a request completed by a successful response of `bytes`
+    /// bytes, as [`Self::record_rx_bytes`], [`Self::record_latency`] and
+    /// [`Self::record_breakdown`] would, with one lookup of its entries
+    pub fn record_response(
+        &mut self,
+        group_id: usize,
+        connection_id: usize,
+        bytes: usize,
+        latency: Duration,
+        breakdown: &LatencyBreakdown,
+    ) {
+        self.request_counts_mut(group_id).completed += 1;
+        let draining = self.measurement_end_ns.is_some();
+        let (entry, global) = self.recording_entries(group_id, connection_id);
+        if draining {
+            entry.record_drain_latency(latency);
+            global.record_drain_latency(latency);
+        } else {
+            entry.record_rx_bytes(bytes);
+            global.record_rx_bytes(bytes);
+            entry.record_latency(latency);
+            global.record_latency(latency);
+        }
+        self.record_breakdown(group_id, breakdown);
+    }
+
     /// Record a measurement request completed by an error reply of `kind`
     ///
     /// It counts as completed, in the errors by kind, and toward its bucket's
@@ -3828,6 +3854,70 @@ mod tests {
                     equivalence_outputs!(old, groups, keep_records, old.entries().iter()),
                     "global {global:?}, records {keep_records}"
                 );
+            }
+        }
+    }
+
+    /// The outputs of two collectors that recorded the same responses under
+    /// `global` with every group policy, one with `record_response`, the
+    /// other with the bytes, latency and breakdown of each apart
+    fn response_outputs(global: &SamplingPolicy, keep_records: bool) -> (String, String) {
+        let groups = equivalence_policies().len();
+        let start = crate::timing::time_ns() - 10_000_000;
+        let mut one = TupleStatsCollector::with_start_time(global.clone(), BUCKET, start);
+        let mut three = TupleStatsCollector::with_start_time(global.clone(), BUCKET, start);
+        for collector in [&mut one, &mut three] {
+            collector.set_keep_records(keep_records);
+            for (group, policy) in equivalence_policies().into_iter().enumerate() {
+                collector.register_group_policy(group, policy);
+            }
+        }
+        let mut state = 1;
+        let mut record = |one: &mut TupleStatsCollector, three: &mut TupleStatsCollector, group| {
+            for connection in 0..3 {
+                let latency = next_latency(&mut state);
+                let breakdown = LatencyBreakdown { service: latency, kernel: None };
+                let bytes = 100 + connection;
+                off_boundary(one.experiment_start_ns);
+                one.record_response(group, connection, bytes, latency, &breakdown);
+                three.record_rx_bytes(group, connection, bytes);
+                three.record_latency(group, connection, latency);
+                three.record_breakdown(group, &breakdown);
+            }
+        };
+        for bucket in 0..2 {
+            if bucket > 0 {
+                advance(&mut one, 1);
+                advance(&mut three, 1);
+            }
+            for _ in 0..10 {
+                (0..groups).for_each(|group| record(&mut one, &mut three, group));
+            }
+        }
+        // Requests completed during the drain count toward latency only
+        let end = crate::timing::time_ns();
+        one.end_measurement(end);
+        three.end_measurement(end);
+        (0..groups).for_each(|group| record(&mut one, &mut three, group));
+        three.first_record_ns = one.first_record_ns;
+        let outputs = |c: &TupleStatsCollector| {
+            let breakdowns: Vec<_> = (0..groups).map(|group| c.latency_breakdown(group)).collect();
+            let out = equivalence_outputs!(c, groups, keep_records, c.entries());
+            format!("{out}{breakdowns:?}\n{:?}", c.latency_breakdown_global())
+        };
+        (outputs(&one), outputs(&three))
+    }
+
+    #[test]
+    fn a_response_records_as_its_bytes_latency_and_breakdown_do() {
+        // Room to move the start back by a bucket
+        while crate::timing::time_ns() < 1_000_000_000 {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        for keep_records in [true, false] {
+            for global in &equivalence_policies() {
+                let (one, three) = response_outputs(global, keep_records);
+                assert_eq!(one, three, "global {global:?}, records {keep_records}");
             }
         }
     }
