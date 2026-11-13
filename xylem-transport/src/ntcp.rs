@@ -21,6 +21,12 @@
 //! a backend with a device clock: then receives carry the NIC's RX hardware
 //! timestamps and sends get ntcp's Scheduled TX timestamps, both on the
 //! [`crate::time_ns`] clock ([`KernelClock::NicCalibrated`]).
+//!
+//! Buffer memory: each group's network may charge its connections' buffers
+//! up to Linux's tcp_mem for this host ([`host_buffer_memory`],
+//! [`NetworkConfig::memory_cap_for`]); buffers start small and grow with
+//! the connection's needs. A write refused memory waits like a write to a
+//! full socket, and `close_all` warns if any did.
 
 use crate::{
     ClockCalibrationReport, ConnectionGroup, Error, KernelClock, KernelTimestamp, RecvOutcome,
@@ -459,6 +465,14 @@ fn network_error(context: &str, e: ntcp_native::Error) -> Error {
         ntcp_native::Error::Backend(e) => {
             Error::Io(io::Error::new(e.kind(), format!("{context}: ntcp packet backend: {e}")))
         }
+        ntcp_native::Error::NoMemory => Error::Io(io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            format!("{context}: ntcp buffer memory exhausted (ENOMEM)"),
+        )),
+        ntcp_native::Error::AddressNotAvailable => Error::Io(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            format!("{context}: no ephemeral port is left for this destination (EADDRNOTAVAIL)"),
+        )),
         ntcp_native::Error::ConnectionClosed(reason) => {
             Error::Connection(format!("{context}: connection closed ({})", reason_text(reason)))
         }
@@ -511,11 +525,13 @@ impl<P: NtcpBackend> NtcpConnectionGroup<P> {
     /// Build the network on the calling thread
     ///
     /// Sets the config's timebase to nanoseconds, the unit of the ticks this
-    /// group passes, raises its buffer budget to hold `tcp.max_connections`
-    /// connections (see [`buffer_budget`]), and generates the TCP secret
-    /// from `/dev/urandom`.
+    /// group passes, replaces its buffer memory thresholds with Linux's
+    /// tcp_mem for this host's memory ([`host_buffer_memory`],
+    /// [`set_memory_cap`]), fails unless that cap admits
+    /// `tcp.max_connections` connections, and generates the TCP secret from
+    /// `/dev/urandom`.
     pub fn new(config: NetworkConfig, io: P) -> Result<Self> {
-        Self::build(config, io, None)
+        Self::build(config, io, None, host_buffer_memory()?)
     }
 
     /// Build the network on the calling thread as a member of the shared
@@ -528,16 +544,19 @@ impl<P: NtcpBackend> NtcpConnectionGroup<P> {
         io: P,
         neighbors: &SharedNeighbors,
     ) -> Result<Self> {
-        Self::build(config, io, Some(neighbors))
+        Self::build(config, io, Some(neighbors), host_buffer_memory()?)
     }
 
+    /// Build the network with the buffer memory thresholds of a host with
+    /// `memory_bytes` of memory for buffers
     fn build(
         mut config: NetworkConfig,
         io: P,
         neighbors: Option<&SharedNeighbors>,
+        memory_bytes: usize,
     ) -> Result<Self> {
         config.tcp.connection.timebase.units_per_second = UNITS_PER_SECOND;
-        config.tcp.max_buffer_bytes = buffer_budget(&config)?;
+        set_memory_cap(&mut config, &io, memory_bytes)?;
         let now = now_ticks();
         let secret = random_secret()?;
         let network = match neighbors {
@@ -685,7 +704,10 @@ impl<P: NtcpBackend> NtcpConnectionGroup<P> {
         let mut deadline = None;
         while sent < data.len() {
             // Whether ntcp refused the write, so it latches a Writable event
-            // once it takes more
+            // once it takes more: for a full send buffer, used-up TX
+            // timestamp records, or buffer memory the cap refused (all
+            // `WouldBlock`; the last can also cut a write short, and the
+            // event comes once memory returns)
             let refused = match self.network.try_write(conn, &data[sent..], options) {
                 Ok(receipt) => {
                     sent += receipt.accepted;
@@ -699,7 +721,7 @@ impl<P: NtcpBackend> NtcpConnectionGroup<P> {
                 Err(e) if e.is_would_block() => true,
                 Err(e) => return Err(network_error("ntcp send", e)),
             };
-            // A full buffer or used-up TX timestamp records
+            // A full buffer, used-up TX timestamp records or no memory
             if !spin {
                 // Without a Writable event to come, stay reported as writable
                 // so the caller tries again
@@ -713,9 +735,11 @@ impl<P: NtcpBackend> NtcpConnectionGroup<P> {
             };
             if self.now() >= deadline {
                 return Err(Error::Connection(format!(
-                    "Send timeout: {} of {} bytes accepted",
+                    "Send timeout: {} of {} bytes accepted ({} ntcp writes of this group \
+                     waited for buffer memory)",
                     sent,
-                    data.len()
+                    data.len(),
+                    self.network.counters().memory_throttled_writes
                 )));
             }
             // A full drive: send space frees only as received ACKs are
@@ -859,6 +883,37 @@ impl<P: NtcpBackend> NtcpConnectionGroup<P> {
         wait_fd(fd, events, wait_ns)
     }
 
+    /// Warn if the run met buffer memory limits: writes that waited for
+    /// memory, opens it refused, or memory pressure
+    ///
+    /// The counters are this group's network's own; groups never share
+    /// buffer memory, so none of them is a shared group's value.
+    fn report_memory(&self) {
+        let counters = self.network.counters();
+        if counters.memory_throttled_writes == 0
+            && counters.memory_refused_opens == 0
+            && counters.memory_pressures == 0
+        {
+            return;
+        }
+        let memory = self.network.config().tcp.buffer_memory();
+        tracing::warn!(
+            "ntcp ({}): buffer memory limited the run: {} writes waited for memory, {} opens \
+             refused, {} entries into memory pressure ({} us), {} buffer growths refused; \
+             {} bytes charged now, thresholds low {} / pressure {} / max {} bytes",
+            self.network.config().local_address,
+            counters.memory_throttled_writes,
+            counters.memory_refused_opens,
+            counters.memory_pressures,
+            counters.memory_pressure_us,
+            counters.memory_refused_growths,
+            counters.buffer_bytes,
+            memory.low,
+            memory.pressure,
+            memory.high,
+        );
+    }
+
     /// Whether every locally closed connection has finished its close
     ///
     /// FIN-WAIT-2 counts as finished: our FIN was ACKed, and only the peer's
@@ -874,20 +929,88 @@ impl<P: NtcpBackend> NtcpConnectionGroup<P> {
     }
 }
 
-/// The `tcp.max_buffer_bytes` a network with `config` needs to hold
-/// `tcp.max_connections` connections, never below the configured budget
-///
-/// ntcp charges each connection what its buffers and timestamp records can
-/// grow to (about 4.7 MB with its default 64 KiB buffers, reserved but not
-/// resident), so its default budget of 256 MiB admits only about 55.
-fn buffer_budget(config: &NetworkConfig) -> Result<usize> {
-    let needed = config.buffer_budget(config.tcp.max_connections).ok_or_else(|| {
+/// The memory this host has for ntcp's buffers: `MemTotal` less the memory
+/// reserved for huge pages, which buffers never use (`/proc/meminfo`)
+pub fn host_buffer_memory() -> Result<usize> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo")
+        .map_err(|e| Error::Io(io::Error::new(e.kind(), format!("read /proc/meminfo: {e}"))))?;
+    buffer_memory(&meminfo)
+}
+
+/// `MemTotal` less the huge page reservation of a `/proc/meminfo` text:
+/// `Hugetlb` (every page size), or `HugePages_Total` pages of
+/// `Hugepagesize` on kernels without it, or none without huge pages
+fn buffer_memory(meminfo: &str) -> Result<usize> {
+    // A field's value, in bytes when given in kB
+    let field = |name: &str| -> Result<Option<u64>> {
+        let Some(line) = meminfo.lines().find_map(|l| l.strip_prefix(name)?.strip_prefix(':'))
+        else {
+            return Ok(None);
+        };
+        let mut words = line.split_whitespace();
+        let value = words.next().and_then(|v| v.parse::<u64>().ok());
+        let scale = match words.next() {
+            None => 1,
+            Some("kB") => 1024,
+            Some(_) => 0,
+        };
+        match value {
+            Some(value) if scale > 0 => Ok(Some(value.saturating_mul(scale))),
+            _ => Err(Error::Config(format!("cannot parse /proc/meminfo's {name}: {line:?}"))),
+        }
+    };
+    let total = field("MemTotal")?
+        .ok_or_else(|| Error::Config("/proc/meminfo has no MemTotal".to_string()))?;
+    let huge = match field("Hugetlb")? {
+        Some(bytes) => bytes,
+        None => match (field("HugePages_Total")?, field("Hugepagesize")?) {
+            (Some(pages), Some(size)) => pages.saturating_mul(size),
+            (None, _) => 0,
+            (Some(_), None) => {
+                return Err(Error::Config(
+                    "/proc/meminfo has HugePages_Total but no Hugepagesize".to_string(),
+                ))
+            }
+        },
+    };
+    let memory = total.checked_sub(huge).ok_or_else(|| {
         Error::Config(format!(
-            "the ntcp buffer budget of {} connections overflows",
-            config.tcp.max_connections
+            "/proc/meminfo reserves {huge} bytes for huge pages of {total} bytes in all"
         ))
     })?;
-    Ok(needed.max(config.tcp.max_buffer_bytes))
+    Ok(usize::try_from(memory).unwrap_or(usize::MAX))
+}
+
+/// Give `config` the buffer memory thresholds Linux's tcp_init_mem gives a
+/// host with `memory_bytes` for buffers ([`NetworkConfig::memory_cap_for`]):
+/// `tcp.buffer_low_bytes`, `tcp.buffer_pressure_bytes` and the cap
+/// `tcp.max_buffer_bytes`. Fails unless the cap is at least the floor at
+/// which a network on `io` admits `tcp.max_connections` connections
+/// ([`NetworkConfig::buffer_budget`]).
+///
+/// The floor is what connections allocate at open; they are charged what
+/// they allocate, so buffers grow from there within the cap.
+pub fn set_memory_cap(
+    config: &mut NetworkConfig,
+    io: &impl PacketIo,
+    memory_bytes: usize,
+) -> Result<()> {
+    let connections = config.tcp.max_connections;
+    let floor = config.buffer_budget(connections, io).ok_or_else(|| {
+        Error::Config(format!("the ntcp buffer budget of {connections} connections overflows"))
+    })?;
+    let (low, pressure, max) = NetworkConfig::memory_cap_for(memory_bytes);
+    if max < floor {
+        return Err(Error::Config(format!(
+            "ntcp buffer memory cap of {max} bytes (tcp_mem for {memory_bytes} bytes of host \
+             memory) is below the {floor} bytes that {connections} connections take at open; \
+             open fewer connections per thread"
+        )));
+    }
+    config.tcp.max_buffer_bytes = max;
+    config.tcp.buffer_pressure_bytes = Some(pressure);
+    config.tcp.buffer_low_bytes = Some(low);
+    Ok(())
 }
 
 /// `ppoll` one fd for `events`, up to `wait_ns` nanoseconds
@@ -927,7 +1050,19 @@ impl<P: NtcpBackend> ConnectionGroup for NtcpConnectionGroup<P> {
     fn add_connection(&mut self, target: &SocketAddr) -> Result<usize> {
         // Take an id only once ntcp accepted the connection, so that a
         // refused `connect` leaves nothing behind
-        let conn = self.network.connect(*target).map_err(|e| network_error("ntcp connect", e))?;
+        let conn = self.network.connect(*target).map_err(|e| match e {
+            ntcp_native::Error::NoMemory => Error::Io(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!(
+                    "ntcp connect to {target}: buffer memory exhausted (ENOMEM): {} of {} bytes \
+                     charged with {} connections open",
+                    self.network.counters().buffer_bytes,
+                    self.network.config().tcp.max_buffer_bytes,
+                    self.slots.len()
+                ),
+            )),
+            e => network_error(&format!("ntcp connect to {target}"), e),
+        })?;
         if self.stamp_records.is_empty() {
             self.stamp_records = stamp_records(conn);
         }
@@ -1092,6 +1227,7 @@ impl<P: NtcpBackend> ConnectionGroup for NtcpConnectionGroup<P> {
     }
 
     fn close_all(&mut self) -> Result<()> {
+        self.report_memory();
         let ids: Vec<usize> = self.slots.live_handles().map(|(id, _)| id).collect();
         for id in ids {
             self.close(id)?;
@@ -1465,7 +1601,7 @@ mod tests {
         let mut config = network_config(SERVER);
         config.tcp.connection.timebase.units_per_second = UNITS_PER_SECOND;
         config.tcp.max_connections = SERVER_CONNECTIONS;
-        config.tcp.max_buffer_bytes = config.buffer_budget(SERVER_CONNECTIONS).unwrap();
+        set_memory_cap(&mut config, &wire, host_buffer_memory().unwrap()).unwrap();
         let mut network =
             Network::new(config, wire, random_secret().unwrap(), now_ticks()).unwrap();
         let listener: Option<ListenerId> = listen.then(|| network.listen(PORT, 16).unwrap());
@@ -1585,7 +1721,7 @@ mod tests {
         group.poll(Duration::ZERO, &mut ready).unwrap();
         assert!(ready.is_empty());
 
-        // Larger than the 64 KiB send buffer: send drives until accepted
+        // Larger than the 64 KiB initial send limit: send drives until accepted
         let big: Vec<u8> = (0..200_000).map(|i| (i % 251) as u8).collect();
         group.send(second, &big).unwrap();
         assert_eq!(recv_exact(&mut group, second, big.len()), big);
@@ -1684,8 +1820,7 @@ mod tests {
     }
 
     #[test]
-    fn more_connections_than_ntcps_default_buffer_budget_admits() {
-        // ntcp's default budget admits about 55 connections
+    fn sixty_four_connections_open_and_echo() {
         const CONNECTIONS: usize = 64;
         let (a, b) = link();
         let _server = EchoServer::start(b, true, ServerClose::OnEof);
@@ -1756,6 +1891,122 @@ mod tests {
         group.close_all().unwrap();
         assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
         assert!(group.closing.is_empty());
+    }
+
+    // =========================================================================
+    // Buffer memory
+    // =========================================================================
+
+    const MEMINFO: &str = "MemTotal:       263728800 kB\nMemFree:        1000 kB\n\
+                           HugePages_Total:     144\nHugepagesize:    1048576 kB\n\
+                           Hugetlb:        167772160 kB\n";
+
+    #[test]
+    fn buffer_memory_leaves_out_huge_pages() {
+        let expected = (263_728_800 - 167_772_160) * 1024;
+        assert_eq!(buffer_memory(MEMINFO).unwrap(), expected);
+        // Without Hugetlb, the default size's pages only (here 16 GiB of
+        // other sizes go uncounted)
+        let old = MEMINFO.replace("Hugetlb:        167772160 kB\n", "");
+        assert_eq!(buffer_memory(&old).unwrap(), (263_728_800 - 144 * 1_048_576) * 1024);
+        // Without huge pages
+        assert_eq!(buffer_memory("MemTotal: 2048 kB\n").unwrap(), 2048 * 1024);
+
+        for bad in ["MemFree: 1 kB\n", "MemTotal: lots kB\n", "MemTotal: 1 MB\n"] {
+            assert!(matches!(buffer_memory(bad), Err(Error::Config(_))), "{bad}");
+        }
+        let err = buffer_memory("MemTotal: 1 kB\nHugetlb: 2 kB\n").unwrap_err();
+        assert!(matches!(&err, Error::Config(m) if m.contains("huge pages")), "{err}");
+    }
+
+    #[test]
+    fn memory_cap_is_tcp_mem_and_at_least_the_floor() {
+        let (a, _b) = link();
+        let mut config = network_config(CLIENT);
+        let memory = 64 << 30;
+        set_memory_cap(&mut config, &a, memory).unwrap();
+        let (low, pressure, max) = NetworkConfig::memory_cap_for(memory);
+        assert_eq!(config.tcp.max_buffer_bytes, max);
+        assert_eq!(config.tcp.buffer_pressure_bytes, Some(pressure));
+        assert_eq!(config.tcp.buffer_low_bytes, Some(low));
+        assert!(max >= config.buffer_budget(config.tcp.max_connections, &a).unwrap());
+
+        // The smallest cap tcp_init_mem gives (768 KiB) holds no 4096
+        let mut config = network_config(CLIENT);
+        config.tcp.max_connections = 4096;
+        let floor = config.buffer_budget(4096, &a).unwrap();
+        let err = set_memory_cap(&mut config, &a, 1 << 20).unwrap_err();
+        let (_, _, max) = NetworkConfig::memory_cap_for(1 << 20);
+        assert!(
+            matches!(&err, Error::Config(m) if m.contains(&max.to_string())
+                && m.contains(&floor.to_string()) && m.contains("4096 connections")),
+            "{err}"
+        );
+        let err = NtcpConnectionGroup::build(config, a, None, 1 << 20).err().unwrap();
+        assert!(matches!(err, Error::Config(_)), "{err}");
+    }
+
+    #[test]
+    fn write_refused_memory_waits_like_a_full_socket() {
+        let (a, b) = link();
+        let _server = EchoServer::start(b, true, ServerClose::OnEof);
+        // tcp_init_mem's least cap, 768 KiB, filled with as many open
+        // connections as its floor admits: what is left is less than one
+        // connection's charge at open, and less than the send ring of a
+        // first 64 KiB write
+        let memory = 1 << 20;
+        let (_, _, max) = NetworkConfig::memory_cap_for(memory);
+        let floor = |n: usize| {
+            let mut config = network_config(CLIENT);
+            config.tcp.max_connections = n;
+            config.buffer_budget(n, &a).unwrap()
+        };
+        let connections = (1..).take_while(|&n| floor(n) <= max).last().unwrap();
+        assert!(max - floor(connections) < 64 * 1024, "{max} {}", floor(connections));
+        let mut config = network_config(CLIENT);
+        config.tcp.max_connections = connections;
+        let mut group = NtcpConnectionGroup::build(config, a, None, memory).unwrap();
+        for _ in 0..connections {
+            group.add_connection(&server_addr()).unwrap();
+        }
+
+        let id = 0;
+        let data: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+        let progress = group.try_send(id, &data).unwrap();
+        assert!(progress.accepted < data.len(), "{}", progress.accepted);
+        assert!(group.network().counters().memory_throttled_writes > 0);
+        // Not an error: like a full socket, the rest waits for ntcp's
+        // Writable event, which comes once memory returns. The other
+        // connections hold theirs until they close
+        assert!(!group.slots.state_mut(id).writable);
+        group.set_write_interest(id, true).unwrap();
+        let mut ready = Vec::new();
+        group.poll(Duration::from_millis(20), &mut ready).unwrap();
+        assert!(!ready.contains(&id), "{ready:?}");
+        for other in 1..connections {
+            group.close(other).unwrap();
+        }
+        let mut sent = progress.accepted;
+        let mut echo = Vec::new();
+        let mut buf = [0u8; 4096];
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while echo.len() < data.len() {
+            assert!(Instant::now() < deadline, "sent {sent}, echoed {}", echo.len());
+            group.flush().unwrap();
+            group.poll(Duration::from_millis(100), &mut ready).unwrap();
+            if !ready.contains(&id) {
+                continue;
+            }
+            if sent < data.len() && group.slots.state_mut(id).writable {
+                sent += group.try_send(id, &data[sent..]).unwrap().accepted;
+                group.set_write_interest(id, sent < data.len()).unwrap();
+            }
+            while let RecvOutcome::Data { len, .. } = group.recv(id, &mut buf).unwrap() {
+                echo.extend_from_slice(&buf[..len]);
+            }
+        }
+        assert!(echo == data);
+        group.close_all().unwrap();
     }
 
     thread_local! {
