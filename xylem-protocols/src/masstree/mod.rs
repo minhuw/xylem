@@ -183,6 +183,8 @@ pub struct MasstreeProtocol {
     rng: Option<rand::rngs::SmallRng>,
     /// Insert phase state (None = no insert phase, go straight to measurement)
     insert_phase: Option<InsertPhaseState>,
+    /// The last formatted key, kept for its allocation
+    key_buf: String,
 }
 
 impl MasstreeProtocol {
@@ -198,6 +200,7 @@ impl MasstreeProtocol {
             random_data: false,
             rng: None,
             insert_phase: None,
+            key_buf: String::new(),
         }
     }
 
@@ -250,6 +253,7 @@ impl MasstreeProtocol {
             random_data,
             rng,
             insert_phase,
+            key_buf: String::new(),
         }
     }
 
@@ -298,9 +302,14 @@ impl MasstreeProtocol {
         self.conn_handshake_state.insert(conn_id, HandshakeState::Done);
     }
 
-    /// Format a key with the configured prefix
-    fn format_key(&self, key: u64) -> String {
-        format!("{}{}", self.key_prefix, key)
+    /// The key `key` with the configured prefix, written into the
+    /// protocol's key buffer, which the caller takes and gives back
+    fn format_key(&mut self, key: u64) -> String {
+        let mut out = std::mem::take(&mut self.key_buf);
+        out.clear();
+        out.push_str(&self.key_prefix);
+        push_decimal(&mut out, key);
+        out
     }
 
     /// Generate value data of the specified size
@@ -446,7 +455,7 @@ impl MasstreeProtocol {
     fn encode(&mut self, op: &MasstreeOp, seq: u16, key: u64) -> Result<Vec<u8>> {
         // Format key with configurable prefix
         let key_str = self.format_key(key);
-        match op {
+        let request = match op {
             MasstreeOp::Get => self.build_get_request(seq, &key_str),
             MasstreeOp::Set => {
                 let size = self.next_value_size(op);
@@ -467,7 +476,9 @@ impl MasstreeProtocol {
                 self.build_scan_request(seq, &key_str, *count, fields)
             }
             MasstreeOp::Checkpoint => self.build_checkpoint_request(seq),
-        }
+        };
+        self.key_buf = key_str;
+        request
     }
 }
 
@@ -493,6 +504,7 @@ impl Protocol for MasstreeProtocol {
                 let request = self
                     .build_set_request(seq, &key_str, &value)
                     .expect("Failed to build SET request for insert phase");
+                self.key_buf = key_str;
                 return crate::Request::warmup(request, (conn_id, seq));
             }
         }
@@ -576,6 +588,21 @@ impl Protocol for MasstreeProtocol {
         // The connections share the insert phase
         self.insert_phase.as_ref().is_some_and(|insert| !insert.is_complete())
     }
+}
+
+/// Append `n` in decimal to `out`, as `{n}` formats it
+fn push_decimal(out: &mut String, mut n: u64) {
+    let mut digits = [0u8; 20];
+    let mut start = digits.len();
+    loop {
+        start -= 1;
+        digits[start] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    out.push_str(std::str::from_utf8(&digits[start..]).expect("decimal digits are ASCII"));
 }
 
 /// One complete response
@@ -1088,6 +1115,16 @@ mod tests {
 
         // Requests should be different
         assert_ne!(req1, req2);
+    }
+
+    #[test]
+    fn keys_are_the_prefix_and_the_decimal_number() {
+        let mut proto = MasstreeProtocol::new(MasstreeOp::Get);
+        for key in [0, 7, 9, 10, 99_999, 100_000, 1 << 32, u64::MAX - 1, u64::MAX] {
+            let formatted = proto.format_key(key);
+            assert_eq!(formatted, format!("key:{key}"));
+            proto.key_buf = formatted;
+        }
     }
 
     #[test]
