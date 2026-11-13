@@ -100,7 +100,7 @@ fn grpc_tensorflow_serving_predict() {
         .arg(requests)
         .arg(&messages)
         .status()
-        .unwrap();
+        .expect("run python3, which the flake's devShell provides");
     assert!(status.success(), "tfs-predict-request.py failed");
     let server = common::tfs::TfsGuard::new(&model).expect("Failed to start TF Serving");
     let json = run(

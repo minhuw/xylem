@@ -178,21 +178,16 @@ fn html_report_preserves_data_and_escapes_profile_text() {
         assert_cell(availability_group, label, "0.00 μs");
     }
 
-    // Node is optional locally; CI's Ubuntu runner provides it. Execute the full
-    // script with a Chart stub to catch syntax errors and positional regressions.
-    let mut child = match Command::new("node")
+    // Execute the full script with a Chart stub to catch syntax errors and
+    // positional regressions, in the Node of the flake's devShell
+    let mut child = Command::new("node")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-    {
-        Ok(child) => child,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!("Node unavailable; JavaScript execution check skipped");
-            return;
-        }
-        Err(e) => panic!("Cannot start Node: {e}"),
-    };
+        .unwrap_or_else(|e| {
+            panic!("Cannot start Node ({e}); run the tests in the flake's devShell")
+        });
     let expected = serde_json::to_string(text).unwrap();
     let harness = format!(
         r#"

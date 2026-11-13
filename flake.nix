@@ -120,6 +120,12 @@
 
             # Testing and benchmarking
             pkgs.hyperfine
+            # The Docker CLI with its compose and buildx plugins, for the
+            # test fixtures; the daemon is the host's
+            pkgs.docker-client
+            pkgs.redis # redis-cli, which Redis tests read keys with
+            pkgs.nodejs # Runs the HTML report's JavaScript in its test
+            pkgs.python3 # tests/ntcp/tun_netns.sh, tools/tfs-predict-request.py
 
             # Additional utilities
             pkgs.tokei # Code statistics
@@ -128,6 +134,9 @@
           ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
             # Profiling, for flamegraph
             pkgs.perf
+            # unshare and ip, for tests/ntcp/tun_netns.sh
+            pkgs.util-linux
+            pkgs.iproute2
           ] ++ dpdkInputs ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
             # The `ntcp-af-xdp` feature links libbpf
             pkgs.libbpf
@@ -157,11 +166,12 @@
             echo "  pre-commit install             - Install git hooks"
             echo "  bacon                          - Watch and build"
             echo ""
-            echo "⚠️  Integration tests require Docker to be installed and running"
+            echo "⚠️  Integration tests need the host's Docker daemon running"
             echo ""
 
-            # Setup pre-commit hooks if not already installed
-            if [ ! -f .git/hooks/pre-commit ]; then
+            # Setup pre-commit hooks if not already installed (a linked
+            # worktree's .git is a file; its hooks are the main checkout's)
+            if hook=$(git rev-parse --git-path hooks/pre-commit 2>/dev/null) && [ ! -f "$hook" ]; then
               echo "Installing pre-commit hooks..."
               pre-commit install
             fi
@@ -172,6 +182,8 @@
           # cc-wrapper's) and the Linux UAPI headers
           NTCP_BPF_CLANG = "${pkgs.llvmPackages.clang-unwrapped}/bin/clang";
           NTCP_BPF_CFLAGS = "-isystem ${pkgs.linuxHeaders}/include";
+          # The SPDK target of the NVMe/TCP integration tests
+          XYLEM_NVMF_TGT = "${pkgs.spdk}/bin/nvmf_tgt";
         });
 
         # Package definition

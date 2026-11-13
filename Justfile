@@ -91,7 +91,7 @@ test-dns:
     cargo nextest run --profile integration -E 'binary(dns_integration)'
 
 # Run NVMe/TCP integration tests against SPDK's nvmf_tgt (no Docker, no
-# root; XYLEM_NVMF_TGT picks the binary, else nixpkgs#spdk is built)
+# root; XYLEM_NVMF_TGT picks the binary, which nix develop sets)
 test-nvme:
     @echo "💾 Running NVMe/TCP integration tests..."
     cargo nextest run --profile integration -E 'binary(nvme_tcp_integration)'
@@ -150,11 +150,6 @@ clean:
 precommit: fmt lint test-unit test-doc
     @echo "✅ Pre-commit checks passed!"
     @echo "   If you want to run full integration tests too, run: just test"
-
-# Install flamegraph tool (one-time setup)
-install-flamegraph:
-    @echo "📊 Installing flamegraph tool..."
-    cargo install flamegraph
 
 # Generate flamegraph using real xylem Worker with echo protocol
 # Uses 1 xylem thread (for clear profiling) and 8 echo server threads

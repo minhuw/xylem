@@ -5,11 +5,11 @@
 //! posix sockets. It runs unprivileged, without hugepages (`--no-huge`, so
 //! SPDK 24.01 or later), on one core: the last CPU, or `XYLEM_NVMF_CORE`.
 //!
-//! The target binary is `XYLEM_NVMF_TGT`, else `nvmf_tgt` built from this
-//! flake's nixpkgs (`nix build --inputs-from . nixpkgs#spdk`), which the
-//! binary cache usually has. The target records its `nvmf_tcp` tracepoints,
-//! which `spdk_trace` reads to show what the target did with each request:
-//! `XYLEM_SPDK_TRACE`, else the one next to `nvmf_tgt`.
+//! The target binary is `XYLEM_NVMF_TGT`, which the flake's devShell sets
+//! to the `nvmf_tgt` of its nixpkgs' SPDK. The target records its
+//! `nvmf_tcp` tracepoints, which `spdk_trace` reads to show what the target
+//! did with each request: `XYLEM_SPDK_TRACE`, else the one next to
+//! `nvmf_tgt`.
 
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -24,23 +24,12 @@ const TRACE_ENTRIES: usize = 65536;
 
 /// The nvmf_tgt binary to run
 fn nvmf_tgt() -> PathBuf {
-    if let Some(path) = std::env::var_os("XYLEM_NVMF_TGT") {
-        return path.into();
-    }
-    let flake = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-    let output = Command::new("nix")
-        .args(["build", "--no-link", "--print-out-paths", "--inputs-from"])
-        .arg(&flake)
-        .arg("nixpkgs#spdk")
-        .output()
-        .expect("run nix to build SPDK; or set XYLEM_NVMF_TGT to an nvmf_tgt binary");
-    assert!(
-        output.status.success(),
-        "nix build nixpkgs#spdk failed; set XYLEM_NVMF_TGT to an nvmf_tgt binary: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let out = String::from_utf8(output.stdout).unwrap();
-    Path::new(out.trim()).join("bin/nvmf_tgt")
+    std::env::var_os("XYLEM_NVMF_TGT")
+        .expect(
+            "XYLEM_NVMF_TGT is unset: run the tests in the flake's devShell (`nix develop`), \
+             which sets it to SPDK's nvmf_tgt, or set it to an nvmf_tgt binary",
+        )
+        .into()
 }
 
 /// The spdk_trace binary that reads the tracepoints of `nvmf_tgt`

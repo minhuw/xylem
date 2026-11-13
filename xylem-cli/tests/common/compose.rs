@@ -329,17 +329,25 @@ static BUILT: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 impl FixtureRuntime for DockerRuntime {
     fn preflight(&self) -> Result<(), Box<dyn std::error::Error>> {
-        if !Command::new("docker").arg("--version").output()?.status.success() {
-            return Err("Docker is not available".into());
-        }
-        if !Command::new(COMPOSE[0])
-            .args(&COMPOSE[1..])
-            .arg("version")
-            .output()
-            .is_ok_and(|o| o.status.success())
-        {
-            return Err("docker compose not available".into());
-        }
+        // The CLI and its compose plugin come from the flake's devShell
+        let devshell = "; run the tests in the flake's devShell (`nix develop`)";
+        command_output("docker --version", Command::new("docker").arg("--version").output())
+            .map_err(|e| format!("{e}{devshell}"))?;
+        command_output(
+            "docker compose version",
+            Command::new(COMPOSE[0]).args(&COMPOSE[1..]).arg("version").output(),
+        )
+        .map_err(|e| format!("{e}{devshell}"))?;
+        // The daemon is the host's
+        command_output(
+            "docker version",
+            Command::new("docker")
+                .args(["version", "--format", "{{.Server.Version}}"])
+                .output(),
+        )
+        .map_err(|e| {
+            format!("the Docker daemon is not reachable (start it, or set DOCKER_HOST): {e}")
+        })?;
         Ok(())
     }
 

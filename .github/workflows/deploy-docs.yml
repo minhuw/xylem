@@ -24,13 +24,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup mdBook
-        uses: peaceiris/actions-mdbook@v2
-        with:
-          mdbook-version: 'latest'
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Setup Magic Nix Cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
 
       - name: Build mdBook
-        run: mdbook build book
+        run: nix develop --command mdbook build book
 
       - name: Publish to Cloudflare Pages
         uses: cloudflare/wrangler-action@v3

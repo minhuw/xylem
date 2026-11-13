@@ -41,16 +41,14 @@ jobs:
 
       - name: Verify generated profile schema
         run: |
-          nix develop --command bash -c 'cargo run --quiet --bin xylem -- schema > /tmp/profile.schema.json'
-          python3 -m json.tool schema/profile.schema.json > /dev/null
-          python3 -m json.tool /tmp/profile.schema.json > /dev/null
-          diff -u schema/profile.schema.json /tmp/profile.schema.json
+          nix develop --command bash -c '
+            cargo run --quiet --bin xylem -- schema > /tmp/profile.schema.json &&
+            python3 -m json.tool schema/profile.schema.json > /dev/null &&
+            python3 -m json.tool /tmp/profile.schema.json > /dev/null &&
+            diff -u schema/profile.schema.json /tmp/profile.schema.json'
 
-      - name: Install redis-cli for integration tests
-        run: sudo apt-get update && sudo apt-get install -y redis-tools
-
-      - name: Verify Docker is available
-        run: docker --version && docker compose version
+      - name: Verify the Docker daemon is reachable
+        run: nix develop --command bash -c 'docker version && docker compose version'
 
       - name: Run unit tests
         run: nix develop --command cargo nextest run --profile unit --workspace
@@ -161,11 +159,8 @@ jobs:
       - name: Setup Magic Nix Cache
         uses: DeterminateSystems/magic-nix-cache-action@main
 
-      - name: Install redis-cli for integration tests
-        run: sudo apt-get update && sudo apt-get install -y redis-tools
-
-      - name: Verify Docker is available
-        run: docker --version && docker compose version
+      - name: Verify the Docker daemon is reachable
+        run: nix develop --command bash -c 'docker version && docker compose version'
 
       - name: Generate coverage (unit tests only for speed)
         run: nix develop --command cargo llvm-cov nextest --all-features --workspace --lcov --output-path lcov.info --no-cfg-coverage --profile unit

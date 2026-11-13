@@ -108,5 +108,5 @@ costs CPU.
 (or `just test-nvme`) starts SPDK's `nvmf_tgt` with a Malloc bdev on a free
 loopback port: unprivileged, without hugepages (`--no-huge -s 512`), on one
 core (the last CPU, or `XYLEM_NVMF_CORE`). The binary is `XYLEM_NVMF_TGT`,
-else the `nvmf_tgt` of this flake's nixpkgs, built with
-`nix build --inputs-from . nixpkgs#spdk`.
+which the flake's devShell (`nix develop`) sets to the `nvmf_tgt` of its
+nixpkgs' SPDK.

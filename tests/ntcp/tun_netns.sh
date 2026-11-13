@@ -33,6 +33,23 @@ dev) TARGET_DIR="$ROOT/target/debug" ;;
 esac
 
 if [[ "${1:-}" != "--inside" ]]; then
+    for tool in cargo unshare ip python3; do
+        if ! command -v "$tool" >/dev/null; then
+            echo "$tool not found: run this in the flake's devShell (nix develop)" >&2
+            exit 1
+        fi
+    done
+    if ! unshare --user --map-root-user --net true; then
+        echo "cannot create an unprivileged user + network namespace;" \
+            "the kernel must allow them (user.max_user_namespaces," \
+            "kernel.unprivileged_userns_clone, AppArmor's" \
+            "kernel.apparmor_restrict_unprivileged_userns)" >&2
+        exit 1
+    fi
+    if [[ ! -c /dev/net/tun ]]; then
+        echo "/dev/net/tun is missing: the kernel needs TUN support" >&2
+        exit 1
+    fi
     echo "Building xylem (--features ntcp) and xylem-echo-server ($PROFILE)..."
     (cd "$ROOT" && cargo build --quiet --profile "$PROFILE" --features ntcp \
         -p xylem-cli -p xylem-echo-server)

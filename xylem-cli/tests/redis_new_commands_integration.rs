@@ -137,7 +137,10 @@ fn existing_keys(redis_cli_args: &[&str], db: u32, prefix: &str) -> u64 {
     let mut args: Vec<String> = redis_cli_args.iter().map(|arg| arg.to_string()).collect();
     args.extend(["--no-auth-warning".into(), "-n".into(), db.to_string(), "EXISTS".into()]);
     args.extend((0..100).map(|key| format!("{prefix}{key}")));
-    let output = Command::new("redis-cli").args(&args).output().expect("run redis-cli");
+    let output = Command::new("redis-cli")
+        .args(&args)
+        .output()
+        .expect("run redis-cli, which the flake's devShell provides");
     String::from_utf8_lossy(&output.stdout).trim().parse().expect("EXISTS count")
 }
 
