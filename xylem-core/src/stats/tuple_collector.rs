@@ -999,24 +999,12 @@ impl TupleStatsCollector {
         self.group_sampling_policies.get(&group_id).unwrap_or(&self.sampling_policy)
     }
 
-    /// Compute time bucket for the current time
-    fn compute_bucket(&self, now_ns: u64) -> u64 {
-        now_ns.saturating_sub(self.experiment_start_ns) / self.bucket_duration_ns
-    }
-
     /// Create both entries through one path, including when bytes arrive before latency.
     fn recording_entries(
         &mut self,
         group_id: usize,
         connection_id: usize,
     ) -> (&mut StatsEntry, &mut StatsEntry) {
-        let mut now_ns = crate::timing::time_ns();
-        if let Some(end_ns) = self.measurement_end_ns {
-            // Responses drained after the window belong to its last bucket.
-            now_ns = now_ns.min(end_ns.saturating_sub(1));
-        }
-        self.first_record_ns.get_or_insert(now_ns);
-        let time_bucket = self.compute_bucket(now_ns);
         let Self {
             buckets,
             keep_records,
@@ -1026,14 +1014,29 @@ impl TupleStatsCollector {
             next_bucket,
             sampling_policy,
             group_sampling_policies,
+            first_record_ns,
+            measurement_end_ns,
+            experiment_start_ns,
+            bucket_duration_ns,
             ..
         } = self;
         let policy = group_sampling_policies.get(&group_id).unwrap_or(sampling_policy);
         let group_in_total = !*keep_records && merges_exactly(policy);
         let global_in_total = !*keep_records && merges_exactly(sampling_policy);
-        let (bucket_entries, bucket_global) = if group_in_total && global_in_total {
+        let in_totals = group_in_total && global_in_total;
+        // The clock is read only for the first record and for a bucket
+        let now_ns = (!in_totals || first_record_ns.is_none()).then(|| {
+            let now_ns = crate::timing::time_ns();
+            // Responses drained after the window belong to its last bucket.
+            let now_ns = measurement_end_ns.map_or(now_ns, |end| now_ns.min(end.saturating_sub(1)));
+            first_record_ns.get_or_insert(now_ns);
+            now_ns
+        });
+        let (bucket_entries, bucket_global) = if in_totals {
             (None, None)
         } else {
+            let now_ns = now_ns.expect("read for the bucket");
+            let time_bucket = now_ns.saturating_sub(*experiment_start_ns) / *bucket_duration_ns;
             let bucket = buckets.entry(time_bucket).or_insert_with(|| Bucket {
                 entries: match next_bucket.take() {
                     Some((bucket, entries)) if bucket == time_bucket => entries,
