@@ -1715,8 +1715,6 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
     where
         P: Protocol,
     {
-        let current_time_ns = crate::timing::time_ns();
-
         if let Some(state) = self.connection_states.get_mut(&connection_id) {
             // Don't add if already on heap (maintain invariant: no duplicates)
             if state.is_on_heap() {
@@ -1732,6 +1730,7 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
             if !protocol.can_send(connection_id) {
                 return false;
             }
+            let current_time_ns = crate::timing::time_ns();
 
             // Add to heap regardless of next_send_time
             // - Connection setup or closed-loop (None): ready immediately
