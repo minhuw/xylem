@@ -41,8 +41,8 @@ use crate::workload::{CommandSelector, FixedCommandSelector, ValueSizeGenerator}
 use crate::{ErrorReply, Parsed, Protocol};
 use anyhow::{anyhow, bail, ensure, Result};
 use rmp::encode;
-use std::collections::HashMap;
 use std::io::Write;
+use xylem_common::FastHashMap;
 
 // Masstree command codes
 const CMD_GET: u8 = 2;
@@ -166,9 +166,9 @@ pub struct MasstreeProtocol {
     /// Operation of each measurement request
     selector: Box<dyn CommandSelector<MasstreeOp>>,
     /// Per-connection sequence numbers
-    conn_send_seq: HashMap<usize, u16>,
+    conn_send_seq: FastHashMap<usize, u16>,
     /// Per-connection handshake state
-    conn_handshake_state: HashMap<usize, HandshakeState>,
+    conn_handshake_state: FastHashMap<usize, HandshakeState>,
     /// Key generator for next_request()
     key_gen: Option<crate::workload::KeyGeneration>,
     /// Value size for next_request() without a size generator
@@ -189,8 +189,8 @@ impl MasstreeProtocol {
     pub fn new(operation: MasstreeOp) -> Self {
         Self {
             selector: Box::new(FixedCommandSelector::new(operation)),
-            conn_send_seq: HashMap::new(),
-            conn_handshake_state: HashMap::new(),
+            conn_send_seq: FastHashMap::default(),
+            conn_handshake_state: FastHashMap::default(),
             key_gen: None,
             value_size: 64,
             value_sizes: None,
@@ -241,8 +241,8 @@ impl MasstreeProtocol {
 
         Self {
             selector: Box::new(FixedCommandSelector::new(operation)),
-            conn_send_seq: HashMap::new(),
-            conn_handshake_state: HashMap::new(),
+            conn_send_seq: FastHashMap::default(),
+            conn_handshake_state: FastHashMap::default(),
             key_gen: Some(key_gen),
             value_size,
             value_sizes: None,
@@ -915,6 +915,7 @@ fn skip_value(data: &[u8], pos: usize) -> Result<Option<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn test_handshake_request() {
