@@ -1952,8 +1952,8 @@ mod tests {
         let _server = EchoServer::start(b, true, ServerClose::OnEof);
         // tcp_init_mem's least cap, 768 KiB, filled with as many open
         // connections as its floor admits: what is left is less than one
-        // connection's charge at open, and less than the send ring of a
-        // first 64 KiB write
+        // connection's charge at open, so the send ring of a first write
+        // grows to a few KiB at most
         let memory = 1 << 20;
         let (_, _, max) = NetworkConfig::memory_cap_for(memory);
         let floor = |n: usize| {
@@ -1976,17 +1976,23 @@ mod tests {
         assert!(progress.accepted < data.len(), "{}", progress.accepted);
         assert!(group.network().counters().memory_throttled_writes > 0);
         // Not an error: like a full socket, the rest waits for ntcp's
-        // Writable event, which comes once memory returns. The other
-        // connections hold theirs until they close
+        // Writable event, which comes once memory returns: here when the
+        // ACK of what it accepted frees its send ring, or once the other
+        // connections, which hold theirs, close. A Writable event lets
+        // the next write take more
         assert!(!group.slots.state_mut(id).writable);
         group.set_write_interest(id, true).unwrap();
         let mut ready = Vec::new();
+        let mut sent = progress.accepted;
         group.poll(Duration::from_millis(20), &mut ready).unwrap();
-        assert!(!ready.contains(&id), "{ready:?}");
+        if group.slots.state_mut(id).writable {
+            let more = group.try_send(id, &data[sent..]).unwrap().accepted;
+            assert!(more > 0, "{ready:?}");
+            sent += more;
+        }
         for other in 1..connections {
             group.close(other).unwrap();
         }
-        let mut sent = progress.accepted;
         let mut echo = Vec::new();
         let mut buf = [0u8; 4096];
         let deadline = Instant::now() + Duration::from_secs(10);
