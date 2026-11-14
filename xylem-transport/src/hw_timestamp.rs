@@ -134,10 +134,10 @@ impl ScmTimestamping {
 // Socket Operations
 // =============================================================================
 
-/// Enable hardware timestamping on a socket
+/// `SO_TIMESTAMPING` flags of NIC hardware timestamps, TX and RX
 ///
-/// This configures the socket to receive TX and RX hardware timestamps.
-/// For TCP, also enables OPT_ID for correlating TX timestamps with byte positions.
+/// With `SOF_TIMESTAMPING_OPT_ID`, the kernel numbers TX timestamps for
+/// correlation with sends.
 ///
 /// # OPT_ID Counter Behavior
 ///
@@ -146,65 +146,57 @@ impl ScmTimestamping {
 /// - For TCP: ee_data contains cumulative bytes sent (starting from 0)
 /// - For UDP: ee_data contains packet count (starting from 0)
 ///
-/// IMPORTANT: This option must be set BEFORE sending any data on the socket,
+/// IMPORTANT: The option must be set BEFORE sending any data on the socket,
 /// otherwise the counter may be offset by data already in flight.
-pub fn enable_socket_timestamping(fd: RawFd) -> Result<()> {
-    use flags::*;
+pub const HARDWARE_FLAGS: u32 = flags::SOF_TIMESTAMPING_RX_HARDWARE
+    | flags::SOF_TIMESTAMPING_TX_HARDWARE
+    | flags::SOF_TIMESTAMPING_RAW_HARDWARE
+    | flags::SOF_TIMESTAMPING_OPT_TSONLY
+    | flags::SOF_TIMESTAMPING_OPT_ID;
 
-    let ts_mode: u32 = SOF_TIMESTAMPING_RX_HARDWARE
-        | SOF_TIMESTAMPING_TX_HARDWARE
-        | SOF_TIMESTAMPING_RAW_HARDWARE
-        | SOF_TIMESTAMPING_OPT_TSONLY
-        | SOF_TIMESTAMPING_OPT_ID;
+/// `SO_TIMESTAMPING` flags of kernel software timestamps, TX and RX; see
+/// [`HARDWARE_FLAGS`] for the TX counter
+pub const SOFTWARE_FLAGS: u32 = flags::SOF_TIMESTAMPING_RX_SOFTWARE
+    | flags::SOF_TIMESTAMPING_TX_SOFTWARE
+    | flags::SOF_TIMESTAMPING_SOFTWARE
+    | flags::SOF_TIMESTAMPING_OPT_TSONLY
+    | flags::SOF_TIMESTAMPING_OPT_ID;
 
+/// Set `SO_TIMESTAMPING` to `ts_flags` on a socket
+///
+/// The error is the `setsockopt` call's, with its errno.
+pub fn set_timestamping(fd: RawFd, ts_flags: u32) -> io::Result<()> {
     let ret = unsafe {
         libc::setsockopt(
             fd,
             libc::SOL_SOCKET,
             libc::SO_TIMESTAMPING,
-            &ts_mode as *const u32 as *const libc::c_void,
+            &ts_flags as *const u32 as *const libc::c_void,
             mem::size_of::<u32>() as libc::socklen_t,
         )
     };
-
     if ret < 0 {
-        return Err(Error::Config(format!(
-            "Failed to enable SO_TIMESTAMPING: {}",
-            io::Error::last_os_error()
-        )));
+        return Err(io::Error::last_os_error());
     }
-
     Ok(())
 }
 
-/// Enable software timestamping on a socket (fallback when HW not available)
+/// Enable hardware timestamping on a socket ([`HARDWARE_FLAGS`])
+pub fn enable_socket_timestamping(fd: RawFd) -> Result<()> {
+    set_timestamping(fd, HARDWARE_FLAGS).map_err(|e| {
+        Error::Config(format!(
+            "setsockopt(SOL_SOCKET, SO_TIMESTAMPING, {HARDWARE_FLAGS:#x}) failed: {e}"
+        ))
+    })
+}
+
+/// Enable software timestamping on a socket ([`SOFTWARE_FLAGS`])
 pub fn enable_software_timestamping(fd: RawFd) -> Result<()> {
-    use flags::*;
-
-    let ts_mode: u32 = SOF_TIMESTAMPING_RX_SOFTWARE
-        | SOF_TIMESTAMPING_TX_SOFTWARE
-        | SOF_TIMESTAMPING_SOFTWARE
-        | SOF_TIMESTAMPING_OPT_TSONLY
-        | SOF_TIMESTAMPING_OPT_ID;
-
-    let ret = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_TIMESTAMPING,
-            &ts_mode as *const u32 as *const libc::c_void,
-            mem::size_of::<u32>() as libc::socklen_t,
-        )
-    };
-
-    if ret < 0 {
-        return Err(Error::Config(format!(
-            "Failed to enable software timestamping: {}",
-            io::Error::last_os_error()
-        )));
-    }
-
-    Ok(())
+    set_timestamping(fd, SOFTWARE_FLAGS).map_err(|e| {
+        Error::Config(format!(
+            "setsockopt(SOL_SOCKET, SO_TIMESTAMPING, {SOFTWARE_FLAGS:#x}) failed: {e}"
+        ))
+    })
 }
 
 /// Bind socket to a specific network interface (required for HW timestamps)
@@ -227,7 +219,7 @@ pub fn bind_to_device(fd: RawFd, interface: &str) -> Result<()> {
 
     if ret < 0 {
         return Err(Error::Config(format!(
-            "Failed to bind to device '{}': {}",
+            "setsockopt(SOL_SOCKET, SO_BINDTODEVICE, '{}') failed: {}",
             interface,
             io::Error::last_os_error()
         )));
@@ -466,7 +458,10 @@ pub fn recvmsg_with_timestamp(
 
 /// Receive TX timestamp from error queue (non-blocking)
 ///
-/// Returns Some((timestamp, opt_id)) if a TX timestamp is available.
+/// Returns `Some((timestamp, opt_id))` for the next TX timestamp and `None`
+/// once the error queue is empty. A message without a TX timestamp, or with
+/// malformed ancillary data, is an error of kind `InvalidData`: with
+/// `SO_TIMESTAMPING` alone, the error queue holds nothing else.
 pub fn recv_tx_timestamp(fd: RawFd) -> io::Result<Option<(KernelTimestamp, u32)>> {
     let mut cmsg_buf = [0u8; CMSG_BUFFER_SIZE];
     let mut dummy_buf = [0u8; 1];
@@ -491,7 +486,21 @@ pub fn recv_tx_timestamp(fd: RawFd) -> io::Result<Option<(KernelTimestamp, u32)>
         return Err(err);
     }
 
-    Ok(extract_tx_timestamp(&cmsg_buf, hdr.msg_controllen))
+    match extract_tx_timestamp(&cmsg_buf, hdr.msg_controllen) {
+        Some(stamp) => Ok(Some(stamp)),
+        None => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "an error-queue message carried no TX timestamp ({} bytes of ancillary data{})",
+                hdr.msg_controllen,
+                if hdr.msg_flags & libc::MSG_CTRUNC != 0 {
+                    ", truncated"
+                } else {
+                    ""
+                }
+            ),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -697,6 +706,43 @@ mod tests {
         }
         assert_eq!(ids, vec![0, 1, 2]);
         assert_eq!(recv_tx_timestamp(fd).unwrap(), None);
+    }
+
+    /// An error-queue message without a TX timestamp is an error, not the
+    /// end of the queue: here an ICMP port unreachable, queued by IP_RECVERR
+    #[test]
+    fn an_error_queue_message_without_a_tx_timestamp_is_an_error() {
+        use std::os::fd::AsRawFd;
+        // A port nothing listens on any more
+        let closed = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        client.connect(closed).unwrap();
+        let fd = client.as_raw_fd();
+        let on: libc::c_int = 1;
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_IP,
+                libc::IP_RECVERR,
+                &on as *const libc::c_int as *const libc::c_void,
+                mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(ret, 0, "{}", io::Error::last_os_error());
+        assert_eq!(recv_tx_timestamp(fd).unwrap(), None, "empty queue");
+        client.send(b"x").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let error = loop {
+            match recv_tx_timestamp(fd) {
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(1))
+                }
+                Ok(stamp) => panic!("expected an error, got {stamp:?}"),
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("carried no TX timestamp"), "{error}");
     }
 
     #[test]

@@ -13,6 +13,7 @@ pub mod tuple_collector;
 // Re-export main types
 pub use breakdown::{
     BreakdownClock, BreakdownStats, BreakdownSummary, KernelSplit, LatencyBreakdown, PartSummary,
+    SplitMiss, SplitMissCounts,
 };
 pub use policy::SamplingPolicy;
 pub use requests::{

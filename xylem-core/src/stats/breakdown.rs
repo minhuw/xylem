@@ -17,6 +17,10 @@
 //!
 //! Only durations are subtracted, each measured in one clock; times from
 //! different clocks are never compared.
+//!
+//! A request without a kernel split says why ([`SplitMiss`]): its send had
+//! no kernel TX timestamp, its receive no kernel RX timestamp, or the two
+//! came from different clocks. [`BreakdownStats`] counts each cause.
 
 use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
@@ -76,6 +80,19 @@ pub struct KernelSplit {
     pub host_stack: Duration,
 }
 
+/// Why a request's round trip has no kernel split
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitMiss {
+    /// The send had no kernel TX timestamp; the receive had one
+    Tx,
+    /// The receive had no kernel RX timestamp; the send had one
+    Rx,
+    /// Neither had a kernel timestamp, as with user-space timestamps
+    TxAndRx,
+    /// Both had one, from different clocks
+    ClockMismatch,
+}
+
 /// Where one completed request's latency went, apart from its send lag
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LatencyBreakdown {
@@ -85,6 +102,8 @@ pub struct LatencyBreakdown {
     /// Present when the send and the receive have kernel timestamps from
     /// the same clock
     pub kernel: Option<KernelSplit>,
+    /// Why there is no kernel split; `None` exactly when `kernel` is set
+    pub miss: Option<SplitMiss>,
 }
 
 impl LatencyBreakdown {
@@ -95,22 +114,39 @@ impl LatencyBreakdown {
     /// timestamp (see [`Timestamp::with_kernel`]).
     #[inline]
     pub fn between(send: &Timestamp, recv: &Timestamp) -> Self {
-        match recv.kernel_duration_since(send) {
-            Some((clock, kernel_rtt)) => {
+        let miss = match (send.kernel(), recv.kernel()) {
+            (Some(tx), Some(rx)) if tx.clock == rx.clock => {
+                let kernel_rtt = Duration::from_nanos(rx.nanos.saturating_sub(tx.nanos));
                 let user_rtt = recv.cycles_duration_since(send);
-                Self {
+                return Self {
                     service: kernel_rtt,
                     kernel: Some(KernelSplit {
-                        clock,
+                        clock: tx.clock,
                         network_server: kernel_rtt,
                         host_stack: user_rtt.saturating_sub(kernel_rtt),
                     }),
-                }
+                    miss: None,
+                };
             }
-            None => Self {
-                service: recv.cycles_duration_since(send),
-                kernel: None,
-            },
+            (Some(_), Some(_)) => SplitMiss::ClockMismatch,
+            (None, Some(_)) => SplitMiss::Tx,
+            (Some(_), None) => SplitMiss::Rx,
+            (None, None) => SplitMiss::TxAndRx,
+        };
+        Self {
+            service: recv.cycles_duration_since(send),
+            kernel: None,
+            miss: Some(miss),
+        }
+    }
+
+    /// The breakdown of a request measured in user-space cycles alone,
+    /// whose send and receive had no kernel timestamp
+    pub fn user_space(service: Duration) -> Self {
+        Self {
+            service,
+            kernel: None,
+            miss: Some(SplitMiss::TxAndRx),
         }
     }
 
@@ -197,6 +233,41 @@ pub struct PartSummary {
     pub max: Option<Duration>,
 }
 
+/// Requests without a kernel split, by what they lacked
+///
+/// A request with neither kernel timestamp counts in both `tx` and `rx`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SplitMissCounts {
+    /// Requests whose send had no kernel TX timestamp
+    pub tx: u64,
+    /// Requests whose receive had no kernel RX timestamp
+    pub rx: u64,
+    /// Requests whose send and receive had kernel timestamps of different
+    /// clocks
+    pub clock_mismatch: u64,
+}
+
+impl SplitMissCounts {
+    #[inline]
+    fn record(&mut self, miss: SplitMiss) {
+        match miss {
+            SplitMiss::Tx => self.tx += 1,
+            SplitMiss::Rx => self.rx += 1,
+            SplitMiss::TxAndRx => {
+                self.tx += 1;
+                self.rx += 1;
+            }
+            SplitMiss::ClockMismatch => self.clock_mismatch += 1,
+        }
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.tx += other.tx;
+        self.rx += other.rx;
+        self.clock_mismatch += other.clock_mismatch;
+    }
+}
+
 /// Latency breakdowns of a scope's completed measurement requests
 #[derive(Debug, Clone, Default)]
 pub struct BreakdownStats {
@@ -206,6 +277,8 @@ pub struct BreakdownStats {
     /// Recorded only for requests with a kernel split, like `network_server`
     host_stack: PartStats,
     network_server: PartStats,
+    /// Requests without a kernel split, by cause
+    missing: SplitMissCounts,
 }
 
 impl BreakdownStats {
@@ -218,6 +291,9 @@ impl BreakdownStats {
             self.host_stack.record(split.host_stack);
             self.network_server.record(split.network_server);
         }
+        if let Some(miss) = breakdown.miss {
+            self.missing.record(miss);
+        }
     }
 
     /// Add another scope's breakdowns to these
@@ -226,6 +302,7 @@ impl BreakdownStats {
         self.service.merge(&other.service);
         self.host_stack.merge(&other.host_stack);
         self.network_server.merge(&other.network_server);
+        self.missing.merge(&other.missing);
     }
 
     /// Summarize the recorded breakdowns
@@ -235,6 +312,7 @@ impl BreakdownStats {
         BreakdownSummary {
             clock: BreakdownClock::from_bits(self.clocks),
             kernel_split_count,
+            kernel_split_missing: self.missing,
             service: self.service.summary(),
             host_stack: split(&self.host_stack),
             network_server: split(&self.network_server),
@@ -249,6 +327,8 @@ pub struct BreakdownSummary {
     pub clock: Option<BreakdownClock>,
     /// Requests whose round trip had a kernel split
     pub kernel_split_count: u64,
+    /// Requests whose round trip had none, by cause
+    pub kernel_split_missing: SplitMissCounts,
     pub service: PartSummary,
     /// `None` when no request had a kernel split
     pub host_stack: Option<PartSummary>,
@@ -297,6 +377,7 @@ mod tests {
                 })
             );
             assert_eq!(breakdown.clock(), expected);
+            assert_eq!(breakdown.miss, None);
         }
     }
 
@@ -305,24 +386,61 @@ mod tests {
         use KernelClock::{NicHardware as Hw, Realtime as Sw};
         let (send, recv) = round_trip();
         let user_rtt = recv.cycles_duration_since(&send);
-        for (send_clock, recv_clock) in [
-            (None, None),
-            (Some(Sw), None),
-            (None, Some(Sw)),
-            (Some(Hw), None),
-            (Some(Sw), Some(Hw)),
-            (Some(Hw), Some(Sw)),
+        for (send_clock, recv_clock, miss) in [
+            (None, None, SplitMiss::TxAndRx),
+            (Some(Sw), None, SplitMiss::Rx),
+            (None, Some(Sw), SplitMiss::Tx),
+            (Some(Hw), None, SplitMiss::Rx),
+            (None, Some(Hw), SplitMiss::Tx),
+            (Some(Sw), Some(Hw), SplitMiss::ClockMismatch),
+            (Some(Hw), Some(Sw), SplitMiss::ClockMismatch),
         ] {
             let send = send_clock.map_or(send, |clock| send.with_kernel(kernel(1_000, clock)));
             let recv = recv_clock.map_or(recv, |clock| recv.with_kernel(kernel(2_000, clock)));
             let breakdown = LatencyBreakdown::between(&send, &recv);
             assert_eq!(
                 breakdown,
-                LatencyBreakdown { service: user_rtt, kernel: None },
+                LatencyBreakdown {
+                    service: user_rtt,
+                    kernel: None,
+                    miss: Some(miss)
+                },
                 "{send_clock:?} -> {recv_clock:?}"
             );
             assert_eq!(breakdown.clock(), BreakdownClock::UserSpace);
         }
+        assert_eq!(LatencyBreakdown::user_space(user_rtt), LatencyBreakdown::between(&send, &recv));
+    }
+
+    #[test]
+    fn requests_without_a_split_count_by_cause_and_merge() {
+        let (send, recv) = round_trip();
+        let sw = |ts: Timestamp, nanos| ts.with_kernel(kernel(nanos, KernelClock::Realtime));
+        let hw = |ts: Timestamp, nanos| ts.with_kernel(kernel(nanos, KernelClock::NicHardware));
+        let mut stats = BreakdownStats::default();
+        for (send, recv, times) in [
+            (sw(send, 1_000), sw(recv, 2_000), 5),
+            (send, sw(recv, 2_000), 4),
+            (sw(send, 1_000), recv, 3),
+            (send, recv, 2),
+            (hw(send, 1_000), sw(recv, 2_000), 1),
+        ] {
+            for _ in 0..times {
+                stats.record(&LatencyBreakdown::between(&send, &recv));
+            }
+        }
+        let summary = stats.summary();
+        assert_eq!(summary.kernel_split_count, 5);
+        assert_eq!(summary.service.sample_count, 15);
+        // Neither timestamp counts in both tx and rx
+        let missing = SplitMissCounts { tx: 4 + 2, rx: 3 + 2, clock_mismatch: 1 };
+        assert_eq!(summary.kernel_split_missing, missing);
+
+        let mut other = BreakdownStats::default();
+        other.record(&LatencyBreakdown::between(&send, &sw(recv, 2_000)));
+        stats.merge(&other);
+        let merged = SplitMissCounts { tx: missing.tx + 1, ..missing };
+        assert_eq!(stats.summary().kernel_split_missing, merged);
     }
 
     #[test]
@@ -340,10 +458,7 @@ mod tests {
     }
 
     fn user(us: u64) -> LatencyBreakdown {
-        LatencyBreakdown {
-            service: Duration::from_micros(us),
-            kernel: None,
-        }
+        LatencyBreakdown::user_space(Duration::from_micros(us))
     }
 
     fn split(clock: KernelClock, host_us: u64, network_us: u64) -> LatencyBreakdown {
@@ -354,6 +469,7 @@ mod tests {
                 network_server: Duration::from_micros(network_us),
                 host_stack: Duration::from_micros(host_us),
             }),
+            miss: None,
         }
     }
 

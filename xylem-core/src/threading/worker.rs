@@ -751,10 +751,9 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
 
         // Poll for TX timestamps from error queue (non-blocking)
         // Must be called AFTER poll() because TX timestamps arrive asynchronously
-        // and may not be available until after the NIC has transmitted the data
-        if let Err(e) = self.pool.poll_tx_timestamps() {
-            tracing::trace!("Error polling TX timestamps: {}", e);
-        }
+        // and may not be available until after the NIC has transmitted the data.
+        // A failed read fails the run: its requests would lose their kernel split.
+        self.pool.poll_tx_timestamps()?;
 
         // Clean up stale TX queue entries (entries older than 1 minute)
         // This prevents memory leaks when TX timestamps are never received
@@ -2544,6 +2543,72 @@ mod tests {
         let host = breakdown.host_stack.unwrap().max.unwrap();
         assert!(host >= Duration::from_micros(900), "{host:?}");
         assert_eq!(global(&worker).max_latency, Some(Duration::from_micros(5)));
+    }
+
+    #[test]
+    fn requests_without_a_kernel_split_count_by_the_stamp_they_lacked() {
+        use crate::stats::SplitMissCounts;
+        use xylem_transport::{KernelClock, KernelTimestamp, Timestamp, TxTimestampInfo};
+        let sw = |nanos| KernelTimestamp { nanos, clock: KernelClock::Realtime };
+        let hw = |nanos| KernelTimestamp { nanos, clock: KernelClock::NicHardware };
+        let factory = FakeFactory::default();
+        let mut worker = fake_worker(&factory, 1, Box::new(UniformPolicyScheduler::closed_loop()));
+        // Request i's TX stamp (its send ends at i + 1) and RX stamp: split,
+        // no TX stamp, no RX stamp, stamps of different clocks
+        let cases = [
+            (Some(sw(1_000)), Some(sw(2_000))),
+            (None, Some(sw(2_000))),
+            (Some(sw(1_000)), None),
+            (Some(sw(1_000)), Some(hw(2_000))),
+        ];
+        for (id, (tx, rx)) in cases.into_iter().enumerate() {
+            // The fake stamps sends with its receive timestamp: none here
+            factory.0.lock().unwrap().timestamp = Timestamp::now();
+            worker.send_requests().unwrap();
+            let mut io = factory.0.lock().unwrap();
+            if let Some(timestamp) = tx {
+                let tx_end = id as u32 + 1;
+                io.tx_timestamps.push(TxTimestampInfo {
+                    conn_id: 0,
+                    tx_end,
+                    cumulative: true,
+                    timestamp,
+                });
+            }
+            let now = Timestamp::now();
+            io.timestamp = rx.map_or(now, |rx| now.with_kernel(rx));
+            io.responses.push_back(Ok((id as u64).to_le_bytes().to_vec()));
+            drop(io);
+            worker.process_responses(Duration::ZERO).unwrap();
+        }
+        let breakdown = worker.stats.latency_breakdown(0);
+        assert_eq!((breakdown.kernel_split_count, breakdown.service.sample_count), (1, 4));
+        assert_eq!(
+            breakdown.kernel_split_missing,
+            SplitMissCounts { tx: 1, rx: 1, clock_mismatch: 1 }
+        );
+        assert_eq!(worker.stats.latency_breakdown_global(), breakdown);
+    }
+
+    #[test]
+    fn an_error_reading_tx_timestamps_fails_the_run() {
+        let factory = FakeFactory::default();
+        let mut worker = fake_worker(&factory, 1, Box::new(UniformPolicyScheduler::closed_loop()));
+        worker.send_requests().unwrap();
+        factory.0.lock().unwrap().tx_error = Some(|| {
+            xylem_transport::Error::Io(std::io::Error::other(
+                "Could not read the TX timestamps of TCP connection 0: recvmsg(MSG_ERRQUEUE): \
+                 boom",
+            ))
+        });
+        let error = worker.process_responses(Duration::ZERO).unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "I/O error: Could not read the TX timestamps of TCP connection 0: \
+             recvmsg(MSG_ERRQUEUE): boom"
+        );
+        worker.config.duration = Duration::from_secs(5);
+        assert!(worker.run().unwrap_err().to_string().contains("recvmsg(MSG_ERRQUEUE)"));
     }
 
     #[test]

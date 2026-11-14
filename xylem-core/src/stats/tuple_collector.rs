@@ -3299,11 +3299,9 @@ mod tests {
                 network_server: Duration::from_micros(network_us),
                 host_stack: Duration::from_micros(host_us),
             }),
+            miss: None,
         };
-        let user = |us| LatencyBreakdown {
-            service: Duration::from_micros(us),
-            kernel: None,
-        };
+        let user = |us| LatencyBreakdown::user_space(Duration::from_micros(us));
         let mut first = TupleStatsCollector::default();
         first.record_breakdown(0, &split(5, 20));
         first.record_breakdown(1, &user(40));
@@ -3879,7 +3877,7 @@ mod tests {
         let mut record = |one: &mut TupleStatsCollector, three: &mut TupleStatsCollector, group| {
             for connection in 0..3 {
                 let latency = next_latency(&mut state);
-                let breakdown = LatencyBreakdown { service: latency, kernel: None };
+                let breakdown = LatencyBreakdown::user_space(latency);
                 let bytes = 100 + connection;
                 off_boundary(one.experiment_start_ns);
                 one.record_response(group, connection, bytes, latency, &breakdown);

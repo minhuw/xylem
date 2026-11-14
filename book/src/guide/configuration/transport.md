@@ -143,7 +143,32 @@ service latency, and with kernel timestamps it splits the round trip into the
 part between the user-space and the kernel timestamps (`host_stack_us`) and
 the kernel round trip (`network_server_us`). A
 request whose TX or RX timestamp did not arrive is measured in cycles and
-counted in `service_us` alone; `kernel_split_count` says how many were split.
+counted in `service_us` alone; `kernel_split_count` says how many were split,
+and `kernel_split_missing` why the others were not (no TX timestamp, no RX
+timestamp, or timestamps of different clocks).
+
+With `"kernel"` or `{ hardware = ... }`, xylem never falls back to
+user-space timestamps without saying so:
+
+- Each socket must accept `SO_TIMESTAMPING` (and, for hardware timestamps,
+  `SO_BINDTODEVICE`). If one refuses, the run fails while it opens its
+  connections, with an error naming the traffic group, the connection, the
+  socket option and the errno, as in `Traffic group 0: cannot open a
+  connection to 10.0.0.2:2117: Could not enable kernel software timestamps on
+  TCP connection 3: setsockopt(SOL_SOCKET, SO_TIMESTAMPING, 0x89a) failed:
+  ...`.
+- Reading a socket's error queue (`recvmsg` with `MSG_ERRQUEUE`) for TX
+  timestamps fails the run on any error but an empty queue, and on a message
+  that carries no TX timestamp.
+- A group that completed requests but split none of them makes the run
+  invalid (exit status 3, results written; see the
+  [`kernel_split` validity check](../thresholds.md#validity)), with the
+  counts of `kernel_split_missing` and the likely fix: without TX
+  timestamps, the interface's driver lacks software-transmit timestamping
+  (check `ethtool -T <interface>` on the interface that reaches the target);
+  without RX timestamps, check software-receive, or for hardware timestamps
+  the NIC's `hwstamp_ctl` RX filter. A group that split only some logs a
+  warning with the counts.
 
 - `unix` groups reject anything but `"user"`, and `ntcp` groups anything but
   `"user"` and (with the DPDK backend) `"nic"`: neither has kernel packet

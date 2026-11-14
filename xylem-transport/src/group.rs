@@ -199,8 +199,10 @@ impl TimestampConfig {
 
     /// Bind a new socket to the interface and enable `source` on it (Linux only)
     ///
-    /// Returns true if kernel timestamping is enabled on the socket. Fails
-    /// only when hardware timestamps are required and either step fails.
+    /// Returns true if kernel timestamping is enabled on the socket, which
+    /// it is for every source but user-space. Failing to enable `source`
+    /// fails, naming the connection, the socket option and its errno; so
+    /// does failing to bind to the interface for hardware timestamps.
     #[cfg(target_os = "linux")]
     pub(crate) fn configure_socket(
         &self,
@@ -209,34 +211,47 @@ impl TimestampConfig {
         transport: &str,
         conn_id: usize,
     ) -> Result<bool> {
+        self.configure_socket_with(fd, source, transport, conn_id, hw_timestamp::set_timestamping)
+    }
+
+    /// [`Self::configure_socket`], setting `SO_TIMESTAMPING` with `set_timestamping`
+    #[cfg(target_os = "linux")]
+    fn configure_socket_with(
+        &self,
+        fd: RawFd,
+        source: TimestampSource,
+        transport: &str,
+        conn_id: usize,
+        set_timestamping: impl FnOnce(RawFd, u32) -> io::Result<()>,
+    ) -> Result<bool> {
         if let (Some(interface), true) = (&self.interface, self.enable_timestamps) {
             if let Err(e) = hw_timestamp::bind_to_device(fd, interface) {
-                if self.require_hardware {
-                    return Err(e);
+                if self.require_hardware || source == TimestampSource::Hardware {
+                    let cause = match e {
+                        Error::Config(message) => message,
+                        e => e.to_string(),
+                    };
+                    return Err(Error::Config(format!(
+                        "Could not bind {transport} connection {conn_id} to '{interface}' for \
+                         its hardware timestamps: {cause}"
+                    )));
                 }
                 tracing::warn!("Could not bind to device '{}': {}", interface, e);
             }
         }
 
-        let result = match source {
-            TimestampSource::Hardware => hw_timestamp::enable_socket_timestamping(fd),
-            TimestampSource::KernelSoftware => hw_timestamp::enable_software_timestamping(fd),
+        let ts_flags = match source {
+            TimestampSource::Hardware => hw_timestamp::HARDWARE_FLAGS,
+            TimestampSource::KernelSoftware => hw_timestamp::SOFTWARE_FLAGS,
             TimestampSource::UserSpace => return Ok(false),
         };
-        match result {
-            Ok(()) => Ok(true),
-            Err(e) if self.require_hardware => Err(e),
-            Err(e) => {
-                tracing::warn!(
-                    "Could not enable {} timestamps on {} connection {}: {}",
-                    source,
-                    transport,
-                    conn_id,
-                    e
-                );
-                Ok(false)
-            }
-        }
+        set_timestamping(fd, ts_flags).map_err(|e| {
+            Error::Config(format!(
+                "Could not enable {source} timestamps on {transport} connection {conn_id}: \
+                 setsockopt(SOL_SOCKET, SO_TIMESTAMPING, {ts_flags:#x}) failed: {e}"
+            ))
+        })?;
+        Ok(true)
     }
 }
 
@@ -434,17 +449,18 @@ impl<C: GroupSocket> GroupCore<C> {
     /// `ee_data + 1`, comparable with `SendReceipt::tx`'s `end`.
     ///
     /// `cumulative` is passed through to `TxTimestampInfo`; `transport`
-    /// names the transport in log messages (e.g., "TCP").
+    /// names the transport in error messages (e.g., "TCP"). Fails on any
+    /// error reading an error queue but an empty one, naming the connection.
     #[cfg(target_os = "linux")]
     pub(crate) fn poll_tx_timestamps(
         &mut self,
         cumulative: bool,
         transport: &str,
         out: &mut Vec<TxTimestampInfo>,
-    ) {
+    ) -> Result<()> {
         out.clear();
         if self.tx_stamping == 0 {
-            return;
+            return Ok(());
         }
 
         for (conn_id, conn) in self.connections.iter_mut().enumerate() {
@@ -467,20 +483,21 @@ impl<C: GroupSocket> GroupCore<C> {
                         counter.on_stamp(tx_end);
                         out.push(TxTimestampInfo { conn_id, tx_end, cumulative, timestamp });
                     }
-                    Ok(None) => break, // No more timestamps available
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    // The error queue is empty (EAGAIN)
+                    Ok(None) => break,
                     Err(e) => {
-                        tracing::trace!(
-                            "Error polling TX timestamp for {} conn {}: {}",
-                            transport,
-                            conn_id,
-                            e
-                        );
-                        break;
+                        return Err(Error::Io(io::Error::new(
+                            e.kind(),
+                            format!(
+                                "Could not read the TX timestamps of {transport} connection \
+                                 {conn_id}: recvmsg(MSG_ERRQUEUE): {e}"
+                            ),
+                        )));
                     }
                 }
             }
         }
+        Ok(())
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -506,5 +523,124 @@ impl<C: GroupSocket> GroupCore<C> {
             self.close(conn_id)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::os::fd::OwnedFd;
+
+    #[test]
+    fn a_socket_that_cannot_enable_its_timestamps_fails_naming_option_and_errno() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let fd = socket.as_raw_fd();
+        let config = TimestampConfig::with_software_timestamps();
+        for (source, flags) in [
+            (TimestampSource::KernelSoftware, hw_timestamp::SOFTWARE_FLAGS),
+            (TimestampSource::Hardware, hw_timestamp::HARDWARE_FLAGS),
+        ] {
+            let mut requested = None;
+            let error = config
+                .configure_socket_with(fd, source, "TCP", 3, |_, ts_flags| {
+                    requested = Some(ts_flags);
+                    Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+                })
+                .unwrap_err()
+                .to_string();
+            assert_eq!(requested, Some(flags));
+            assert!(
+                error.starts_with(&format!(
+                    "Configuration error: Could not enable {source} timestamps on TCP \
+                     connection 3: setsockopt(SOL_SOCKET, SO_TIMESTAMPING, {flags:#x}) failed: "
+                )),
+                "{error}"
+            );
+            assert!(error.ends_with(&format!("(os error {})", libc::EOPNOTSUPP)), "{error}");
+        }
+        // User-space timestamps set no socket option
+        let user =
+            config.configure_socket_with(fd, TimestampSource::UserSpace, "TCP", 3, |_, _| {
+                panic!("set SO_TIMESTAMPING for user-space timestamps")
+            });
+        assert!(!user.unwrap());
+        // The real option succeeds on a UDP socket
+        let source = TimestampSource::KernelSoftware;
+        assert!(config.configure_socket(fd, source, "UDP", 0).unwrap());
+    }
+
+    #[test]
+    fn hardware_timestamps_fail_when_the_socket_cannot_bind_to_the_interface() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let config = TimestampConfig::with_interface("xylem-no-such-if");
+        let error = config
+            .configure_socket_with(
+                socket.as_raw_fd(),
+                TimestampSource::Hardware,
+                "UDP",
+                1,
+                |_, _| panic!("enabled timestamps on an unbound socket"),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with(
+                "Configuration error: Could not bind UDP connection 1 to 'xylem-no-such-if' for \
+                 its hardware timestamps: setsockopt(SOL_SOCKET, SO_BINDTODEVICE, \
+                 'xylem-no-such-if') failed: "
+            ),
+            "{error}"
+        );
+        assert!(error.contains("(os error"), "{error}");
+    }
+
+    /// A connection whose "socket" is any file descriptor
+    struct FdConn {
+        fd: OwnedFd,
+        tx: TxCounter,
+    }
+
+    impl GroupSocket for FdConn {
+        fn socket_fd(&self) -> RawFd {
+            self.fd.as_raw_fd()
+        }
+
+        fn tx_counter(&mut self) -> Option<&mut TxCounter> {
+            Some(&mut self.tx)
+        }
+    }
+
+    #[test]
+    fn an_error_queue_read_error_fails_naming_the_connection() {
+        // Not a socket: recvmsg fails with ENOTSOCK, not EAGAIN
+        let (reader, _writer) = std::io::pipe().unwrap();
+        let mut core = GroupCore::new().unwrap();
+        let conn_id = core.reserve_id();
+        let mut tx = TxCounter::default();
+        tx.advance(10);
+        core.insert(conn_id, FdConn { fd: reader.into(), tx });
+        let mut out = Vec::new();
+        let error = core.poll_tx_timestamps(true, "TCP", &mut out).unwrap_err().to_string();
+        assert!(
+            error.starts_with(
+                "I/O error: Could not read the TX timestamps of TCP connection 0: \
+                 recvmsg(MSG_ERRQUEUE): "
+            ),
+            "{error}"
+        );
+        assert!(error.ends_with(&format!("(os error {})", libc::ENOTSOCK)), "{error}");
+    }
+
+    #[test]
+    fn an_empty_error_queue_is_no_error() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut core = GroupCore::new().unwrap();
+        let conn_id = core.reserve_id();
+        let mut tx = TxCounter::default();
+        tx.advance(1);
+        core.insert(conn_id, FdConn { fd: socket.into(), tx });
+        let mut out = vec![];
+        core.poll_tx_timestamps(false, "UDP", &mut out).unwrap();
+        assert!(out.is_empty());
     }
 }

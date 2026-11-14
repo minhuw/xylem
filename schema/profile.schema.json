@@ -1094,7 +1094,7 @@
       ]
     },
     "ValidityCheck": {
-      "description": "Checks that a run applied its configured load",
+      "description": "Checks that a run applied its configured load, and measured it with\nits configured timestamps",
       "oneOf": [
         {
           "description": "Fraction of a rate-driven group's intended sends that never went out",
@@ -1105,11 +1105,16 @@
           "description": "Fraction of a rate-driven group's sends that went out late",
           "type": "string",
           "const": "late_sends"
+        },
+        {
+          "description": "Fraction of the completed requests of a group with kernel or hardware\ntimestamps that had a kernel split; fails at zero",
+          "type": "string",
+          "const": "kernel_split"
         }
       ]
     },
     "ValidityConfig": {
-      "description": "Checks that a run applied the load it was configured with. Each applies\nto every traffic group with a rate-driven traffic policy; a closed loop\nhas no schedule to fall behind.",
+      "description": "Checks that a run applied the load it was configured with, and measured\nit with the timestamps it was configured with. \"unsent\" and \"late_sends\"\napply to every traffic group with a rate-driven traffic policy (a closed\nloop has no schedule to fall behind); \"kernel_split\" to every traffic\ngroup with `timestamps = \"kernel\"` or `{ hardware = ... }` that\ncompleted a request: it fails when none of them had a kernel split.",
       "type": "object",
       "properties": {
         "enabled": {
@@ -1130,7 +1135,7 @@
           "default": 0.001
         },
         "skip": {
-          "description": "Checks to leave out: \"unsent\", \"late_sends\"",
+          "description": "Checks to leave out: \"unsent\", \"late_sends\", \"kernel_split\"",
           "type": "array",
           "items": {
             "$ref": "#/$defs/ValidityCheck"

@@ -558,10 +558,16 @@ fn breakdown_section(breakdown: &super::LatencyBreakdownStats) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n");
+    let missing = breakdown.kernel_split_missing.map_or_else(String::new, |missing| {
+        format!(
+            "; without one, no TX timestamp: {}, no RX timestamp: {}, clock mismatch: {}",
+            missing.tx, missing.rx, missing.clock_mismatch
+        )
+    });
     format!(
-        "<h4>Latency Breakdown</h4>\n<p>Clock: {clock}; requests with a kernel split: {split}. \
-         {note}</p>\n<table>\n<tr>\n<th>Part</th>\n<th>Mean</th>\n<th>p50</th>\n\
-         <th>p99</th>\n<th>p99.9</th>\n<th>Max</th>\n</tr>\n{rows}\n</table>",
+        "<h4>Latency Breakdown</h4>\n<p>Clock: {clock}; requests with a kernel split: \
+         {split}{missing}. {note}</p>\n<table>\n<tr>\n<th>Part</th>\n<th>Mean</th>\n\
+         <th>p50</th>\n<th>p99</th>\n<th>p99.9</th>\n<th>Max</th>\n</tr>\n{rows}\n</table>",
         clock = breakdown.clock_name(),
         split = breakdown.kernel_split_count,
         note = super::BREAKDOWN_NOTE,

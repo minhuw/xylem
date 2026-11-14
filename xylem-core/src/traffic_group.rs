@@ -118,6 +118,12 @@ impl TimestampSourceConfig {
     pub fn is_user(&self) -> bool {
         *self == TimestampSourceConfig::User
     }
+
+    /// Whether the group's kernel sockets take kernel timestamps
+    /// (`SO_TIMESTAMPING`): `"kernel"` or `{ hardware = "<interface>" }`
+    pub fn is_kernel(&self) -> bool {
+        matches!(self, TimestampSourceConfig::Kernel | TimestampSourceConfig::Hardware(_))
+    }
 }
 
 impl std::fmt::Display for TimestampSourceConfig {

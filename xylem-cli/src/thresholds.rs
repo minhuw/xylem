@@ -1,5 +1,6 @@
 //! Pass/fail thresholds on the results, and checks that a run applied the
-//! load it was configured with
+//! load it was configured with and measured it with the configured
+//! timestamps
 //!
 //! A threshold compares a metric of the final results with a limit:
 //! `"latency{group=api}" = ["p99 < 250us"]`. A metric is a path into a
@@ -19,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use xylem_core::stats::{BreakdownClock, ErrorKindCounts, RequestCounts, LATE_SEND_THRESHOLD};
-use xylem_core::traffic_group::{PolicyConfig, TrafficGroupConfig};
+use xylem_core::traffic_group::{PolicyConfig, TimestampSourceConfig, TrafficGroupConfig};
 
 /// Outcome of a run, from its validity checks and thresholds
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,7 +104,8 @@ impl ThresholdResult {
     }
 }
 
-/// Checks that a run applied its configured load
+/// Checks that a run applied its configured load, and measured it with
+/// its configured timestamps
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ValidityCheck {
@@ -111,6 +113,9 @@ pub enum ValidityCheck {
     Unsent,
     /// Fraction of a rate-driven group's sends that went out late
     LateSends,
+    /// Fraction of the completed requests of a group with kernel or hardware
+    /// timestamps that had a kernel split; fails at zero
+    KernelSplit,
 }
 
 impl ValidityCheck {
@@ -119,6 +124,7 @@ impl ValidityCheck {
         match self {
             ValidityCheck::Unsent => "unsent",
             ValidityCheck::LateSends => "late_sends",
+            ValidityCheck::KernelSplit => "kernel_split",
         }
     }
 }
@@ -131,7 +137,8 @@ pub struct ValidityResult {
     pub group: Option<String>,
     /// The fraction measured; null when the group recorded nothing
     pub observed: Option<f64>,
-    /// Largest fraction that passes
+    /// Largest fraction that passes; for `kernel_split`, the fraction the
+    /// observed one must exceed (0)
     pub limit: f64,
     pub ok: bool,
     /// Why the check failed; omitted when it passed
@@ -155,15 +162,22 @@ impl ValidityResult {
         self.observed.map_or_else(|| "n/a".to_string(), percent)
     }
 
-    /// The limit as a percentage
+    /// The limit as a percentage; `> 0.00%` for `kernel_split`, which the
+    /// observed fraction must exceed
     pub fn limit_text(&self) -> String {
-        percent(self.limit)
+        match self.check {
+            ValidityCheck::KernelSplit => format!("> {}", percent(self.limit)),
+            _ => percent(self.limit),
+        }
     }
 }
 
-/// Checks that a run applied the load it was configured with. Each applies
-/// to every traffic group with a rate-driven traffic policy; a closed loop
-/// has no schedule to fall behind.
+/// Checks that a run applied the load it was configured with, and measured
+/// it with the timestamps it was configured with. "unsent" and "late_sends"
+/// apply to every traffic group with a rate-driven traffic policy (a closed
+/// loop has no schedule to fall behind); "kernel_split" to every traffic
+/// group with `timestamps = "kernel"` or `{ hardware = ... }` that
+/// completed a request: it fails when none of them had a kernel split.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ValidityConfig {
@@ -178,7 +192,7 @@ pub struct ValidityConfig {
     /// intended send time by more than 100 µs (default 0.01)
     #[serde(default = "default_max_late_send_ratio")]
     pub max_late_send_ratio: f64,
-    /// Checks to leave out: "unsent", "late_sends"
+    /// Checks to leave out: "unsent", "late_sends", "kernel_split"
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skip: Vec<ValidityCheck>,
 }
@@ -230,6 +244,7 @@ impl ValidityConfig {
         [
             (ValidityCheck::Unsent, self.max_unsent_ratio),
             (ValidityCheck::LateSends, self.max_late_send_ratio),
+            (ValidityCheck::KernelSplit, 0.0),
         ]
         .into_iter()
         .filter(|(check, _)| !self.skip.contains(check))
@@ -392,6 +407,7 @@ fn probe_stats() -> (Value, Value) {
     let latency_breakdown = LatencyBreakdownStats {
         clock: Some(BreakdownClock::KernelSoftware),
         kernel_split_count: 0,
+        kernel_split_missing: Some(Default::default()),
         service_us: part.clone(),
         host_stack_us: Some(part.clone()),
         network_server_us: Some(part),
@@ -769,7 +785,11 @@ pub fn evaluate(results: &mut DetailedExperimentResults, config: &ProfileConfig)
     verdict
 }
 
-/// Run the validity checks on every rate-driven traffic group
+/// Run the validity checks on every traffic group they apply to
+///
+/// Warns about every group with kernel or hardware timestamps that split
+/// some, but not all, of its completed requests' round trips, and about
+/// one that split none if "kernel_split" does not run.
 fn check_validity(
     results: &DetailedExperimentResults,
     validity: &ValidityConfig,
@@ -778,18 +798,133 @@ fn check_validity(
     let checks = validity.checks();
     let mut outcomes = Vec::new();
     for (id, group) in groups.iter().enumerate() {
+        let stats = results.traffic_groups.iter().find(|g| g.id == id).map(|g| &g.stats);
         // A closed loop sends when a response frees its pipeline, so it has
         // no schedule to fall behind.
-        if matches!(group.traffic_policy, PolicyConfig::ClosedLoop) {
-            continue;
-        }
-        let requests =
-            results.traffic_groups.iter().find(|g| g.id == id).map(|g| &g.stats.requests);
+        let closed_loop = matches!(group.traffic_policy, PolicyConfig::ClosedLoop);
         for &(check, limit) in &checks {
+            if check == ValidityCheck::KernelSplit || closed_loop {
+                continue;
+            }
+            let requests = stats.map(|stats| &stats.requests);
             outcomes.push(check_group_validity(check, limit, &group.name, requests));
+        }
+        let Some(breakdown) = stats.map(|stats| &stats.latency_breakdown) else {
+            continue;
+        };
+        let Some(split) = kernel_split(group, breakdown) else {
+            continue;
+        };
+        let checked = checks.iter().any(|&(check, _)| check == ValidityCheck::KernelSplit);
+        if let Some(reason) = &split.reason {
+            if split.observed > 0.0 || !checked {
+                tracing::warn!("Traffic group '{}': {}", group.name, reason);
+            } else {
+                tracing::error!("Invalid run: traffic group '{}': {}", group.name, reason);
+            }
+        }
+        if checked {
+            outcomes.push(ValidityResult {
+                check: ValidityCheck::KernelSplit,
+                group: Some(group.name.clone()),
+                observed: Some(split.observed),
+                limit: 0.0,
+                ok: split.observed > 0.0,
+                reason: split.reason.filter(|_| split.observed == 0.0),
+            });
         }
     }
     outcomes
+}
+
+/// A group's kernel split: the fraction of its completed requests that had
+/// one, and unless all had one, why the others had none
+struct KernelSplitOutcome {
+    observed: f64,
+    reason: Option<String>,
+}
+
+/// The kernel split of a group with kernel or hardware timestamps that
+/// completed requests; `None` for any other group
+fn kernel_split(
+    group: &TrafficGroupConfig,
+    breakdown: &LatencyBreakdownStats,
+) -> Option<KernelSplitOutcome> {
+    if !group.timestamps.is_kernel() {
+        return None;
+    }
+    let completed = breakdown.service_us.sample_count;
+    let split = breakdown.kernel_split_count;
+    if completed == 0 {
+        return None;
+    }
+    let observed = split as f64 / completed as f64;
+    if split == completed {
+        return Some(KernelSplitOutcome { observed, reason: None });
+    }
+    let missing = breakdown.kernel_split_missing.unwrap_or_default();
+    let hardware = matches!(group.timestamps, TimestampSourceConfig::Hardware(_));
+    let interface = match &group.timestamps {
+        TimestampSourceConfig::Hardware(interface) => interface.as_str(),
+        _ => "<interface>",
+    };
+    let mut fixes = Vec::new();
+    if missing.tx > 0 {
+        fixes.push(if hardware {
+            format!(
+                "no TX timestamps: the NIC stamps no transmitted packet; check that \
+                 `ethtool -T {interface}` lists hardware-transmit and that its hardware \
+                 timestamping is on (`hwstamp_ctl -i {interface}` reports tx_type 1)"
+            )
+        } else {
+            format!(
+                "no TX timestamps: the interface lacks software-transmit timestamping (its \
+                 driver never calls skb_tx_timestamp()); check `ethtool -T {interface}` on \
+                 the interface that reaches the target"
+            )
+        });
+    }
+    if missing.rx > 0 {
+        fixes.push(if hardware {
+            format!(
+                "no RX timestamps: the NIC's RX filter skips these packets; check that \
+                 `ethtool -T {interface}` lists hardware-receive and that the rx_filter \
+                 `hwstamp_ctl -i {interface}` reports covers them"
+            )
+        } else {
+            format!(
+                "no RX timestamps: check that `ethtool -T {interface}` lists software-receive \
+                 on the interface that reaches the target"
+            )
+        });
+    }
+    if missing.clock_mismatch > 0 {
+        fixes.push(
+            "TX and RX timestamps of different clocks: one direction was stamped by the NIC, \
+             the other by the kernel"
+                .to_string(),
+        );
+    }
+    let causes = format!(
+        "{} lacked a kernel TX timestamp, {} a kernel RX timestamp, and {} had TX and RX \
+         timestamps of different clocks",
+        missing.tx, missing.rx, missing.clock_mismatch
+    );
+    let reason = if split == 0 {
+        format!(
+            "none of the {completed} completed requests had a kernel split with timestamps = \
+             {}: {causes}. Likely fix: {}",
+            group.timestamps,
+            fixes.join("; ")
+        )
+    } else {
+        format!(
+            "{split} of the {completed} completed requests had a kernel split with timestamps \
+             = {}; of the others, {causes}",
+            group.timestamps
+        )
+    };
+    Some(KernelSplitOutcome { observed, reason: Some(reason) })
 }
 
 /// Run one validity check on a group's request counts
@@ -813,6 +948,7 @@ fn check_group_validity(
     let (count, total) = match check {
         ValidityCheck::Unsent => (requests.unsent, requests.sent + requests.unsent),
         ValidityCheck::LateSends => (requests.late_sends, requests.sent),
+        ValidityCheck::KernelSplit => unreachable!("check_validity checks kernel splits"),
     };
     let observed = if total == 0 {
         0.0
@@ -842,6 +978,7 @@ fn check_group_validity(
             percent(observed),
             percent(limit),
         ),
+        ValidityCheck::KernelSplit => unreachable!("check_validity checks kernel splits"),
     };
     outcome(Some(observed), Some(reason))
 }
@@ -904,12 +1041,19 @@ file = "unused"
                 network_server: latency,
                 host_stack: Duration::from_micros(1),
             };
-            stats.record_breakdown(0, &LatencyBreakdown { service: latency, kernel: Some(kernel) });
+            stats.record_breakdown(
+                0,
+                &LatencyBreakdown {
+                    service: latency,
+                    kernel: Some(kernel),
+                    miss: None,
+                },
+            );
         }
         for ms in 1..=10 {
             let latency = Duration::from_millis(ms);
             stats.record_latency(1, 0, latency);
-            stats.record_breakdown(1, &LatencyBreakdown { service: latency, kernel: None });
+            stats.record_breakdown(1, &LatencyBreakdown::user_space(latency));
         }
         stats
     }
@@ -1599,8 +1743,11 @@ nope = ["> 1"]
             let mut paths = Vec::new();
             numeric_paths(probe, &[], &mut paths);
             for path in paths {
-                // clamped_samples is written only for a bounded HDR histogram
-                if path.last().unwrap() != "clamped_samples" {
+                // clamped_samples is written only for a bounded HDR histogram,
+                // kernel_split_missing only with kernel or hardware timestamps
+                if path.last().unwrap() != "clamped_samples"
+                    && !path.contains(&"kernel_split_missing".to_string())
+                {
                     assert!(lookup(&stats, &path).is_some(), "{path:?}");
                 }
             }
@@ -1950,6 +2097,141 @@ error_latency = ["p99 > 4ms", "max < 1ms"]
         assert_eq!(json["check"], "unsent");
         assert_eq!(json["group"], "api");
         assert_eq!(json["ok"], false);
+    }
+
+    /// Results of the test profile with `timestamps` on both groups, where
+    /// "api" completed 10 requests split as `splits` says and "batch" none
+    fn kernel_results(
+        timestamps: TimestampSourceConfig,
+        validity: &str,
+        splits: &[Option<xylem_core::stats::SplitMiss>],
+    ) -> (ProfileConfig, DetailedExperimentResults) {
+        use xylem_core::stats::{KernelSplit, LatencyBreakdown};
+        let mut config = profile(validity).unwrap();
+        for group in &mut config.traffic_groups {
+            group.timestamps = timestamps.clone();
+        }
+        let mut stats = TupleStatsCollector::new(SamplingPolicy::default(), Duration::from_secs(1));
+        stats.register_group_policy(0, SamplingPolicy::default());
+        stats.register_group_policy(1, SamplingPolicy::default());
+        let latency = Duration::from_micros(10);
+        for &miss in splits {
+            stats.record_latency(0, 0, latency);
+            let kernel = miss.is_none().then_some(KernelSplit {
+                clock: xylem_transport::KernelClock::Realtime,
+                network_server: latency,
+                host_stack: Duration::ZERO,
+            });
+            stats.record_breakdown(0, &LatencyBreakdown { service: latency, kernel, miss });
+        }
+        let results = results_of(&config, &stats);
+        (config, results)
+    }
+
+    #[test]
+    fn a_kernel_timestamp_group_that_splits_nothing_makes_the_run_invalid() {
+        use xylem_core::stats::SplitMiss::{ClockMismatch, Rx, Tx, TxAndRx};
+        let splits =
+            [Some(Tx); 7].into_iter().chain([Some(TxAndRx), Some(Rx), Some(ClockMismatch)]);
+        let (config, mut results) =
+            kernel_results(TimestampSourceConfig::Kernel, "", &splits.collect::<Vec<_>>());
+        let verdict = evaluate(&mut results, &config);
+        assert_eq!((verdict, verdict.exit_code()), (Verdict::InvalidRun, 3));
+        let check = results.validity.iter().find(|c| c.check == ValidityCheck::KernelSplit);
+        let check = check.unwrap();
+        assert_eq!(
+            (check.key().as_str(), check.observed, check.ok),
+            ("kernel_split{group=api}", Some(0.0), false)
+        );
+        assert_eq!(check.limit_text(), "> 0.00%");
+        let reason = check.reason.as_deref().unwrap();
+        assert!(
+            reason.starts_with(
+                "none of the 10 completed requests had a kernel split with timestamps = \
+                 \"kernel\": 8 lacked a kernel TX timestamp, 2 a kernel RX timestamp, and 1 \
+                 had TX and RX timestamps of different clocks. Likely fix: no TX timestamps: \
+                 the interface lacks software-transmit timestamping"
+            ),
+            "{reason}"
+        );
+        assert!(reason.contains("check `ethtool -T <interface>`"), "{reason}");
+        assert!(reason.contains("no RX timestamps: check that `ethtool -T"), "{reason}");
+        assert!(reason.contains("TX and RX timestamps of different clocks: one"), "{reason}");
+        // "batch" completed nothing: it has no kernel_split check
+        assert_eq!(
+            results
+                .validity
+                .iter()
+                .filter(|c| c.check == ValidityCheck::KernelSplit)
+                .count(),
+            1
+        );
+        // The counts are in the results
+        let json = serde_json::to_value(&results).unwrap();
+        let api = &json["traffic_groups"][0]["stats"]["latency_breakdown"];
+        assert_eq!(api["kernel_split_count"], 0);
+        let missing = serde_json::json!({ "tx": 8, "rx": 2, "clock_mismatch": 1 });
+        assert_eq!(api["kernel_split_missing"], missing);
+        assert_eq!(json["global"]["latency_breakdown"]["kernel_split_missing"], missing);
+        assert_eq!(json["validity"].as_array().unwrap().last().unwrap()["check"], "kernel_split");
+    }
+
+    #[test]
+    fn a_partial_kernel_split_passes_and_a_full_one_is_checked_too() {
+        use xylem_core::stats::SplitMiss::Tx;
+        for (splits, observed) in
+            [(vec![None, Some(Tx), Some(Tx), Some(Tx)], 0.25), (vec![None; 4], 1.0)]
+        {
+            let (config, mut results) = kernel_results(TimestampSourceConfig::Kernel, "", &splits);
+            assert_eq!(evaluate(&mut results, &config), Verdict::Pass);
+            let check = results.validity.iter().find(|c| c.check == ValidityCheck::KernelSplit);
+            let check = check.unwrap();
+            assert_eq!((check.observed, check.ok, &check.reason), (Some(observed), true, &None));
+        }
+    }
+
+    #[test]
+    fn hardware_timestamps_that_split_nothing_name_the_interface_in_the_fix() {
+        use xylem_core::stats::SplitMiss::Rx;
+        let hardware = TimestampSourceConfig::Hardware("data0".into());
+        let (config, mut results) = kernel_results(hardware, "", &[Some(Rx); 3]);
+        assert_eq!(evaluate(&mut results, &config), Verdict::InvalidRun);
+        let reason = results.validity.last().unwrap().reason.clone().unwrap();
+        assert!(
+            reason.starts_with(
+                "none of the 3 completed requests had a kernel split with timestamps = { \
+                 hardware = \"data0\" }: 0 lacked a kernel TX timestamp, 3 a kernel RX \
+                 timestamp, and 0 had TX and RX timestamps of different clocks. Likely fix: \
+                 no RX timestamps: the NIC's RX filter skips these packets; check that \
+                 `ethtool -T data0` lists hardware-receive and that the rx_filter \
+                 `hwstamp_ctl -i data0` reports covers them"
+            ),
+            "{reason}"
+        );
+        assert!(!reason.contains("no TX timestamps"), "{reason}");
+    }
+
+    #[test]
+    fn the_kernel_split_check_can_be_skipped_and_skips_other_timestamps() {
+        use xylem_core::stats::SplitMiss::Tx;
+        for validity in ["[validity]\nskip = [\"kernel_split\"]", "[validity]\nenabled = false"] {
+            let (config, mut results) =
+                kernel_results(TimestampSourceConfig::Kernel, validity, &[Some(Tx)]);
+            evaluate(&mut results, &config);
+            assert!(results.validity.iter().all(|c| c.check != ValidityCheck::KernelSplit));
+        }
+        // User-space timestamps never split, and report no missing splits
+        let (config, mut results) = kernel_results(
+            TimestampSourceConfig::User,
+            "",
+            &[Some(xylem_core::stats::SplitMiss::TxAndRx)],
+        );
+        evaluate(&mut results, &config);
+        assert!(results.validity.iter().all(|c| c.check != ValidityCheck::KernelSplit));
+        let json = serde_json::to_value(&results).unwrap();
+        assert!(json["global"]["latency_breakdown"].get("kernel_split_missing").is_none());
+        let api = &json["traffic_groups"][0]["stats"]["latency_breakdown"];
+        assert!(api.get("kernel_split_missing").is_none(), "{api}");
     }
 
     #[test]

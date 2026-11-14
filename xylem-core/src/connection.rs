@@ -1117,7 +1117,10 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         groups: Vec<GroupConfig<T>>,
         roles: &HashMap<usize, Vec<ConnectionRole>>,
         mut add_connection: impl FnMut(&mut G, &T) -> Result<(usize, SocketAddr)>,
-    ) -> Result<Self> {
+    ) -> Result<Self>
+    where
+        T: std::fmt::Display,
+    {
         let total_connections: usize = groups
             .iter()
             .map(|(group_id, _, count, _, _)| roles.get(group_id).map_or(*count, Vec::len))
@@ -1158,7 +1161,12 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
             let mut load_index = 0;
             for &role in group_roles {
                 let opened_ns = crate::timing::time_ns();
-                let (connection_id, address) = add_connection(&mut group, &target)?;
+                let (connection_id, address) =
+                    add_connection(&mut group, &target).map_err(|e| {
+                        e.context(format_args!(
+                            "Traffic group {group_id}: cannot open a connection to {target}"
+                        ))
+                    })?;
                 // A control connection takes no arrivals of the group's
                 // dispatcher: it sends its setup requests off the heap
                 let (mut policy, dispatcher) = match role {
@@ -2171,7 +2179,7 @@ mod tests {
         .unwrap();
         pool.send(0, &[0], 7u64, true).unwrap();
         factory.0.lock().unwrap().responses.push_back(Ok(vec![0]));
-        let breakdown = LatencyBreakdown { service: Duration::ZERO, kernel: None };
+        let breakdown = LatencyBreakdown::user_space(Duration::ZERO);
         assert_eq!(
             pool.recv_responses(0, |_| Ok(Parsed::ok(1, 7))).unwrap(),
             vec![Completion {
@@ -2464,6 +2472,40 @@ mod tests {
         );
         assert_eq!(unstamped.service, recv_ts.duration_since(&send_ts));
         assert_eq!(unstamped.kernel, None);
+        // and says it lacked its TX timestamp
+        assert_eq!(stamped.miss, None);
+        assert_eq!(unstamped.miss, Some(crate::stats::SplitMiss::Tx));
+    }
+
+    #[test]
+    fn a_connection_the_transport_cannot_set_up_fails_the_pool_naming_its_group() {
+        let factory = test_support::FakeFactory::default();
+        factory.0.lock().unwrap().connect_error = Some(|| {
+            xylem_transport::Error::Config(
+                "Could not enable kernel software timestamps on TCP connection 0: \
+                 setsockopt(SOL_SOCKET, SO_TIMESTAMPING, 0x89a) failed: Operation not \
+                 supported (os error 95)"
+                    .into(),
+            )
+        });
+        let Err(error) = ConnectionPool::<_, u64>::new(
+            &factory,
+            "127.0.0.1:1".parse().unwrap(),
+            1,
+            1,
+            Box::new(crate::scheduler::UniformPolicyScheduler::closed_loop()),
+            4,
+        ) else {
+            panic!("built a pool whose connection failed");
+        };
+        assert!(matches!(error, crate::Error::Config(_)), "{error:?}");
+        assert_eq!(
+            error.to_string(),
+            "Configuration error: Traffic group 4: cannot open a connection to 127.0.0.1:1: \
+             Could not enable kernel software timestamps on TCP connection 0: \
+             setsockopt(SOL_SOCKET, SO_TIMESTAMPING, 0x89a) failed: Operation not supported \
+             (os error 95)"
+        );
     }
 
     #[test]
@@ -2990,6 +3032,11 @@ pub(crate) mod test_support {
         /// `try_send` takes bytes on them, only while `writable` is set
         pub write_interest: Vec<usize>,
         pub writable: bool,
+        /// `add_connection` fails with this, as a transport fails to set a
+        /// socket up
+        pub connect_error: Option<fn() -> xylem_transport::Error>,
+        /// `poll_tx_timestamps` fails with this, as reading an error queue can
+        pub tx_error: Option<fn() -> xylem_transport::Error>,
     }
 
     impl Default for FakeIo {
@@ -3014,6 +3061,8 @@ pub(crate) mod test_support {
                 capacity: None,
                 write_interest: Vec::new(),
                 writable: false,
+                connect_error: None,
+                tx_error: None,
             }
         }
     }
@@ -3048,6 +3097,9 @@ pub(crate) mod test_support {
 
     impl ConnectionGroup for FakeGroup {
         fn add_connection(&mut self, _: &SocketAddr) -> xylem_transport::Result<usize> {
+            if let Some(error) = self.io.lock().unwrap().connect_error {
+                return Err(error());
+            }
             let id = self.connections;
             self.connections += 1;
             Ok(id)
@@ -3167,6 +3219,9 @@ pub(crate) mod test_support {
             let mut io = self.io.lock().unwrap();
             io.tx_polls += 1;
             out.clear();
+            if let Some(error) = io.tx_error {
+                return Err(error());
+            }
             out.append(&mut io.tx_timestamps);
             Ok(())
         }

@@ -40,6 +40,20 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+impl Error {
+    /// This error with `context` in front of its message, keeping its kind
+    pub fn context(self, context: impl fmt::Display) -> Self {
+        match self {
+            Error::Io(e) => Error::Io(std::io::Error::new(e.kind(), format!("{context}: {e}"))),
+            Error::Connection(msg) => Error::Connection(format!("{context}: {msg}")),
+            Error::Protocol(msg) => Error::Protocol(format!("{context}: {msg}")),
+            Error::Config(msg) => Error::Config(format!("{context}: {msg}")),
+            Error::Stats(msg) => Error::Stats(format!("{context}: {msg}")),
+            Error::Other(msg) => Error::Other(format!("{context}: {msg}")),
+        }
+    }
+}
+
 impl From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Self {
         Error::Io(err)

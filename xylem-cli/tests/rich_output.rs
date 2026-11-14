@@ -376,16 +376,11 @@ fn latency_breakdown_is_reported_per_group_and_globally() {
                     network_server: Duration::from_micros(10 * us),
                     host_stack: Duration::from_micros(us),
                 }),
+                miss: None,
             },
         );
         stats.record_latency(1, 0, Duration::from_micros(us));
-        stats.record_breakdown(
-            1,
-            &LatencyBreakdown {
-                service: Duration::from_micros(us),
-                kernel: None,
-            },
-        );
+        stats.record_breakdown(1, &LatencyBreakdown::user_space(Duration::from_micros(us)));
     }
     let group = |name: &str| TrafficGroupConfig {
         name: name.to_string(),

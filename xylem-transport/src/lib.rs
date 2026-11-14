@@ -26,6 +26,10 @@
 //!
 //! `TimestampConfig::require_hardware` never falls back: a group is not
 //! created unless its interface has hardware timestamping switched on.
+//! Once a group resolved its source, adding a connection fails if its socket
+//! refuses `SO_TIMESTAMPING` (or `SO_BINDTODEVICE` for hardware timestamps),
+//! and `poll_tx_timestamps` fails on any error-queue read error but an empty
+//! queue: a connection never silently loses its kernel timestamps.
 //!
 //! Each group logs the source in effect once, at info level. A kernel
 //! timestamp is used for a latency only when the send and the receive both

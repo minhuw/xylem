@@ -14,7 +14,7 @@ use std::path::Path;
 use std::time::Duration;
 use xylem_core::stats::{
     AggregatedStats, BreakdownClock, BreakdownSummary, PartSummary, RequestCounts, SendLagSummary,
-    TupleStatsCollector, LATE_SEND_THRESHOLD,
+    SplitMissCounts, TupleStatsCollector, LATE_SEND_THRESHOLD,
 };
 use xylem_core::traffic_group::Dispatch;
 
@@ -117,6 +117,13 @@ pub struct LatencyBreakdownStats {
     /// clock, which split their round trip into `host_stack_us` and
     /// `network_server_us`
     pub kernel_split_count: u64,
+    /// Requests without a kernel split, by what they lacked: `tx` (no kernel
+    /// TX timestamp), `rx` (no kernel RX timestamp; a request with neither
+    /// counts in both) and `clock_mismatch` (both, from different clocks).
+    /// Present only for traffic groups with `timestamps = "kernel"` or
+    /// `{ hardware = ... }`, and globally when any group has them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_split_missing: Option<SplitMissCounts>,
     /// Actual receive minus actual send, in the clock each latency uses: a
     /// request's latency minus its send lag. Always present.
     pub service_us: BreakdownPartStats,
@@ -129,10 +136,13 @@ pub struct LatencyBreakdownStats {
 }
 
 impl LatencyBreakdownStats {
-    fn new(summary: &BreakdownSummary) -> Self {
+    /// The breakdown of a scope; `kernel_timestamps`: some group of the
+    /// scope takes kernel timestamps, so its missing splits are reported
+    fn new(summary: &BreakdownSummary, kernel_timestamps: bool) -> Self {
         Self {
             clock: summary.clock,
             kernel_split_count: summary.kernel_split_count,
+            kernel_split_missing: kernel_timestamps.then_some(summary.kernel_split_missing),
             service_us: BreakdownPartStats::new(&summary.service),
             host_stack_us: summary.host_stack.as_ref().map(BreakdownPartStats::new),
             network_server_us: summary.network_server.as_ref().map(BreakdownPartStats::new),
@@ -293,7 +303,7 @@ pub struct DetailedExperimentResults {
     /// Every threshold expression, in key order
     #[serde(default)]
     pub thresholds: Vec<ThresholdResult>,
-    /// Every validity check of every rate-driven traffic group
+    /// Every validity check of every traffic group it applies to
     #[serde(default)]
     pub validity: Vec<ValidityResult>,
     pub global: GlobalStats,
@@ -604,7 +614,10 @@ impl DetailedExperimentResults {
             error_latency: Self::latency_stats(&tuple_stats.error_latency_global()),
             requests: tuple_stats.request_counts_global(),
             send_lag: SendLagStats::new(&tuple_stats.send_lag_global()),
-            latency_breakdown: LatencyBreakdownStats::new(&tuple_stats.latency_breakdown_global()),
+            latency_breakdown: LatencyBreakdownStats::new(
+                &tuple_stats.latency_breakdown_global(),
+                traffic_group_configs.iter().any(|group| group.timestamps.is_kernel()),
+            ),
         };
 
         // Build per-group results
@@ -634,6 +647,7 @@ impl DetailedExperimentResults {
                         send_lag: SendLagStats::new(&tuple_stats.send_lag(group_id)),
                         latency_breakdown: LatencyBreakdownStats::new(
                             &tuple_stats.latency_breakdown(group_id),
+                            config.timestamps.is_kernel(),
                         ),
                     },
                     protocol_metadata: None,
@@ -801,6 +815,15 @@ impl DetailedExperimentResults {
         println!("{indent}Latency breakdown (μs):");
         line("  Clock:", breakdown.clock_name().to_string());
         line("  Split reqs:", breakdown.kernel_split_count.to_string());
+        if let Some(missing) = &breakdown.kernel_split_missing {
+            line(
+                "  Unsplit, no:",
+                format!(
+                    "TX stamp {}, RX stamp {}; clock mismatch {}",
+                    missing.tx, missing.rx, missing.clock_mismatch
+                ),
+            );
+        }
         line("", "Mean      p50       p99       p99.9     Max".to_string());
         for (label, part) in breakdown.parts() {
             let row = match part {

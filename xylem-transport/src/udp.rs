@@ -204,8 +204,7 @@ impl ConnectionGroup for UdpConnectionGroup {
     #[cfg(target_os = "linux")]
     fn poll_tx_timestamps(&mut self, out: &mut Vec<crate::TxTimestampInfo>) -> Result<()> {
         // One stamp per datagram: exact
-        self.core.poll_tx_timestamps(false, "UDP", out);
-        Ok(())
+        self.core.poll_tx_timestamps(false, "UDP", out)
     }
 
     fn len(&self) -> usize {

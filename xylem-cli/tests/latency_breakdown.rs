@@ -1,7 +1,8 @@
 //! Through the real executable, over loopback: kernel timestamps split each
-//! round trip in the latency breakdown, user-space timestamps report only
-//! its service part, and NIC timestamps that are not switched on fail the
-//! run before any connection opens.
+//! round trip in the latency breakdown and count the requests without a
+//! split by cause, user-space timestamps report only its service part, and
+//! NIC timestamps that are not switched on fail the run before any
+//! connection opens.
 //!
 //! The echo servers answer like `xylem-echo-server` with no delay: every
 //! TCP byte and every UDP datagram goes straight back.
@@ -113,6 +114,13 @@ fn kernel_timestamps_split_the_round_trip_over_tcp_and_udp() {
             assert!(split * 10 >= samples * 9, "{context}");
             let clock = breakdown["clock"].as_str().unwrap();
             assert!(clock == "kernel_software" || clock == "mixed" && split < samples, "{context}");
+            // Every request without a split lacked a stamp; one clock only
+            let missing = &breakdown["kernel_split_missing"];
+            let count = |key| missing[key].as_u64().unwrap_or_else(|| panic!("{context}"));
+            assert_eq!(count("clock_mismatch"), 0, "{context}");
+            let unsplit = samples - split;
+            assert!(count("tx") <= unsplit && count("rx") <= unsplit, "{context}");
+            assert!(count("tx") + count("rx") >= unsplit, "{context}");
             let service = &breakdown["service_us"];
             assert_eq!(service["sample_count"], samples, "{context}");
             for part in ["host_stack_us", "network_server_us"] {
@@ -131,6 +139,13 @@ fn kernel_timestamps_split_the_round_trip_over_tcp_and_udp() {
                 assert_eq!(service, network, "{context}");
             }
         }
+        // The group's split passes its validity check
+        let checks = json["validity"].as_array().unwrap();
+        assert_eq!(checks.len(), 1, "{transport}: {checks:?}");
+        assert_eq!(checks[0]["check"], "kernel_split", "{transport}");
+        assert_eq!(checks[0]["group"], "echo", "{transport}");
+        assert_eq!(checks[0]["ok"], true, "{transport}");
+        assert!(checks[0]["observed"].as_f64().unwrap() >= 0.9, "{transport}");
     }
 }
 
@@ -142,11 +157,13 @@ fn user_space_timestamps_report_only_the_service_latency() {
     for (breakdown, samples) in breakdowns(&json) {
         assert_eq!(breakdown["clock"], "user_space", "{breakdown}");
         assert_eq!(breakdown["kernel_split_count"], 0, "{breakdown}");
+        assert!(breakdown.get("kernel_split_missing").is_none(), "{breakdown}");
         assert!(breakdown["host_stack_us"].is_null(), "{breakdown}");
         assert!(breakdown["network_server_us"].is_null(), "{breakdown}");
         assert_eq!(breakdown["service_us"]["sample_count"], samples, "{breakdown}");
         assert!(f64_at(&breakdown["service_us"], "p99_us") > 0.0, "{breakdown}");
     }
+    assert_eq!(json["validity"], serde_json::json!([]));
 }
 
 #[cfg(target_os = "linux")]

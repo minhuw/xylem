@@ -275,8 +275,7 @@ impl ConnectionGroup for TcpConnectionGroup {
     #[cfg(target_os = "linux")]
     fn poll_tx_timestamps(&mut self, out: &mut Vec<crate::TxTimestampInfo>) -> Result<()> {
         // The kernel stamps the last segment sent together: cumulative
-        self.core.poll_tx_timestamps(true, "TCP", out);
-        Ok(())
+        self.core.poll_tx_timestamps(true, "TCP", out)
     }
 
     fn len(&self) -> usize {

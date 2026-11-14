@@ -232,6 +232,7 @@ sampling policy records every latency.
 "latency_breakdown": {
   "clock": "kernel_software",
   "kernel_split_count": 41230,
+  "kernel_split_missing": { "tx": 0, "rx": 0, "clock_mismatch": 0 },
   "service_us": {
     "sample_count": 41230, "mean_us": 14.1, "p50_us": 13.9,
     "p99_us": 19.8, "p999_us": 31.2, "max_us": 212.4
@@ -286,6 +287,16 @@ timestamp did not arrive, or came from different clocks, count in
   `host_stack_us` is the user-space stack's own time.
 - `kernel_split_count`: requests with a kernel split. Below
   `service_us.sample_count`, some requests lacked a usable kernel timestamp.
+- `kernel_split_missing`: the requests without a kernel split, by what they
+  lacked: `tx`, no kernel TX timestamp (none arrived on the socket's error
+  queue before the response); `rx`, no kernel RX timestamp on the response;
+  `clock_mismatch`, both, from different clocks. A request with neither
+  timestamp counts in both `tx` and `rx`. Present only for traffic groups
+  with `timestamps = "kernel"` or `{ hardware = ... }`, and in the global
+  breakdown when any group has them. A group with these timestamps that
+  completed requests but split none makes the run invalid (the
+  [`kernel_split` validity check](./thresholds.md#validity)); one that split
+  only some logs a warning with these counts.
 
 Every part reports `sample_count`, an exact `mean_us` and `max_us`, and
 `p50_us`, `p99_us` and `p999_us` from an HDR histogram with three significant
@@ -298,7 +309,7 @@ network_server_us.mean_us` is the mean user-space round trip of the split
 requests, unless some `host_stack_us` saturated at zero.
 
 The console prints the same parts in one row each, and the HTML report in a
-table per scope.
+table per scope; both add the `kernel_split_missing` counts when present.
 
 ### NIC clock calibration
 

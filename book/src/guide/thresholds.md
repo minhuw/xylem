@@ -179,22 +179,31 @@ such thresholds in the profile.
 A rate-driven traffic policy (every policy except `closed-loop`) gives each
 request an intended send time. Two checks compare each rate-driven traffic
 group's [request accounting](./output-formats.md#request-accounting) with that
-schedule:
+schedule, and a third checks that a group with kernel or hardware
+[timestamps](configuration/transport.md#timestamps) measured with them:
 
 | Check | Observed | Default limit |
 |---|---|---|
 | `unsent` | `unsent / (sent + unsent)`: intended sends that never went out | `max_unsent_ratio = 0.001` |
 | `late_sends` | `late_sends / sent`: sends more than 100 µs behind their intended time | `max_late_send_ratio = 0.01` |
+| `kernel_split` | `kernel_split_count / service_us.sample_count` of the [latency breakdown](./output-formats.md#latency-breakdown): completed requests with a kernel split | must be above 0 (fixed) |
 
-A closed-loop group is exempt: it sends whenever a response frees its
-pipeline, so it has no schedule to fall behind.
+A closed-loop group is exempt from `unsent` and `late_sends`: it sends
+whenever a response frees its pipeline, so it has no schedule to fall behind.
+`kernel_split` applies to every group with `timestamps = "kernel"` or
+`{ hardware = ... }` that completed a request, closed loops included. It
+fails when none of the group's completed requests had a kernel split: the
+latencies were all measured in user-space cycles, not with the configured
+timestamps. Its `reason` gives the group's `kernel_split_missing` counts and
+the likely fix. A group that split some but not all of its requests passes,
+and xylem logs a warning with the counts (also when the check is skipped).
 
 ```toml
 [validity]
 enabled = true                # false: no checks, the run is never invalid
 max_unsent_ratio = 0.001
 max_late_send_ratio = 0.01
-skip = ["late_sends"]         # leave out single checks
+skip = ["late_sends"]         # leave out single checks: "unsent", "late_sends", "kernel_split"
 ```
 
 ### What an invalid run tells you
@@ -273,6 +282,8 @@ The JSON results record the verdict and every check, thresholds in key order:
   `requests.timed_out / requests.sent`.
 - `observed` is in the unit of that field (microseconds for durations), a
   fraction for rates and validity checks, or `null` when the run lacks it.
+- `limit` is the largest fraction that passes, but for `kernel_split`: 0,
+  which the observed fraction must exceed (the console prints `limit > 0.00%`).
 - `group` is `null` for the global stats.
 - `reason` is present only for a failed validity check.
 
