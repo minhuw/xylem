@@ -201,12 +201,15 @@ impl NtcpDpdkPort {
             .map_err(|e| io_error(&format!("start DPDK port {}", config.device), e))?;
         let mac = port.mac_address().map_err(|e| io_error("read the port's MAC address", e))?;
         tracing::info!(
-            "ntcp DPDK: port {} ({}) mac={} queues={} rx_timestamps={}",
+            "ntcp DPDK: port {} ({}) mac={} queues={} rx_timestamps={} rx_checksum={} \
+             tx_checksum={}",
             port.port_id(),
             config.device,
             mac.map(|o| format!("{o:02x}")).join(":"),
             port.queues(),
-            port.clock().is_some()
+            port.clock().is_some(),
+            port.rx_checksum(),
+            port.tx_checksum()
         );
 
         let neighbors = SharedNeighbors::new(

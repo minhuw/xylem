@@ -35,10 +35,10 @@ use crate::{
 use ntcp_io::{ClockDescriptor, PacketIo};
 use ntcp_io_dpdk::{bracketed_reading, ClockCalibration};
 use ntcp_native::{
-    BlockReason, CloseReason, ConnId, DriveReport, Event, Network, NetworkConfig, ReadOutcome,
-    RxReadTimestamps, SharedNeighbors, State, TimestampClock, TimestampEvent, TxTimestampEvent,
-    TxTimestampOutcome, TxTimestampRequest, TxTimestampSource, TxTimestampStage, WorkBudget,
-    WriteOptions,
+    BlockReason, CloseReason, ConnId, Counters, DriveReport, Event, Network, NetworkConfig,
+    ReadOutcome, RxReadTimestamps, SharedNeighbors, State, TimestampClock, TimestampEvent,
+    TxTimestampEvent, TxTimestampOutcome, TxTimestampRequest, TxTimestampSource, TxTimestampStage,
+    WorkBudget, WriteOptions,
 };
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -888,8 +888,7 @@ impl<P: NtcpBackend> NtcpConnectionGroup<P> {
     ///
     /// The counters are this group's network's own; groups never share
     /// buffer memory, so none of them is a shared group's value.
-    fn report_memory(&self) {
-        let counters = self.network.counters();
+    fn report_memory(&self, counters: &Counters) {
         if counters.memory_throttled_writes == 0
             && counters.memory_refused_opens == 0
             && counters.memory_pressures == 0
@@ -911,6 +910,24 @@ impl<P: NtcpBackend> NtcpConnectionGroup<P> {
             memory.low,
             memory.pressure,
             memory.high,
+        );
+    }
+
+    /// Warn if the network discarded packets, naming each reason that
+    /// counted any (ntcp's per-reason counts, after Linux's kfree_skb drop
+    /// reasons)
+    ///
+    /// The counts are this group's network's own, never summed over the
+    /// members of shared flows.
+    fn report_drops(&self, counters: &Counters) {
+        if counters.discarded == 0 {
+            return;
+        }
+        tracing::warn!(
+            "ntcp ({}): discarded {} packets: {}",
+            self.network.config().local_address,
+            counters.discarded,
+            drop_reasons(counters),
         );
     }
 
@@ -979,6 +996,18 @@ fn buffer_memory(meminfo: &str) -> Result<usize> {
         ))
     })?;
     Ok(usize::try_from(memory).unwrap_or(usize::MAX))
+}
+
+/// Each drop reason that counted any, with its count: "PKT_TOO_SMALL 2,
+/// TCP_OLD_DATA 1"
+fn drop_reasons(counters: &Counters) -> String {
+    let reasons: Vec<String> = counters
+        .drops
+        .iter()
+        .filter(|&(_, count)| count > 0)
+        .map(|(reason, count)| format!("{reason} {count}"))
+        .collect();
+    reasons.join(", ")
 }
 
 /// Give `config` the buffer memory thresholds Linux's tcp_init_mem gives a
@@ -1227,7 +1256,9 @@ impl<P: NtcpBackend> ConnectionGroup for NtcpConnectionGroup<P> {
     }
 
     fn close_all(&mut self) -> Result<()> {
-        self.report_memory();
+        let counters = self.network.counters();
+        self.report_memory(&counters);
+        self.report_drops(&counters);
         let ids: Vec<usize> = self.slots.live_handles().map(|(id, _)| id).collect();
         for id in ids {
             self.close(id)?;
@@ -1532,6 +1563,7 @@ mod tests {
                     }),
                 },
                 tcp_segment_size: None,
+                l4_checksum: ntcp_io::RxChecksum::Unknown,
             }))
         }
     }
@@ -1891,6 +1923,24 @@ mod tests {
         group.close_all().unwrap();
         assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
         assert!(group.closing.is_empty());
+    }
+
+    #[test]
+    fn drop_reasons_name_each_reason_that_counted() {
+        let (a, b) = link();
+        let mut group = client(a);
+        assert_eq!(drop_reasons(&group.network().counters()), "");
+        // Shorter than an IPv4 header, and an IPv4 header whose checksum is
+        // wrong
+        b.0.send(&[0x45, 0, 0]).unwrap();
+        let mut header = [0x45, 0, 0, 20, 0, 0, 0, 0, 64, 6, 0xde, 0xad, 0, 0, 0, 0, 0, 0, 0, 0];
+        header[12..16].copy_from_slice(&SERVER.parse::<std::net::Ipv4Addr>().unwrap().octets());
+        header[16..20].copy_from_slice(&CLIENT.parse::<std::net::Ipv4Addr>().unwrap().octets());
+        b.0.send(&header).unwrap();
+        group.drive().unwrap();
+        let counters = group.network().counters();
+        assert_eq!(counters.discarded, 2);
+        assert_eq!(drop_reasons(&counters), "PKT_TOO_SMALL 1, IP_CSUM 1");
     }
 
     // =========================================================================
