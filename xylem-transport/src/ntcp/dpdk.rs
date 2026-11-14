@@ -71,8 +71,8 @@ pub struct NtcpDpdkConfig {
     /// EAL devargs of the port: a PCI address, optionally with PMD
     /// arguments (`0000:05:00.0,dv_flow_en=1`), or a virtual device
     pub device: String,
-    /// More EAL arguments, after `-a DEVICE` (or `--vdev DEVICE`); unless
-    /// they name lcores, EAL gets `--lcores=0@CPU` for the first CPU the
+    /// More EAL arguments, after `-a DEVICE` (or `--vdev DEVICE --no-pci`);
+    /// unless they name lcores, EAL gets `--lcores=0@CPU` for the first CPU the
     /// calling thread may run on, so it starts no lcore threads of its own
     pub eal_args: Vec<String>,
     /// IP MTU of the port
@@ -156,14 +156,19 @@ fn first_cpu(set: &libc::cpu_set_t) -> Option<usize> {
 }
 
 /// The EAL arguments for `config`; `cpu` is the main lcore's CPU unless the
-/// configured arguments name lcores
+/// configured arguments name lcores. A virtual device gets `--no-pci` unless
+/// they have it: EAL would otherwise probe every PCI device, which ntcp's
+/// `Eal::init` refuses.
 fn eal_args(config: &NtcpDpdkConfig, cpu: usize) -> Vec<String> {
-    let flag = if is_pci(&config.device) {
-        "-a"
+    let mut args = if is_pci(&config.device) {
+        vec!["-a".to_string(), config.device.clone()]
     } else {
-        "--vdev"
+        let mut args = vec!["--vdev".to_string(), config.device.clone()];
+        if !config.eal_args.iter().any(|arg| arg == "--no-pci") {
+            args.push("--no-pci".to_string());
+        }
+        args
     };
-    let mut args = vec![flag.to_string(), config.device.clone()];
     if !names_lcores(&config.eal_args) {
         args.push(format!("--lcores=0@{cpu}"));
     }
@@ -337,7 +342,9 @@ mod tests {
         let args = eal_args(&config("0000:05:00.0,dv_flow_en=1", &["--in-memory"]), 3);
         assert_eq!(args, ["-a", "0000:05:00.0,dv_flow_en=1", "--lcores=0@3", "--in-memory"]);
         let args = eal_args(&config("net_ring0", &["-l", "1"]), 3);
-        assert_eq!(args, ["--vdev", "net_ring0", "-l", "1"]);
+        assert_eq!(args, ["--vdev", "net_ring0", "--no-pci", "-l", "1"]);
+        let args = eal_args(&config("net_tap0,iface=x", &["--no-pci", "-l", "1"]), 3);
+        assert_eq!(args, ["--vdev", "net_tap0,iface=x", "--no-pci", "-l", "1"]);
         for named in ["--lcores=0@1", "-l1", "-c", "-c0x2"] {
             assert!(names_lcores(&[named.to_string()]), "{named}");
         }

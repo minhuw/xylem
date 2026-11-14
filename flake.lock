@@ -42,17 +42,17 @@
         "packetdrill": "packetdrill"
       },
       "locked": {
-        "lastModified": 1794624961,
-        "narHash": "sha256-VZtG7sy0PwArwVzUqrO9pf3aI4v5LA8afgJkrh7hqjs=",
+        "lastModified": 1794657712,
+        "narHash": "sha256-iN3zIPDgK+79xYfuM2JGqSMdlNRzhr0qiOpjx3/oMrY=",
         "owner": "minhuw",
         "repo": "ntcp",
-        "rev": "fb2ae25684cf1f03ade510819852de08e4effe05",
+        "rev": "3ee907e96604d71b0461d25aa4f270261590cf2e",
         "type": "github"
       },
       "original": {
         "owner": "minhuw",
         "repo": "ntcp",
-        "rev": "fb2ae25684cf1f03ade510819852de08e4effe05",
+        "rev": "3ee907e96604d71b0461d25aa4f270261590cf2e",
         "type": "github"
       }
     },

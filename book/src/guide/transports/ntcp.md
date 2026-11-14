@@ -133,7 +133,7 @@ prefix_len = 24
 | `endpoints[].ifname` | Name of that thread's TUN device. |
 | `endpoints[].local_ip` | ntcp's own address on that device: unicast, not one of the kernel's addresses. |
 | `dpdk.device` | DPDK: EAL devargs of the port, a PCI address (optionally with PMD arguments) or a virtual device. |
-| `dpdk.eal_args` | More EAL arguments, after `-a DEVICE`. |
+| `dpdk.eal_args` | More EAL arguments, after `-a DEVICE` (a virtual device: `--vdev DEVICE --no-pci`). |
 | `dpdk.local_ips` | ntcp's IPv4 address for each worker thread that runs ntcp traffic groups, in ascending thread-ID order like `endpoints`. |
 | `dpdk.prefix_len` | Prefix length of the on-link network of `local_ips`, 1 to 32. |
 | `dpdk.gateway` | Router for targets outside that network (optional): another address on it. |
