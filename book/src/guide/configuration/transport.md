@@ -147,6 +147,21 @@ counted in `service_us` alone; `kernel_split_count` says how many were split,
 and `kernel_split_missing` why the others were not (no TX timestamp, no RX
 timestamp, or timestamps of different clocks).
 
+A response can arrive before its request's TX timestamp was read from the
+error queue: a NIC reports a hardware TX timestamp only once the transmit
+completed, which can be later than a fast round trip. Such a response
+completes its request at once, so the connection sends its next request on
+schedule and an adaptive traffic policy gets the latency measured so far, in
+cycles; only the latency sample waits for the TX timestamp, for at most
+`experiment.tx_timestamp_timeout` (default 10 ms; see the
+[experiment fields](../../reference/schema.md#fields)). With the stamp in
+time, the sample is split like any other; without, or still waiting at the
+end of the drain, it is measured in cycles and counts in
+`kernel_split_missing.tx`. Either way it counts in the time bucket of its
+response's receive, and in the measurement window if the response arrived in
+it, however late it is recorded. Sampling only the requests whose stamp came
+first would favour slow requests, more so the faster the server.
+
 With `"kernel"` or `{ hardware = ... }`, xylem never falls back to
 user-space timestamps without saying so:
 

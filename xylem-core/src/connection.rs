@@ -71,6 +71,9 @@ type GroupConfig<Target> =
 /// Entries older than this are cleaned up to prevent memory leaks from lost packets
 const TX_QUEUE_STALE_TIMEOUT_NS: u64 = 60_000_000_000;
 
+/// Default for [`ConnectionPool::set_tx_timestamp_timeout`]
+pub const DEFAULT_TX_TIMESTAMP_TIMEOUT: Duration = Duration::from_millis(10);
+
 /// Most timed-out request IDs a connection remembers to recognise their late
 /// responses; the oldest are forgotten first
 const TIMED_OUT_MEMORY: usize = 4096;
@@ -105,6 +108,62 @@ pub struct Completion<ReqId> {
     /// response, as it records only those latencies in the latency
     /// distribution.
     pub breakdown: LatencyBreakdown,
+    /// The response came before its request's kernel TX timestamp: the
+    /// request is complete, but its latency sample waits for the stamp and
+    /// comes from [`ConnectionPool::take_deferred`]. `latency` and
+    /// `breakdown` are then the ones measured so far, in cycles, which only
+    /// the traffic policy gets.
+    pub deferred: bool,
+}
+
+/// The latency sample of a measurement request whose successful response
+/// came before its kernel TX timestamp, taken once the stamp arrived or the
+/// wait for it ended; see [`ConnectionPool::take_deferred`]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeferredSample {
+    pub group_id: usize,
+    pub connection_id: usize,
+    /// When the response was received (a `timing::time_ns` value): the
+    /// sample belongs to that time's bucket and window
+    pub received_ns: u64,
+    /// Bytes the response took, like [`Completion::bytes_consumed`]
+    pub bytes: usize,
+    /// Send lag plus service latency, like [`Completion::latency`]
+    pub latency: Duration,
+    /// Kernel split with the TX timestamp, or the cycles without one
+    /// ([`crate::stats::SplitMiss::Tx`])
+    pub breakdown: LatencyBreakdown,
+}
+
+/// A completed measurement request waiting for its kernel TX timestamp
+#[derive(Debug)]
+struct DeferredResponse {
+    send_ts: Timestamp,
+    send_lag: Duration,
+    recv_ts: Timestamp,
+    bytes: usize,
+    received_ns: u64,
+}
+
+impl DeferredResponse {
+    /// Its sample, with `tx` as its send's kernel TX timestamp if it arrived
+    fn sample(
+        self,
+        group_id: usize,
+        connection_id: usize,
+        tx: Option<KernelTimestamp>,
+    ) -> DeferredSample {
+        let send_ts = tx.map_or(self.send_ts, |kernel| self.send_ts.with_kernel(kernel));
+        let breakdown = LatencyBreakdown::between(&send_ts, &self.recv_ts);
+        DeferredSample {
+            group_id,
+            connection_id,
+            received_ns: self.received_ns,
+            bytes: self.bytes,
+            latency: self.send_lag + breakdown.service,
+            breakdown,
+        }
+    }
 }
 
 /// What a connection does with error replies, and the kinds it has seen
@@ -194,6 +253,21 @@ struct PendingRequest {
     is_setup: bool,
     /// Kernel TX timestamp of the send, once reported
     tx_kernel_ts: Option<KernelTimestamp>,
+    /// [`TxEntry::seq`] of the send, if it waits for a TX timestamp
+    tx_seq: Option<u64>,
+}
+
+/// A send whose transport reports TX timestamps, waiting for its stamp
+#[derive(Debug)]
+struct TxEntry<ReqId> {
+    /// Exclusive end of the send's TX counter range
+    end: u32,
+    req_id: ReqId,
+    /// When it was queued (a `timing::time_ns` value), for stale entry cleanup
+    enqueued_ns: u64,
+    /// Number of the send among the connection's stamped sends, in send
+    /// order: the queue is sorted by it
+    seq: u64,
 }
 
 /// Per-connection application state (no transport - I/O goes through ConnectionGroup)
@@ -205,21 +279,25 @@ struct PendingRequest {
 /// 1. `pending_map: FastHashMap<ReqId, PendingRequest>` - Primary storage, O(1) lookup by request ID
 ///    Used when responses arrive (protocol provides req_id)
 ///
-/// 2. `tx_pending_queue: VecDeque<(u32, ReqId, u64)>` - Queue for TX timestamp correlation
-///    Holds `(TxRange::end, req_id, enqueue_time_ns)` for sends whose transport reports
-///    TX timestamps (`SendReceipt::tx` is `Some`); other sends never enter it.
-///    Requests are pushed to back (ends increase monotonically, wrapping),
-///    TX timestamps are matched from front (kernel delivers in order).
-///    The u64 is a monotonic timestamp (nanoseconds) for stale entry cleanup.
+/// 2. `tx_pending_queue: VecDeque<TxEntry>` - Queue for TX timestamp correlation
+///    Holds an entry for each send whose transport reports TX timestamps
+///    (`SendReceipt::tx` is `Some`); other sends never enter it.
+///    Requests are pushed to back (ends and sequence numbers increase monotonically,
+///    ends wrapping), TX timestamps are matched from front (kernel delivers in order).
 ///
 /// Flow (see `xylem_transport`'s "TX Timestamp Correlation" for the contract):
 /// - send() -> push_back to tx_pending_queue if `tx` is Some, insert into pending_map
 /// - poll_tx_timestamps() -> a cumulative stamp pops from front while end <= tx_end; an
-///   exact stamp removes only the entry with end == tx_end; set pending_map[req_id].tx_kernel_ts
-/// - recv() -> lookup pending_map by req_id, clean up queue if needed, compute latency
+///   exact stamp removes only the entry with end == tx_end; set pending_map[req_id].tx_kernel_ts,
+///   or take the sample of a deferred response
+/// - recv() -> lookup pending_map by req_id, compute latency
 ///
-/// Queue cleanup: When a response arrives before its TX timestamp, or its stamp was lost,
-/// the queue entry is removed when the response completes the request.
+/// A successful measurement response with a kernel RX timestamp that arrives before its
+/// request's TX timestamp completes the request at once, but its latency sample waits in
+/// `deferred`, keyed by the entry's sequence number, and its entry stays queued: the
+/// stamp, when it arrives, pops the entry and takes the sample in O(1). The pool gives up
+/// waiting after its TX timestamp timeout. Any other response arriving before its TX
+/// timestamp removes its entry, found by its sequence number.
 ///
 /// # Send Queue
 ///
@@ -255,9 +333,16 @@ pub struct ConnectionState<ReqId: Eq + Hash + Clone> {
     max_pending_requests: usize,
     /// Primary storage: ReqId -> PendingRequest for O(1) response lookup
     pending_map: FastHashMap<ReqId, PendingRequest>,
-    /// Queue of (tx_end, ReqId, enqueue_time_ns) for TX timestamp correlation - push back, pop front
-    /// The enqueue_time_ns is used for stale entry cleanup (entries older than 1 minute are removed)
-    tx_pending_queue: VecDeque<(u32, ReqId, u64)>,
+    /// Sends waiting for their TX timestamps, in send order - push back, pop front
+    tx_pending_queue: VecDeque<TxEntry<ReqId>>,
+    /// [`TxEntry::seq`] of the next stamped send
+    next_tx_seq: u64,
+    /// Completed measurement requests whose latency samples wait for their
+    /// TX timestamps, by [`TxEntry::seq`]; their entries stay queued
+    deferred: FastHashMap<u64, DeferredResponse>,
+    /// `(seq, received_ns)` of the requests deferred since the pool last
+    /// took them
+    newly_deferred: Vec<(u64, u64)>,
     /// Receive buffer: unparsed bytes in `recv_buffer[..recv_len]`, spare
     /// initialised space after them that the transport reads into
     recv_buffer: Vec<u8>,
@@ -337,6 +422,9 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
                 Default::default(),
             ),
             tx_pending_queue: VecDeque::with_capacity(max_pending_requests),
+            next_tx_seq: 0,
+            deferred: FastHashMap::default(),
+            newly_deferred: Vec::new(),
             // Sized as the pool opens the connection, not at its first read:
             // the first reads of every connection come together at the start
             // of the run, where growing each buffer made sends late
@@ -591,11 +679,18 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         is_warmup: bool,
         is_setup: bool,
     ) {
-        if let Some(tx) = tx {
+        let tx_seq = tx.map(|tx| {
             // Queue for TX timestamp correlation (ends increase monotonically)
-            let now_ns = crate::timing::time_ns();
-            self.tx_pending_queue.push_back((tx.end, req_id.clone(), now_ns));
-        }
+            let seq = self.next_tx_seq;
+            self.next_tx_seq += 1;
+            self.tx_pending_queue.push_back(TxEntry {
+                end: tx.end,
+                req_id: req_id.clone(),
+                enqueued_ns: crate::timing::time_ns(),
+                seq,
+            });
+            seq
+        });
         if let Some(timeout) = self.request_timeout {
             // One timeout per connection, so deadlines increase in send order
             let timeout_ns = timeout.as_nanos().min(u64::MAX as u128) as u64;
@@ -610,6 +705,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
                 is_warmup: is_warmup || is_setup,
                 is_setup,
                 tx_kernel_ts: None,
+                tx_seq,
             },
         );
     }
@@ -626,28 +722,15 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         }
     }
 
-    /// Clean up queue entry for a completed request that didn't receive its TX timestamp
+    /// Remove the TX queue entry of the send numbered `seq`, if still queued
     ///
-    /// Uses linear search to find and remove the entry, handling out-of-order responses.
-    /// Also cleans up any stale entries for already-completed requests along the way.
-    fn cleanup_tx_queue_entry(&mut self, req_id: &ReqId) {
-        // First, try to pop stale entries from the front (common case optimization)
-        while let Some((_, front_id, _)) = self.tx_pending_queue.front() {
-            if front_id == req_id {
-                self.tx_pending_queue.pop_front();
-                return;
-            }
-            if !self.pending_map.contains_key(front_id) {
-                // Stale entry, remove it
-                self.tx_pending_queue.pop_front();
-            } else {
-                // Found a still-pending request, stop front cleanup
-                break;
-            }
-        }
-
-        // If not found at front, search and remove from middle of queue (out-of-order case)
-        if let Some(pos) = self.tx_pending_queue.iter().position(|(_, id, _)| id == req_id) {
+    /// The queue is sorted by sequence number, so the entry is found by a
+    /// binary search; responses in order find it at the front.
+    fn remove_tx_entry(&mut self, seq: u64) {
+        if self.tx_pending_queue.front().is_some_and(|entry| entry.seq == seq) {
+            self.tx_pending_queue.pop_front();
+        } else if let Ok(pos) = self.tx_pending_queue.binary_search_by_key(&seq, |entry| entry.seq)
+        {
             self.tx_pending_queue.remove(pos);
         }
     }
@@ -657,6 +740,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
     /// Removes entries that are older than `TX_QUEUE_STALE_TIMEOUT_NS` (1 minute).
     /// This prevents memory growth when TX timestamps are never received (e.g., packet loss,
     /// NIC doesn't support HW timestamps, or kernel drops error queue messages).
+    /// A deferred response whose entry goes stays deferred until the pool gives up on it.
     ///
     /// Returns the number of stale entries removed.
     pub fn cleanup_stale_tx_queue_entries(&mut self) -> usize {
@@ -669,8 +753,8 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         // Pop stale entries from front
         // Queue is ordered by tx_end, and since sends are sequential, enqueue_time
         // increases monotonically. Thus if front is not stale, none are.
-        while let Some(&(_, _, enqueue_time)) = self.tx_pending_queue.front() {
-            if now_ns.saturating_sub(enqueue_time) > TX_QUEUE_STALE_TIMEOUT_NS {
+        while let Some(entry) = self.tx_pending_queue.front() {
+            if now_ns.saturating_sub(entry.enqueued_ns) > TX_QUEUE_STALE_TIMEOUT_NS {
                 self.tx_pending_queue.pop_front();
                 removed += 1;
             } else {
@@ -679,6 +763,29 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         }
 
         removed
+    }
+
+    /// Give the send of `entry`, just taken off the queue, its TX timestamp:
+    /// set it on its pending request, or take the sample of its deferred
+    /// response into `samples`. Returns whether it went to a request.
+    fn stamp(
+        &mut self,
+        entry: TxEntry<ReqId>,
+        tx_ts: KernelTimestamp,
+        samples: &mut Vec<DeferredSample>,
+    ) -> bool {
+        if let Some(deferred) = self.deferred.remove(&entry.seq) {
+            samples.push(deferred.sample(self.group_id, self.connection_id, Some(tx_ts)));
+            return true;
+        }
+        // A request that reused the ID of a completed one is another send
+        match self.pending_map.get_mut(&entry.req_id) {
+            Some(pending) if pending.tx_seq == Some(entry.seq) => {
+                pending.tx_kernel_ts = Some(tx_ts);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Update pending requests with a kernel TX timestamp
@@ -691,49 +798,73 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
     ///   it. Earlier entries stay queued, so a stamp that is lost or arrives
     ///   out of order is never given to another request.
     ///
+    /// A request whose response came first and waits for the stamp
+    /// ([`Completion::deferred`]) has its sample pushed to `samples`.
+    ///
     /// Uses wrapping comparison to handle u32 counter overflow correctly.
     ///
-    /// Returns the number of pending requests that were updated with the TX timestamp.
+    /// Returns the number of requests, pending or deferred, given the TX timestamp.
     pub fn set_tx_timestamp(
         &mut self,
         tx_end: u32,
         cumulative: bool,
         tx_ts: KernelTimestamp,
+        samples: &mut Vec<DeferredSample>,
     ) -> usize {
         if !cumulative {
-            let Some(pos) = self.tx_pending_queue.iter().position(|&(end, _, _)| end == tx_end)
+            let Some(pos) = self.tx_pending_queue.iter().position(|entry| entry.end == tx_end)
             else {
                 return 0;
             };
-            let (_, req_id, _) = self.tx_pending_queue.remove(pos).expect("position is in range");
-            return match self.pending_map.get_mut(&req_id) {
-                Some(pending) => {
-                    pending.tx_kernel_ts = Some(tx_ts);
-                    1
-                }
-                None => 0,
-            };
+            let entry = self.tx_pending_queue.remove(pos).expect("position is in range");
+            return usize::from(self.stamp(entry, tx_ts, samples));
         }
 
         let mut updated_count = 0;
 
         // Pop from front while end <= tx_end (queue is ordered by end)
         // Use wrapping comparison to handle counter overflow after ~4GB (TCP) or ~4B packets (UDP)
-        while let Some(&(end, ref req_id, _)) = self.tx_pending_queue.front() {
-            if wrapping_le(end, tx_end) {
-                // Update pending_map if request still exists (might have been completed already
-                // if response arrived before TX timestamp)
-                if let Some(pending) = self.pending_map.get_mut(req_id) {
-                    pending.tx_kernel_ts = Some(tx_ts);
-                    updated_count += 1;
-                }
-                self.tx_pending_queue.pop_front();
-            } else {
-                break;
-            }
+        while self
+            .tx_pending_queue
+            .front()
+            .is_some_and(|entry| wrapping_le(entry.end, tx_end))
+        {
+            let entry = self.tx_pending_queue.pop_front().expect("checked the front");
+            updated_count += usize::from(self.stamp(entry, tx_ts, samples));
         }
 
         updated_count
+    }
+
+    /// Give up waiting for the TX timestamp of the deferred response of the
+    /// send numbered `seq`, if it still waits: push its sample, measured in
+    /// cycles, to `samples`
+    fn give_up_deferred(&mut self, seq: u64, samples: &mut Vec<DeferredSample>) {
+        if let Some(deferred) = self.deferred.remove(&seq) {
+            self.remove_tx_entry(seq);
+            samples.push(deferred.sample(self.group_id, self.connection_id, None));
+        }
+    }
+
+    /// Give up waiting for every deferred response's TX timestamp, in send
+    /// order, as [`Self::give_up_deferred`] does
+    fn give_up_all_deferred(&mut self, samples: &mut Vec<DeferredSample>) {
+        if self.deferred.is_empty() {
+            return;
+        }
+        let (group_id, connection_id) = (self.group_id, self.connection_id);
+        let deferred = &mut self.deferred;
+        self.tx_pending_queue.retain(|entry| match deferred.remove(&entry.seq) {
+            Some(response) => {
+                samples.push(response.sample(group_id, connection_id, None));
+                false
+            }
+            None => true,
+        });
+        // Entries removed as stale leave their responses behind
+        let mut rest: Vec<_> = self.deferred.drain().collect();
+        rest.sort_unstable_by_key(|&(seq, _)| seq);
+        samples.extend(rest.into_iter().map(|(_, r)| r.sample(group_id, connection_id, None)));
     }
 
     /// Deadline of the oldest pending request with a timeout, pruning the
@@ -761,8 +892,8 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
             }
             let (_, req_id) = self.deadlines.pop_front().expect("next_deadline found an entry");
             let pending = self.pending_map.remove(&req_id).expect("next_deadline checked it");
-            if pending.tx_kernel_ts.is_none() {
-                self.cleanup_tx_queue_entry(&req_id);
+            if let (None, Some(seq)) = (pending.tx_kernel_ts, pending.tx_seq) {
+                self.remove_tx_entry(seq);
             }
             expired += 1;
             if !pending.is_warmup {
@@ -783,21 +914,27 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         self.timed_out_ids.insert(req_id, is_warmup);
     }
 
-    /// Complete the pending request `req_id`, returning its latency, whether
-    /// it was a warmup request, and where its latency went
+    /// Complete the pending request `req_id` with a response received at
+    /// `recv_ts`, an error reply of kind `error` if set, taking the bytes
+    /// absorbed so far
     ///
     /// A response to a timed-out request is dropped (`Ok(None)`) and, for a
     /// measurement request, counted as late. Any other unknown ID is an error
     /// on a byte stream; on a datagram connection it is a duplicate or stray
     /// datagram and is dropped.
+    ///
+    /// A successful measurement response with a kernel RX timestamp whose
+    /// request has no TX timestamp yet but waits for one is deferred
+    /// ([`Completion::deferred`]).
     fn complete(
         &mut self,
-        req_id: &ReqId,
+        req_id: ReqId,
         recv_ts: Timestamp,
         datagram: bool,
-    ) -> Result<Option<(Duration, bool, LatencyBreakdown)>> {
-        let Some(pending) = self.pending_map.remove(req_id) else {
-            if let Some(is_warmup) = self.timed_out_ids.remove(req_id) {
+        error: Option<ErrorKindId>,
+    ) -> Result<Option<Completion<ReqId>>> {
+        let Some(pending) = self.pending_map.remove(&req_id) else {
+            if let Some(is_warmup) = self.timed_out_ids.remove(&req_id) {
                 if !is_warmup {
                     self.late_responses += 1;
                 }
@@ -814,19 +951,48 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         // The kernel TX timestamp joins the send's own cycles, so the
         // latency falls back to cycles unless the receive has a kernel
         // timestamp from the same clock
-        let send_ts = match pending.tx_kernel_ts {
-            Some(kernel) => pending.send_ts.with_kernel(kernel),
-            None => {
-                self.cleanup_tx_queue_entry(req_id);
+        let mut deferred = false;
+        let send_ts = match (pending.tx_kernel_ts, pending.tx_seq) {
+            (Some(kernel), _) => pending.send_ts.with_kernel(kernel),
+            (None, Some(seq)) => {
+                // The stamp may still be on its way: a NIC reports it once
+                // the transmit completed, which can be after a fast round
+                // trip. Only a sample that can split waits for it.
+                if !pending.is_warmup && error.is_none() && recv_ts.kernel().is_some() {
+                    let received_ns = crate::timing::time_ns();
+                    self.deferred.insert(
+                        seq,
+                        DeferredResponse {
+                            send_ts: pending.send_ts,
+                            send_lag: pending.send_lag,
+                            recv_ts,
+                            bytes: self.absorbed_bytes,
+                            received_ns,
+                        },
+                    );
+                    self.newly_deferred.push((seq, received_ns));
+                    deferred = true;
+                } else {
+                    self.remove_tx_entry(seq);
+                }
                 pending.send_ts
             }
+            (None, None) => pending.send_ts,
         };
         let breakdown = LatencyBreakdown::between(&send_ts, &recv_ts);
         let latency = pending.send_lag + breakdown.service;
         if pending.is_setup {
             self.finish_setup_request();
         }
-        Ok(Some((latency, pending.is_warmup, breakdown)))
+        Ok(Some(Completion {
+            id: req_id,
+            latency,
+            is_warmup: pending.is_warmup,
+            bytes_consumed: std::mem::take(&mut self.absorbed_bytes),
+            error,
+            breakdown,
+            deferred,
+        }))
     }
 
     /// Process `data` as if the transport had just read it into the spare tail
@@ -918,15 +1084,8 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
             let error = error
                 .map(|error| self.error_replies.report(self.group_id, self.connection_id, &error))
                 .transpose()?;
-            if let Some((latency, is_warmup, breakdown)) = self.complete(&req_id, recv_ts, false)? {
-                responses.push(Completion {
-                    id: req_id,
-                    latency,
-                    is_warmup,
-                    bytes_consumed: std::mem::take(&mut self.absorbed_bytes),
-                    error,
-                    breakdown,
-                });
+            if let Some(completion) = self.complete(req_id, recv_ts, false, error)? {
+                responses.push(completion);
             }
         }
         // Compact the remaining partial frame once, regardless of response count.
@@ -977,15 +1136,8 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
             let error = error
                 .map(|error| self.error_replies.report(self.group_id, self.connection_id, &error))
                 .transpose()?;
-            if let Some((latency, is_warmup, breakdown)) = self.complete(&req_id, recv_ts, true)? {
-                responses.push(Completion {
-                    id: req_id,
-                    latency,
-                    is_warmup,
-                    bytes_consumed: std::mem::take(&mut self.absorbed_bytes),
-                    error,
-                    breakdown,
-                });
+            if let Some(completion) = self.complete(req_id, recv_ts, true, error)? {
+                responses.push(completion);
             }
         }
         Ok(responses)
@@ -1034,6 +1186,14 @@ pub struct ConnectionPool<G: ConnectionGroup, ReqId: Eq + Hash + Clone> {
     sent: Vec<SentRequest>,
     /// See [`Self::set_preloading`]
     preloading: bool,
+    /// See [`Self::set_tx_timestamp_timeout`]
+    tx_timestamp_timeout_ns: u64,
+    /// `(deadline_ns, connection_id, seq)` of the deferred responses, in
+    /// receive order, so in deadline order. Entries of responses no longer
+    /// waiting are pruned from the front.
+    deferred_deadlines: VecDeque<(u64, usize, u64)>,
+    /// Samples of deferred responses not yet taken by [`Self::take_deferred`]
+    deferred_samples: Vec<DeferredSample>,
 }
 
 impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionPool<G, ReqId> {
@@ -1220,6 +1380,9 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
             staged: Vec::new(),
             sent: Vec::new(),
             preloading: false,
+            tx_timestamp_timeout_ns: DEFAULT_TX_TIMESTAMP_TIMEOUT.as_nanos() as u64,
+            deferred_deadlines: VecDeque::new(),
+            deferred_samples: Vec::new(),
         })
     }
 
@@ -1229,6 +1392,62 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
     /// others until preload ends and their schedules are anchored again
     pub fn set_preloading(&mut self, preloading: bool) {
         self.preloading = preloading;
+    }
+
+    /// Set how long the latency sample of a response that came before its
+    /// request's kernel TX timestamp ([`Completion::deferred`]) waits for
+    /// the stamp, counted from the receive (default
+    /// [`DEFAULT_TX_TIMESTAMP_TIMEOUT`]); see [`Self::expire_deferred_at`]
+    pub fn set_tx_timestamp_timeout(&mut self, timeout: Duration) {
+        self.tx_timestamp_timeout_ns = timeout.as_nanos().min(u64::MAX as u128) as u64;
+    }
+
+    /// Whether a response's latency sample waits for its TX timestamp
+    pub fn has_deferred(&self) -> bool {
+        !self.deferred_deadlines.is_empty()
+    }
+
+    /// Earliest time a deferred response may stop waiting for its TX
+    /// timestamp (a `timing::time_ns` value); it may be early, never late
+    pub fn next_deferred_deadline(&self) -> Option<u64> {
+        self.deferred_deadlines.front().map(|&(deadline_ns, _, _)| deadline_ns)
+    }
+
+    /// Give up waiting for the TX timestamps of the deferred responses whose
+    /// wait ended by `now_ns`: their samples, measured in cycles, are taken
+    /// by [`Self::take_deferred`]. Visits only those and the entries of
+    /// responses no longer waiting in front of them.
+    pub fn expire_deferred_at(&mut self, now_ns: u64) {
+        while let Some(&(deadline_ns, connection_id, seq)) = self.deferred_deadlines.front() {
+            let state = self.connection_states.get_mut(&connection_id);
+            let Some(state) = state.filter(|state| state.deferred.contains_key(&seq)) else {
+                self.deferred_deadlines.pop_front();
+                continue;
+            };
+            if deadline_ns > now_ns {
+                break;
+            }
+            self.deferred_deadlines.pop_front();
+            state.give_up_deferred(seq, &mut self.deferred_samples);
+        }
+    }
+
+    /// Give up waiting for every deferred response's TX timestamp, as
+    /// [`Self::expire_deferred_at`] does once their wait ended; read the
+    /// TX timestamps that arrived first ([`Self::poll_tx_timestamps`])
+    pub fn give_up_deferred(&mut self) {
+        while let Some((_, connection_id, seq)) = self.deferred_deadlines.pop_front() {
+            if let Some(state) = self.connection_states.get_mut(&connection_id) {
+                state.give_up_deferred(seq, &mut self.deferred_samples);
+            }
+        }
+    }
+
+    /// Take the samples of the deferred responses whose TX timestamps
+    /// arrived, or whose wait for them ended, since the last call
+    pub fn take_deferred(&mut self, samples: &mut Vec<DeferredSample>) {
+        samples.clear();
+        std::mem::swap(samples, &mut self.deferred_samples);
     }
 
     /// Whether preload runs; see [`Self::set_preloading`]
@@ -1556,6 +1775,13 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
                 return Err(crate::Error::Connection("Connection closed by peer".to_string()))
             }
         };
+        let timeout_ns = self.tx_timestamp_timeout_ns;
+        for (seq, received_ns) in state.newly_deferred.drain(..) {
+            let deadline_ns = received_ns.saturating_add(timeout_ns);
+            self.deferred_deadlines.push_back((deadline_ns, connection_id, seq));
+        }
+        // A deferred response gives the policy its latency measured so far:
+        // waiting for the TX timestamp would delay the policy's feedback
         for response in &responses {
             // A fast error reply would make an adaptive policy speed up
             if !response.is_warmup && response.error.is_none() {
@@ -1572,9 +1798,11 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
     ///
     /// TX timestamps arrive asynchronously from the kernel's error queue.
     /// This method retrieves them and updates the corresponding pending requests
-    /// so that latency calculations can use hardware TX timestamps.
+    /// so that latency calculations can use hardware TX timestamps. Deferred
+    /// responses whose stamps arrived have their samples taken by
+    /// [`Self::take_deferred`].
     ///
-    /// Returns the number of pending requests updated with TX timestamps.
+    /// Returns the number of requests, pending or deferred, given TX timestamps.
     /// Note: A single TX timestamp may update multiple requests if they were
     /// batched together in a single kernel acknowledgment.
     pub fn poll_tx_timestamps(&mut self) -> Result<usize> {
@@ -1583,8 +1811,12 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
 
         for tx_info in &self.tx_timestamps {
             if let Some(state) = self.connection_states.get_mut(&tx_info.conn_id) {
-                count +=
-                    state.set_tx_timestamp(tx_info.tx_end, tx_info.cumulative, tx_info.timestamp);
+                count += state.set_tx_timestamp(
+                    tx_info.tx_end,
+                    tx_info.cumulative,
+                    tx_info.timestamp,
+                    &mut self.deferred_samples,
+                );
             }
         }
 
@@ -1919,8 +2151,11 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
     ///
     /// This marks the connection as closed, clears pending requests, and removes
     /// it from the connection pool to prevent drain_iteration from hanging.
+    /// Its deferred responses stop waiting for their TX timestamps, as in
+    /// [`Self::give_up_deferred`].
     pub fn close(&mut self, connection_id: usize) -> Result<()> {
         if let Some(state) = self.connection_states.get_mut(&connection_id) {
+            state.give_up_all_deferred(&mut self.deferred_samples);
             state.close();
         }
         // Remove from connection_ids to prevent drain_iteration from waiting on it
@@ -1929,8 +2164,10 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         Ok(())
     }
 
-    /// Close all connections
+    /// Close all connections; their deferred responses stop waiting for
+    /// their TX timestamps, as in [`Self::give_up_deferred`]
     pub fn close_all(&mut self) -> Result<()> {
+        self.give_up_deferred();
         for state in self.connection_states.values_mut() {
             state.close();
         }
@@ -2189,6 +2426,7 @@ mod tests {
                 bytes_consumed: 1,
                 error: None,
                 breakdown,
+                deferred: false,
             }]
         );
         assert_eq!(pool.get_state(0).unwrap().pending_count(), 0);
@@ -2262,7 +2500,12 @@ mod tests {
             // The TX stamp is decoded long after the send; its decode time
             // must not stand in for the send time
             assert_eq!(
-                state.set_tx_timestamp(8, true, kernel(1_000_000, KernelClock::Realtime)),
+                state.set_tx_timestamp(
+                    8,
+                    true,
+                    kernel(1_000_000, KernelClock::Realtime),
+                    &mut Vec::new()
+                ),
                 1
             );
             let recv_ts = Timestamp::now();
@@ -2301,9 +2544,9 @@ mod tests {
         let ts = Timestamp::now();
         state.record_send(1, ts, Duration::ZERO, tx(0, 10), false);
         state.record_send(2, ts, Duration::ZERO, tx(10, 20), false);
-        assert_eq!(state.set_tx_timestamp(10, true, sw(100)), 1);
+        assert_eq!(state.set_tx_timestamp(10, true, sw(100), &mut Vec::new()), 1);
         assert_eq!((stamped(&state, 1), stamped(&state, 2)), (Some(100), None));
-        assert_eq!(state.set_tx_timestamp(20, true, sw(200)), 1);
+        assert_eq!(state.set_tx_timestamp(20, true, sw(200), &mut Vec::new()), 1);
         assert_eq!(stamped(&state, 2), Some(200));
         assert!(state.tx_pending_queue.is_empty());
 
@@ -2311,7 +2554,7 @@ mod tests {
         state.record_send(3, ts, Duration::ZERO, tx(20, 25), false);
         state.record_send(4, ts, Duration::ZERO, tx(25, 30), false);
         state.record_send(5, ts, Duration::ZERO, tx(30, 40), false);
-        assert_eq!(state.set_tx_timestamp(30, true, sw(300)), 2);
+        assert_eq!(state.set_tx_timestamp(30, true, sw(300), &mut Vec::new()), 2);
         assert_eq!(
             (stamped(&state, 3), stamped(&state, 4), stamped(&state, 5)),
             (Some(300), Some(300), None)
@@ -2321,7 +2564,7 @@ mod tests {
         let mut state = self::state();
         state.record_send(1, ts, Duration::ZERO, tx(u32::MAX - 4, 5), false);
         state.record_send(2, ts, Duration::ZERO, tx(5, 15), false);
-        assert_eq!(state.set_tx_timestamp(5, true, sw(1)), 1);
+        assert_eq!(state.set_tx_timestamp(5, true, sw(1), &mut Vec::new()), 1);
         assert_eq!((stamped(&state, 1), stamped(&state, 2)), (Some(1), None));
     }
 
@@ -2335,20 +2578,128 @@ mod tests {
             state.record_send(id, ts, Duration::ZERO, tx(id as u32, id as u32 + 1), false);
         }
         // Datagram 0's stamp is lost; 2 arrives before 1
-        assert_eq!(state.set_tx_timestamp(3, false, sw(30)), 1);
-        assert_eq!(state.set_tx_timestamp(2, false, sw(20)), 1);
+        assert_eq!(state.set_tx_timestamp(3, false, sw(30), &mut Vec::new()), 1);
+        assert_eq!(state.set_tx_timestamp(2, false, sw(20), &mut Vec::new()), 1);
         assert_eq!(
             (0..4).map(|id| stamped(&state, id)).collect::<Vec<_>>(),
             vec![None, Some(20), Some(30), None]
         );
         // A duplicate or unknown stamp matches nothing
-        assert_eq!(state.set_tx_timestamp(3, false, sw(31)), 0);
-        assert_eq!(state.set_tx_timestamp(9, false, sw(90)), 0);
+        assert_eq!(state.set_tx_timestamp(3, false, sw(31), &mut Vec::new()), 0);
+        assert_eq!(state.set_tx_timestamp(9, false, sw(90), &mut Vec::new()), 0);
         assert_eq!(stamped(&state, 2), Some(30));
 
         // Completing the unstamped request removes its queue entry
         state.process_recv(&frame(0, 8), ts, parse_frame).unwrap();
-        assert_eq!(state.tx_pending_queue.iter().map(|e| e.1).collect::<Vec<_>>(), vec![3]);
+        assert_eq!(state.tx_pending_queue.iter().map(|e| e.req_id).collect::<Vec<_>>(), vec![3]);
+    }
+
+    /// Responses that come before their TX stamps wait in send order, and
+    /// each stamp takes the samples it covers off the front of the queue
+    #[test]
+    fn deferred_responses_take_their_own_stamps_when_they_arrive() {
+        let mut state = state();
+        let ts = Timestamp::now();
+        let rx = Timestamp::now().with_kernel(sw(5_000));
+        for id in 1..=3u64 {
+            let end = id as u32 * 10;
+            state.record_send(id, ts, Duration::ZERO, tx(end - 10, end), false);
+        }
+        // 2 and 1 are answered, out of order, before any stamp; 3 is pending
+        let done = state
+            .process_recv(&[frame(2, 8), frame(1, 9)].concat(), rx, parse_frame)
+            .unwrap();
+        assert_eq!(
+            done.iter().map(|c| (c.id, c.deferred)).collect::<Vec<_>>(),
+            [(2, true), (1, true)]
+        );
+        let newly: Vec<_> = state.newly_deferred.iter().map(|&(seq, _)| seq).collect();
+        assert_eq!(newly, [1, 0]);
+        assert_eq!(state.pending_count(), 1);
+        // A new send reuses ID 1 before the stamps arrive
+        state.record_send(1, ts, Duration::ZERO, tx(30, 40), false);
+
+        // One stamp covers 1 and 2, the next 3, the last the new 1
+        let mut samples = Vec::new();
+        assert_eq!(state.set_tx_timestamp(20, true, sw(1_000), &mut samples), 2);
+        assert_eq!(samples.iter().map(|s| s.bytes).collect::<Vec<_>>(), [9, 8], "send order");
+        for sample in &samples {
+            let split = sample.breakdown.kernel.unwrap();
+            assert_eq!(split.network_server, Duration::from_micros(4));
+            assert_eq!(sample.latency, Duration::from_micros(4));
+        }
+        assert_eq!(stamped(&state, 1), None, "the reused ID is another send");
+        assert_eq!(state.set_tx_timestamp(30, true, sw(2_000), &mut samples), 1);
+        assert_eq!(state.set_tx_timestamp(40, true, sw(3_000), &mut samples), 1);
+        assert_eq!((stamped(&state, 3), stamped(&state, 1)), (Some(2_000), Some(3_000)));
+        assert_eq!(samples.len(), 2);
+        assert!(state.deferred.is_empty() && state.tx_pending_queue.is_empty());
+    }
+
+    /// Warmup requests, error replies and responses without a kernel RX
+    /// stamp cannot split, so they do not wait for their TX stamps
+    #[test]
+    fn only_a_sample_that_can_split_waits_for_its_tx_stamp() {
+        let mut state = state();
+        let ts = Timestamp::now();
+        let rx = Timestamp::now().with_kernel(sw(5_000));
+        state.record_send(1, ts, Duration::ZERO, tx(0, 8), true);
+        state.record_send(2, ts, Duration::ZERO, tx(8, 16), false);
+        state.record_send(3, ts, Duration::ZERO, tx(16, 24), false);
+        let done = state.process_recv(&frame(1, 8), rx, parse_frame).unwrap();
+        assert!(!done[0].deferred);
+        let done = state.process_recv(&frame(2, 8), ts, parse_frame).unwrap();
+        assert!(!done[0].deferred);
+        let done = state
+            .process_recv(&frame(3, 8), rx, |data| {
+                parse_frame(data).map(|parsed| match parsed {
+                    Parsed::Complete { consumed, id, .. } => {
+                        Parsed::error(consumed, id, ErrorReply::new("ERR", "test"))
+                    }
+                    other => other,
+                })
+            })
+            .unwrap();
+        assert!(done[0].error.is_some() && !done[0].deferred);
+        assert!(state.deferred.is_empty() && state.tx_pending_queue.is_empty());
+    }
+
+    /// Giving up on a closed connection's samples takes them in send order,
+    /// in cycles
+    #[test]
+    fn closing_a_connection_gives_up_on_its_deferred_samples() {
+        let factory = test_support::FakeFactory::default();
+        let mut pool = ConnectionPool::new(
+            &factory,
+            "127.0.0.1:1".parse().unwrap(),
+            1,
+            4,
+            Box::new(crate::scheduler::UniformPolicyScheduler::closed_loop()),
+            0,
+        )
+        .unwrap();
+        for id in 0..3u64 {
+            pool.send(0, &id.to_le_bytes(), id, false).unwrap();
+        }
+        let rx = Timestamp::now().with_kernel(sw(5_000));
+        factory.0.lock().unwrap().timestamp = rx;
+        let response: Vec<u8> = [2u64, 0].iter().flat_map(|id| id.to_le_bytes()).collect();
+        factory.0.lock().unwrap().responses.push_back(Ok(response));
+        let done = pool
+            .recv_responses(0, |data| {
+                Ok(Parsed::ok(8, u64::from_le_bytes(data[..8].try_into().unwrap())))
+            })
+            .unwrap();
+        assert!(done.iter().all(|c| c.deferred));
+        assert_eq!(pool.deferred_deadlines.len(), 2);
+        pool.close(0).unwrap();
+        let mut samples = Vec::new();
+        pool.take_deferred(&mut samples);
+        let misses: Vec<_> = samples.iter().map(|s| s.breakdown.miss).collect();
+        assert_eq!(misses, [Some(crate::stats::SplitMiss::Tx); 2]);
+        // The deadlines of samples given up on are pruned
+        pool.expire_deferred_at(0);
+        assert!(!pool.has_deferred());
     }
 
     #[test]
@@ -2357,16 +2708,21 @@ mod tests {
         let ts = Timestamp::now();
         state.record_send(1, ts, Duration::ZERO, None, false);
         assert!(state.tx_pending_queue.is_empty());
-        assert_eq!(state.set_tx_timestamp(1, true, sw(1)), 0);
+        assert_eq!(state.set_tx_timestamp(1, true, sw(1), &mut Vec::new()), 0);
         assert_eq!(state.process_recv(&frame(1, 8), ts, parse_frame).unwrap().len(), 1);
     }
 
     #[test]
     fn stale_tx_cleanup_preserves_expiry_boundary() {
         let mut state = state();
-        state.tx_pending_queue.extend([(1, 1, 10), (2, 2, 11), (3, 3, 12)]);
+        state.tx_pending_queue.extend((1..=3).map(|n| TxEntry {
+            end: n as u32,
+            req_id: n,
+            enqueued_ns: 9 + n,
+            seq: n,
+        }));
         assert_eq!(state.cleanup_stale_tx_queue_entries_at(TX_QUEUE_STALE_TIMEOUT_NS + 11), 1);
-        assert_eq!(state.tx_pending_queue.front().unwrap().1, 2);
+        assert_eq!(state.tx_pending_queue.front().unwrap().req_id, 2);
         assert_eq!(state.cleanup_stale_tx_queue_entries_at(TX_QUEUE_STALE_TIMEOUT_NS + 13), 2);
     }
 
@@ -2452,14 +2808,16 @@ mod tests {
         state.record_send(1, send_ts, lag, tx(0, 8), false);
         state.record_send(2, send_ts, lag, tx(8, 16), false);
         // A kernel TX stamp still measures the service part: 500 µs
-        assert_eq!(state.set_tx_timestamp(8, true, kernel(1_000_000)), 1);
+        assert_eq!(state.set_tx_timestamp(8, true, kernel(1_000_000), &mut Vec::new()), 1);
         let recv_ts = Timestamp::now().with_kernel(kernel(1_500_000));
         let responses = state
             .process_recv(&[frame(1, 8), frame(2, 8)].concat(), recv_ts, parse_frame)
             .unwrap();
         assert_eq!(responses[0].latency, lag + Duration::from_micros(500));
-        // Without one, the service part is measured in cycles
+        // Without one, the service part is measured in cycles, for the
+        // policy: the sample waits for the stamp
         assert_eq!(responses[1].latency, lag + recv_ts.duration_since(&send_ts));
+        assert_eq!((responses[0].deferred, responses[1].deferred), (false, true));
         // The breakdown's service part is the latency without the send lag;
         // only the stamped request splits it, against the send's own cycles
         let (stamped, unstamped) = (responses[0].breakdown, responses[1].breakdown);
@@ -2626,7 +2984,7 @@ mod tests {
         let receipt = xylem_transport::SendReceipt { timestamp: Timestamp::now(), tx };
         let mut sent = Vec::new();
         state.on_progress(SendProgress { accepted: 8, receipt }, &mut sent);
-        let ends: Vec<_> = state.tx_pending_queue.iter().map(|&(end, id, _)| (id, end)).collect();
+        let ends: Vec<_> = state.tx_pending_queue.iter().map(|e| (e.req_id, e.end)).collect();
         assert_eq!(ends, [(1, 103), (2, 108)]);
         // The warmup request is sent, but not measured
         assert_eq!(sent.iter().map(|sent| sent.measured).collect::<Vec<_>>(), [true, false]);

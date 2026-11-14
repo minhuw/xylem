@@ -57,6 +57,13 @@ seed = 42
   nothing for this long while it preloads fails the run, however long the
   whole preload takes; see
   [run phases](../guide/output-formats.md#run-phases).
+- `tx_timestamp_timeout` (string, default `"10ms"`, more than zero): with
+  `timestamps = "kernel"` or `{ hardware = ... }`, how long the latency
+  sample of a response that arrived before its request's TX timestamp waits
+  for the stamp, counted from the receive. The request completes at once; a
+  sample whose stamp did not arrive by then is measured in cycles and counts
+  in `kernel_split_missing.tx`; see
+  [timestamps](../guide/configuration/transport.md#timestamps).
 - `busy_poll_us` (integer, optional, at least 1): turn on busy polling with
   this budget in microseconds; see [busy polling](#busy-polling). Off when
   unset.

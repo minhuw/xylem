@@ -7,9 +7,9 @@
 //! - Single connection, single pending request: Simple closed-loop latency measurement
 //! - Multiple connections with pipelining: High-throughput load testing
 
-use crate::connection::{ConnectionPool, SentRequest, TrafficGroupConfig};
+use crate::connection::{ConnectionPool, DeferredSample, SentRequest, TrafficGroupConfig};
 use crate::request_dump::RequestDumper;
-use crate::stats::{StatsRecorder, TupleStatsCollector, UNSENT_WALK_CAP};
+use crate::stats::{ReceivedAt, StatsRecorder, TupleStatsCollector, UNSENT_WALK_CAP};
 use crate::threading::{PreloadTicket, PreloadWait, StartTicket};
 use crate::timing;
 use crate::traffic_group::OnError;
@@ -112,6 +112,13 @@ pub struct Worker<G: ConnectionGroup, P: Protocol, S: StatsRecorder = TupleStats
     outbox: Outbox,
     /// Reused buffer for the requests the transport took
     sent: Vec<SentRequest>,
+    /// Reused buffer for the samples of responses that waited for their TX
+    /// timestamps
+    deferred: Vec<DeferredSample>,
+    /// When the measurement window closed (a `timing::time_ns` value), just
+    /// before [`StatsRecorder::end_measurement`]: responses received from
+    /// then on were drained
+    window_closed_ns: Option<u64>,
     /// How long after the last I/O polls do not wait, in nanoseconds; `None`
     /// (the default) lets every poll wait (see [`Self::set_busy_poll`])
     busy_poll_ns: Option<u64>,
@@ -217,6 +224,8 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             ready_ids: Vec::new(),
             outbox: Outbox::default(),
             sent: Vec::new(),
+            deferred: Vec::new(),
+            window_closed_ns: None,
             busy_poll_ns: None,
             last_io_ns: 0,
             setup_timeout: DEFAULT_SETUP_TIMEOUT,
@@ -267,6 +276,20 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
     /// load, but no reply should take that long.
     pub fn set_setup_timeout(&mut self, timeout: Duration) {
         self.setup_timeout = timeout;
+    }
+
+    /// Let the latency sample of a response that came before its request's
+    /// kernel TX timestamp wait up to `timeout` for the stamp, counted from
+    /// the receive; see [`ConnectionPool::set_tx_timestamp_timeout`]
+    ///
+    /// The request completes at once: its pipeline slot is freed and the
+    /// traffic policy gets the latency measured so far, in cycles. Only its
+    /// sample waits, and counts once recorded where a sample recorded at
+    /// the receive would. A sample whose stamp did not arrive in time, or by
+    /// the end of the drain, is measured in cycles and counts in
+    /// `kernel_split_missing.tx`.
+    pub fn set_tx_timestamp_timeout(&mut self, timeout: Duration) {
+        self.pool.set_tx_timestamp_timeout(timeout);
     }
 
     /// Busy-poll for up to `budget` after the last I/O; `None` (the default)
@@ -434,11 +457,16 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         let actual_end_us = wall_clock_us();
         self.stats.record_actual_load_loop_samples(actual_start_us, actual_end_us);
         loop_result?;
+        self.window_closed_ns = Some(timing::time_ns());
         self.stats.end_measurement(end_ns);
         self.record_unsent(end_ns);
 
-        // Stop sending and wait for the responses still pending
+        // Stop sending and wait for the responses still pending, and for the
+        // TX timestamps of those that came first
         self.drain_responses()?;
+        self.pool.poll_tx_timestamps()?;
+        self.pool.give_up_deferred();
+        self.record_deferred();
         self.check_setup_done()?;
 
         // Close all connections
@@ -755,9 +783,15 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         // A failed read fails the run: its requests would lose their kernel split.
         self.pool.poll_tx_timestamps()?;
 
+        // Samples of responses that came before their TX timestamps: those
+        // whose stamps just arrived, and those that waited long enough
+        let now_ns = timing::time_ns();
+        self.pool.expire_deferred_at(now_ns);
+        self.record_deferred();
+
         // Clean up stale TX queue entries (entries older than 1 minute)
         // This prevents memory leaks when TX timestamps are never received
-        self.maintain_tx_queues(timing::time_ns());
+        self.maintain_tx_queues(now_ns);
 
         let mut driven_sends = false;
         for &connection_id in &ready_ids {
@@ -805,7 +839,8 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             };
 
             for response in responses {
-                if response.is_warmup {
+                // A deferred response is recorded once its TX timestamp arrives
+                if response.is_warmup || response.deferred {
                     continue;
                 }
                 match response.error {
@@ -865,6 +900,26 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         self.record_sent();
 
         Ok(())
+    }
+
+    /// Record the samples of the responses that waited for their TX
+    /// timestamps, each where a sample recorded at its receive would count
+    fn record_deferred(&mut self) {
+        self.pool.take_deferred(&mut self.deferred);
+        for sample in &self.deferred {
+            let received = ReceivedAt {
+                ns: sample.received_ns,
+                drained: self.window_closed_ns.is_some_and(|closed| sample.received_ns >= closed),
+            };
+            self.stats.record_response_at(
+                sample.group_id,
+                sample.connection_id,
+                sample.bytes,
+                sample.latency,
+                &sample.breakdown,
+                received,
+            );
+        }
     }
 
     /// Take what the protocol asks for after parsing data received on
@@ -1084,9 +1139,11 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         }
     }
 
-    /// Wait for pending responses after the measurement window, until none
-    /// is pending or `drain_timeout` passes. Sends nothing. Measurement
-    /// requests still pending then are counted as timed out, without a latency.
+    /// Wait for pending responses after the measurement window, and for the
+    /// TX timestamps of responses that came before them, until none is
+    /// pending or waiting or `drain_timeout` passes. Sends nothing.
+    /// Measurement requests still pending then are counted as timed out,
+    /// without a latency.
     fn drain_responses(&mut self) -> Result<()> {
         let timeout_ns = self.config.drain_timeout.as_nanos().min(u64::MAX as u128) as u64;
         let deadline_ns = timing::time_ns().saturating_add(timeout_ns);
@@ -1094,17 +1151,17 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         // poll that reports neither leaves them pending: a busy-polling
         // drain checks every connection only when one may have finished
         let mut pending = self.has_pending();
-        while pending {
+        while pending || self.pool.has_deferred() {
             let now_ns = timing::time_ns();
             if now_ns >= deadline_ns {
                 break;
             }
             // Short waits keep TX timestamp polling and the deadline responsive.
             let wait_ns = (deadline_ns - now_ns).min(10_000_000);
-            let wait_ns = self
-                .pool
-                .next_request_deadline()
-                .map_or(wait_ns, |next| wait_ns.min(next.saturating_sub(now_ns)));
+            let wait_ns = [self.pool.next_request_deadline(), self.pool.next_deferred_deadline()]
+                .into_iter()
+                .flatten()
+                .fold(wait_ns, |wait_ns, next| wait_ns.min(next.saturating_sub(now_ns)));
             self.process_responses(self.busy_poll_timeout(Duration::from_nanos(wait_ns), now_ns))?;
             let ready = !self.ready_ids.is_empty();
             if ready {
@@ -2580,6 +2637,10 @@ mod tests {
             io.responses.push_back(Ok((id as u64).to_le_bytes().to_vec()));
             drop(io);
             worker.process_responses(Duration::ZERO).unwrap();
+            // The request without a TX stamp waits for it; give up at once,
+            // before the next stamp, which covers every earlier send, comes
+            worker.pool.expire_deferred_at(u64::MAX);
+            worker.record_deferred();
         }
         let breakdown = worker.stats.latency_breakdown(0);
         assert_eq!((breakdown.kernel_split_count, breakdown.service.sample_count), (1, 4));
@@ -2588,6 +2649,181 @@ mod tests {
             SplitMissCounts { tx: 1, rx: 1, clock_mismatch: 1 }
         );
         assert_eq!(worker.stats.latency_breakdown_global(), breakdown);
+    }
+
+    fn sw_stamp(nanos: u64) -> xylem_transport::KernelTimestamp {
+        xylem_transport::KernelTimestamp {
+            nanos,
+            clock: xylem_transport::KernelClock::Realtime,
+        }
+    }
+
+    /// Queue on `factory` the response to request `id`, with a kernel RX
+    /// stamp at `rx_ns`; the fake stamps later sends with the cycles alone
+    fn respond_with_rx_stamp(factory: &FakeFactory, id: u64, rx_ns: u64) {
+        let mut io = factory.0.lock().unwrap();
+        io.timestamp = xylem_transport::Timestamp::now().with_kernel(sw_stamp(rx_ns));
+        io.responses.push_back(Ok(id.to_le_bytes().to_vec()));
+    }
+
+    /// Process the queued response on `worker`, then let the fake stamp
+    /// sends with the cycles alone again
+    fn process_rx_stamped(worker: &mut Worker<FakeGroup, FakeProtocol>, factory: &FakeFactory) {
+        worker.process_responses(Duration::ZERO).unwrap();
+        factory.0.lock().unwrap().timestamp = xylem_transport::Timestamp::now();
+    }
+
+    /// Report the TX stamp at `tx_ns` of the fake's `n`th send (from 1)
+    fn report_tx_stamp(factory: &FakeFactory, n: u32, tx_ns: u64) {
+        factory.0.lock().unwrap().tx_timestamps.push(xylem_transport::TxTimestampInfo {
+            conn_id: 0,
+            tx_end: n,
+            cumulative: true,
+            timestamp: sw_stamp(tx_ns),
+        });
+    }
+
+    #[test]
+    fn a_tx_stamp_arriving_after_the_response_still_splits_its_sample() {
+        let factory = FakeFactory::default();
+        let mut worker = fake_worker(&factory, 1, Box::new(UniformPolicyScheduler::closed_loop()));
+        worker.send_requests().unwrap();
+        respond_with_rx_stamp(&factory, 0, 6_000);
+        process_rx_stamped(&mut worker, &factory);
+        // The request is complete, but its sample waits for the TX stamp
+        assert_eq!(worker.pool.get_state(0).unwrap().pending_count(), 0);
+        assert!(worker.pool.has_deferred());
+        assert_eq!(worker.stats.request_counts_global().completed, 0);
+        assert_eq!(worker.stats.latency_breakdown_global().service.sample_count, 0);
+
+        report_tx_stamp(&factory, 1, 1_000);
+        worker.process_responses(Duration::ZERO).unwrap();
+        assert!(!worker.pool.has_deferred());
+        let breakdown = worker.stats.latency_breakdown_global();
+        assert_eq!((breakdown.kernel_split_count, breakdown.service.sample_count), (1, 1));
+        assert_eq!(breakdown.kernel_split_missing, crate::stats::SplitMissCounts::default());
+        assert_eq!(breakdown.network_server.unwrap().max, Some(Duration::from_micros(5)));
+        let stats = global(&worker);
+        assert_eq!((stats.total_requests, stats.max_latency), (1, Some(Duration::from_micros(5))));
+        let rx_bytes: u64 = worker.stats.entries().map(|(_, entry)| entry.rx_bytes).sum();
+        assert_eq!(rx_bytes, 8);
+        assert_eq!(worker.stats.request_counts_global().completed, 1);
+    }
+
+    #[test]
+    fn a_tx_stamp_that_never_arrives_leaves_the_sample_in_cycles_after_the_timeout() {
+        let factory = FakeFactory::default();
+        let mut worker = fake_worker(&factory, 1, Box::new(UniformPolicyScheduler::closed_loop()));
+        worker.set_tx_timestamp_timeout(Duration::from_millis(50));
+        worker.send_requests().unwrap();
+        let sent = timing::time_ns();
+        respond_with_rx_stamp(&factory, 0, 6_000);
+        process_rx_stamped(&mut worker, &factory);
+        let deadline = worker.pool.next_deferred_deadline().unwrap();
+        assert!(deadline >= sent + 50_000_000 && deadline <= timing::time_ns() + 50_000_000);
+        // Still waiting before its deadline
+        worker.process_responses(Duration::ZERO).unwrap();
+        assert!(timing::time_ns() < deadline, "the test outran its timeout");
+        assert_eq!(worker.stats.latency_breakdown_global().service.sample_count, 0);
+
+        thread::sleep(Duration::from_nanos(deadline.saturating_sub(timing::time_ns())));
+        worker.process_responses(Duration::ZERO).unwrap();
+        assert!(!worker.pool.has_deferred());
+        let breakdown = worker.stats.latency_breakdown_global();
+        assert_eq!((breakdown.kernel_split_count, breakdown.service.sample_count), (0, 1));
+        let missing = crate::stats::SplitMissCounts { tx: 1, rx: 0, clock_mismatch: 0 };
+        assert_eq!(breakdown.kernel_split_missing, missing);
+        assert_eq!(breakdown.clock, Some(crate::stats::BreakdownClock::UserSpace));
+        // Its queue entry went with it: a late stamp gives nothing
+        report_tx_stamp(&factory, 1, 1_000);
+        worker.process_responses(Duration::ZERO).unwrap();
+        assert_eq!(worker.stats.latency_breakdown_global().service.sample_count, 1);
+        assert_eq!(global(&worker).total_requests, 1);
+    }
+
+    #[test]
+    fn the_end_of_the_run_records_every_sample_still_waiting_for_its_tx_stamp() {
+        let factory = FakeFactory::default();
+        let mut worker = fake_worker(&factory, 1, Box::new(UniformPolicyScheduler::closed_loop()));
+        // Longer than the drain: the end of the run gives up on the rest
+        worker.set_tx_timestamp_timeout(Duration::from_secs(10));
+        for id in 0..2 {
+            worker.send_requests().unwrap();
+            respond_with_rx_stamp(&factory, id, 9_000);
+            process_rx_stamped(&mut worker, &factory);
+        }
+        assert_eq!(sent_requests(&factory), 2);
+        assert_eq!(worker.pool.get_state(0).unwrap().pending_count(), 0);
+        // Request 0's stamp arrives, request 1's never does
+        report_tx_stamp(&factory, 1, 1_000);
+        let started = timing::time_ns();
+        worker.config.duration = Duration::ZERO;
+        worker.run().unwrap();
+        assert!(timing::time_ns() - started < 1_000_000_000, "the drain bounds the wait");
+        assert!(!worker.pool.has_deferred());
+        let breakdown = worker.stats.latency_breakdown_global();
+        assert_eq!((breakdown.kernel_split_count, breakdown.service.sample_count), (1, 2));
+        assert_eq!(breakdown.kernel_split_missing.tx, 1);
+        assert_eq!(breakdown.network_server.unwrap().max, Some(Duration::from_micros(8)));
+        // Both arrived in the window
+        assert_eq!(global(&worker).total_requests, 2);
+        let counts = worker.stats.request_counts_global();
+        assert_eq!((counts.sent, counts.completed, counts.timed_out), (2, 2, 0));
+    }
+
+    #[test]
+    fn a_waiting_sample_counts_in_the_window_its_response_arrived_in() {
+        let factory = FakeFactory::default();
+        let mut worker = fake_worker(&factory, 1, Box::new(UniformPolicyScheduler::closed_loop()));
+        worker.set_tx_timestamp_timeout(Duration::from_millis(5));
+        // Request 0's response arrives in the window, its TX stamp after the
+        // window; request 1's response arrives during the drain, its TX
+        // stamp never
+        worker.send_requests().unwrap();
+        respond_with_rx_stamp(&factory, 0, 9_000);
+        process_rx_stamped(&mut worker, &factory);
+        worker.send_requests().unwrap();
+        assert_eq!(sent_requests(&factory), 2);
+        report_tx_stamp(&factory, 1, 1_000);
+        respond_with_rx_stamp(&factory, 1, 9_000);
+        worker.config.duration = Duration::ZERO;
+        worker.run().unwrap();
+        let breakdown = worker.stats.latency_breakdown_global();
+        assert_eq!((breakdown.kernel_split_count, breakdown.service.sample_count), (1, 2));
+        assert_eq!(breakdown.kernel_split_missing.tx, 1);
+        // Only the window's response counts toward throughput, in the
+        // window's bucket, with its bytes
+        let stats = global(&worker);
+        assert_eq!((stats.total_requests, stats.latency_sample_count), (1, 2));
+        let points = worker.stats.time_series_global();
+        assert_eq!(points.iter().map(|p| p.request_count).sum::<u64>(), 1);
+        let entries: Vec<_> = worker
+            .stats
+            .entries()
+            .map(|(key, entry)| (key.time_bucket, entry.rx_bytes))
+            .collect();
+        assert_eq!(entries, [(0, 8)]);
+        assert_eq!(worker.stats.request_counts_global().completed, 2);
+    }
+
+    #[test]
+    fn a_response_waiting_for_its_tx_stamp_neither_delays_the_next_send_nor_the_feedback() {
+        let factory = FakeFactory::default();
+        let feedback = Arc::<std::sync::Mutex<Vec<Duration>>>::default();
+        let mut worker =
+            group_worker(&factory, 1, 1, Box::new(FeedbackPolicy(Arc::clone(&feedback))));
+        worker.send_requests().unwrap();
+        assert_eq!(sent_requests(&factory), 1);
+        respond_with_rx_stamp(&factory, 0, 6_000);
+        process_rx_stamped(&mut worker, &factory);
+        assert!(worker.pool.has_deferred());
+        // The policy has the latency measured so far, and the full pipeline
+        // sends its next request at once
+        assert_eq!(feedback.lock().unwrap().len(), 1);
+        worker.send_requests().unwrap();
+        assert_eq!(sent_requests(&factory), 2);
+        assert!(worker.pool.has_deferred());
+        assert_eq!(worker.stats.latency_breakdown_global().service.sample_count, 0);
     }
 
     #[test]

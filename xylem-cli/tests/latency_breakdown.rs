@@ -1,6 +1,5 @@
-//! Through the real executable, over loopback: kernel timestamps split each
-//! round trip in the latency breakdown and count the requests without a
-//! split by cause, user-space timestamps report only its service part, and
+//! Through the real executable, over loopback: kernel timestamps split
+//! every round trip in the latency breakdown, user-space timestamps report only its service part, and
 //! NIC timestamps that are not switched on fail the run before any
 //! connection opens.
 //!
@@ -109,18 +108,13 @@ fn kernel_timestamps_split_the_round_trip_over_tcp_and_udp() {
         for (breakdown, samples) in breakdowns(&json) {
             let context = format!("{transport}: {breakdown}");
             assert!(samples > 1000, "{context}");
-            // Loopback stamps every send and receive in the kernel
+            // Loopback stamps every send and receive in the kernel, and a
+            // response that comes before its TX stamp waits for it
             let split = breakdown["kernel_split_count"].as_u64().unwrap();
-            assert!(split * 10 >= samples * 9, "{context}");
-            let clock = breakdown["clock"].as_str().unwrap();
-            assert!(clock == "kernel_software" || clock == "mixed" && split < samples, "{context}");
-            // Every request without a split lacked a stamp; one clock only
-            let missing = &breakdown["kernel_split_missing"];
-            let count = |key| missing[key].as_u64().unwrap_or_else(|| panic!("{context}"));
-            assert_eq!(count("clock_mismatch"), 0, "{context}");
-            let unsplit = samples - split;
-            assert!(count("tx") <= unsplit && count("rx") <= unsplit, "{context}");
-            assert!(count("tx") + count("rx") >= unsplit, "{context}");
+            assert_eq!(split, samples, "{context}");
+            assert_eq!(breakdown["clock"], "kernel_software", "{context}");
+            let missing = serde_json::json!({ "tx": 0, "rx": 0, "clock_mismatch": 0 });
+            assert_eq!(breakdown["kernel_split_missing"], missing, "{context}");
             let service = &breakdown["service_us"];
             assert_eq!(service["sample_count"], samples, "{context}");
             for part in ["host_stack_us", "network_server_us"] {
@@ -135,9 +129,7 @@ fn kernel_timestamps_split_the_round_trip_over_tcp_and_udp() {
             assert!(f64_at(network, "p50_us") > 0.0, "{context}");
             // The latency uses the kernel round trip, so split requests'
             // service latency is it
-            if split == samples {
-                assert_eq!(service, network, "{context}");
-            }
+            assert_eq!(service, network, "{context}");
         }
         // The group's split passes its validity check
         let checks = json["validity"].as_array().unwrap();
@@ -145,7 +137,7 @@ fn kernel_timestamps_split_the_round_trip_over_tcp_and_udp() {
         assert_eq!(checks[0]["check"], "kernel_split", "{transport}");
         assert_eq!(checks[0]["group"], "echo", "{transport}");
         assert_eq!(checks[0]["ok"], true, "{transport}");
-        assert!(checks[0]["observed"].as_f64().unwrap() >= 0.9, "{transport}");
+        assert_eq!(checks[0]["observed"].as_f64(), Some(1.0), "{transport}");
     }
 }
 

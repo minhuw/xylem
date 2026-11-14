@@ -8,7 +8,7 @@
 use super::breakdown::{BreakdownStats, BreakdownSummary, LatencyBreakdown};
 use super::policy::SamplingPolicy;
 use super::requests::{RequestCounts, SendLagStats, SendLagSummary, LATE_SEND_THRESHOLD};
-use super::AggregatedStats;
+use super::{AggregatedStats, ReceivedAt};
 use hdrhistogram::Histogram;
 use sketches_ddsketch::{Config as DDSketchConfig, DDSketch};
 use std::collections::{BTreeMap, HashMap};
@@ -1005,6 +1005,17 @@ impl TupleStatsCollector {
         group_id: usize,
         connection_id: usize,
     ) -> (&mut StatsEntry, &mut StatsEntry) {
+        self.recording_entries_at(group_id, connection_id, None)
+    }
+
+    /// The entries of an event at `at`, or now if `None`: an event after the
+    /// measurement window (drained) belongs to the window's last bucket
+    fn recording_entries_at(
+        &mut self,
+        group_id: usize,
+        connection_id: usize,
+        at: Option<ReceivedAt>,
+    ) -> (&mut StatsEntry, &mut StatsEntry) {
         let Self {
             buckets,
             keep_records,
@@ -1026,9 +1037,13 @@ impl TupleStatsCollector {
         let in_totals = group_in_total && global_in_total;
         // The clock is read only for the first record and for a bucket
         let now_ns = (!in_totals || first_record_ns.is_none()).then(|| {
-            let now_ns = crate::timing::time_ns();
+            let (now_ns, drained) = match at {
+                Some(at) => (at.ns, at.drained),
+                None => (crate::timing::time_ns(), measurement_end_ns.is_some()),
+            };
             // Responses drained after the window belong to its last bucket.
-            let now_ns = measurement_end_ns.map_or(now_ns, |end| now_ns.min(end.saturating_sub(1)));
+            let end_ns = measurement_end_ns.filter(|_| drained);
+            let now_ns = end_ns.map_or(now_ns, |end| now_ns.min(end.saturating_sub(1)));
             first_record_ns.get_or_insert(now_ns);
             now_ns
         });
@@ -1131,6 +1146,33 @@ impl TupleStatsCollector {
         let draining = self.measurement_end_ns.is_some();
         let (entry, global) = self.recording_entries(group_id, connection_id);
         if draining {
+            entry.record_drain_latency(latency);
+            global.record_drain_latency(latency);
+        } else {
+            entry.record_rx_bytes(bytes);
+            global.record_rx_bytes(bytes);
+            entry.record_latency(latency);
+            global.record_latency(latency);
+        }
+        self.record_breakdown(group_id, breakdown);
+    }
+
+    /// Record a request completed by a successful response as
+    /// [`Self::record_response`] does, some time after its receive: in the
+    /// time bucket of `received.ns`, and as drained only if
+    /// `received.drained`, whenever it is recorded
+    pub fn record_response_at(
+        &mut self,
+        group_id: usize,
+        connection_id: usize,
+        bytes: usize,
+        latency: Duration,
+        breakdown: &LatencyBreakdown,
+        received: ReceivedAt,
+    ) {
+        self.request_counts_mut(group_id).completed += 1;
+        let (entry, global) = self.recording_entries_at(group_id, connection_id, Some(received));
+        if received.drained {
             entry.record_drain_latency(latency);
             global.record_drain_latency(latency);
         } else {
@@ -2901,6 +2943,62 @@ mod tests {
     }
 
     #[test]
+    fn a_response_recorded_after_its_receive_counts_in_its_receive_bucket_and_window() {
+        let second = 1_000_000_000;
+        let start = 100 * second;
+        let mut collector = TupleStatsCollector::with_start_time(
+            SamplingPolicy::Limited { max_samples: 1000, rate: 1.0 },
+            Duration::from_secs(1),
+            start,
+        );
+        let breakdown = LatencyBreakdown::user_space(Duration::from_micros(7));
+        let latency = Duration::from_micros(7);
+        // Received in bucket 0 of the window, recorded once bucket 2 began
+        // and the window, 3 s long, closed; then one received 0.5 s into the
+        // drain, which belongs to the window's last bucket
+        collector.record_response_at(
+            0,
+            0,
+            8,
+            latency,
+            &breakdown,
+            ReceivedAt {
+                ns: start + 2 * second + 1,
+                drained: false,
+            },
+        );
+        collector.end_measurement(start + 3 * second);
+        collector.record_response_at(
+            0,
+            0,
+            8,
+            latency,
+            &breakdown,
+            ReceivedAt { ns: start + second / 2, drained: false },
+        );
+        collector.record_response_at(
+            0,
+            0,
+            8,
+            latency,
+            &breakdown,
+            ReceivedAt {
+                ns: start + 3 * second + second / 2,
+                drained: true,
+            },
+        );
+        let buckets: Vec<_> = collector
+            .entries()
+            .map(|(key, entry)| (key.time_bucket, entry.request_count, entry.rx_bytes))
+            .collect();
+        assert_eq!(buckets, vec![(0, 1, 8), (2, 1, 8)]);
+        let stats = collector.aggregate_global(Duration::from_secs(3));
+        assert_eq!((stats.total_requests, stats.latency_sample_count), (2, 3));
+        assert_eq!(collector.request_counts_global().completed, 3);
+        assert_eq!(collector.latency_breakdown_global().service.sample_count, 3);
+    }
+
+    #[test]
     fn test_tuple_collector_basic() {
         let start_ns = crate::timing::time_ns();
         let mut collector = TupleStatsCollector::with_start_time(
@@ -2943,6 +3041,16 @@ mod tests {
         }
         impl StatsRecorder for DefaultRecorder {
             fn record_latency(&mut self, _: usize, _: usize, _: Duration) {}
+            fn record_response_at(
+                &mut self,
+                _: usize,
+                _: usize,
+                _: usize,
+                _: Duration,
+                _: &LatencyBreakdown,
+                _: ReceivedAt,
+            ) {
+            }
             fn record_tx_bytes(&mut self, _: usize, _: usize, _: usize) {}
             fn record_rx_bytes(&mut self, _: usize, _: usize, _: usize) {}
         }

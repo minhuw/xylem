@@ -213,6 +213,11 @@
           "description": "Longest time a connection may take to set up (default 10s), counted\nfrom the start of its connect: a connection whose protocol setup\n(such as Redis AUTH or the HTTP/2 preface) has not finished by then\nfails the run. Also the longest a thread may receive nothing while\nit preloads (such as an insert phase)",
           "type": "string",
           "default": "10s"
+        },
+        "tx_timestamp_timeout": {
+          "description": "With kernel or hardware timestamps, how long the latency sample of a\nresponse that arrived before its request's TX timestamp waits for\nthe stamp, counted from the receive (default 10ms). The request\ncompletes at once; a sample whose stamp has not arrived by then is\nmeasured in cycles and counts in `kernel_split_missing.tx`",
+          "type": "string",
+          "default": "10ms"
         }
       },
       "additionalProperties": false,

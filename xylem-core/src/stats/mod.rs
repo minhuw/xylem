@@ -24,6 +24,18 @@ pub use tuple_collector::{
     ConnectionStats, LatencyStorage, StatsEntry, StatsKey, TimeSeriesPoint, TupleStatsCollector,
 };
 
+/// When a response recorded some time after its receive was received; see
+/// [`StatsRecorder::record_response_at`]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceivedAt {
+    /// The receive time (a `timing::time_ns` value), which places the
+    /// response in its time bucket
+    pub ns: u64,
+    /// Received after [`StatsRecorder::end_measurement`]: the request
+    /// completed during the drain
+    pub drained: bool,
+}
+
 /// Trait for statistics collectors used by Worker
 ///
 /// `TupleStatsCollector` implements this trait and groups stats by
@@ -82,6 +94,23 @@ pub trait StatsRecorder: Send {
         self.record_latency(group_id, connection_id, latency);
         self.record_breakdown(group_id, connection_id, breakdown);
     }
+
+    /// Record a request completed by a successful response like
+    /// [`Self::record_response`], but some time after it was received, as
+    /// `received` says: the worker records a response whose kernel TX
+    /// timestamp came after it once the stamp arrived. It counts where and
+    /// as a response recorded at its receive would: in its receive's time
+    /// bucket, and toward throughput unless `received.drained`, even when
+    /// recorded after [`Self::end_measurement`].
+    fn record_response_at(
+        &mut self,
+        group_id: usize,
+        connection_id: usize,
+        bytes: usize,
+        latency: Duration,
+        breakdown: &LatencyBreakdown,
+        received: ReceivedAt,
+    );
 
     /// Record transmitted bytes
     fn record_tx_bytes(&mut self, group_id: usize, connection_id: usize, bytes: usize);
@@ -174,6 +203,26 @@ impl StatsRecorder for TupleStatsCollector {
             bytes,
             latency,
             breakdown,
+        );
+    }
+
+    fn record_response_at(
+        &mut self,
+        group_id: usize,
+        connection_id: usize,
+        bytes: usize,
+        latency: Duration,
+        breakdown: &LatencyBreakdown,
+        received: ReceivedAt,
+    ) {
+        TupleStatsCollector::record_response_at(
+            self,
+            group_id,
+            connection_id,
+            bytes,
+            latency,
+            breakdown,
+            received,
         );
     }
 

@@ -572,6 +572,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
             }
             worker.set_busy_poll(experiment.busy_poll());
             worker.set_setup_timeout(experiment.setup_timeout);
+            worker.set_tx_timestamp_timeout(experiment.tx_timestamp_timeout);
 
             worker.run_with_start(start)?;
             let calibration = worker

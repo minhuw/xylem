@@ -289,7 +289,9 @@ timestamp did not arrive, or came from different clocks, count in
   `service_us.sample_count`, some requests lacked a usable kernel timestamp.
 - `kernel_split_missing`: the requests without a kernel split, by what they
   lacked: `tx`, no kernel TX timestamp (none arrived on the socket's error
-  queue before the response); `rx`, no kernel RX timestamp on the response;
+  queue within `experiment.tx_timestamp_timeout` of the response; see
+  [timestamps](./configuration/transport.md#timestamps)); `rx`, no kernel RX
+  timestamp on the response;
   `clock_mismatch`, both, from different clocks. A request with neither
   timestamp counts in both `tx` and `rx`. Present only for traffic groups
   with `timestamps = "kernel"` or `{ hardware = ... }`, and in the global
