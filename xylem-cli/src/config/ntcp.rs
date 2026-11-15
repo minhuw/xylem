@@ -102,6 +102,14 @@ pub struct NtcpDpdk {
     /// Router for destinations outside that network
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gateway: Option<Ipv4Addr>,
+    /// Mbufs in each queue's pool (ntcp's default when unset: 16383), more
+    /// than the queue's RX and TX descriptors together. Each pool is
+    /// hugepage memory on the device's NUMA socket, allocated whole at
+    /// start: 2368 bytes an mbuf plus about 1.1 MB, so 40 MB a queue at
+    /// 16383 on 2 MiB pages (68.3 MB with --no-huge)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub mbufs_per_queue: Option<u32>,
 }
 
 /// The network interface of backend "af_xdp"
@@ -292,6 +300,12 @@ fn validate_dpdk(config: &NtcpConfig, threads: &[usize]) -> Result<()> {
     if config.mtu > u32::from(u16::MAX) {
         bail!("ntcp.mtu must fit 16 bits for the DPDK backend, got {}", config.mtu);
     }
+    if dpdk.mbufs_per_queue == Some(0) {
+        bail!(
+            "ntcp.dpdk.mbufs_per_queue must be more than the queue's RX and TX descriptors, \
+             got 0; leave it out for ntcp's default"
+        );
+    }
     validate_addresses("dpdk", &dpdk.local_ips, dpdk.prefix_len, dpdk.gateway, threads)
 }
 
@@ -463,6 +477,11 @@ prefix_len = 24
         assert_eq!(dpdk.eal_args, ["--in-memory"]);
         assert_eq!(dpdk.local_ips[1].to_string(), "10.80.0.13");
         assert_eq!((dpdk.prefix_len, dpdk.gateway), (24, None));
+        assert_eq!(dpdk.mbufs_per_queue, None);
+
+        let sized = DPDK.replace("prefix_len = 24", "prefix_len = 24\nmbufs_per_queue = 4095");
+        let dpdk = profile(&[("tcp", "[0]")], &sized).ntcp.unwrap().dpdk.unwrap();
+        assert_eq!(dpdk.mbufs_per_queue, Some(4095));
     }
 
     const AF_XDP: &str = r#"
@@ -547,6 +566,11 @@ prefix_len = 24
                 "prefix_len = 24",
                 "prefix_len = 24\ngateway = \"10.80.0.12\"",
                 "gateway 10.80.0.12",
+            ),
+            (
+                "prefix_len = 24",
+                "prefix_len = 24\nmbufs_per_queue = 0",
+                "ntcp.dpdk.mbufs_per_queue must be more than",
             ),
         ] {
             let message = error(&tcp, &DPDK.replace(from, to));

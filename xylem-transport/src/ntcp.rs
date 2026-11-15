@@ -931,6 +931,30 @@ impl<P: NtcpBackend> NtcpConnectionGroup<P> {
         );
     }
 
+    /// Warn if the backend's device ran short of packet buffers (DPDK's mbuf
+    /// pools): transmits that found the pool empty and waited, receive
+    /// buffer allocation failures, and packets the device dropped before
+    /// the stack saw them
+    ///
+    /// `tx_nombuf` is this group's queue's own; `rx_nombuf` and `rx_missed`
+    /// are the port's totals, the same in every member's warning, so they
+    /// must not be summed over the members.
+    fn report_device(&self, counters: &Counters) {
+        if counters.rx_nombuf == 0 && counters.rx_missed == 0 && counters.tx_nombuf == 0 {
+            return;
+        }
+        tracing::warn!(
+            "ntcp ({}): the device ran short of packet buffers: {} transmits found this \
+             queue's pool empty and waited (tx_nombuf); port totals over all queues: {} \
+             receive buffer allocation failures (rx_nombuf), {} packets dropped by the device \
+             (rx_missed)",
+            self.network.config().local_address,
+            counters.tx_nombuf,
+            counters.rx_nombuf,
+            counters.rx_missed,
+        );
+    }
+
     /// Whether every locally closed connection has finished its close
     ///
     /// FIN-WAIT-2 counts as finished: our FIN was ACKed, and only the peer's
@@ -1259,6 +1283,7 @@ impl<P: NtcpBackend> ConnectionGroup for NtcpConnectionGroup<P> {
         let counters = self.network.counters();
         self.report_memory(&counters);
         self.report_drops(&counters);
+        self.report_device(&counters);
         let ids: Vec<usize> = self.slots.live_handles().map(|(id, _)| id).collect();
         for id in ids {
             self.close(id)?;

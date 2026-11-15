@@ -881,6 +881,7 @@ fn start_ntcp_dpdk(
         mtu: u16::try_from(ntcp.mtu).expect("validated ntcp.mtu"),
         prefix_len: dpdk.prefix_len,
         gateway: dpdk.gateway,
+        mbufs_per_queue: dpdk.mbufs_per_queue,
         members,
     })
     .with_context(|| format!("Failed to start the DPDK port {}", dpdk.device))?;

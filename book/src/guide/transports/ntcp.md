@@ -47,7 +47,8 @@ The device must exist before xylem starts; xylem attaches to it and never create
 The DPDK backend drives one Ethernet port. Each worker thread that runs ntcp traffic gets one queue pair of the port and its own IPv4 address on the port's network; a flow rule steers that address to the thread's queue. The threads share one ARP table: ntcp resolves its next hops and answers ARP requests for its addresses itself.
 
 - **The device.** EAL probes only the device you name (`-a`). With NVIDIA/Mellanox mlx5 NICs the port stays bound to `mlx5_core` (bifurcated driver) and needs `ib_uverbs` and `mlx5_ib` loaded; other NICs must be bound to `vfio-pci`. Name PMD arguments in the device string: `0000:05:00.0,dv_flow_en=1`.
-- **Hugepages.** EAL needs hugepages, e.g. 1 GiB pages reserved at boot. `--in-memory` keeps EAL's files out of `/dev/hugepages` and `/var/run`.
+- **Hugepages.** EAL needs hugepages, e.g. 1 GiB pages reserved at boot. `--in-memory` keeps EAL's files out of `/dev/hugepages` and `/var/run`. Besides EAL's own, each queue's mbuf pool takes hugepage memory on the device's NUMA socket, allocated when the port starts: 2368 bytes an mbuf plus about 1.1 MB, so 40.0 MB a queue with ntcp's default of 16383 mbufs (10.8 MB at 4095), 160 MB for four threads; with `--no-huge`, 68.3 MB a queue. `dpdk.mbufs_per_queue` changes the pool size.
+- **Buffer shortage.** When a run ends, xylem logs a warning for each thread whose port ran short of mbufs: transmits that found the thread's pool empty and waited (`tx_nombuf`), and the port's receive buffer allocation failures (`rx_nombuf`) and packets the device dropped for want of a posted buffer (`rx_missed`). The two receive counts are the port's totals since it started, the same in every thread's warning; do not add them up.
 - **Privileges.** Run xylem as root (or with the capabilities DPDK needs for the device).
 - **Addresses.** ntcp's addresses must be unused on the network, and must not be the kernel's address on that device.
 - **The port takes the device's traffic.** The port is not isolated (on mlx5, an isolated port cannot read the NIC's clock, which NIC timestamps need), so while xylem runs, the kernel no longer receives the device's traffic. Keep management traffic on another interface.
@@ -137,6 +138,7 @@ prefix_len = 24
 | `dpdk.local_ips` | ntcp's IPv4 address for each worker thread that runs ntcp traffic groups, in ascending thread-ID order like `endpoints`. |
 | `dpdk.prefix_len` | Prefix length of the on-link network of `local_ips`, 1 to 32. |
 | `dpdk.gateway` | Router for targets outside that network (optional): another address on it. |
+| `dpdk.mbufs_per_queue` | Mbufs in each queue's pool (optional; ntcp's default, 16383, when left out). It must be more than the queue's RX and TX descriptors together (1024 each by default): xylem refuses 0, and the port refuses to start with fewer. A power of two less one (4095, 16383) fills the pool's ring exactly. Each mbuf takes 2368 bytes of hugepage memory (4096 with `--no-huge`), see [DPDK setup](#dpdk-setup). |
 | `af_xdp.ifname` | AF_XDP: the network interface. |
 | `af_xdp.mode` | `"native"` (default) or `"generic"` XDP. |
 | `af_xdp.local_ips`, `af_xdp.prefix_len`, `af_xdp.gateway` | As for DPDK: one address per ntcp thread, the on-link prefix and an optional router. |

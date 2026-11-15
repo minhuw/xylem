@@ -386,6 +386,15 @@
             "format": "ipv4"
           }
         },
+        "mbufs_per_queue": {
+          "description": "Mbufs in each queue's pool (ntcp's default when unset: 16383), more\nthan the queue's RX and TX descriptors together. Each pool is\nhugepage memory on the device's NUMA socket, allocated whole at\nstart: 2368 bytes an mbuf plus about 1.1 MB, so 40 MB a queue at\n16383 on 2 MiB pages (68.3 MB with --no-huge)",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 1
+        },
         "prefix_len": {
           "description": "Prefix length of the on-link network of `local_ips`",
           "type": "integer",

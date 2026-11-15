@@ -81,6 +81,10 @@ pub struct NtcpDpdkConfig {
     /// through `gateway`
     pub prefix_len: u8,
     pub gateway: Option<Ipv4Addr>,
+    /// Mbufs in each queue's pool, or ntcp's default
+    /// ([`PortConfig::mbufs_per_queue`]); `Port::start` refuses a number not
+    /// above the queue's RX and TX descriptors
+    pub mbufs_per_queue: Option<u32>,
     /// Queue `i` belongs to member `i`
     pub members: Vec<NtcpDpdkMember>,
 }
@@ -202,16 +206,21 @@ impl NtcpDpdkPort {
         port_config.mtu = config.mtu;
         port_config.isolate = false;
         port_config.rx_timestamps = config.members.iter().any(|m| m.nic_timestamps);
+        if let Some(mbufs) = config.mbufs_per_queue {
+            port_config.mbufs_per_queue = mbufs;
+        }
+        let mbufs = port_config.mbufs_per_queue;
         let port = Port::start(eal, port_config)
             .map_err(|e| io_error(&format!("start DPDK port {}", config.device), e))?;
         let mac = port.mac_address().map_err(|e| io_error("read the port's MAC address", e))?;
         tracing::info!(
-            "ntcp DPDK: port {} ({}) mac={} queues={} rx_timestamps={} rx_checksum={} \
-             tx_checksum={}",
+            "ntcp DPDK: port {} ({}) mac={} queues={} mbufs_per_queue={} rx_timestamps={} \
+             rx_checksum={} tx_checksum={}",
             port.port_id(),
             config.device,
             mac.map(|o| format!("{o:02x}")).join(":"),
             port.queues(),
+            mbufs,
             port.clock().is_some(),
             port.rx_checksum(),
             port.tx_checksum()
@@ -325,6 +334,7 @@ mod tests {
             mtu: 1500,
             prefix_len: 24,
             gateway: None,
+            mbufs_per_queue: None,
             members: Vec::new(),
         }
     }
