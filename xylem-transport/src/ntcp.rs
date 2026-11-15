@@ -1226,7 +1226,14 @@ impl<P: NtcpBackend> ConnectionGroup for NtcpConnectionGroup<P> {
                 Ok(RecvOutcome::Eof)
             }
             Ok(ReadOutcome::EmptyBuffer) => Ok(RecvOutcome::WouldBlock),
-            Err(ntcp_native::Error::WouldBlock(BlockReason::Receive | BlockReason::Connecting)) => {
+            // Nothing to read yet; or the connection's output is reserved
+            // (a packet the backend pushed back, as a full TX ring does),
+            // which keeps its data from being read until the packet leaves.
+            // Either way the refused read arms Readable: ntcp raises it once
+            // data arrives or the reservation ends with data waiting
+            Err(ntcp_native::Error::WouldBlock(
+                BlockReason::Receive | BlockReason::Connecting | BlockReason::OutputReserved,
+            )) => {
                 self.slots.set_readable(conn_id, false);
                 Ok(RecvOutcome::WouldBlock)
             }
@@ -1383,7 +1390,7 @@ mod tests {
     use std::cell::Cell;
     use std::net::SocketAddrV6;
     use std::os::unix::net::UnixDatagram;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Instant;
 
@@ -1602,6 +1609,36 @@ mod tests {
         }
         fn read_device_clock(&self) -> io::Result<u64> {
             Ok(nic_ticks())
+        }
+    }
+
+    /// A link end whose transmits the test can hold back, as a full DPDK TX
+    /// ring does: each transmit takes one of `allowance`, and with none left
+    /// the backend pushes back
+    struct GatedWire {
+        wire: Wire,
+        allowance: Arc<AtomicUsize>,
+    }
+
+    impl PacketIo for GatedWire {
+        fn layer(&self) -> PacketLayer {
+            PacketLayer::Ip
+        }
+        fn receive(&mut self, out: &mut [u8]) -> io::Result<Option<usize>> {
+            self.wire.receive(out)
+        }
+        fn transmit(&mut self, packet: &[u8]) -> io::Result<TxOutcome> {
+            let take = |n: usize| n.checked_sub(1);
+            if self.allowance.try_update(Ordering::Relaxed, Ordering::Relaxed, take).is_err() {
+                return Ok(TxOutcome::WouldBlock);
+            }
+            self.wire.transmit(packet)
+        }
+    }
+
+    impl NtcpBackend for GatedWire {
+        fn wait_fd(&self) -> Option<RawFd> {
+            self.wire.wait_fd()
         }
     }
 
@@ -1966,6 +2003,67 @@ mod tests {
         let counters = group.network().counters();
         assert_eq!(counters.discarded, 2);
         assert_eq!(drop_reasons(&counters), "PKT_TOO_SMALL 1, IP_CSUM 1");
+    }
+
+    // =========================================================================
+    // Output reservations
+    // =========================================================================
+
+    /// A client whose backend takes every transmit, and the handle that sets
+    /// how many more it takes
+    fn gated_client(wire: Wire) -> (NtcpConnectionGroup<GatedWire>, Arc<AtomicUsize>) {
+        let allowance = Arc::new(AtomicUsize::new(usize::MAX));
+        let wire = GatedWire { wire, allowance: allowance.clone() };
+        (NtcpConnectionGroup::new(network_config(CLIENT), wire).unwrap(), allowance)
+    }
+
+    #[test]
+    fn a_read_an_output_reservation_refuses_completes_once_it_ends() {
+        let (a, b) = link();
+        let _server = EchoServer::start(b, true, ServerClose::Never);
+        let (mut group, allowance) = gated_client(a);
+        let id = group.add_connection(&server_addr()).unwrap();
+        group.send(id, b"ping").unwrap();
+        let mut ready = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.contains(&id) {
+            assert!(Instant::now() < deadline, "no echo");
+            group.poll(Duration::from_millis(100), &mut ready).unwrap();
+        }
+
+        // The echo waits unread when the backend starts pushing back: the
+        // packet it refuses holds the connection's output reserved, and
+        // ntcp refuses the read
+        allowance.store(0, Ordering::Relaxed);
+        assert_eq!(group.try_send(id, b"pong").unwrap().accepted, 4);
+        group.flush().unwrap();
+        let conn = group.slots.handle(id).unwrap();
+        let mut buf = [0u8; 64];
+        assert!(matches!(
+            group.network.try_read(conn, &mut buf),
+            Err(ntcp_native::Error::WouldBlock(BlockReason::OutputReserved))
+        ));
+        // Like a read of an empty buffer: no error, and no readiness while
+        // the reservation lasts
+        assert!(matches!(group.recv(id, &mut buf).unwrap(), RecvOutcome::WouldBlock));
+        for _ in 0..3 {
+            group.poll(Duration::ZERO, &mut ready).unwrap();
+            assert!(ready.is_empty(), "{ready:?}");
+        }
+
+        // The backend takes packets again. A drive receives before it
+        // transmits, so in this one no reply to "pong" can arrive: what
+        // makes the connection ready is the end of the reservation, as the
+        // held packet leaves, with the echo still waiting
+        allowance.store(usize::MAX, Ordering::Relaxed);
+        group.poll(Duration::ZERO, &mut ready).unwrap();
+        assert_eq!(ready, [id]);
+        let RecvOutcome::Data { len, .. } = group.recv(id, &mut buf).unwrap() else {
+            panic!("no data once the reservation ended");
+        };
+        assert_eq!(&buf[..len], b"ping");
+        assert_eq!(recv_exact(&mut group, id, 4), b"pong");
+        group.close_all().unwrap();
     }
 
     // =========================================================================
