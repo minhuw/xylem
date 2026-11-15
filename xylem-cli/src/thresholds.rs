@@ -410,7 +410,8 @@ fn probe_stats() -> (Value, Value) {
         kernel_split_missing: Some(Default::default()),
         service_us: part.clone(),
         host_stack_us: Some(part.clone()),
-        network_server_us: Some(part),
+        network_server_us: Some(part.clone()),
+        user_round_trip_us: Some(part),
     };
     let global = GlobalStats {
         total_requests: 0,
@@ -1040,6 +1041,7 @@ file = "unused"
                 clock: xylem_transport::KernelClock::Realtime,
                 network_server: latency,
                 host_stack: Duration::from_micros(1),
+                user_round_trip: latency + Duration::from_micros(1),
             };
             stats.record_breakdown(
                 0,
@@ -1801,6 +1803,12 @@ nope = ["> 1"]
                 false,
             ),
             (
+                "latency_breakdown.user_round_trip_us{group=api}",
+                "p50 < 1ms",
+                path(&["latency_breakdown", "user_round_trip_us", "p50_us"]),
+                false,
+            ),
+            (
                 "latency_breakdown.kernel_split_count",
                 "> 0",
                 path(&["latency_breakdown", "kernel_split_count"]),
@@ -1839,7 +1847,8 @@ nope = ["> 1"]
             "latency_breakdown.kernel_split_count",
             "latency_breakdown.service_us,",
             "latency_breakdown.host_stack_us,",
-            "latency_breakdown.network_server_us",
+            "latency_breakdown.network_server_us,",
+            "latency_breakdown.user_round_trip_us",
         ] {
             assert!(error.contains(metric), "{metric}: {error}");
         }
@@ -2121,6 +2130,7 @@ error_latency = ["p99 > 4ms", "max < 1ms"]
                 clock: xylem_transport::KernelClock::Realtime,
                 network_server: latency,
                 host_stack: Duration::ZERO,
+                user_round_trip: latency,
             });
             stats.record_breakdown(0, &LatencyBreakdown { service: latency, kernel, miss });
         }

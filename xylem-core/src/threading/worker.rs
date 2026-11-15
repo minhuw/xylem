@@ -2565,6 +2565,7 @@ mod tests {
         // User-space timestamps only: the service latency, no kernel split
         assert_eq!(breakdown.clock, Some(BreakdownClock::UserSpace));
         assert_eq!((breakdown.kernel_split_count, breakdown.host_stack), (0, None));
+        assert_eq!(breakdown.user_round_trip, None);
         assert_eq!(worker.stats.latency_breakdown(0), breakdown);
     }
 
@@ -2599,6 +2600,10 @@ mod tests {
         // The cycles round trip spans the 1 ms sleep
         let host = breakdown.host_stack.unwrap().max.unwrap();
         assert!(host >= Duration::from_micros(900), "{host:?}");
+        // One request: its user-space round trip is the sum of the parts
+        let rtt = breakdown.user_round_trip.unwrap();
+        assert_eq!((rtt.sample_count, rtt.max), (1, Some(host + Duration::from_micros(5))));
+        assert_eq!(worker.stats.latency_breakdown(0), breakdown);
         assert_eq!(global(&worker).max_latency, Some(Duration::from_micros(5)));
     }
 

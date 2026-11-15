@@ -203,7 +203,8 @@ fn mask_summary(stdout: &str) -> (String, Vec<String>) {
 
 /// The note the console prints with every latency breakdown
 const BREAKDOWN_NOTE: &str =
-    "Each part's percentiles are of that part alone; they do not add up to the total's.";
+    "Each part's percentiles are of that part alone; they do not add up to the total's. \
+     User RTT has those of Host stack + Net+server per request.";
 
 /// The console summary of the echo profile with measured values masked.
 fn masked_summary(target: &str) -> String {
@@ -264,6 +265,7 @@ Latency breakdown (μs):
   Service:       #.##      #.##      #.##      #.##      #.##
   Host stack:    n/a (no kernel split)
   Net+server:    n/a (no kernel split)
+  User RTT:      n/a (no kernel split)
   {note}
 
 {single}
@@ -314,6 +316,7 @@ Statistics:
     Service:     #.##      #.##      #.##      #.##      #.##
     Host stack:  n/a (no kernel split)
     Net+server:  n/a (no kernel split)
+    User RTT:    n/a (no kernel split)
     {note}
 
 {single}
@@ -548,7 +551,8 @@ const MASKED_JSON: &str = r#"{
         "max_us": #
       },
       "host_stack_us": null,
-      "network_server_us": null
+      "network_server_us": null,
+      "user_round_trip_us": null
     }
   },
   "traffic_groups": [
@@ -628,7 +632,8 @@ const MASKED_JSON: &str = r#"{
             "max_us": #
           },
           "host_stack_us": null,
-          "network_server_us": null
+          "network_server_us": null,
+          "user_round_trip_us": null
         }
       },
       "connection_addrs": [
@@ -790,6 +795,7 @@ fn assert_json_results(
         assert_eq!(breakdown["clock"], "user_space");
         assert_eq!(breakdown["kernel_split_count"], 0);
         assert!(breakdown["host_stack_us"].is_null() && breakdown["network_server_us"].is_null());
+        assert!(breakdown["user_round_trip_us"].is_null());
         let service = &breakdown["service_us"];
         assert_eq!(service["sample_count"], stats["latency"]["sample_count"]);
         for key in ["mean_us", "max_us"] {

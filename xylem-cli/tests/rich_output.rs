@@ -375,6 +375,7 @@ fn latency_breakdown_is_reported_per_group_and_globally() {
                     clock: KernelClock::NicHardware,
                     network_server: Duration::from_micros(10 * us),
                     host_stack: Duration::from_micros(us),
+                    user_round_trip: Duration::from_micros(11 * us),
                 }),
                 miss: None,
             },
@@ -419,6 +420,8 @@ fn latency_breakdown_is_reported_per_group_and_globally() {
     assert_eq!(nic["host_stack_us"]["mean_us"], 50.5);
     assert_eq!(nic["host_stack_us"]["sample_count"], 100);
     assert_eq!(nic["network_server_us"]["mean_us"], 505.0);
+    assert_eq!(nic["user_round_trip_us"]["mean_us"], 555.5);
+    assert_eq!(nic["user_round_trip_us"]["max_us"], 1100.0);
     for key in ["p50_us", "p99_us", "p999_us"] {
         let p = nic["network_server_us"][key].as_f64().unwrap();
         assert!(p > 0.0 && p <= 1000.0 * 1.001, "{key}: {p}");
@@ -429,6 +432,7 @@ fn latency_breakdown_is_reported_per_group_and_globally() {
     assert_eq!(user["kernel_split_count"], 0);
     assert_eq!(user["service_us"]["mean_us"], 50.5);
     assert!(user["host_stack_us"].is_null() && user["network_server_us"].is_null());
+    assert!(user["user_round_trip_us"].is_null());
 
     // Globally the clocks differ, and only group 0's requests are split
     let global = &json["global"]["latency_breakdown"];
@@ -436,6 +440,7 @@ fn latency_breakdown_is_reported_per_group_and_globally() {
     assert_eq!(global["kernel_split_count"], 100);
     assert_eq!(global["service_us"]["sample_count"], 200);
     assert_eq!(global["host_stack_us"]["sample_count"], 100);
+    assert_eq!(global["user_round_trip_us"]["sample_count"], 100);
     // The send lag stays where it was, outside the breakdown
     assert!(json["global"]["send_lag"].is_object());
     assert!(global.get("send_lag").is_none());

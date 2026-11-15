@@ -244,6 +244,10 @@ sampling policy records every latency.
   "network_server_us": {
     "sample_count": 41230, "mean_us": 14.1, "p50_us": 13.9,
     "p99_us": 19.8, "p999_us": 31.2, "max_us": 212.4
+  },
+  "user_round_trip_us": {
+    "sample_count": 41230, "mean_us": 23.9, "p50_us": 23.4,
+    "p99_us": 31.6, "p999_us": 47.9, "max_us": 398.1
   }
 }
 ```
@@ -270,12 +274,18 @@ The parts of one request are:
   taken inside the send call, so this subtracts the end of that call; a NIC
   usually transmits after the call returned, so with NIC timestamps this adds
   the send path through the stack, driver and NIC queue.
+- `user_round_trip_us`: for the same requests, the user-space round trip
+  itself: cycles from the send call's return to the receive call's return.
+  Per request it is `network_server_us + host_stack_us`, except where
+  `host_stack_us` saturated at zero, where it is less (the kernel round trip
+  was the longer). Its percentiles are those of that sum per request, which
+  the two parts' percentiles cannot give.
 
 Each part's two terms are measured in one clock; xylem subtracts durations,
-never times from different clocks. `host_stack_us` and `network_server_us`
-are `null` when no request had a kernel split. Requests whose TX or RX
-timestamp did not arrive, or came from different clocks, count in
-`service_us` alone.
+never times from different clocks. `host_stack_us`, `network_server_us` and
+`user_round_trip_us` are `null` when no request had a kernel split. Requests
+whose TX or RX timestamp did not arrive, or came from different clocks, count
+in `service_us` alone.
 
 - `clock`: the clock of the service latencies: `user_space` (no kernel split),
   `kernel_software`, `nic_hardware`, `nic_calibrated`, or `mixed` when the
@@ -306,9 +316,9 @@ digits; the values are `null` without samples. Each part's percentiles are
 taken over that part alone, so they do not add up: the p99 of
 `host_stack_us` plus the p99 of `network_server_us` is not the p99 of the
 latency, and the slowest requests of one part need not be the slowest of
-another. Only the means add up: `host_stack_us.mean_us +
-network_server_us.mean_us` is the mean user-space round trip of the split
-requests, unless some `host_stack_us` saturated at zero.
+another. For the percentiles of the host stack and the network and server
+together, read `user_round_trip_us`, which records each split request's sum
+(see above for where `host_stack_us` saturated).
 
 The console prints the same parts in one row each, and the HTML report in a
 table per scope; both add the `kernel_split_missing` counts when present.

@@ -81,8 +81,9 @@ fields added in later versions:
   `error_latency` (the latencies of [error replies](./output-formats.md#error-replies)),
   `send_lag`, and the parts of the
   [latency breakdown](./output-formats.md#latency-breakdown),
-  `latency_breakdown.service_us`, `latency_breakdown.host_stack_us` and
-  `latency_breakdown.network_server_us`. An expression on a summary names an
+  `latency_breakdown.service_us`, `latency_breakdown.host_stack_us`,
+  `latency_breakdown.network_server_us` and
+  `latency_breakdown.user_round_trip_us`. An expression on a summary names an
   aggregation, which picks one of its `_us` fields.
 - **Single values** are the other numbers: `total_requests`,
   `throughput_rps` (also written `throughput`), `throughput_mbps`,
@@ -110,6 +111,7 @@ the results.
 "requests.errors"                     = ["rate < 0.01"]   # error replies / requests.sent
 "error_latency"                       = ["p99 < 5ms"]
 "latency_breakdown.network_server_us" = ["p99 < 100us"]   # needs kernel or NIC timestamps
+"latency_breakdown.user_round_trip_us" = ["p99 < 150us"]  # host stack + network and server
 "latency_breakdown.kernel_split_count" = ["rate > 0.99"]  # the split covers the requests
 ```
 
@@ -147,9 +149,9 @@ A threshold fails when the run has no value for it, and its `observed` is
 
 - a `null` field, such as `send_lag` of a closed loop, `latency.min_us` when
   no latency was recorded (see [latency fields](./output-formats.md#latency-fields)),
-  or `latency_breakdown.host_stack_us` and `network_server_us` when no request
-  had a kernel split (user-space timestamps, or a transport without kernel
-  timestamps);
+  or `latency_breakdown.host_stack_us`, `network_server_us` and
+  `user_round_trip_us` when no request had a kernel split (user-space
+  timestamps, or a transport without kernel timestamps);
 - a duration field of `latency` or `error_latency` when its `sample_count`
   is zero;
 - `std_dev_us` or `confidence_interval_us` of either summary when its

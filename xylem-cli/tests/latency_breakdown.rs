@@ -117,7 +117,7 @@ fn kernel_timestamps_split_the_round_trip_over_tcp_and_udp() {
             assert_eq!(breakdown["kernel_split_missing"], missing, "{context}");
             let service = &breakdown["service_us"];
             assert_eq!(service["sample_count"], samples, "{context}");
-            for part in ["host_stack_us", "network_server_us"] {
+            for part in ["host_stack_us", "network_server_us", "user_round_trip_us"] {
                 let part = &breakdown[part];
                 assert_eq!(part["sample_count"], split, "{context}");
                 for key in ["mean_us", "p50_us", "p99_us", "p999_us", "max_us"] {
@@ -127,6 +127,13 @@ fn kernel_timestamps_split_the_round_trip_over_tcp_and_udp() {
             }
             let network = &breakdown["network_server_us"];
             assert!(f64_at(network, "p50_us") > 0.0, "{context}");
+            // Each request's user-space round trip is at most its two parts'
+            // sum: equal, or less where host_stack saturated at zero
+            let (host, rtt) = (&breakdown["host_stack_us"], &breakdown["user_round_trip_us"]);
+            let sum = |key| f64_at(host, key) + f64_at(network, key);
+            assert!(f64_at(rtt, "mean_us") <= sum("mean_us") + 0.002, "{context}");
+            assert!(f64_at(rtt, "max_us") <= sum("max_us") + 1e-6, "{context}");
+            assert!(f64_at(rtt, "p50_us") > 0.0, "{context}");
             // The latency uses the kernel round trip, so split requests'
             // service latency is it
             assert_eq!(service, network, "{context}");
@@ -152,6 +159,7 @@ fn user_space_timestamps_report_only_the_service_latency() {
         assert!(breakdown.get("kernel_split_missing").is_none(), "{breakdown}");
         assert!(breakdown["host_stack_us"].is_null(), "{breakdown}");
         assert!(breakdown["network_server_us"].is_null(), "{breakdown}");
+        assert!(breakdown["user_round_trip_us"].is_null(), "{breakdown}");
         assert_eq!(breakdown["service_us"]["sample_count"], samples, "{breakdown}");
         assert!(f64_at(&breakdown["service_us"], "p99_us") > 0.0, "{breakdown}");
     }

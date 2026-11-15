@@ -2828,6 +2828,7 @@ mod tests {
             split.host_stack,
             recv_ts.cycles_duration_since(&send_ts).saturating_sub(split.network_server)
         );
+        assert_eq!(split.user_round_trip, recv_ts.cycles_duration_since(&send_ts));
         assert_eq!(unstamped.service, recv_ts.duration_since(&send_ts));
         assert_eq!(unstamped.kernel, None);
         // and says it lacked its TX timestamp

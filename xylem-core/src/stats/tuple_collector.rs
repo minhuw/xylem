@@ -3406,6 +3406,7 @@ mod tests {
                 clock: KernelClock::Realtime,
                 network_server: Duration::from_micros(network_us),
                 host_stack: Duration::from_micros(host_us),
+                user_round_trip: Duration::from_micros(host_us + network_us),
             }),
             miss: None,
         };
@@ -3427,14 +3428,18 @@ mod tests {
         assert_eq!(group0.service.mean, Some(Duration::from_micros(100) / 3));
         assert_eq!(group0.host_stack.unwrap().max, Some(Duration::from_micros(9)));
         assert_eq!(group0.network_server.unwrap().max, Some(Duration::from_micros(50)));
+        let rtt = group0.user_round_trip.unwrap();
+        assert_eq!((rtt.sample_count, rtt.max), (3, Some(Duration::from_micros(59))));
         let group1 = merged.latency_breakdown(1);
         assert_eq!(group1.clock, Some(BreakdownClock::UserSpace));
         assert_eq!((group1.kernel_split_count, group1.host_stack), (0, None));
+        assert_eq!(group1.user_round_trip, None);
 
         let global = merged.latency_breakdown_global();
         assert_eq!(global.clock, Some(BreakdownClock::Mixed));
         assert_eq!((global.kernel_split_count, global.service.sample_count), (3, 4));
         assert_eq!(global.service.max, Some(Duration::from_micros(50)));
+        assert_eq!(global.user_round_trip.unwrap().sample_count, 3);
         assert_eq!(merged.latency_breakdown(9), BreakdownSummary::default());
     }
 

@@ -14,6 +14,10 @@
 //!   the time from the kernel RX timestamp to the receive call's return,
 //!   minus the time from the kernel TX timestamp to the send call's return
 //!   (negative when the NIC transmits after the call returned).
+//! - `user_round_trip`: the user-space round trip itself, unsaturated, so
+//!   one request's exact `network_server + host_stack` (the two differ only
+//!   where `host_stack` saturated at zero). Percentiles of the parts don't
+//!   add up; this part gives the percentiles of their sum.
 //!
 //! Only durations are subtracted, each measured in one clock; times from
 //! different clocks are never compared.
@@ -78,6 +82,10 @@ pub struct KernelSplit {
     pub network_server: Duration,
     /// User-space round trip minus the kernel round trip, zero if negative
     pub host_stack: Duration,
+    /// User-space round trip: cycles from the send call's return to the
+    /// receive call's return. Equals `network_server + host_stack` unless
+    /// `host_stack` saturated at zero, where it is less.
+    pub user_round_trip: Duration,
 }
 
 /// Why a request's round trip has no kernel split
@@ -124,6 +132,7 @@ impl LatencyBreakdown {
                         clock: tx.clock,
                         network_server: kernel_rtt,
                         host_stack: user_rtt.saturating_sub(kernel_rtt),
+                        user_round_trip: user_rtt,
                     }),
                     miss: None,
                 };
@@ -275,8 +284,10 @@ pub struct BreakdownStats {
     clocks: u8,
     service: PartStats,
     /// Recorded only for requests with a kernel split, like `network_server`
+    /// and `user_round_trip`
     host_stack: PartStats,
     network_server: PartStats,
+    user_round_trip: PartStats,
     /// Requests without a kernel split, by cause
     missing: SplitMissCounts,
 }
@@ -290,6 +301,7 @@ impl BreakdownStats {
         if let Some(split) = breakdown.kernel {
             self.host_stack.record(split.host_stack);
             self.network_server.record(split.network_server);
+            self.user_round_trip.record(split.user_round_trip);
         }
         if let Some(miss) = breakdown.miss {
             self.missing.record(miss);
@@ -302,6 +314,7 @@ impl BreakdownStats {
         self.service.merge(&other.service);
         self.host_stack.merge(&other.host_stack);
         self.network_server.merge(&other.network_server);
+        self.user_round_trip.merge(&other.user_round_trip);
         self.missing.merge(&other.missing);
     }
 
@@ -316,6 +329,7 @@ impl BreakdownStats {
             service: self.service.summary(),
             host_stack: split(&self.host_stack),
             network_server: split(&self.network_server),
+            user_round_trip: split(&self.user_round_trip),
         }
     }
 }
@@ -334,6 +348,11 @@ pub struct BreakdownSummary {
     pub host_stack: Option<PartSummary>,
     /// `None` when no request had a kernel split
     pub network_server: Option<PartSummary>,
+    /// The user-space round trip of the split requests, whose percentiles
+    /// are those of `host_stack + network_server` per request (see
+    /// [`KernelSplit::user_round_trip`]); `None` when no request had a
+    /// kernel split
+    pub user_round_trip: Option<PartSummary>,
 }
 
 #[cfg(test)]
@@ -374,6 +393,7 @@ mod tests {
                     clock,
                     network_server: kernel_rtt,
                     host_stack: user_rtt - kernel_rtt,
+                    user_round_trip: user_rtt,
                 })
             );
             assert_eq!(breakdown.clock(), expected);
@@ -452,9 +472,44 @@ mod tests {
         let split = LatencyBreakdown::between(&send, &recv).kernel.unwrap();
         assert_eq!(split.network_server, Duration::from_millis(1));
         assert_eq!(split.host_stack, Duration::ZERO);
+        // The user-space round trip stays unsaturated: less than the sum
+        assert_eq!(split.user_round_trip, recv.cycles_duration_since(&send));
+        assert!(split.user_round_trip < split.network_server + split.host_stack);
         // A kernel RX timestamp before the TX one saturates too
         let recv = Timestamp::now().with_kernel(kernel(500_000, KernelClock::Realtime));
         assert_eq!(LatencyBreakdown::between(&send, &recv).service, Duration::ZERO);
+    }
+
+    #[test]
+    fn user_round_trip_is_recorded_unsaturated_for_split_requests_only() {
+        let sw = |ts: Timestamp, nanos| ts.with_kernel(kernel(nanos, KernelClock::Realtime));
+        // 20 ms of cycles around a 5 ms kernel round trip
+        let (send, recv) = round_trip();
+        let long = recv.cycles_duration_since(&send);
+        let unsaturated = LatencyBreakdown::between(&sw(send, 1_000_000), &sw(recv, 6_000_000));
+        let split = unsaturated.kernel.unwrap();
+        assert_eq!(split.user_round_trip, long);
+        assert_eq!(split.user_round_trip, split.network_server + split.host_stack);
+        // Cycles read back to back around a 1 ms kernel round trip: host_stack
+        // saturates, the user-space round trip is shorter than the sum
+        let (send, recv) = (Timestamp::now(), Timestamp::now());
+        let short = recv.cycles_duration_since(&send);
+        let saturated = LatencyBreakdown::between(&sw(send, 1_000_000), &sw(recv, 2_000_000));
+        let split = saturated.kernel.unwrap();
+        assert_eq!(split.host_stack, Duration::ZERO);
+        assert_eq!(split.user_round_trip, short);
+        assert!(split.user_round_trip < split.network_server + split.host_stack);
+
+        let mut stats = BreakdownStats::default();
+        stats.record(&unsaturated);
+        stats.record(&saturated);
+        // A request without a split adds nothing to the part
+        stats.record(&LatencyBreakdown::user_space(Duration::from_secs(1)));
+        let rtt = stats.summary().user_round_trip.unwrap();
+        let ns = |duration: Duration| duration.as_nanos() as u64;
+        assert_eq!(rtt.sample_count, 2);
+        assert_eq!(rtt.max, Some(Duration::from_nanos(ns(long))));
+        assert_eq!(rtt.mean, Some(Duration::from_nanos((ns(long) + ns(short)) / 2)));
     }
 
     fn user(us: u64) -> LatencyBreakdown {
@@ -468,6 +523,7 @@ mod tests {
                 clock,
                 network_server: Duration::from_micros(network_us),
                 host_stack: Duration::from_micros(host_us),
+                user_round_trip: Duration::from_micros(host_us + network_us),
             }),
             miss: None,
         }
@@ -484,6 +540,7 @@ mod tests {
         assert_eq!(summary.clock, Some(BreakdownClock::UserSpace));
         assert_eq!(summary.kernel_split_count, 0);
         assert_eq!((summary.host_stack, summary.network_server), (None, None));
+        assert_eq!(summary.user_round_trip, None);
         let service = summary.service;
         assert_eq!(service.sample_count, 1000);
         assert_eq!(service.mean, Some(Duration::from_nanos(500_500)));
@@ -526,6 +583,9 @@ mod tests {
         assert_eq!(host.mean, Some(Duration::from_micros(105) / 11));
         let network = summary.network_server.unwrap();
         assert_eq!((network.sample_count, network.max), (11, Some(Duration::from_micros(500))));
+        let rtt = summary.user_round_trip.unwrap();
+        assert_eq!((rtt.sample_count, rtt.max), (11, Some(Duration::from_micros(550))));
+        assert_eq!(rtt.mean, Some(Duration::from_micros(55 + 550 + 50 + 500) / 11));
 
         // Hardware and software splits in one scope are mixed too
         let mut hw = BreakdownStats::default();

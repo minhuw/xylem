@@ -115,7 +115,7 @@ pub struct LatencyBreakdownStats {
     pub clock: Option<BreakdownClock>,
     /// Requests whose send and receive had kernel timestamps from the same
     /// clock, which split their round trip into `host_stack_us` and
-    /// `network_server_us`
+    /// `network_server_us`; `user_round_trip_us` holds their whole round trip
     pub kernel_split_count: u64,
     /// Requests without a kernel split, by what they lacked: `tx` (no kernel
     /// TX timestamp), `rx` (no kernel RX timestamp; a request with neither
@@ -133,6 +133,13 @@ pub struct LatencyBreakdownStats {
     /// Kernel round trip, kernel RX minus kernel TX timestamp; null when no
     /// request had a kernel split
     pub network_server_us: Option<BreakdownPartStats>,
+    /// User-space round trip of the requests with a kernel split, cycles from
+    /// the send call's return to the receive call's return: per request
+    /// `network_server_us + host_stack_us`, except where `host_stack_us`
+    /// saturated at zero, where it is less. Its percentiles are those of that
+    /// sum, which the parts' percentiles do not give. Null when no request had
+    /// a kernel split
+    pub user_round_trip_us: Option<BreakdownPartStats>,
 }
 
 impl LatencyBreakdownStats {
@@ -146,15 +153,17 @@ impl LatencyBreakdownStats {
             service_us: BreakdownPartStats::new(&summary.service),
             host_stack_us: summary.host_stack.as_ref().map(BreakdownPartStats::new),
             network_server_us: summary.network_server.as_ref().map(BreakdownPartStats::new),
+            user_round_trip_us: summary.user_round_trip.as_ref().map(BreakdownPartStats::new),
         }
     }
 
     /// Each part with its label, in output order
-    pub(crate) fn parts(&self) -> [(&'static str, Option<&BreakdownPartStats>); 3] {
+    pub(crate) fn parts(&self) -> [(&'static str, Option<&BreakdownPartStats>); 4] {
         [
             ("Service", Some(&self.service_us)),
             ("Host stack", self.host_stack_us.as_ref()),
             ("Net+server", self.network_server_us.as_ref()),
+            ("User RTT", self.user_round_trip_us.as_ref()),
         ]
     }
 
@@ -205,7 +214,8 @@ impl BreakdownPartStats {
 
 /// Note shown with every latency breakdown
 pub(crate) const BREAKDOWN_NOTE: &str =
-    "Each part's percentiles are of that part alone; they do not add up to the total's.";
+    "Each part's percentiles are of that part alone; they do not add up to the total's. \
+     User RTT has those of Host stack + Net+server per request.";
 
 /// Microseconds in a duration.
 fn micros(duration: Duration) -> f64 {

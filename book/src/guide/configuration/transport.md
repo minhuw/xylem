@@ -141,7 +141,8 @@ clock, and the cycles otherwise; either way the
 [latency breakdown](../output-formats.md#latency-breakdown) reports the
 service latency, and with kernel timestamps it splits the round trip into the
 part between the user-space and the kernel timestamps (`host_stack_us`) and
-the kernel round trip (`network_server_us`). A
+the kernel round trip (`network_server_us`), and reports the whole user-space
+round trip of those requests (`user_round_trip_us`). A
 request whose TX or RX timestamp did not arrive is measured in cycles and
 counted in `service_us` alone; `kernel_split_count` says how many were split,
 and `kernel_split_missing` why the others were not (no TX timestamp, no RX

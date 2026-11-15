@@ -112,7 +112,7 @@ fn html_report_preserves_data_and_escapes_profile_text() {
     assert_cell(group, "p50 Latency", "1.25 μs");
     assert_cell(group, "p99 Latency", "3.75 μs");
     assert_eq!(body.matches("<h4>Latency Breakdown</h4>").count(), 2);
-    assert_eq!(body.matches("<td colspan=\"5\">n/a (no kernel split)</td>").count(), 4);
+    assert_eq!(body.matches("<td colspan=\"5\">n/a (no kernel split)</td>").count(), 6);
     assert_eq!(body.matches("they do not add up to the total").count(), 2);
     assert_eq!(body.matches("<td>Requests Timed Out (no latency)</td>").count(), 2);
     assert!(body.contains("<td>Latency Samples</td>\n                    <td>1</td>"));
