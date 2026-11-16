@@ -82,6 +82,11 @@ ip link set lo up
 for i in 0 1; do
     # `ip tuntap add` creates IFF_TUN | IFF_NO_PI, as Tun::open requires
     ip tuntap add dev "ntcp$i" mode tun
+    # Else the kernel sends a router solicitation into the device when ntcp
+    # opens it, which ntcp's IPv4-only endpoint discards
+    if [[ -d /proc/sys/net/ipv6 ]]; then
+        echo 1 >"/proc/sys/net/ipv6/conf/ntcp$i/disable_ipv6"
+    fi
     ip addr add "10.7$((3 + i)).0.1/24" dev "ntcp$i"
     ip link set "ntcp$i" mtu 1500 up
 done
