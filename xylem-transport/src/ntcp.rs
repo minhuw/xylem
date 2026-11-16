@@ -657,6 +657,18 @@ impl<P: NtcpBackend> NtcpConnectionGroup<P> {
         self.last_tick
     }
 
+    /// `network_error`, and for `Stopped` the failure that stopped the
+    /// network: a drive that fails for anything else stops the network
+    /// first, and every later call only says `Stopped`
+    fn network_error(&self, context: &str, e: ntcp_native::Error) -> Error {
+        match (&e, self.network.failure()) {
+            (ntcp_native::Error::Stopped, Some(failure)) => {
+                Error::Connection(format!("{context}: {e}: {failure}"))
+            }
+            _ => network_error(context, e),
+        }
+    }
+
     /// The tick `timeout` from now
     fn deadline_after(&mut self, timeout: Duration) -> u64 {
         self.now().saturating_add(ticks(timeout))
@@ -719,7 +731,7 @@ impl<P: NtcpBackend> NtcpConnectionGroup<P> {
                     false
                 }
                 Err(e) if e.is_would_block() => true,
-                Err(e) => return Err(network_error("ntcp send", e)),
+                Err(e) => return Err(self.network_error("ntcp send", e)),
             };
             // A full buffer, used-up TX timestamp records or no memory
             if !spin {
@@ -766,7 +778,10 @@ impl<P: NtcpBackend> NtcpConnectionGroup<P> {
     /// Drive the network once with `budget`
     fn drive_with(&mut self, budget: WorkBudget) -> Result<DriveReport> {
         let now = self.now();
-        let report = self.network.drive(now, budget).map_err(|e| network_error("ntcp drive", e))?;
+        let report = match self.network.drive(now, budget) {
+            Ok(report) => report,
+            Err(e) => return Err(self.network_error("ntcp drive", e)),
+        };
         // What was written before is on its way; a drive that ran out of
         // transmit budget reports more work, which the caller drives again
         self.unflushed = false;
@@ -1114,7 +1129,7 @@ impl<P: NtcpBackend> ConnectionGroup for NtcpConnectionGroup<P> {
                     self.slots.len()
                 ),
             )),
-            e => network_error(&format!("ntcp connect to {target}"), e),
+            e => self.network_error(&format!("ntcp connect to {target}"), e),
         })?;
         if self.stamp_records.is_empty() {
             self.stamp_records = stamp_records(conn);
@@ -1164,7 +1179,7 @@ impl<P: NtcpBackend> ConnectionGroup for NtcpConnectionGroup<P> {
         if let Err(e) = self.network.set_nodelay(conn, true) {
             self.slots.remove(id);
             let _ = self.network.abort(conn);
-            return Err(network_error("ntcp set_nodelay", e));
+            return Err(self.network_error("ntcp set_nodelay", e));
         }
         Ok(id)
     }
@@ -1226,18 +1241,13 @@ impl<P: NtcpBackend> ConnectionGroup for NtcpConnectionGroup<P> {
                 Ok(RecvOutcome::Eof)
             }
             Ok(ReadOutcome::EmptyBuffer) => Ok(RecvOutcome::WouldBlock),
-            // Nothing to read yet; or the connection's output is reserved
-            // (a packet the backend pushed back, as a full TX ring does),
-            // which keeps its data from being read until the packet leaves.
-            // Either way the refused read arms Readable: ntcp raises it once
-            // data arrives or the reservation ends with data waiting
-            Err(ntcp_native::Error::WouldBlock(
-                BlockReason::Receive | BlockReason::Connecting | BlockReason::OutputReserved,
-            )) => {
+            // Nothing to read yet: the refused read arms Readable, which
+            // ntcp raises once data arrives
+            Err(ntcp_native::Error::WouldBlock(BlockReason::Receive | BlockReason::Connecting)) => {
                 self.slots.set_readable(conn_id, false);
                 Ok(RecvOutcome::WouldBlock)
             }
-            Err(e) => Err(network_error("ntcp recv", e)),
+            Err(e) => Err(self.network_error("ntcp recv", e)),
         }
     }
 
@@ -1642,6 +1652,34 @@ mod tests {
         }
     }
 
+    /// A link end whose transmits fail once the test breaks it, as a
+    /// device that went away does
+    struct BrokenWire {
+        wire: Wire,
+        broken: Arc<AtomicBool>,
+    }
+
+    impl PacketIo for BrokenWire {
+        fn layer(&self) -> PacketLayer {
+            PacketLayer::Ip
+        }
+        fn receive(&mut self, out: &mut [u8]) -> io::Result<Option<usize>> {
+            self.wire.receive(out)
+        }
+        fn transmit(&mut self, packet: &[u8]) -> io::Result<TxOutcome> {
+            if self.broken.load(Ordering::Relaxed) {
+                return Err(io::Error::other("the link broke"));
+            }
+            self.wire.transmit(packet)
+        }
+    }
+
+    impl NtcpBackend for BrokenWire {
+        fn wait_fd(&self) -> Option<RawFd> {
+            self.wire.wait_fd()
+        }
+    }
+
     const CLIENT: &str = "10.99.0.2";
     const SERVER: &str = "10.99.0.1";
     const PORT: u16 = 7000;
@@ -2018,7 +2056,7 @@ mod tests {
     }
 
     #[test]
-    fn a_read_an_output_reservation_refuses_completes_once_it_ends() {
+    fn a_read_takes_effect_while_the_backend_pushes_back() {
         let (a, b) = link();
         let _server = EchoServer::start(b, true, ServerClose::Never);
         let (mut group, allowance) = gated_client(a);
@@ -2032,38 +2070,67 @@ mod tests {
         }
 
         // The echo waits unread when the backend starts pushing back: the
-        // packet it refuses holds the connection's output reserved, and
-        // ntcp refuses the read
+        // "pong" it refuses holds the connection's output reserved
         allowance.store(0, Ordering::Relaxed);
         assert_eq!(group.try_send(id, b"pong").unwrap().accepted, 4);
         group.flush().unwrap();
-        let conn = group.slots.handle(id).unwrap();
-        let mut buf = [0u8; 64];
-        assert!(matches!(
-            group.network.try_read(conn, &mut buf),
-            Err(ntcp_native::Error::WouldBlock(BlockReason::OutputReserved))
-        ));
-        // Like a read of an empty buffer: no error, and no readiness while
-        // the reservation lasts
-        assert!(matches!(group.recv(id, &mut buf).unwrap(), RecvOutcome::WouldBlock));
-        for _ in 0..3 {
-            group.poll(Duration::ZERO, &mut ready).unwrap();
-            assert!(ready.is_empty(), "{ready:?}");
-        }
+        let pushed_back = group.network().counters().backend_backpressure;
+        assert!(pushed_back > 0);
+        assert!(group.drive().unwrap().tx_blocked);
 
-        // The backend takes packets again. A drive receives before it
-        // transmits, so in this one no reply to "pong" can arrive: what
-        // makes the connection ready is the end of the reservation, as the
-        // held packet leaves, with the echo still waiting
-        allowance.store(usize::MAX, Ordering::Relaxed);
-        group.poll(Duration::ZERO, &mut ready).unwrap();
-        assert_eq!(ready, [id]);
+        // The read takes effect all the same: it returns the echo
+        let mut buf = [0u8; 64];
         let RecvOutcome::Data { len, .. } = group.recv(id, &mut buf).unwrap() else {
-            panic!("no data once the reservation ended");
+            panic!("no data while the backend pushes back");
         };
         assert_eq!(&buf[..len], b"ping");
+
+        // "pong" stays held while the backend refuses it, so no echo of it
+        // arrives
+        for _ in 0..5 {
+            group.poll(Duration::from_millis(5), &mut ready).unwrap();
+            assert!(ready.is_empty(), "{ready:?}");
+        }
+        assert!(group.network().counters().backend_backpressure > pushed_back);
+
+        // Once the backend takes packets again, the held "pong" leaves and
+        // its echo comes back
+        allowance.store(usize::MAX, Ordering::Relaxed);
         assert_eq!(recv_exact(&mut group, id, 4), b"pong");
         group.close_all().unwrap();
+    }
+
+    #[test]
+    fn calls_after_a_failed_drive_name_its_failure() {
+        let (a, b) = link();
+        let _server = EchoServer::start(b, true, ServerClose::Never);
+        let broken = Arc::new(AtomicBool::new(false));
+        let wire = BrokenWire { wire: a, broken: broken.clone() };
+        let mut group = NtcpConnectionGroup::new(network_config(CLIENT), wire).unwrap();
+        let id = group.add_connection(&server_addr()).unwrap();
+
+        // The drive that meets the backend's failure stops the network
+        broken.store(true, Ordering::Relaxed);
+        group.try_send(id, b"lost").unwrap();
+        let err = group.flush().unwrap_err();
+        assert!(err.to_string().contains("the link broke"), "{err}");
+        assert!(group.network().is_stopped());
+
+        // Later calls only get Stopped from ntcp; the error says why
+        for err in [
+            group.try_send(id, b"x").unwrap_err(),
+            group.recv(id, &mut [0u8; 8]).unwrap_err(),
+            group.add_connection(&server_addr()).unwrap_err(),
+        ] {
+            assert!(
+                matches!(&err, Error::Connection(m) if m.contains("stopped")
+                && m.contains("the link broke")),
+                "{err}"
+            );
+        }
+        let mut ready = Vec::new();
+        let err = group.poll(Duration::ZERO, &mut ready).unwrap_err();
+        assert!(err.to_string().contains("the link broke"), "{err}");
     }
 
     // =========================================================================
