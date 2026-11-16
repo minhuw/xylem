@@ -2,12 +2,14 @@
 //!
 //! `NtcpConnectionGroup` runs every connection of a group on one
 //! caller-driven ntcp [`Network`], generic over its packet backend (`P`). The
-//! group drives the network from its own calls: `add_connection`, `flush`,
-//! `poll` and `close_all` advance the stack. `send` only writes into it, so
-//! that a round of sends costs a pass or two of the stack, at the worker's
-//! `flush` calls or the next `poll`. When the stack has nothing left to do, `poll` blocks on the
-//! backend's file descriptor, or keeps driving a backend that has none
-//! (DPDK, AF_XDP).
+//! group drives the network from its own calls: `add_connection`, `poll`
+//! and `close_all` advance the stack. `send` writes into it and then pushes
+//! the connection's output ([`Network::push`]), as Linux's sendmsg ends in
+//! tcp_push, so `flush` has nothing to transmit. What a push leaves (output
+//! autocorking held, frames waiting for backend room) goes out in the next
+//! `poll`'s first drive, before it can sleep. When the stack has nothing
+//! left to do, `poll` blocks on the backend's file descriptor, or keeps
+//! driving a backend that has none (DPDK, AF_XDP).
 //!
 //! `NtcpTunFactory` builds groups over an existing Linux TUN device,
 //! [`dpdk::NtcpDpdkFactory`] (`ntcp-dpdk` feature) over one queue pair of a
@@ -66,13 +68,6 @@ pub mod dpdk;
 /// other values. A drive that hits a limit reports `more_work`, so the group
 /// drives again before it blocks.
 const WORK_BUDGET: WorkBudget = WorkBudget::new(64, 64, 64, 64);
-
-/// Work done by each drive of `flush`, which puts the round's requests on
-/// the wire: transmit only
-///
-/// Following ntcp's guidance, received packets and timers wait for the next
-/// `poll` instead of costing every round a full drive.
-const FLUSH_BUDGET: WorkBudget = WorkBudget::new(0, WORK_BUDGET.transmit, 0, 0);
 
 /// Number of events taken from the network per `drain_events` call
 const EVENT_BATCH: usize = 64;
@@ -522,8 +517,14 @@ pub struct NtcpConnectionGroup<P: NtcpBackend> {
     tx_stamps: Vec<TxTimestampInfo>,
     /// Present once NIC timestamps are enabled
     nic: Option<NicClock>,
-    /// `send` wrote bytes that no drive has transmitted yet
-    unflushed: bool,
+    /// A push since the last drive left work for a drive (`more_work`)
+    push_work: bool,
+    /// The latest a wait may sleep to: the earliest of the last drive's
+    /// `next_deadline` and those of the pushes since, each of which is only
+    /// its own connection's (and neighbor tables') deadline
+    wake_by: Option<u64>,
+    /// The last drive left a frame waiting for backend room
+    tx_blocked: bool,
     /// The last tick passed to ntcp, which rejects time going backwards
     last_tick: u64,
     /// Source of ticks; tests replace it
@@ -584,7 +585,9 @@ impl<P: NtcpBackend> NtcpConnectionGroup<P> {
             stamp_records: Vec::new(),
             tx_stamps: Vec::new(),
             nic: None,
-            unflushed: false,
+            push_work: false,
+            wake_by: None,
+            tx_blocked: false,
             last_tick: now,
             clock: now_ticks,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
@@ -774,10 +777,16 @@ impl<P: NtcpBackend> NtcpConnectionGroup<P> {
                 self.drain_stamps();
             }
         }
-        // The bytes are in the stack; they go on the wire at the next flush
-        // or poll, which the worker calls after its round of sends
+        // Taken once the stack has the bytes, before the push transmits them
         let timestamp = Timestamp::now();
-        self.unflushed |= sent > 0;
+        if sent > 0 {
+            self.push(conn)?;
+            if stamped {
+                // The push scheduled the bytes unless the peer's window or
+                // autocorking held them back: their stamps are then ready
+                self.drain_stamps();
+            }
+        }
         let tx = match range {
             Some((start, end)) if stamped => Some(TxRange { start: start as u32, end: end as u32 }),
             _ => None,
@@ -788,22 +797,44 @@ impl<P: NtcpBackend> NtcpConnectionGroup<P> {
         })
     }
 
-    /// Drive the network once with `budget`
-    fn drive_with(&mut self, budget: WorkBudget) -> Result<DriveReport> {
-        let now = self.now();
-        let report = match self.network.drive(now, budget) {
-            Ok(report) => report,
-            Err(e) => return Err(self.network_error("ntcp drive", e)),
-        };
-        // What was written before is on its way; a drive that ran out of
-        // transmit budget reports more work, which the caller drives again
-        self.unflushed = false;
-        Ok(report)
+    /// Send what the writes of one send left on `conn`, as Linux's tcp_push
+    /// at the end of sendmsg: push until the connection has nothing more to
+    /// send now or the backend pushes back
+    ///
+    /// Never drives: a drive between the sends of one round would end the
+    /// autocorking holds of the round's earlier sends. What the pushes leave
+    /// for a drive, and the deadlines they arm, `wait` honours.
+    fn push(&mut self, conn: ConnId) -> Result<()> {
+        loop {
+            let now = self.now();
+            let report = match self.network.push(conn, now) {
+                Ok(report) => report,
+                Err(e) => return Err(self.network_error("ntcp push", e)),
+            };
+            self.push_work |= report.more_work;
+            if let Some(next) = report.next_deadline {
+                self.wake_by = Some(self.wake_by.map_or(next, |d| d.min(next)));
+            }
+            if !report.more || report.tx_blocked {
+                return Ok(());
+            }
+        }
     }
 
     /// Drive the network once: receive, transmit, timers and reclaim
     fn drive(&mut self) -> Result<DriveReport> {
-        self.drive_with(WORK_BUDGET)
+        let now = self.now();
+        let report = match self.network.drive(now, WORK_BUDGET) {
+            Ok(report) => report,
+            Err(e) => return Err(self.network_error("ntcp drive", e)),
+        };
+        // The drive sent what the pushes left, and its deadline is the
+        // network's, which covers theirs; a drive that ran out of budget
+        // reports more work, which the caller drives again
+        self.push_work = false;
+        self.wake_by = report.next_deadline;
+        self.tx_blocked = report.tx_blocked;
+        Ok(report)
     }
 
     /// Drain every pending event into the slot table; returns whether the
@@ -889,21 +920,26 @@ impl<P: NtcpBackend> NtcpConnectionGroup<P> {
     /// Wait on the backend fd until it is ready, the next ntcp timer, or
     /// `deadline` (ticks), whichever comes first; return at once for a
     /// backend without an fd, which the caller then drives again
-    fn wait(&mut self, report: &DriveReport, deadline: u64) -> Result<()> {
+    ///
+    /// A push since the last drive that left work for a drive returns at
+    /// once too. Otherwise the wait ends no later than the earliest of the
+    /// last drive's `next_deadline` and those of the pushes since, as ntcp
+    /// asks of an embedding that sleeps.
+    fn wait(&mut self, deadline: u64) -> Result<()> {
+        if self.push_work {
+            return Ok(());
+        }
         let Some(fd) = self.network.backend().wait_fd() else {
             std::hint::spin_loop();
             return Ok(());
         };
         let now = self.now();
-        let mut until = deadline;
-        if let Some(timer) = report.next_deadline {
-            until = until.min(timer);
-        }
+        let until = self.wake_by.map_or(deadline, |wake| wake.min(deadline));
         let wait_ns = until.saturating_sub(now);
         if wait_ns == 0 {
             return Ok(());
         }
-        let events = if report.tx_blocked {
+        let events = if self.tx_blocked {
             libc::POLLIN | libc::POLLOUT
         } else {
             libc::POLLIN
@@ -1286,7 +1322,7 @@ impl<P: NtcpBackend> ConnectionGroup for NtcpConnectionGroup<P> {
                 )));
             }
             if !report.more_work && !more_events {
-                self.wait(&report, deadline)?;
+                self.wait(deadline)?;
             }
         }
 
@@ -1313,23 +1349,11 @@ impl<P: NtcpBackend> ConnectionGroup for NtcpConnectionGroup<P> {
         Ok(())
     }
 
+    /// Nothing to do: each send pushed its connection's output, and what
+    /// the pushes left goes out in the next `poll`'s first drive, before it
+    /// can sleep. Driving here would end autocorking holds that later
+    /// writes may still join.
     fn flush(&mut self) -> Result<()> {
-        if !self.unflushed {
-            return Ok(());
-        }
-        // Transmit until a drive leaves budget over (nothing more to send)
-        // or the backend pushes back; poll transmits the rest
-        loop {
-            let report = self.drive_with(FLUSH_BUDGET)?;
-            if report.transmitted < FLUSH_BUDGET.transmit || report.tx_blocked {
-                break;
-            }
-        }
-        if self.nic.is_some() {
-            // The drive scheduled the requests' bytes unless the peer's
-            // window held them back: their stamps are then ready
-            self.drain_stamps();
-        }
         Ok(())
     }
 
@@ -1374,7 +1398,7 @@ impl<P: NtcpBackend> ConnectionGroup for NtcpConnectionGroup<P> {
                 break;
             }
             if !report.more_work && !more_events {
-                self.wait(&report, deadline)?;
+                self.wait(deadline)?;
             }
         }
         self.slots.collect_ready(ready);
@@ -1418,6 +1442,12 @@ impl<P: NtcpBackend> ConnectionGroup for NtcpConnectionGroup<P> {
         self.report_drops(&counters);
         self.report_device(&counters);
         self.report_frames(&counters);
+        tracing::debug!(
+            "ntcp ({}): {} segments sent, {} pushes held by autocorking",
+            self.network.config().local_address,
+            counters.out_segments,
+            counters.autocorked,
+        );
         let ids: Vec<usize> = self.slots.live_handles().map(|(id, _)| id).collect();
         for id in ids {
             self.close(id)?;
@@ -1452,7 +1482,7 @@ impl<P: NtcpBackend> ConnectionGroup for NtcpConnectionGroup<P> {
                 return Ok(());
             }
             if !report.more_work && !more_events {
-                self.wait(&report, deadline)?;
+                self.wait(deadline)?;
             }
         }
     }
@@ -1827,6 +1857,59 @@ mod tests {
     impl NtcpBackend for SynAckCorruptingWire {
         fn wait_fd(&self) -> Option<RawFd> {
             self.0.wait_fd()
+        }
+    }
+
+    /// A link end whose device completes transmits only at the next drive,
+    /// as a DPDK queue does, so that a push may autocork
+    struct CorkWire(Wire);
+
+    impl PacketIo for CorkWire {
+        fn layer(&self) -> PacketLayer {
+            PacketLayer::Ip
+        }
+        fn receive(&mut self, out: &mut [u8]) -> io::Result<Option<usize>> {
+            self.0.receive(out)
+        }
+        fn transmit(&mut self, packet: &[u8]) -> io::Result<TxOutcome> {
+            self.0.transmit(packet)
+        }
+        fn tx_completion(&self) -> ntcp_io::TxCompletion {
+            ntcp_io::TxCompletion::NextPoll
+        }
+    }
+
+    impl NtcpBackend for CorkWire {
+        fn wait_fd(&self) -> Option<RawFd> {
+            self.0.wait_fd()
+        }
+    }
+
+    /// A link end whose transmits vanish once the test mutes it, as on a
+    /// path that went silent: the backend takes them and nothing arrives
+    struct MutedWire {
+        wire: Wire,
+        muted: Arc<AtomicBool>,
+    }
+
+    impl PacketIo for MutedWire {
+        fn layer(&self) -> PacketLayer {
+            PacketLayer::Ip
+        }
+        fn receive(&mut self, out: &mut [u8]) -> io::Result<Option<usize>> {
+            self.wire.receive(out)
+        }
+        fn transmit(&mut self, packet: &[u8]) -> io::Result<TxOutcome> {
+            if self.muted.load(Ordering::Relaxed) {
+                return Ok(TxOutcome::Submitted);
+            }
+            self.wire.transmit(packet)
+        }
+    }
+
+    impl NtcpBackend for MutedWire {
+        fn wait_fd(&self) -> Option<RawFd> {
+            self.wire.wait_fd()
         }
     }
 
@@ -2293,10 +2376,9 @@ mod tests {
         let mut group = NtcpConnectionGroup::new(network_config(CLIENT), wire).unwrap();
         let id = group.add_connection(&server_addr()).unwrap();
 
-        // The drive that meets the backend's failure stops the network
+        // The send's push meets the backend's failure and stops the network
         broken.store(true, Ordering::Relaxed);
-        group.try_send(id, b"lost").unwrap();
-        let err = group.flush().unwrap_err();
+        let err = group.try_send(id, b"lost").unwrap_err();
         assert!(err.to_string().contains("the link broke"), "{err}");
         assert!(group.network().is_stopped());
 
@@ -2315,6 +2397,103 @@ mod tests {
         let mut ready = Vec::new();
         let err = group.poll(Duration::ZERO, &mut ready).unwrap_err();
         assert!(err.to_string().contains("the link broke"), "{err}");
+    }
+
+    // =========================================================================
+    // Pushes
+    // =========================================================================
+
+    #[test]
+    fn a_send_puts_its_request_on_the_wire_without_a_flush() {
+        let (a, b) = link();
+        let _server = EchoServer::start(b, true, ServerClose::OnEof);
+        let mut group = client(a);
+        let id = group.add_connection(&server_addr()).unwrap();
+        let conn = group.slots.handle(id).unwrap();
+        for (round, request) in [&b"ping"[..], b"pong"].into_iter().enumerate() {
+            let before = group.network().counters().out_segments;
+            if round == 0 {
+                group.send(id, request).unwrap();
+            } else {
+                assert_eq!(group.try_send(id, request).unwrap().accepted, 4);
+            }
+            // Sent in the call, before any drive, flush or poll
+            assert!(group.network().counters().out_segments > before);
+            assert_eq!(group.network().transport_info(conn).unwrap().notsent_bytes, 0);
+            assert!(!group.push_work);
+            assert_eq!(recv_exact(&mut group, id, 4), request);
+        }
+        group.close_all().unwrap();
+    }
+
+    #[test]
+    fn a_push_autocorking_held_is_sent_before_poll_sleeps() {
+        let (a, b) = link();
+        let _server = EchoServer::start(b, true, ServerClose::OnEof);
+        let mut group = NtcpConnectionGroup::new(network_config(CLIENT), CorkWire(a)).unwrap();
+        let id = group.add_connection(&server_addr()).unwrap();
+        let conn = group.slots.handle(id).unwrap();
+        let info = |group: &NtcpConnectionGroup<CorkWire>| {
+            group.network().transport_info(conn).unwrap().notsent_bytes
+        };
+
+        // The first request leaves in its send; the second, written while
+        // the first is still in the device, is held
+        group.send(id, b"one").unwrap();
+        assert_eq!(info(&group), 0);
+        assert_eq!(group.network().counters().autocorked, 0);
+        group.send(id, b"two").unwrap();
+        group.flush().unwrap();
+        assert_eq!(group.network().counters().autocorked, 1);
+        assert_eq!(info(&group), 3);
+        assert!(group.push_work);
+
+        // A wait after the hold returns at once rather than sleep on it
+        let started = Instant::now();
+        let deadline = group.deadline_after(Duration::from_secs(1));
+        group.wait(deadline).unwrap();
+        assert!(started.elapsed() < Duration::from_millis(100), "{:?}", started.elapsed());
+
+        // poll drives before it can sleep, and the drive sends the hold
+        let mut ready = Vec::new();
+        group.poll(Duration::ZERO, &mut ready).unwrap();
+        assert_eq!(info(&group), 0);
+        assert!(!group.push_work);
+        assert_eq!(recv_exact(&mut group, id, 6), b"onetwo");
+        group.close_all().unwrap();
+    }
+
+    #[test]
+    fn a_wait_ends_by_the_deadlines_of_the_last_drive_and_the_pushes_since() {
+        let (a, b) = link();
+        let _server = EchoServer::start(b, true, ServerClose::OnEof);
+        let muted = Arc::new(AtomicBool::new(false));
+        let wire = MutedWire { wire: a, muted: muted.clone() };
+        let mut group = NtcpConnectionGroup::new(network_config(CLIENT), wire).unwrap();
+        let id = group.add_connection(&server_addr()).unwrap();
+        let idle = group.wake_by;
+
+        // The request vanishes: its push arms the connection's
+        // retransmission timers, which no drive has seen yet
+        muted.store(true, Ordering::Relaxed);
+        group.send(id, b"lost").unwrap();
+        let pushed = group.wake_by.unwrap();
+        assert!(idle.is_none_or(|idle| pushed < idle), "{idle:?} {pushed}");
+        let started = Instant::now();
+        let deadline = group.deadline_after(Duration::from_secs(10));
+        group.wait(deadline).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+        assert!(group.now() >= pushed);
+
+        // A drive runs the timer that came due, retransmits into the void
+        // and arms the next; a wait then ends by that drive's deadline
+        group.drive().unwrap();
+        let driven = group.wake_by.unwrap();
+        let started = Instant::now();
+        let deadline = group.deadline_after(Duration::from_secs(10));
+        group.wait(deadline).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+        assert!(group.now() >= driven);
     }
 
     // =========================================================================

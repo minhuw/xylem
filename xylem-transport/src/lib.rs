@@ -271,7 +271,7 @@ pub trait ConnectionGroup {
     /// and their TX range. The caller keeps the rest, asks for
     /// [`Self::set_write_interest`], and sends it once `poll` reports the
     /// connection, so it can keep reading meanwhile. Bytes go on the wire as
-    /// with `send`, at the next `flush` or `poll` on a user-space stack.
+    /// with `send`.
     ///
     /// The default sends all of `data` with `send`, which suits datagram
     /// transports: a datagram is sent whole or not at all.
