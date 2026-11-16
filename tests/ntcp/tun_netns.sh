@@ -11,7 +11,10 @@
 # xylem-echo-server listens on 0.0.0.0:9999. Each scenario runs xylem with
 # the xylem-echo protocol in closed loop, once over ntcp and once over kernel
 # TCP, and prints throughput and p50/p99 from the JSON results. A run fails
-# if it completes no requests, exits non-zero or logs a warning or error.
+# if it completes no requests, exits non-zero or logs a warning or error
+# (xylem logs to stdout; both stdout and stderr are checked). Worker threads
+# take the first two CPUs this script may run on, so pinning them never
+# warns.
 #
 # Usage: tests/ntcp/tun_netns.sh            (builds, then runs both scenarios)
 # Environment: NTCP_PROFILE=release|dev (default release), NTCP_DURATION
@@ -101,6 +104,13 @@ for _ in $(seq 50); do
 done
 kill -0 "$SERVER_PID"
 
+# xylem pins thread N to CPU N: use CPUs this process may run on
+read -r CPU0 CPU1 < <(python3 -c 'import os; print(*sorted(os.sched_getaffinity(0))[:2])')
+if [[ -z "${CPU1:-}" ]]; then
+    echo "need at least two CPUs in the affinity mask" >&2
+    exit 1
+fi
+
 # profile NAME TRANSPORT THREADS TARGET_IP
 profile() {
     local name=$1 transport=$2 threads=$3 target=$4
@@ -144,12 +154,14 @@ run() {
     fi
     local status=0
     "$XYLEM" -P "$WORK/$name.toml" >"$WORK/$name.out" 2>"$WORK/$name.err" || status=$?
-    python3 - "$name" "$status" "$WORK/$name.json" "$WORK/$name.err" <<'EOF' || FAILED=1
+    python3 - "$name" "$status" "$WORK/$name.json" "$WORK/$name.out" "$WORK/$name.err" <<'EOF' || FAILED=1
 import json, re, sys
-name, status, result, log = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+name, status, result, logs = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4:]
 problems = []
-with open(log) as f:
-    warnings = [l.rstrip() for l in f if re.search(r"\b(WARN|ERROR)\b", l)]
+warnings = []
+for log in logs:
+    with open(log) as f:
+        warnings += [l.rstrip() for l in f if re.search(r"\b(WARN|ERROR)\b", l)]
 if status != 0:
     problems.append(f"exit status {status}")
 if warnings:
@@ -171,8 +183,9 @@ if problems:
     for line in warnings[:10]:
         print("   ", line)
     if status != 0:
-        with open(log) as f:
-            print("    stderr tail:", *f.readlines()[-10:], sep="\n    ")
+        for log in logs:
+            with open(log) as f:
+                print(f"    {log} tail:", *f.readlines()[-10:], sep="\n    ")
     sys.exit(1)
 EOF
 }
@@ -180,10 +193,10 @@ EOF
 echo
 echo "xylem-echo, closed loop, $CONNECTIONS connections per thread, $DURATION"
 echo "-------------------------------------------------------------------------------"
-run ntcp-1thread ntcp "[0]" 1
-run tcp-1thread tcp "[0]" 1
-run ntcp-2threads ntcp "[0, 1]" 2
-run tcp-2threads tcp "[0, 1]" 2
+run ntcp-1thread ntcp "[$CPU0]" 1
+run tcp-1thread tcp "[$CPU0]" 1
+run ntcp-2threads ntcp "[$CPU0, $CPU1]" 2
+run tcp-2threads tcp "[$CPU0, $CPU1]" 2
 
 if [[ "$FAILED" != 0 ]]; then
     echo "FAILED" >&2
