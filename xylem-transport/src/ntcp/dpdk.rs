@@ -15,13 +15,18 @@
 //! restores the calling thread's affinity afterwards. A worker thread must
 //! be pinned before `create_group`: attaching a queue registers the thread
 //! with EAL with its CPU set at that time.
+//!
+//! A queue hands its received mbufs to the stack by reference, up to its
+//! frame budget F (`mbufs_per_queue` less the rings and the lcore caches of
+//! every queue), which is known once the queue is attached: `create_group`
+//! logs it, and warns if it is too small to hold any frame.
 
 use super::{
     NtcpBackend, NtcpConnectionGroup, NIC_RX_TIMESTAMP_RANGES, NIC_TX_TIMESTAMP_SPARE,
     UNITS_PER_SECOND,
 };
 use crate::{Error, Result, TransportFactory};
-use ntcp_io::ClockDescriptor;
+use ntcp_io::{ClockDescriptor, PacketIo};
 use ntcp_io_dpdk::{Eal, Flow, HostedQueue, Port, PortConfig, QueueHandle};
 use ntcp_native::{EthernetNextHop, Link, NetworkConfig, SharedNeighborLimits, SharedNeighbors};
 use std::io;
@@ -36,6 +41,9 @@ const NEIGHBOR_ENTRIES: usize = 64;
 const NEIGHBOR_REPLIES: usize = 16;
 
 impl NtcpBackend for HostedQueue {
+    // rte_eth_stats' rx_nombuf and imissed count the whole port
+    const RX_COUNTERS_PER_PORT: bool = true;
+
     fn wait_fd(&self) -> Option<RawFd> {
         None
     }
@@ -99,6 +107,8 @@ pub struct NtcpDpdkPort {
     /// Queue pairs not yet taken by a member's group; they, the attached
     /// queues and the flows keep the port started
     queues: Vec<Mutex<Option<QueueHandle>>>,
+    /// Mbufs in each queue's pool, the configured number or ntcp's default
+    mbufs_per_queue: u32,
     /// Destroyed when the port is dropped, after the workers' groups
     _flows: Mutex<Vec<Flow>>,
 }
@@ -264,6 +274,7 @@ impl NtcpDpdkPort {
             config,
             neighbors,
             queues,
+            mbufs_per_queue: mbufs,
             _flows: Mutex::new(flows),
         }))
     }
@@ -300,6 +311,34 @@ impl TransportFactory for NtcpDpdkFactory {
                 Error::Config(format!("DPDK queue {} already has a group", self.member))
             })?;
         let queue = handle.attach().map_err(|e| io_error("attach a DPDK queue", e))?;
+        // Set by the attach, from the pool, the rings the PMD granted and
+        // the port's queues
+        let budget = queue.rx_frame_budget().ok_or_else(|| {
+            Error::Config(format!("DPDK queue {} reports no frame budget", self.member))
+        })?;
+        // ntcp copies an arrival while more than 3/4 F frames are out, the
+        // arrival included
+        if budget * 3 / 4 == 0 {
+            tracing::warn!(
+                "ntcp DPDK: queue {} ({}) has a frame budget of {budget} mbufs \
+                 (mbufs_per_queue={} less the RX and TX rings and the lcore caches of {} \
+                 queues): every received frame will be copied instead of held by reference; \
+                 raise ntcp.dpdk.mbufs_per_queue to hold them",
+                self.member,
+                member.local_ip,
+                self.port.mbufs_per_queue,
+                port.members.len(),
+            );
+        } else {
+            tracing::info!(
+                "ntcp DPDK: queue {} ({}) holds received mbufs by reference: frame budget \
+                 {budget} of mbufs_per_queue={}, arrivals copied past {}",
+                self.member,
+                member.local_ip,
+                self.port.mbufs_per_queue,
+                budget * 3 / 4,
+            );
+        }
 
         let mut config = NetworkConfig::new(IpAddr::V4(member.local_ip), u32::from(port.mtu));
         config.tcp.max_connections = member.max_connections.max(1);

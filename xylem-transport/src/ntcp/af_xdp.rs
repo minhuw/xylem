@@ -16,6 +16,12 @@
 //! Attaching the program and installing rules needs CAP_BPF, CAP_NET_ADMIN
 //! and CAP_NET_RAW (or root). The program is detached when the port and
 //! every group are dropped, or by the kernel when the process exits.
+//!
+//! Each socket registers a UMEM of ntcp's default geometry, 16384 frames of
+//! 2048 bytes (32 MiB), whose frames ntcp holds by reference until the data
+//! they carry is read. Without CAP_IPC_LOCK the kernel charges every UMEM
+//! to the user's locked memory and refuses one past RLIMIT_MEMLOCK;
+//! `create_group` then fails naming the limit and the size the port needs.
 
 use super::{NtcpBackend, NtcpConnectionGroup, UNITS_PER_SECOND};
 use crate::{Error, Result, TransportFactory};
@@ -83,6 +89,8 @@ pub struct NtcpAfXdpPort {
     neighbors: SharedNeighbors,
     /// Queue pairs not yet taken by a member's group
     queues: Vec<Mutex<Option<QueueHandle>>>,
+    /// Bytes of each socket's UMEM, frame size times frame count
+    umem_bytes: u64,
     /// Held, not read: deleted from the interface on drop
     _rules: Vec<Rule>,
     /// Held, not read: the program hands frames for an address to the
@@ -97,6 +105,58 @@ fn io_error(context: &str, e: io::Error) -> Error {
 
 fn ntcp_error(context: &str, e: ntcp_native::Error) -> Error {
     Error::Config(format!("{context}: {e}"))
+}
+
+/// The soft RLIMIT_MEMLOCK in bytes, which bounds the locked memory the
+/// kernel charges AF_XDP UMEMs to; None if unlimited or unreadable
+fn memlock_limit() -> Option<u64> {
+    let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: writes one rlimit into `limit`
+    if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limit) } != 0
+        || limit.rlim_cur == libc::RLIM_INFINITY
+    {
+        return None;
+    }
+    Some(limit.rlim_cur)
+}
+
+/// The error of a socket that could not be opened on `queue`, of a port
+/// with `queues` sockets of `umem_bytes` each, under RLIMIT_MEMLOCK
+/// `memlock` ([`memlock_limit`])
+///
+/// Without CAP_IPC_LOCK, the kernel charges each UMEM to the user's locked
+/// memory and refuses its registration (XDP_UMEM_REG) with ENOBUFS once
+/// that would pass RLIMIT_MEMLOCK (xdp_umem_account_pages); ntcp passes
+/// the error on as is. With the limit unlimited, ENOBUFS has another cause
+/// and keeps its plain message.
+fn socket_error(
+    e: io::Error,
+    queue: u32,
+    queues: usize,
+    umem_bytes: u64,
+    memlock: Option<u64>,
+) -> Error {
+    let context = format!("open an AF_XDP socket on queue {queue}");
+    let limit = match (e.raw_os_error(), memlock) {
+        (Some(libc::ENOBUFS), Some(limit)) => limit,
+        _ => return io_error(&context, e),
+    };
+    let needed = umem_bytes * queues as u64;
+    Error::Io(io::Error::new(
+        e.kind(),
+        format!(
+            "{context}: the kernel refused to lock its {} KiB UMEM in memory ({e}): without \
+             CAP_IPC_LOCK it charges every AF_XDP UMEM to the user's locked memory, bounded \
+             by RLIMIT_MEMLOCK, {} KiB here, and this port's {queues} sockets need {} KiB, \
+             besides any other UMEM of the same user. Raise the memlock limit to at least {} \
+             KiB (ulimit -l, LimitMEMLOCK= of a systemd unit, /etc/security/limits.conf) or \
+             grant xylem CAP_IPC_LOCK",
+            umem_bytes / 1024,
+            limit / 1024,
+            needed / 1024,
+            needed / 1024,
+        ),
+    ))
 }
 
 /// Members need distinct addresses and distinct queues: a queue has one
@@ -129,6 +189,7 @@ impl NtcpAfXdpPort {
         let mut port_config = PortConfig::new(config.interface.clone());
         port_config.mode = config.mode;
         port_config.mtu = config.mtu;
+        let umem_bytes = u64::from(port_config.frame_size) * u64::from(port_config.frame_count);
         let port = Port::attach(port_config).map_err(|e| {
             io_error(&format!("attach ntcp's XDP program to {}", config.interface), e)
         })?;
@@ -139,12 +200,14 @@ impl NtcpAfXdpPort {
         // required and the sockets' binds find out about unusable queues
         let enabled = port.enabled_queues().ok();
         tracing::info!(
-            "ntcp AF_XDP: {} (ifindex {}) mode={:?} mac={} queues={} enabled={enabled:?}",
+            "ntcp AF_XDP: {} (ifindex {}) mode={:?} mac={} queues={} enabled={enabled:?} \
+             umem={} KiB per socket",
             config.interface,
             port.ifindex(),
             port.mode(),
             mac.map(|o| format!("{o:02x}")).join(":"),
             port.queues(),
+            umem_bytes / 1024,
         );
         if let Some(enabled) = enabled {
             if let Some(member) = config.members.iter().find(|m| m.queue >= enabled) {
@@ -216,6 +279,7 @@ impl NtcpAfXdpPort {
             config,
             neighbors,
             queues,
+            umem_bytes,
             _rules: rules,
             _addresses: addresses,
             port,
@@ -260,7 +324,7 @@ impl TransportFactory for NtcpAfXdpFactory {
                 Error::Config(format!("AF_XDP queue {} already has a group", member.queue))
             })?;
         let queue = handle.attach().map_err(|e| {
-            io_error(&format!("open an AF_XDP socket on queue {}", member.queue), e)
+            socket_error(e, member.queue, port.members.len(), self.port.umem_bytes, memlock_limit())
         })?;
 
         let mut config = NetworkConfig::new(IpAddr::V4(member.local_ip), port.mtu);
@@ -295,5 +359,28 @@ mod tests {
         assert!(check_members(&[member([10, 80, 0, 12], 0), member([10, 80, 0, 13], 3)]).is_ok());
         assert!(check_members(&[member([10, 80, 0, 12], 0), member([10, 80, 0, 12], 1)]).is_err());
         assert!(check_members(&[member([10, 80, 0, 12], 1), member([10, 80, 0, 13], 1)]).is_err());
+    }
+
+    #[test]
+    fn a_umem_refused_for_memlock_names_the_limit_and_the_fix() {
+        let enobufs = || io::Error::from_raw_os_error(libc::ENOBUFS);
+        let umem = 2048 * 16384;
+        let message = socket_error(enobufs(), 1, 2, umem, Some(8 << 20)).to_string();
+        for part in [
+            "open an AF_XDP socket on queue 1",
+            "32768 KiB UMEM",
+            "RLIMIT_MEMLOCK, 8192 KiB here",
+            "2 sockets need 65536 KiB",
+            "at least 65536 KiB",
+            "CAP_IPC_LOCK",
+        ] {
+            assert!(message.contains(part), "{part:?} not in {message}");
+        }
+        // Unlimited, ENOBUFS has another cause; other errors keep theirs
+        let plain = socket_error(enobufs(), 1, 2, umem, None).to_string();
+        assert!(!plain.contains("RLIMIT_MEMLOCK"), "{plain}");
+        let eperm = io::Error::from_raw_os_error(libc::EPERM);
+        let plain = socket_error(eperm, 1, 2, umem, Some(8 << 20)).to_string();
+        assert!(!plain.contains("RLIMIT_MEMLOCK"), "{plain}");
     }
 }

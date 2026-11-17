@@ -29,6 +29,11 @@
 //! frame while it waits to be read. A write refused memory waits like a
 //! write to a full socket, and `close_all` warns if any did, or if received
 //! data was pruned, collapsed or dropped for memory.
+//!
+//! Received frames: on DPDK and AF_XDP, ntcp holds each received frame by
+//! reference until the data it carries is read, within the backend's frame
+//! budget F; past 3/4 F it copies arrivals and collapses held frames into
+//! copies, and `close_all` warns if it did. TUN copies every frame.
 
 use crate::{
     ClockCalibrationReport, ConnectionGroup, Error, KernelClock, KernelTimestamp, RecvOutcome,
@@ -139,6 +144,11 @@ fn ticks(duration: Duration) -> u64 {
 
 /// A packet backend an ntcp group can run on
 pub trait NtcpBackend: PacketIo {
+    /// Whether the receive counts of the backend's device counters
+    /// (`rx_nombuf`, `rx_missed`) are its port's totals over every queue,
+    /// as DPDK's are, rather than this queue's own (an AF_XDP socket's)
+    const RX_COUNTERS_PER_PORT: bool = false;
+
     /// A file descriptor that becomes readable when packets arrive (and
     /// writable when a blocked transmit can proceed), for `poll` to sleep
     /// on; `None` makes `poll` busy-poll the backend instead
@@ -980,15 +990,29 @@ impl<P: NtcpBackend> NtcpConnectionGroup<P> {
     }
 
     /// Warn if the backend's device ran short of packet buffers (DPDK's mbuf
-    /// pools): transmits that found the pool empty and waited, receive
-    /// buffer allocation failures, and packets the device dropped before
-    /// the stack saw them
+    /// pools, an AF_XDP socket's fill ring): transmits that found the pool
+    /// empty and waited, receive buffer allocation failures, and packets the
+    /// device dropped before the stack saw them
     ///
-    /// `tx_nombuf` is this group's queue's own; `rx_nombuf` and `rx_missed`
+    /// `tx_nombuf` is this group's queue's own. On DPDK
+    /// ([`NtcpBackend::RX_COUNTERS_PER_PORT`]) `rx_nombuf` and `rx_missed`
     /// are the port's totals, the same in every member's warning, so they
-    /// must not be summed over the members.
+    /// must not be summed over the members; on AF_XDP they are the socket's.
     fn report_device(&self, counters: &Counters) {
         if counters.rx_nombuf == 0 && counters.rx_missed == 0 && counters.tx_nombuf == 0 {
+            return;
+        }
+        if !P::RX_COUNTERS_PER_PORT {
+            tracing::warn!(
+                "ntcp ({}): the device ran short of packet buffers: {} transmits found this \
+                 queue's pool empty and waited (tx_nombuf); this queue's {} receives found no \
+                 posted buffer (rx_nombuf), {} packets dropped before the stack saw them \
+                 (rx_missed)",
+                self.network.config().local_address,
+                counters.tx_nombuf,
+                counters.rx_nombuf,
+                counters.rx_missed,
+            );
             return;
         }
         tracing::warn!(
@@ -1000,6 +1024,33 @@ impl<P: NtcpBackend> NtcpConnectionGroup<P> {
             counters.tx_nombuf,
             counters.rx_nombuf,
             counters.rx_missed,
+        );
+    }
+
+    /// Warn if received frames were copied rather than held by reference
+    /// (DPDK mbufs, AF_XDP UMEM frames): arrivals copied past 3/4 of the
+    /// frame budget or that the backend could not lend, and held frames
+    /// collapsed into copies to give the device's pool back
+    ///
+    /// The counters are this group's network's own. A copying backend
+    /// (TUN) holds no frames and counts neither.
+    fn report_frames(&self, counters: &Counters) {
+        if counters.rx_frames_copied == 0 && counters.rx_frames_collapsed == 0 {
+            return;
+        }
+        let budget = match self.network.backend().rx_frame_budget() {
+            Some(budget) => budget.to_string(),
+            None => "none".to_string(),
+        };
+        tracing::warn!(
+            "ntcp ({}): received frames were copied instead of held by reference: {} \
+             arrivals copied (rx_frames_copied: past 3/4 of the frame budget, or frames the \
+             backend could not lend), {} held frames collapsed into copies \
+             (rx_frames_collapsed); frame budget {budget}, {} frames held now",
+            self.network.config().local_address,
+            counters.rx_frames_copied,
+            counters.rx_frames_collapsed,
+            counters.rx_frames_held,
         );
     }
 
@@ -1335,6 +1386,7 @@ impl<P: NtcpBackend> ConnectionGroup for NtcpConnectionGroup<P> {
         self.report_receive_memory(&counters);
         self.report_drops(&counters);
         self.report_device(&counters);
+        self.report_frames(&counters);
         let ids: Vec<usize> = self.slots.live_handles().map(|(id, _)| id).collect();
         for id in ids {
             self.close(id)?;
