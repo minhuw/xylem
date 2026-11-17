@@ -65,6 +65,13 @@ The AF_XDP backend shares a network interface with the kernel. xylem attaches an
 - **Mode.** `mode = "native"` (default) runs the program in the driver and fails on a driver without native XDP; `"generic"` works on any interface, veth included, but is slower.
 - **Queues.** With several threads, xylem installs ntuple rules (`ethtool -N`) that steer each thread's address to its queue, and ARP to one queue; the interface needs that many combined queues and ntuple filtering. One thread needs neither.
 - **Addresses.** ntcp's addresses must be unused on the network and must not be the kernel's addresses.
+- **veth.** A veth pair works in generic mode, with two requirements:
+  - *One RX queue per end.* A veth has no ntuple filters, so xylem can steer nothing to a queue. With one enabled RX queue it needs no rules: every frame arrives on queue 0, which the only ntcp thread takes. A veth created with more (`numrxqueues 2`) fails at start with `steer 10.80.0.20 -> queue 0: ETHTOOL_GRXCLSRLCNT: Operation not supported`. `ip link add x0 type veth peer name x1` enables one queue per end; else create the pair with `numtxqueues 1 numrxqueues 1` on both ends, or set `ethtool -L <dev> rx 1 tx 1` on each end. Run one ntcp thread per veth.
+  - *TX checksum offload off on the peer.* veth turns TX checksum offload on by default. The kernel on the peer end then sends its TCP segments with only a partial checksum, and generic XDP hands them to ntcp that way, so ntcp discards every SYN-ACK as a bad TCP checksum and no connection opens. Turn it off on the peer end (the kernel's side, where the server runs) with `ethtool -K x1 tx off`. When a connection does not open within the connect timeout, xylem's error names every reason the stack discarded packets for, and for TCP checksums adds this hint:
+
+    ```text
+    Error: Connection error: Traffic group 0: cannot open a connection to 10.80.0.1:9999: Connection timeout; ntcp (10.80.0.20) discarded 4 packets: TCP_CSUM 4; TCP checksums failed: likely TX checksum offload on the peer side of a veth or other virtual link, which leaves partial checksums; turn it off there with `ethtool -K <dev> tx off`
+    ```
 - **Cleanup.** xylem removes the program, its addresses and its rules when the run ends.
 - **Timestamps.** Copy mode, user-space timestamps only: no NIC timestamps, so `timestamps` must be `"user"`.
 

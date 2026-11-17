@@ -1133,6 +1133,34 @@ fn drop_reasons(counters: &Counters) -> String {
     reasons.join(", ")
 }
 
+/// A connect timeout's error: "Connection timeout", then every reason the
+/// network at `local` discarded packets for, and a hint when that was a
+/// TCP checksum, which a handshake reply left with a partial checksum
+/// fails (a veth peer's TX checksum offload)
+fn connect_timeout_text(local: IpAddr, counters: &Counters) -> String {
+    let mut text = "Connection timeout".to_string();
+    if counters.discarded == 0 {
+        return text;
+    }
+    text.push_str(&format!(
+        "; ntcp ({local}) discarded {} packets: {}",
+        counters.discarded,
+        drop_reasons(counters)
+    ));
+    let checksum_failed = counters
+        .drops
+        .iter()
+        .any(|(reason, count)| reason.name() == "TCP_CSUM" && count > 0);
+    if checksum_failed {
+        text.push_str(
+            "; TCP checksums failed: likely TX checksum offload on the peer side of a veth or \
+             other virtual link, which leaves partial checksums; turn it off there with \
+             `ethtool -K <dev> tx off`",
+        );
+    }
+    text
+}
+
 /// Give `config` the buffer memory thresholds Linux's tcp_init_mem gives a
 /// host with `memory_bytes` for buffers ([`NetworkConfig::memory_cap_for`]):
 /// `tcp.buffer_low_bytes`, `tcp.buffer_pressure_bytes` and the cap
@@ -1252,7 +1280,10 @@ impl<P: NtcpBackend> ConnectionGroup for NtcpConnectionGroup<P> {
             if self.now() >= deadline {
                 self.slots.remove(id);
                 let _ = self.network.abort(conn);
-                return Err(Error::Connection("Connection timeout".to_string()));
+                return Err(Error::Connection(connect_timeout_text(
+                    self.network.config().local_address,
+                    &self.network.counters(),
+                )));
             }
             if !report.more_work && !more_events {
                 self.wait(&report, deadline)?;
@@ -1766,6 +1797,39 @@ mod tests {
         }
     }
 
+    /// A link end that corrupts the TCP checksum of each SYN-ACK it
+    /// receives, as a peer's TX checksum offload leaves it partial on a veth
+    struct SynAckCorruptingWire(Wire);
+
+    impl PacketIo for SynAckCorruptingWire {
+        fn layer(&self) -> PacketLayer {
+            PacketLayer::Ip
+        }
+        fn receive(&mut self, out: &mut [u8]) -> io::Result<Option<usize>> {
+            let Some(len) = self.0.receive(out)? else {
+                return Ok(None);
+            };
+            // IPv4 carrying TCP with SYN and ACK set: flip the checksum
+            let packet = &mut out[..len];
+            if len >= 20 && packet[0] >> 4 == 4 && packet[9] == 6 {
+                let header = usize::from(packet[0] & 0x0f) * 4;
+                if len >= header + 20 && packet[header + 13] & 0x12 == 0x12 {
+                    packet[header + 16] ^= 0xff;
+                }
+            }
+            Ok(Some(len))
+        }
+        fn transmit(&mut self, packet: &[u8]) -> io::Result<TxOutcome> {
+            self.0.transmit(packet)
+        }
+    }
+
+    impl NtcpBackend for SynAckCorruptingWire {
+        fn wait_fd(&self) -> Option<RawFd> {
+            self.0.wait_fd()
+        }
+    }
+
     const CLIENT: &str = "10.99.0.2";
     const SERVER: &str = "10.99.0.1";
     const PORT: u16 = 7000;
@@ -2021,9 +2085,36 @@ mod tests {
         group.set_connect_timeout(Duration::from_millis(300));
         let started = Instant::now();
         let err = group.add_connection(&server_addr()).unwrap_err();
-        assert!(matches!(&err, Error::Connection(m) if m.contains("timeout")), "{err}");
+        // Nothing was discarded: no drop reasons, no hint
+        assert!(matches!(&err, Error::Connection(m) if m == "Connection timeout"), "{err}");
         assert!(started.elapsed() >= Duration::from_millis(300));
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn connect_timeout_names_a_failed_syn_ack_checksum() {
+        let (a, b) = link();
+        let _server = EchoServer::start(b, true, ServerClose::OnEof);
+        let mut group =
+            NtcpConnectionGroup::new(network_config(CLIENT), SynAckCorruptingWire(a)).unwrap();
+        group.set_connect_timeout(Duration::from_millis(300));
+        let err = group.add_connection(&server_addr()).unwrap_err();
+        let Error::Connection(text) = &err else {
+            panic!("{err}")
+        };
+        let failed = group
+            .network()
+            .counters()
+            .drops
+            .iter()
+            .find(|(reason, _)| reason.name() == "TCP_CSUM")
+            .map(|(_, count)| count)
+            .unwrap();
+        assert!(failed > 0, "{text}");
+        let reasons = format!("discarded {failed} packets: TCP_CSUM {failed};");
+        assert!(text.starts_with(&format!("Connection timeout; ntcp ({CLIENT}) {reasons}")));
+        assert!(text.contains("TCP checksums failed"), "{text}");
+        assert!(text.contains("`ethtool -K <dev> tx off`"), "{text}");
     }
 
     #[test]
@@ -2129,6 +2220,11 @@ mod tests {
         let counters = group.network().counters();
         assert_eq!(counters.discarded, 2);
         assert_eq!(drop_reasons(&counters), "PKT_TOO_SMALL 1, IP_CSUM 1");
+        // A connect timeout names them, with no TCP checksum hint
+        assert_eq!(
+            connect_timeout_text(CLIENT.parse().unwrap(), &counters),
+            "Connection timeout; ntcp (10.99.0.2) discarded 2 packets: PKT_TOO_SMALL 1, IP_CSUM 1"
+        );
     }
 
     // =========================================================================
