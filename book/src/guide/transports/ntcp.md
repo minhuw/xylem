@@ -147,11 +147,11 @@ Validation requires the `[ntcp]` section whenever a group uses ntcp, and checks 
 
 ## Buffer memory
 
-ntcp sizes buffers as Linux does: each connection starts with a 64 KiB receive window and a 64 KiB send limit, the receive buffer grows with what the application reads per round trip (up to 32 MiB, window scale 10), and the send limit grows with the congestion window (up to 4 MiB). A connection is charged only what it has allocated, about 95 KB when it opens with a 1500-byte MTU.
+ntcp sizes buffers as Linux does: each connection starts with a 64 KiB receive window and a 64 KiB send limit, the receive buffer grows with what the application reads per round trip (up to 32 MiB, window scale 10), and the send limit grows with the congestion window (up to 4 MiB). A connection is charged only what it has allocated: about 1.6 KB when it opens, a send ring at its first write (6 KB for a small request), which grows with the data it holds queued, and the data it receives while that is held unread or beyond a gap (each frame's length plus its queue slot), returned as it is read.
 
 Each worker thread's stack caps its buffer memory with the thresholds Linux's `tcp_mem` takes at boot, computed from the host's memory: `MemTotal` less the huge page reservation (`Hugetlb`) in `/proc/meminfo`, of which about 4.7% (`low`), 6.25% (`pressure`) and 9.4% (`max`, the hard cap). Above `pressure`, buffers stop growing until the charge falls back to `low`. xylem fails at startup with a configuration error, naming both numbers, if the cap is below what the thread's connections take when they open. There is no setting to override the cap.
 
-A write refused memory waits, as on Linux: xylem keeps the unsent bytes and sends them once ntcp reports the connection writable again. A blocking send gives up after 5 s, and a connection that cannot open for lack of memory fails with an out-of-memory error. When a run ends, xylem logs a warning for each stack that had writes waiting for memory, refused opens, or memory pressure.
+A write refused memory waits, as on Linux: xylem keeps the unsent bytes and sends them once ntcp reports the connection writable again. A blocking send gives up after 5 s, and a connection that cannot open for lack of memory fails with an out-of-memory error. Received data is held up to each connection's receive limit, and only while the cap has room; past either, ntcp collapses the receive queue, prunes out-of-order data and drops segments, as Linux does. When a run ends, xylem logs a warning for each stack that had writes waiting for memory, refused opens, or memory pressure, and for each that pruned, collapsed or dropped received data for memory.
 
 ## NIC timestamps (DPDK)
 

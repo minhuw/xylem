@@ -24,9 +24,11 @@
 //!
 //! Buffer memory: each group's network may charge its connections' buffers
 //! up to Linux's tcp_mem for this host ([`host_buffer_memory`],
-//! [`NetworkConfig::memory_cap_for`]); buffers start small and grow with
-//! the connection's needs. A write refused memory waits like a write to a
-//! full socket, and `close_all` warns if any did.
+//! [`NetworkConfig::memory_cap_for`]); send buffers start small and grow
+//! with the connection's writes, and received data is charged frame by
+//! frame while it waits to be read. A write refused memory waits like a
+//! write to a full socket, and `close_all` warns if any did, or if received
+//! data was pruned, collapsed or dropped for memory.
 
 use crate::{
     ClockCalibrationReport, ConnectionGroup, Error, KernelClock, KernelTimestamp, RecvOutcome,
@@ -719,7 +721,8 @@ impl<P: NtcpBackend> NtcpConnectionGroup<P> {
             // once it takes more: for a full send buffer, used-up TX
             // timestamp records, or buffer memory the cap refused (all
             // `WouldBlock`; the last can also cut a write short, and the
-            // event comes once memory returns)
+            // event comes once the cap has room for what the next write
+            // needs to take a byte)
             let refused = match self.network.try_write(conn, &data[sent..], options) {
                 Ok(receipt) => {
                     sent += receipt.accepted;
@@ -913,7 +916,7 @@ impl<P: NtcpBackend> NtcpConnectionGroup<P> {
         let memory = self.network.config().tcp.buffer_memory();
         tracing::warn!(
             "ntcp ({}): buffer memory limited the run: {} writes waited for memory, {} opens \
-             refused, {} entries into memory pressure ({} us), {} buffer growths refused; \
+             refused, {} entries into memory pressure ({} us), {} send buffer growths refused; \
              {} bytes charged now, thresholds low {} / pressure {} / max {} bytes",
             self.network.config().local_address,
             counters.memory_throttled_writes,
@@ -925,6 +928,36 @@ impl<P: NtcpBackend> NtcpConnectionGroup<P> {
             memory.low,
             memory.pressure,
             memory.high,
+        );
+    }
+
+    /// Warn if received data met its memory limits: receive queues pruned
+    /// or collapsed, out-of-order data dropped, or segments refused for
+    /// memory (ntcp's counters by Linux's TcpExt names)
+    ///
+    /// The counters are this group's network's own, like `report_memory`'s.
+    fn report_receive_memory(&self, counters: &Counters) {
+        if counters.prune_called == 0
+            && counters.rcv_pruned == 0
+            && counters.ofo_pruned == 0
+            && counters.rcv_collapsed == 0
+            && counters.rcv_queue_drops == 0
+            && counters.ofo_drops == 0
+        {
+            return;
+        }
+        tracing::warn!(
+            "ntcp ({}): receive memory limited the run: {} prunes started (PruneCalled), {} \
+             left the queue over its limit (RcvPruned), {} dropped out-of-order data \
+             (OfoPruned); {} received frames collapsed (TCPRcvCollapsed); segments refused \
+             for memory: {} in order (TCPRcvQDrop), {} out of order (TCPOFODrop)",
+            self.network.config().local_address,
+            counters.prune_called,
+            counters.rcv_pruned,
+            counters.ofo_pruned,
+            counters.rcv_collapsed,
+            counters.rcv_queue_drops,
+            counters.ofo_drops,
         );
     }
 
@@ -1299,6 +1332,7 @@ impl<P: NtcpBackend> ConnectionGroup for NtcpConnectionGroup<P> {
     fn close_all(&mut self) -> Result<()> {
         let counters = self.network.counters();
         self.report_memory(&counters);
+        self.report_receive_memory(&counters);
         self.report_drops(&counters);
         self.report_device(&counters);
         let ids: Vec<usize> = self.slots.live_handles().map(|(id, _)| id).collect();
@@ -1726,8 +1760,10 @@ mod tests {
         }
     }
 
-    /// Connections an echo server holds at once
-    const SERVER_CONNECTIONS: usize = 72;
+    /// Connections an echo server holds at once: more than the 174 that
+    /// fill the least buffer memory cap
+    /// (`write_refused_memory_waits_like_a_full_socket`)
+    const SERVER_CONNECTIONS: usize = 256;
 
     fn run_echo_server(wire: Wire, listen: bool, close: ServerClose, stop: &AtomicBool) {
         let mut config = network_config(SERVER);
@@ -2191,9 +2227,10 @@ mod tests {
         let (a, b) = link();
         let _server = EchoServer::start(b, true, ServerClose::OnEof);
         // tcp_init_mem's least cap, 768 KiB, filled with as many open
-        // connections as its floor admits: what is left is less than one
-        // connection's charge at open, so the send ring of a first write
-        // grows to a few KiB at most
+        // connections as its floor admits: what is left is less than what
+        // one connection adds to the floor (about 1.6 KB, with no receive
+        // ring), so the send ring of a first write grows to a few KiB at
+        // most
         let memory = 1 << 20;
         let (_, _, max) = NetworkConfig::memory_cap_for(memory);
         let floor = |n: usize| {
@@ -2203,6 +2240,7 @@ mod tests {
         };
         let connections = (1..).take_while(|&n| floor(n) <= max).last().unwrap();
         assert!(max - floor(connections) < 64 * 1024, "{max} {}", floor(connections));
+        assert!(connections < SERVER_CONNECTIONS, "{connections}");
         let mut config = network_config(CLIENT);
         config.tcp.max_connections = connections;
         let mut group = NtcpConnectionGroup::build(config, a, None, memory).unwrap();
