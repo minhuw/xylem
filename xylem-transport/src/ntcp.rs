@@ -36,6 +36,9 @@
 //! reference until the data it carries is read, within the backend's frame
 //! budget F; past 3/4 F it copies arrivals and collapses held frames into
 //! copies, and `close_all` warns if it did. TUN copies every frame.
+//!
+//! ICMP: ntcp answers Echo Requests and sends ICMP errors itself, within
+//! Linux's rate limits; `close_all` warns if any of them was not sent.
 
 use crate::{
     ClockCalibrationReport, ConnectionGroup, Error, KernelClock, KernelTimestamp, RecvOutcome,
@@ -44,10 +47,10 @@ use crate::{
 use ntcp_io::{ClockDescriptor, PacketIo};
 use ntcp_io_dpdk::{bracketed_reading, ClockCalibration};
 use ntcp_native::{
-    BlockReason, CloseReason, ConnId, Counters, DriveReport, Event, Network, NetworkConfig,
-    ReadOutcome, RxReadTimestamps, SharedNeighbors, State, TimestampClock, TimestampEvent,
-    TxTimestampEvent, TxTimestampOutcome, TxTimestampRequest, TxTimestampSource, TxTimestampStage,
-    WorkBudget, WriteOptions,
+    BlockReason, CloseReason, ConnId, Counters, DriveReport, Event, IcmpOutputCounters, Network,
+    NetworkConfig, ReadOutcome, RxReadTimestamps, SharedNeighbors, State, TimestampClock,
+    TimestampEvent, TxTimestampEvent, TxTimestampOutcome, TxTimestampRequest, TxTimestampSource,
+    TxTimestampStage, WorkBudget, WriteOptions,
 };
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -1090,6 +1093,30 @@ impl<P: NtcpBackend> NtcpConnectionGroup<P> {
         );
     }
 
+    /// Report the ICMP messages the network originated (Echo Replies and
+    /// errors): a warning, naming each nonzero count, if any was lost
+    /// (dropped at a full queue, unsent, refused by the rate limits or by an
+    /// unauthorized return route), else a debug line if any was queued
+    ///
+    /// The counts are this group's network's own.
+    fn report_icmp(&self, icmp: &IcmpOutputCounters) {
+        let counts = icmp_counts(icmp);
+        if counts.is_empty() {
+            return;
+        }
+        let local = self.network.config().local_address;
+        let lost = icmp.dropped
+            + icmp.unsent
+            + icmp.unauthorized_routes
+            + icmp.rate_limited_global
+            + icmp.rate_limited_host;
+        if lost > 0 {
+            tracing::warn!("ntcp ({local}): {lost} ICMP messages not sent: {counts}");
+        } else {
+            tracing::debug!("ntcp ({local}): ICMP messages sent: {counts}");
+        }
+    }
+
     /// Whether every locally closed connection has finished its close
     ///
     /// FIN-WAIT-2 counts as finished: our FIN was ACKed, and only the peer's
@@ -1167,6 +1194,26 @@ fn drop_reasons(counters: &Counters) -> String {
         .map(|(reason, count)| format!("{reason} {count}"))
         .collect();
     reasons.join(", ")
+}
+
+/// Each ICMP output count that is nonzero, by its `IcmpOutputCounters`
+/// field: "echo_replies 3, rate_limited_global 1"
+fn icmp_counts(icmp: &IcmpOutputCounters) -> String {
+    let counts = [
+        ("echo_replies", icmp.echo_replies),
+        ("errors", icmp.errors),
+        ("dropped", icmp.dropped),
+        ("unauthorized_routes", icmp.unauthorized_routes),
+        ("unsent", icmp.unsent),
+        ("rate_limited_global", icmp.rate_limited_global),
+        ("rate_limited_host", icmp.rate_limited_host),
+    ];
+    let counts: Vec<String> = counts
+        .iter()
+        .filter(|&&(_, count)| count > 0)
+        .map(|(name, count)| format!("{name} {count}"))
+        .collect();
+    counts.join(", ")
 }
 
 /// A connect timeout's error: "Connection timeout", then every reason the
@@ -1442,6 +1489,7 @@ impl<P: NtcpBackend> ConnectionGroup for NtcpConnectionGroup<P> {
         self.report_drops(&counters);
         self.report_device(&counters);
         self.report_frames(&counters);
+        self.report_icmp(&self.network.icmp_counters());
         tracing::debug!(
             "ntcp ({}): {} segments sent, {} pushes held by autocorking",
             self.network.config().local_address,
@@ -2308,6 +2356,43 @@ mod tests {
             connect_timeout_text(CLIENT.parse().unwrap(), &counters),
             "Connection timeout; ntcp (10.99.0.2) discarded 2 packets: PKT_TOO_SMALL 1, IP_CSUM 1"
         );
+    }
+
+    #[test]
+    fn icmp_counts_name_each_count_that_is_nonzero() {
+        let (a, b) = link();
+        let mut group = client(a);
+        assert_eq!(icmp_counts(&group.network().icmp_counters()), "");
+        // An Echo Request to the client, which ntcp answers
+        let checksum = |bytes: &[u8]| -> [u8; 2] {
+            let mut sum: u32 =
+                bytes.chunks(2).map(|w| u32::from(w[0]) << 8 | u32::from(w[1])).sum();
+            while sum > 0xffff {
+                sum = (sum & 0xffff) + (sum >> 16);
+            }
+            (!(sum as u16)).to_be_bytes()
+        };
+        let mut packet = [0u8; 28];
+        packet[..12].copy_from_slice(&[0x45, 0, 0, 28, 0, 1, 0, 0, 64, 1, 0, 0]);
+        packet[12..16].copy_from_slice(&SERVER.parse::<std::net::Ipv4Addr>().unwrap().octets());
+        packet[16..20].copy_from_slice(&CLIENT.parse::<std::net::Ipv4Addr>().unwrap().octets());
+        let header = checksum(&packet[..20]);
+        packet[10..12].copy_from_slice(&header);
+        packet[20..28].copy_from_slice(&[8, 0, 0, 0, 0x12, 0x34, 0, 1]);
+        let icmp = checksum(&packet[20..]);
+        packet[22..24].copy_from_slice(&icmp);
+        b.0.send(&packet).unwrap();
+        group.drive().unwrap();
+        let mut reply = [0u8; 64];
+        let len = b.0.recv(&mut reply).unwrap();
+        assert_eq!((len, reply[9], reply[20]), (28, 1, 0), "an ICMP Echo Reply");
+        assert_eq!(icmp_counts(&group.network().icmp_counters()), "echo_replies 1");
+        let icmp = IcmpOutputCounters {
+            errors: 2,
+            rate_limited_global: 3,
+            ..Default::default()
+        };
+        assert_eq!(icmp_counts(&icmp), "errors 2, rate_limited_global 3");
     }
 
     // =========================================================================
