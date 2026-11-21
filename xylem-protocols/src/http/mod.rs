@@ -76,8 +76,18 @@ impl HttpProtocol {
         host: String,
         body_size: usize,
     ) -> Self {
+        Self::with_options(method, path, host, body_size, true)
+    }
+
+    pub fn with_options(
+        method: HttpMethod,
+        path: String,
+        host: String,
+        body_size: usize,
+        keep_alive: bool,
+    ) -> Self {
         Self {
-            request: Self::build_request(method, &path, &host, body_size),
+            request: Self::build_request(method, &path, &host, body_size, keep_alive),
             conn_seq: HashMap::new(),
             conn_response_seq: HashMap::new(),
         }
@@ -91,14 +101,22 @@ impl HttpProtocol {
     }
 
     /// Generate HTTP request, with a body of `body_size` 'x' bytes for POST/PUT
-    fn build_request(method: HttpMethod, path: &str, host: &str, body_size: usize) -> Vec<u8> {
+    fn build_request(
+        method: HttpMethod,
+        path: &str,
+        host: &str,
+        body_size: usize,
+        keep_alive: bool,
+    ) -> Vec<u8> {
+        let connection = if keep_alive { "keep-alive" } else { "close" };
         let mut request = format!(
             "{} {} HTTP/1.1\r\n\
              Host: {}\r\n\
-             Connection: keep-alive\r\n",
+             Connection: {}\r\n",
             method.as_str(),
             path,
-            host
+            host,
+            connection
         );
 
         match method {
@@ -623,5 +641,29 @@ mod tests {
         let interim = "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nTransfer-Encoding: chunked\r\n\r\n";
         let response = [interim.as_bytes(), &chunked("1\r\nx\r\n0\r\n\r\n")].concat();
         assert_eq!(parse_one(&response).unwrap(), Parsed::ok(response.len(), (0, 0)));
+    }
+
+    #[test]
+    fn test_keep_alive_header_and_config_default() {
+        // HttpConfig defaults keep_alive to true (both Default and serde)
+        let default_cfg = crate::configs::HttpConfig::default();
+        assert!(default_cfg.keep_alive);
+        let parsed_default: crate::configs::HttpConfig =
+            serde_json::from_str(r#"{"method":"GET","path":"/"}"#).unwrap();
+        assert!(parsed_default.keep_alive);
+
+        let mut keep_alive_proto = HttpProtocol::from_config(&parsed_default).unwrap();
+        let req = String::from_utf8(keep_alive_proto.next_request(0).data).unwrap();
+        assert!(req.contains("Connection: keep-alive\r\n"), "{req}");
+        assert!(!req.contains("Connection: close\r\n"), "{req}");
+
+        let parsed_close: crate::configs::HttpConfig =
+            serde_json::from_str(r#"{"method":"GET","path":"/health","keep_alive":false}"#)
+                .unwrap();
+        assert!(!parsed_close.keep_alive);
+        let mut close_proto = HttpProtocol::from_config(&parsed_close).unwrap();
+        let req = String::from_utf8(close_proto.next_request(0).data).unwrap();
+        assert!(req.contains("Connection: close\r\n"), "{req}");
+        assert!(!req.contains("Connection: keep-alive\r\n"), "{req}");
     }
 }

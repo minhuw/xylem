@@ -148,6 +148,7 @@ fn real_cli_http_honors_body_size_and_host_fallback() {
             path: "/payload".into(),
             host,
             body_size: 17,
+            ..Default::default()
         };
         let (target, requests) = cli_requests("http", serde_json::to_value(&config).unwrap());
         config.host.get_or_insert(target);

@@ -380,6 +380,15 @@ impl<C: GroupSocket> GroupCore<C> {
         self.mux.register_fd(socket, conn_id, Interest::READABLE)
     }
 
+    /// Register a connecting socket with the group's multiplexer for writes
+    pub(crate) fn register_writable<S: AsRawFd>(
+        &mut self,
+        socket: &S,
+        conn_id: usize,
+    ) -> Result<()> {
+        self.mux.register_fd(socket, conn_id, Interest::WRITABLE)
+    }
+
     /// Start tracking a connection whose socket is already registered
     // Only Linux reads the TX counter
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
@@ -391,9 +400,15 @@ impl<C: GroupSocket> GroupCore<C> {
         if self.connections.len() <= conn_id {
             self.connections.resize_with(conn_id + 1, || None);
         }
-        debug_assert!(self.connections[conn_id].is_none(), "ids are never reused");
+        debug_assert!(self.connections[conn_id].is_none(), "slot must be empty before insert");
         self.connections[conn_id] = Some(conn);
         self.live += 1;
+    }
+
+    /// Record that TX timestamping was enabled on an already-inserted connection
+    #[cfg(target_os = "linux")]
+    pub(crate) fn note_tx_stamping_enabled(&mut self) {
+        self.tx_stamping += 1;
     }
 
     /// A live connection
@@ -431,13 +446,58 @@ impl<C: GroupSocket> GroupCore<C> {
 
     /// Whether `poll` also reports `conn_id` when its socket is writable
     pub(crate) fn set_write_interest(&mut self, conn_id: usize, interested: bool) -> Result<()> {
-        let fd = self.conn_mut(conn_id)?.socket_fd();
         let interest = if interested {
             Interest::BOTH
         } else {
             Interest::READABLE
         };
+        self.set_interest(conn_id, interest)
+    }
+
+    /// Update the multiplexer interest of `conn_id`
+    pub(crate) fn set_interest(&mut self, conn_id: usize, interest: Interest) -> Result<()> {
+        let fd = self.conn_mut(conn_id)?.socket_fd();
         self.mux.modify(fd, conn_id, interest)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn drain_tx_timestamps_for(
+        conn_id: usize,
+        conn: &mut C,
+        cumulative: bool,
+        transport: &str,
+        out: &mut Vec<TxTimestampInfo>,
+    ) -> Result<()> {
+        let fd = conn.socket_fd();
+        let Some(counter) = conn.tx_counter() else {
+            return Ok(());
+        };
+        if !counter.pending() {
+            return Ok(());
+        }
+
+        // Poll error queue for TX timestamps (non-blocking)
+        loop {
+            match hw_timestamp::recv_tx_timestamp(fd) {
+                Ok(Some((timestamp, opt_id))) => {
+                    let tx_end = opt_id.wrapping_add(1);
+                    counter.on_stamp(tx_end);
+                    out.push(TxTimestampInfo { conn_id, tx_end, cumulative, timestamp });
+                }
+                // The error queue is empty (EAGAIN)
+                Ok(None) => break,
+                Err(e) => {
+                    return Err(Error::Io(io::Error::new(
+                        e.kind(),
+                        format!(
+                            "Could not read the TX timestamps of {transport} connection \
+                             {conn_id}: recvmsg(MSG_ERRQUEUE): {e}"
+                        ),
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Drain TX timestamps from the error queue of every connection with
@@ -467,37 +527,28 @@ impl<C: GroupSocket> GroupCore<C> {
             let Some(conn) = conn else {
                 continue;
             };
-            let fd = conn.socket_fd();
-            let Some(counter) = conn.tx_counter() else {
-                continue;
-            };
-            if !counter.pending() {
-                continue;
-            }
-
-            // Poll error queue for TX timestamps (non-blocking)
-            loop {
-                match hw_timestamp::recv_tx_timestamp(fd) {
-                    Ok(Some((timestamp, opt_id))) => {
-                        let tx_end = opt_id.wrapping_add(1);
-                        counter.on_stamp(tx_end);
-                        out.push(TxTimestampInfo { conn_id, tx_end, cumulative, timestamp });
-                    }
-                    // The error queue is empty (EAGAIN)
-                    Ok(None) => break,
-                    Err(e) => {
-                        return Err(Error::Io(io::Error::new(
-                            e.kind(),
-                            format!(
-                                "Could not read the TX timestamps of {transport} connection \
-                                 {conn_id}: recvmsg(MSG_ERRQUEUE): {e}"
-                            ),
-                        )));
-                    }
-                }
-            }
+            Self::drain_tx_timestamps_for(conn_id, conn, cumulative, transport, out)?;
         }
         Ok(())
+    }
+
+    /// Drain pending TX timestamps for a single connection in O(1) (Linux only)
+    #[cfg(target_os = "linux")]
+    pub(crate) fn poll_tx_timestamps_for(
+        &mut self,
+        conn_id: usize,
+        cumulative: bool,
+        transport: &str,
+        out: &mut Vec<TxTimestampInfo>,
+    ) -> Result<()> {
+        out.clear();
+        if self.tx_stamping == 0 {
+            return Ok(());
+        }
+        let Some(conn) = self.connections.get_mut(conn_id).and_then(Option::as_mut) else {
+            return Ok(());
+        };
+        Self::drain_tx_timestamps_for(conn_id, conn, cumulative, transport, out)
     }
 
     pub(crate) fn len(&self) -> usize {

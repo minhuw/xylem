@@ -687,6 +687,9 @@ pub struct HttpConfig {
     /// Request body size for POST/PUT (bytes)
     #[serde(default = "default_body_size")]
     pub body_size: usize,
+    /// Whether to send `Connection: keep-alive` (true) or `Connection: close` (false)
+    #[serde(default = "default_true")]
+    pub keep_alive: bool,
 }
 
 fn default_http_method() -> String {
@@ -701,6 +704,10 @@ fn default_body_size() -> usize {
     64
 }
 
+fn default_true() -> bool {
+    true
+}
+
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
@@ -708,6 +715,7 @@ impl Default for HttpConfig {
             path: default_http_path(),
             host: None,
             body_size: default_body_size(),
+            keep_alive: true,
         }
     }
 }

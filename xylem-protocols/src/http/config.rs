@@ -25,7 +25,13 @@ impl HttpProtocol {
                 && !host.bytes().any(|b| b.is_ascii_whitespace() || b.is_ascii_control()),
             "Invalid HTTP path or host"
         );
-        Ok(Self::with_body_size(method, config.path.clone(), host, config.body_size))
+        Ok(Self::with_options(
+            method,
+            config.path.clone(),
+            host,
+            config.body_size,
+            config.keep_alive,
+        ))
     }
 }
 
@@ -47,6 +53,7 @@ mod tests {
             path: "/api/data".to_string(),
             host: Some("example.com".to_string()),
             body_size: 1024,
+            ..Default::default()
         };
         let protocol = HttpProtocol::from_config(&config).unwrap();
         assert_eq!(Protocol::name(&protocol), "http");

@@ -711,6 +711,7 @@ fn http_from_config_post_uses_body_size_and_localhost() {
         path: "/submit".to_string(),
         host: None,
         body_size: 2,
+        ..Default::default()
     };
     let post = b"POST /submit HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\
         Content-Length: 2\r\nContent-Type: application/octet-stream\r\n\r\nxx";

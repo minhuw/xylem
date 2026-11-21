@@ -87,6 +87,16 @@ impl PreloadBarrier {
     }
 }
 
+/// Outcome of initiating a reconnect on a picked connection
+enum ReconnectStep {
+    /// Connected immediately; send the request right away with this connect start timestamp
+    Immediate(xylem_transport::Timestamp),
+    /// Non-blocking handshake in progress; wait for `poll()` + `finish_reconnect`
+    InProgress,
+    /// Connect failed and the connection was closed cleanly
+    Closed,
+}
+
 /// Worker with connection pooling and request pipelining
 ///
 /// Uses `ConnectionGroup` internally for efficient I/O multiplexing.
@@ -263,6 +273,17 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
     /// [`OnError::Abort`], the run fails at the first one, warmup included.
     pub fn set_on_error(&mut self, group_id: usize, on_error: OnError) {
         self.pool.set_on_error(group_id, on_error);
+    }
+
+    /// Set the maximum requests per connection for traffic group `group_id`
+    /// before closing and reconnecting (`None` keeps connections persistent)
+    pub fn set_max_requests_per_connection(&mut self, group_id: usize, limit: Option<u64>) {
+        self.pool.set_max_requests_per_connection(group_id, limit);
+    }
+
+    /// Set the timeout for non-blocking reconnect handshakes
+    pub fn set_connect_timeout(&mut self, timeout: Duration) {
+        self.pool.set_connect_timeout(timeout);
     }
 
     /// Fail the run when a connection's setup (see [`Protocol::setup_pending`])
@@ -621,6 +642,7 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             }
             let state = self.pool.get_state(connection_id).expect("Connection state not found");
             let group_id = state.group_id();
+            let needs_reconnect = state.needs_reconnect();
             let preloading = self.pool.is_preloading();
             if preloading {
                 // The protocol's state may have changed since the connection
@@ -636,62 +658,35 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
                 }
             }
 
-            let request = {
-                let protocol =
-                    self.protocols.get_mut(&group_id).expect("Protocol not found for group_id");
-                protocol.next_request(connection_id)
-            };
-            if state.is_control() && !request.metadata.is_setup {
-                return Err(crate::Error::Protocol(format!(
-                    "Traffic group {group_id}, connection {connection_id}: the protocol sent a \
-                     request that is no setup request on a control connection"
-                )));
-            }
-            if preloading && !request.metadata.is_warmup {
-                return Err(crate::Error::Protocol(format!(
-                    "Traffic group {group_id}, connection {connection_id}: the protocol sent a \
-                     measurement request during preload"
-                )));
-            }
-
-            if request.metadata.is_setup {
-                // Connection setup (a handshake, AUTH, ...) may carry
-                // credentials: it is never dumped, measured or scheduled.
-                self.pool.queue_setup(connection_id, &request.data, request.request_id)?;
+            let intended_ns = if preloading {
+                None
             } else {
-                // Record request to dump file if enabled
-                if let Some(ref dumper) = self.request_dumper {
-                    let req_id_str = format!("{:?}", request.request_id);
-                    self.record_request(
-                        dumper,
-                        group_id,
-                        connection_id,
-                        &request.data,
-                        &req_id_str,
-                    );
-                }
+                self.pool.intended_send_time(pick)
+            };
 
-                // Queue the request (track warmup status for response
-                // handling); it is sent, and its stats recorded, when the
-                // transport takes it. An open-loop request's latency starts
-                // at its intended send time. Preload follows no schedule.
-                let intended_ns = if preloading {
-                    None
-                } else {
-                    self.pool.intended_send_time(pick)
-                };
-                self.pool.queue_request(
+            let mut connect_start_ts = None;
+            if needs_reconnect {
+                match self.initiate_reconnect(
                     connection_id,
-                    &request.data,
-                    request.request_id,
-                    request.metadata.is_warmup,
+                    group_id,
+                    pick,
                     intended_ns,
-                )?;
-
-                // Advance the policy's schedule
-                if !preloading {
-                    self.pool.on_request_sent(pick, timing::time_ns());
+                    preloading,
+                )? {
+                    ReconnectStep::Immediate(ts) => connect_start_ts = Some(ts),
+                    ReconnectStep::InProgress => {
+                        sends_this_iteration += 1;
+                        continue;
+                    }
+                    ReconnectStep::Closed => continue,
                 }
+            }
+
+            let was_setup =
+                self.queue_next_request(connection_id, group_id, intended_ns, connect_start_ts)?;
+
+            if !was_setup && !preloading {
+                self.pool.on_request_sent(pick, timing::time_ns());
             }
 
             // Try to re-add connection to heap if it still has capacity
@@ -724,6 +719,93 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         Ok(sends_this_iteration)
     }
 
+    /// Start a reconnect on `connection_id` for `pick`.
+    fn initiate_reconnect(
+        &mut self,
+        connection_id: usize,
+        group_id: usize,
+        pick: crate::connection::Pick,
+        intended_ns: Option<u64>,
+        preloading: bool,
+    ) -> Result<ReconnectStep> {
+        match self.pool.start_reconnect(connection_id, intended_ns) {
+            Ok(Some(connect_start_ts)) => Ok(ReconnectStep::Immediate(connect_start_ts)),
+            Ok(None) => {
+                if !preloading {
+                    self.pool.on_request_sent(pick, timing::time_ns());
+                }
+                Ok(ReconnectStep::InProgress)
+            }
+            Err(e @ crate::Error::Connection(_)) => {
+                self.close_failed(connection_id, group_id, e)?;
+                Ok(ReconnectStep::Closed)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Ask `group_id`'s protocol for its next request on `connection_id` and
+    /// queue it on the pool. Returns `true` if it was a setup request.
+    fn queue_next_request(
+        &mut self,
+        connection_id: usize,
+        group_id: usize,
+        intended_ns: Option<u64>,
+        connect_start_ts: Option<xylem_transport::Timestamp>,
+    ) -> Result<bool> {
+        let is_control = self
+            .pool
+            .get_state(connection_id)
+            .expect("Connection state not found")
+            .is_control();
+        let preloading = self.pool.is_preloading();
+
+        let request = {
+            let protocol =
+                self.protocols.get_mut(&group_id).expect("Protocol not found for group_id");
+            protocol.next_request(connection_id)
+        };
+        if is_control && !request.metadata.is_setup {
+            return Err(crate::Error::Protocol(format!(
+                "Traffic group {group_id}, connection {connection_id}: the protocol sent a \
+                 request that is no setup request on a control connection"
+            )));
+        }
+        if preloading && !request.metadata.is_warmup {
+            return Err(crate::Error::Protocol(format!(
+                "Traffic group {group_id}, connection {connection_id}: the protocol sent a \
+                 measurement request during preload"
+            )));
+        }
+
+        if request.metadata.is_setup {
+            // Connection setup (a handshake, AUTH, ...) may carry
+            // credentials: it is never dumped, measured or scheduled.
+            self.pool.queue_setup(connection_id, &request.data, request.request_id)?;
+            Ok(true)
+        } else {
+            // Record request to dump file if enabled
+            if let Some(ref dumper) = self.request_dumper {
+                let req_id_str = format!("{:?}", request.request_id);
+                self.record_request(dumper, group_id, connection_id, &request.data, &req_id_str);
+            }
+
+            // Queue the request (track warmup status for response
+            // handling); it is sent, and its stats recorded, when the
+            // transport takes it. An open-loop request's latency starts
+            // at its intended send time. Preload follows no schedule.
+            self.pool.queue_request_with_connect(
+                connection_id,
+                &request.data,
+                request.request_id,
+                request.metadata.is_warmup,
+                intended_ns,
+                connect_start_ts,
+            )?;
+            Ok(false)
+        }
+    }
+
     /// Write what was queued since the last flush and put it on the wire,
     /// recording the requests the transport took
     fn flush(&mut self) -> Result<()> {
@@ -753,10 +835,17 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
     }
 
     /// Bound every receive wait by the experiment deadline, the next
-    /// request timeout and the next setup deadline. A closed-loop entry has
-    /// no timestamp, so test readiness before interpreting an empty peek.
+    /// request timeout, the next connect timeout, any draining-for-reconnect
+    /// TX timestamp deadline, and the next setup deadline. A closed-loop entry
+    /// has no timestamp, so test readiness before interpreting an empty peek.
     fn poll_timeout(&self, now_ns: u64, end_ns: u64) -> Duration {
         let end_ns = self.pool.next_request_deadline().map_or(end_ns, |next| next.min(end_ns));
+        let end_ns = self.pool.next_connect_deadline().map_or(end_ns, |next| next.min(end_ns));
+        let end_ns = if self.pool.draining_for_reconnect_count() > 0 {
+            self.pool.next_deferred_deadline().map_or(end_ns, |next| next.min(end_ns))
+        } else {
+            end_ns
+        };
         let end_ns = self.setup_deadlines.front().map_or(end_ns, |&(next, _)| next.min(end_ns));
         let remaining_ns = end_ns.saturating_sub(now_ns);
         let wait_ns = if self.pool.has_ready(now_ns) {
@@ -788,6 +877,7 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         let now_ns = timing::time_ns();
         self.pool.expire_deferred_at(now_ns);
         self.record_deferred();
+        self.finish_draining_for_reconnect()?;
 
         // Clean up stale TX queue entries (entries older than 1 minute)
         // This prevents memory leaks when TX timestamps are never received
@@ -799,6 +889,19 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
                 Some(s) => s,
                 None => continue,
             };
+
+            // In-progress non-blocking reconnect became ready
+            if state.is_connecting() {
+                let group_id = state.group_id();
+                driven_sends |= self.handle_connecting_ready(connection_id, group_id)?;
+                continue;
+            }
+
+            // Draining deferred TX timestamps before closing: already polled
+            // above; never call recv() on a draining socket.
+            if state.is_draining_for_reconnect() {
+                continue;
+            }
 
             // Queued bytes waited for the connection to become writable
             if state.is_write_blocked() {
@@ -884,6 +987,24 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
                 Err(e) => return Err(e),
             }
 
+            // If the connection reached `max_requests_per_connection` and has
+            // no pending requests left, drain any deferred TX timestamps or
+            // close now so the next scheduled send initiates a fresh TCP connect.
+            if self.pool.get_state(connection_id).is_some_and(|s| s.reached_request_limit()) {
+                if self.pool.get_state(connection_id).is_some_and(|s| s.has_deferred()) {
+                    self.pool.poll_tx_timestamps_for(connection_id)?;
+                    self.record_deferred();
+                }
+                if self.pool.get_state(connection_id).is_some_and(|s| s.has_deferred()) {
+                    self.pool.begin_drain_for_reconnect(connection_id)?;
+                    continue;
+                }
+                self.pool.close_for_reconnect(connection_id)?;
+                if self.window_closed_ns.is_some() {
+                    continue;
+                }
+            }
+
             // Reschedule connection if it can send but isn't on heap
             // This handles two cases:
             // 1. Pipeline transitioned from full to available
@@ -898,7 +1019,77 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         }
         // Requests written once their connections became writable
         self.record_sent();
+        self.expire_connects(timing::time_ns())?;
 
+        Ok(())
+    }
+
+    /// Complete an in-progress non-blocking reconnect once `poll()` reports it ready.
+    /// Returns `true` if a request was queued and needs a flush.
+    fn handle_connecting_ready(&mut self, connection_id: usize, group_id: usize) -> Result<bool> {
+        let Some((connect_start_ts, intended_ns, abandoned)) =
+            (match self.pool.finish_reconnect(connection_id) {
+                Ok(outcome) => outcome,
+                Err(e @ crate::Error::Connection(_)) => {
+                    self.close_failed(connection_id, group_id, e)?;
+                    return Ok(false);
+                }
+                Err(e) => return Err(e),
+            })
+        else {
+            return Ok(false);
+        };
+        if self.window_closed_ns.is_some() || abandoned {
+            self.pool.close_for_reconnect(connection_id)?;
+            return Ok(false);
+        }
+        let _ =
+            self.queue_next_request(connection_id, group_id, intended_ns, Some(connect_start_ts))?;
+        let protocol = self.protocols.get(&group_id).expect("Protocol not found for group_id");
+        self.pool.try_schedule_connection(connection_id, protocol);
+        self.write_queued(connection_id, group_id)?;
+        Ok(true)
+    }
+
+    /// Close and reschedule any `DrainingForReconnect` connections whose last
+    /// deferred TX timestamp just resolved or expired.
+    fn finish_draining_for_reconnect(&mut self) -> Result<()> {
+        if !self.pool.has_ready_to_close_for_reconnect() {
+            return Ok(());
+        }
+        let mut ready = Vec::new();
+        self.pool.take_ready_to_close_for_reconnect(&mut ready);
+        for connection_id in ready {
+            let Some(state) = self.pool.get_state(connection_id) else {
+                continue;
+            };
+            if state.is_closed() || !state.is_draining_for_reconnect() || state.has_deferred() {
+                continue;
+            }
+            let group_id = state.group_id();
+            self.pool.close_for_reconnect(connection_id)?;
+            if self.window_closed_ns.is_none() {
+                let protocol =
+                    self.protocols.get(&group_id).expect("Protocol not found for group_id");
+                self.pool.try_schedule_connection(connection_id, protocol);
+            }
+        }
+        Ok(())
+    }
+
+    /// Close any in-flight non-blocking reconnect that exceeded its connect timeout.
+    fn expire_connects(&mut self, now_ns: u64) -> Result<()> {
+        let mut expired = Vec::new();
+        self.pool.expire_connects_at(now_ns, |connection_id, group_id| {
+            expired.push((connection_id, group_id));
+        });
+        for (connection_id, group_id) in expired {
+            self.close_failed(
+                connection_id,
+                group_id,
+                crate::Error::Connection("Connection timeout".to_string()),
+            )?;
+        }
         Ok(())
     }
 
@@ -1145,6 +1336,9 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
     /// Measurement requests still pending then are counted as timed out,
     /// without a latency.
     fn drain_responses(&mut self) -> Result<()> {
+        // Never wait on an unsent in-flight reconnect during post-window drain;
+        // pending responses and DrainingForReconnect TX timestamps still drain.
+        self.pool.abort_connecting_for_drain()?;
         let timeout_ns = self.config.drain_timeout.as_nanos().min(u64::MAX as u128) as u64;
         let deadline_ns = timing::time_ns().saturating_add(timeout_ns);
         // Only ready connections and timeouts end pending requests, so a
@@ -1292,7 +1486,7 @@ mod tests {
     use xylem_common::{ErrorReply, Parsed, Request, RequestMeta};
     use xylem_transport::TcpTransportFactory;
 
-    use crate::connection::test_support::{FakeFactory, FakeGroup, FakeIo};
+    use crate::connection::test_support::{FakeFactory, FakeGroup, FakeIo, ReconnectMode};
     use crate::scheduler::{PolicyScheduler, UniformPolicyScheduler};
     use crate::stats::SamplingPolicy;
 
@@ -3890,5 +4084,430 @@ mod tests {
         }
         assert_eq!(io.lock().unwrap().sent_on[3..], [2, 2]);
         assert_eq!(worker.stats.request_counts_global().completed, 1);
+    }
+
+    #[test]
+    fn reconnect_immediate_max_requests_1_and_2() {
+        for limit in [1u64, 2u64] {
+            let factory = FakeFactory::default();
+            factory.0.lock().unwrap().live_timestamps = true;
+            factory.0.lock().unwrap().reconnect_mode = ReconnectMode::Immediate;
+
+            let mut stats = TupleStatsCollector::default();
+            stats.register_group_policy(0, SamplingPolicy::Unlimited);
+            let config = WorkerConfig {
+                target: "127.0.0.1:1".parse().unwrap(),
+                duration: Duration::from_secs(1),
+                conn_count: 1,
+                max_pending_per_conn: 1,
+                drain_timeout: FAKE_DRAIN_TIMEOUT,
+            };
+            let mut worker = Worker::new(
+                &factory,
+                FakeProtocol::default(),
+                stats,
+                config,
+                Box::new(UniformPolicyScheduler::closed_loop()),
+            )
+            .unwrap();
+            worker.set_max_requests_per_connection(0, Some(limit));
+            worker.anchor_schedules(timing::time_ns());
+
+            let io = factory.0.clone();
+            // Send 4 requests sequentially
+            for req_id in 0u64..4 {
+                assert_eq!(worker.send_requests().unwrap(), 1, "limit={limit} req={req_id}");
+                io.lock().unwrap().responses.push_back(Ok(req_id.to_le_bytes().to_vec()));
+                worker.process_responses(Duration::ZERO).unwrap();
+            }
+
+            let expected_reconnects = match limit {
+                1 => 3, // before req 1, 2, 3
+                2 => 1, // before req 2
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                io.lock().unwrap().reconnect_started.len(),
+                expected_reconnects,
+                "limit={limit}"
+            );
+            assert_eq!(worker.stats.request_counts_global().completed, 4);
+            let bd = worker.stats.latency_breakdown_global();
+            assert_eq!(bd.service.sample_count, 4);
+            assert_eq!(
+                bd.connect.unwrap().sample_count,
+                expected_reconnects as u64,
+                "only the first request after each reconnect records connect latency"
+            );
+            assert_eq!(bd.connect_request.unwrap().sample_count, expected_reconnects as u64);
+        }
+    }
+
+    #[test]
+    fn reconnect_async_einprogress_separates_sw_connect_from_hw_request_only() {
+        use xylem_transport::{KernelClock, KernelTimestamp, Timestamp, TxTimestampInfo};
+
+        let factory = FakeFactory::default();
+        {
+            let mut io = factory.0.lock().unwrap();
+            io.live_timestamps = true;
+            io.reconnect_mode = ReconnectMode::Async;
+        }
+        let mut stats = TupleStatsCollector::default();
+        stats.register_group_policy(0, SamplingPolicy::Unlimited);
+        let config = WorkerConfig {
+            target: "127.0.0.1:1".parse().unwrap(),
+            duration: Duration::from_secs(1),
+            conn_count: 1,
+            max_pending_per_conn: 1,
+            drain_timeout: FAKE_DRAIN_TIMEOUT,
+        };
+        let mut worker = Worker::new(
+            &factory,
+            FakeProtocol::default(),
+            stats,
+            config,
+            Box::new(UniformPolicyScheduler::closed_loop()),
+        )
+        .unwrap();
+        worker.set_max_requests_per_connection(0, Some(1));
+        worker.anchor_schedules(timing::time_ns());
+
+        let io = factory.0.clone();
+
+        // Request 0 on initial pre-opened connection
+        worker.send_requests().unwrap();
+        io.lock().unwrap().responses.push_back(Ok(0u64.to_le_bytes().to_vec()));
+        worker.process_responses(Duration::ZERO).unwrap();
+        assert!(worker.pool.get_state(0).unwrap().needs_reconnect());
+
+        // Request 1 starts async reconnect (EINPROGRESS)
+        worker.send_requests().unwrap();
+        assert!(worker.pool.get_state(0).unwrap().is_connecting());
+        assert_eq!(io.lock().unwrap().sent.len(), 1, "must not send before handshake finishes");
+
+        // Simulate a 3 ms TCP handshake
+        thread::sleep(Duration::from_millis(3));
+
+        // Handshake completes on next poll -> request 1 is queued and flushed immediately
+        io.lock().unwrap().connecting_ready = true;
+        worker.process_responses(Duration::ZERO).unwrap();
+        assert_eq!(io.lock().unwrap().reconnect_finished, vec![0]);
+        assert_eq!(io.lock().unwrap().sent.len(), 2, "request 1 sent immediately on connect");
+
+        // Deliver HW TX timestamp (500 us before HW RX timestamp) and response
+        let hw_tx = KernelTimestamp {
+            nanos: 10_000_000,
+            clock: KernelClock::NicHardware,
+        };
+        let hw_rx = KernelTimestamp {
+            nanos: 10_500_000,
+            clock: KernelClock::NicHardware,
+        };
+        {
+            let mut io = io.lock().unwrap();
+            io.live_timestamps = false;
+            io.connecting_ready = false;
+            io.timestamp = Timestamp::now().with_kernel(hw_rx);
+            io.tx_timestamps.push(TxTimestampInfo {
+                conn_id: 0,
+                tx_end: 2,
+                cumulative: true,
+                timestamp: hw_tx,
+            });
+            io.responses.push_back(Ok(1u64.to_le_bytes().to_vec()));
+        }
+        worker.process_responses(Duration::ZERO).unwrap();
+
+        let bd = worker.stats.latency_breakdown_global();
+        assert_eq!(bd.kernel_split_count, 1);
+        assert_eq!(bd.kernel_split_missing.tx, 1); // req 0 had no HW stamp; req 1 did!
+                                                   // Pure HW request-only network_server is exactly 500 us (NOT polluted by 3 ms connect!)
+        let net = bd.network_server.unwrap();
+        assert_eq!(net.sample_count, 1);
+        assert_eq!(net.mean, Some(Duration::from_micros(500)));
+
+        // SW connect latency captured the >= 3 ms handshake, and connect_request >= connect
+        let connect = bd.connect.unwrap();
+        let connect_request = bd.connect_request.unwrap();
+        assert_eq!(connect.sample_count, 1);
+        assert_eq!(connect_request.sample_count, 1);
+        assert!(connect.mean.unwrap() >= Duration::from_millis(2), "connect={:?}", connect.mean);
+        assert!(
+            connect_request.mean.unwrap() >= connect.mean.unwrap(),
+            "connect_request={:?} < connect={:?}",
+            connect_request.mean,
+            connect.mean
+        );
+    }
+
+    #[test]
+    fn reconnect_drains_deferred_tx_timestamp_before_closing_socket() {
+        use xylem_transport::{KernelClock, KernelTimestamp, Timestamp, TxTimestampInfo};
+
+        let factory = FakeFactory::default();
+        factory.0.lock().unwrap().reconnect_mode = ReconnectMode::Immediate;
+
+        let mut stats = TupleStatsCollector::default();
+        stats.register_group_policy(0, SamplingPolicy::Unlimited);
+        let config = WorkerConfig {
+            target: "127.0.0.1:1".parse().unwrap(),
+            duration: Duration::from_secs(1),
+            conn_count: 1,
+            max_pending_per_conn: 1,
+            drain_timeout: FAKE_DRAIN_TIMEOUT,
+        };
+        let mut worker = Worker::new(
+            &factory,
+            FakeProtocol::default(),
+            stats,
+            config,
+            Box::new(UniformPolicyScheduler::closed_loop()),
+        )
+        .unwrap();
+        worker.set_max_requests_per_connection(0, Some(1));
+        worker.anchor_schedules(timing::time_ns());
+
+        let io = factory.0.clone();
+
+        // Request 0 -> finish so req 1 goes through a reconnect
+        worker.send_requests().unwrap();
+        io.lock().unwrap().responses.push_back(Ok(0u64.to_le_bytes().to_vec()));
+        worker.process_responses(Duration::ZERO).unwrap();
+
+        // Request 1 reconnects immediately and sends
+        let send_ts = Timestamp::now();
+        io.lock().unwrap().timestamp = send_ts;
+        worker.send_requests().unwrap();
+        assert_eq!(io.lock().unwrap().sent.len(), 2);
+
+        // Response 1 arrives with HW RX timestamp BEFORE TX timestamp is in MSG_ERRQUEUE
+        let hw_rx = KernelTimestamp {
+            nanos: 2_000_000,
+            clock: KernelClock::NicHardware,
+        };
+        {
+            let mut io = io.lock().unwrap();
+            io.timestamp = Timestamp::now().with_kernel(hw_rx);
+            io.responses.push_back(Ok(1u64.to_le_bytes().to_vec()));
+        }
+        let closes_before = io.lock().unwrap().closed_conns.len();
+        worker.process_responses(Duration::ZERO).unwrap();
+
+        // Must have attempted O(1) poll_tx_timestamps_for, then paused I/O and entered DrainingForReconnect
+        assert_eq!(io.lock().unwrap().tx_polls_for, vec![0]);
+        assert_eq!(io.lock().unwrap().paused_io, vec![0]);
+        assert_eq!(
+            io.lock().unwrap().closed_conns.len(),
+            closes_before,
+            "socket must stay open until deferred TX stamp arrives"
+        );
+        assert!(worker.pool.get_state(0).unwrap().is_draining_for_reconnect());
+        assert_eq!(worker.pool.draining_for_reconnect_count(), 1);
+        assert!(!worker.pool.get_state(0).unwrap().can_send());
+
+        // Now deliver the delayed HW TX timestamp (300 us before hw_rx)
+        let hw_tx = KernelTimestamp {
+            nanos: 1_700_000,
+            clock: KernelClock::NicHardware,
+        };
+        io.lock().unwrap().tx_timestamps.push(TxTimestampInfo {
+            conn_id: 0,
+            tx_end: 2,
+            cumulative: true,
+            timestamp: hw_tx,
+        });
+        worker.process_responses(Duration::ZERO).unwrap();
+
+        // Draining completed: socket closed for reconnect, rescheduled, 0 lost TX stamps!
+        assert_eq!(io.lock().unwrap().closed_conns.len(), closes_before + 1);
+        assert_eq!(worker.pool.draining_for_reconnect_count(), 0);
+        assert!(worker.pool.get_state(0).unwrap().needs_reconnect());
+        assert!(worker.pool.get_state(0).unwrap().can_send());
+
+        let bd = worker.stats.latency_breakdown_global();
+        assert_eq!(bd.kernel_split_count, 1);
+        assert_eq!(bd.network_server.unwrap().mean, Some(Duration::from_micros(300)));
+        assert_eq!(bd.connect.unwrap().sample_count, 1);
+        assert_eq!(bd.connect_request.unwrap().sample_count, 1);
+    }
+
+    #[test]
+    fn reconnect_failures_and_timeout_close_failed_connection_cleanly() {
+        let conn_err: fn() -> xylem_transport::Error =
+            || xylem_transport::Error::Connection("connection refused".into());
+
+        // 1. FailStart and FailFinish close the failed connection while sibling keeps going
+        for mode in [ReconnectMode::FailStart(conn_err), ReconnectMode::FailFinish(conn_err)] {
+            let factory = FakeFactory::default();
+            factory.0.lock().unwrap().reconnect_mode = ReconnectMode::Immediate;
+            let mut stats = TupleStatsCollector::default();
+            stats.register_group_policy(0, SamplingPolicy::Unlimited);
+            let config = WorkerConfig {
+                target: "127.0.0.1:1".parse().unwrap(),
+                duration: Duration::from_secs(1),
+                conn_count: 2,
+                max_pending_per_conn: 1,
+                drain_timeout: FAKE_DRAIN_TIMEOUT,
+            };
+            let mut worker = Worker::new(
+                &factory,
+                FakeProtocol::default(),
+                stats,
+                config,
+                Box::new(UniformPolicyScheduler::closed_loop()),
+            )
+            .unwrap();
+            worker.set_max_requests_per_connection(0, Some(1));
+            worker.anchor_schedules(timing::time_ns());
+
+            let io = factory.0.clone();
+            // Initial sends on conn 0 and conn 1
+            worker.send_requests().unwrap();
+            // Reply on conn 0 only so conn 0 enters NeedsReconnect while conn 1 stays healthy
+            {
+                let mut io = io.lock().unwrap();
+                io.response_connection_id = 0;
+                io.responses.push_back(Ok(0u64.to_le_bytes().to_vec()));
+            }
+            worker.process_responses(Duration::ZERO).unwrap();
+            assert!(worker.pool.get_state(0).unwrap().needs_reconnect());
+
+            // Now inject reconnect failure mode on conn 0
+            io.lock().unwrap().reconnect_mode = mode;
+            worker.send_requests().unwrap();
+            if matches!(mode, ReconnectMode::FailFinish(_)) {
+                assert!(worker.pool.get_state(0).unwrap().is_connecting());
+                io.lock().unwrap().connecting_ready = true;
+                worker.process_responses(Duration::ZERO).unwrap();
+            }
+
+            assert!(worker.pool.get_state(0).unwrap().is_closed(), "{mode:?}");
+            assert!(!worker.pool.get_state(1).unwrap().is_closed(), "{mode:?}");
+            assert_eq!(worker.pool.connection_ids(), &[1]);
+        }
+
+        // 2. Hung SYN times out and counts open-loop arrival as unsent
+        let factory = FakeFactory::default();
+        factory.0.lock().unwrap().reconnect_mode = ReconnectMode::HangAsync;
+        let mut stats = TupleStatsCollector::default();
+        stats.register_group_policy(0, SamplingPolicy::Unlimited);
+        let config = WorkerConfig {
+            target: "127.0.0.1:1".parse().unwrap(),
+            duration: Duration::from_secs(1),
+            conn_count: 1,
+            max_pending_per_conn: 1,
+            drain_timeout: FAKE_DRAIN_TIMEOUT,
+        };
+        let mut worker = Worker::new(
+            &factory,
+            FakeProtocol::default(),
+            stats,
+            config,
+            Box::new(UniformPolicyScheduler::fixed_rate(10_000.0)),
+        )
+        .unwrap();
+        worker.set_max_requests_per_connection(0, Some(1));
+        worker.set_connect_timeout(Duration::from_millis(5));
+        let start_ns = timing::time_ns();
+        worker.anchor_schedules(start_ns);
+
+        let io = factory.0.clone();
+        // Send req 0 and complete it
+        while io.lock().unwrap().sent.is_empty() {
+            worker.send_requests().unwrap();
+            thread::sleep(Duration::from_micros(200));
+        }
+        io.lock().unwrap().responses.push_back(Ok(0u64.to_le_bytes().to_vec()));
+        worker.process_responses(Duration::ZERO).unwrap();
+        assert!(worker.pool.get_state(0).unwrap().needs_reconnect());
+
+        // Trigger async reconnect (which hangs)
+        while !worker.pool.get_state(0).unwrap().is_connecting() {
+            worker.send_requests().unwrap();
+            thread::sleep(Duration::from_micros(200));
+        }
+        assert!(worker.pool.next_connect_deadline().is_some());
+
+        // Wait past 5 ms connect timeout and poll -> closes failed conn & counts 1 unsent
+        thread::sleep(Duration::from_millis(10));
+        worker.process_responses(Duration::ZERO).unwrap();
+        assert!(worker.pool.get_state(0).unwrap().is_closed());
+        assert_eq!(worker.stats.request_counts_global().unsent, 1);
+    }
+
+    fn drive_one_open_loop_send(
+        worker: &mut Worker<FakeGroup, FakeProtocol>,
+        io: &std::sync::Mutex<FakeIo>,
+        target_sent: usize,
+    ) {
+        while io.lock().unwrap().sent.len() < target_sent {
+            worker.send_requests().unwrap();
+            if worker.pool.get_state(0).unwrap().is_connecting() {
+                io.lock().unwrap().connecting_ready = true;
+                worker.process_responses(Duration::ZERO).unwrap();
+                io.lock().unwrap().connecting_ready = false;
+            }
+            thread::sleep(Duration::from_micros(200));
+        }
+    }
+
+    #[test]
+    fn reconnect_open_loop_fixed_rate_and_poisson_with_drain_abort() {
+        for scheduler_kind in ["fixed-rate", "poisson"] {
+            let factory = FakeFactory::default();
+            {
+                let mut io = factory.0.lock().unwrap();
+                io.live_timestamps = true;
+                io.reconnect_mode = ReconnectMode::Async;
+            }
+            let scheduler: Box<dyn PolicyScheduler> = match scheduler_kind {
+                "fixed-rate" => Box::new(UniformPolicyScheduler::fixed_rate(1_000.0)),
+                "poisson" => Box::new(UniformPolicyScheduler::poisson(1_000.0).unwrap()),
+                _ => unreachable!(),
+            };
+            let mut stats = TupleStatsCollector::default();
+            stats.register_group_policy(0, SamplingPolicy::Unlimited);
+            let config = WorkerConfig {
+                target: "127.0.0.1:1".parse().unwrap(),
+                duration: Duration::from_secs(1),
+                conn_count: 1,
+                max_pending_per_conn: 1,
+                drain_timeout: Duration::from_millis(20),
+            };
+            let mut worker =
+                Worker::new(&factory, FakeProtocol::default(), stats, config, scheduler).unwrap();
+            worker.set_max_requests_per_connection(0, Some(1));
+            let start_ns = timing::time_ns();
+            worker.anchor_schedules(start_ns);
+
+            let io = factory.0.clone();
+            // Run 3 requests on open-loop schedule with async reconnects
+            for req_id in 0u64..3 {
+                drive_one_open_loop_send(&mut worker, &io, req_id as usize + 1);
+                io.lock().unwrap().responses.push_back(Ok(req_id.to_le_bytes().to_vec()));
+                worker.process_responses(Duration::ZERO).unwrap();
+            }
+
+            assert_eq!(io.lock().unwrap().reconnect_started.len(), 2, "{scheduler_kind}");
+            assert_eq!(io.lock().unwrap().reconnect_finished.len(), 2, "{scheduler_kind}");
+            assert_eq!(worker.stats.request_counts_global().completed, 3, "{scheduler_kind}");
+            assert_eq!(worker.stats.send_lag_global().sample_count, 3, "{scheduler_kind}");
+            let bd = worker.stats.latency_breakdown_global();
+            assert_eq!(bd.connect.unwrap().sample_count, 2, "{scheduler_kind}");
+            assert_eq!(bd.connect_request.unwrap().sample_count, 2, "{scheduler_kind}");
+
+            // Start one more async reconnect, then close window and verify drain aborts it cleanly
+            while !worker.pool.get_state(0).unwrap().is_connecting() {
+                worker.send_requests().unwrap();
+                thread::sleep(Duration::from_micros(200));
+            }
+            let end_ns = timing::time_ns();
+            worker.window_closed_ns = Some(end_ns);
+            worker.record_unsent(end_ns);
+            worker.drain_responses().unwrap();
+            assert!(!worker.pool.get_state(0).unwrap().is_connecting());
+            assert!(worker.stats.request_counts_global().unsent >= 1, "{scheduler_kind}");
+        }
     }
 }

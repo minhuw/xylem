@@ -3409,6 +3409,8 @@ mod tests {
                 user_round_trip: Duration::from_micros(host_us + network_us),
             }),
             miss: None,
+            connect: None,
+            connect_request: None,
         };
         let user = |us| LatencyBreakdown::user_space(Duration::from_micros(us));
         let mut first = TupleStatsCollector::default();

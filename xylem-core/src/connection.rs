@@ -74,6 +74,9 @@ const TX_QUEUE_STALE_TIMEOUT_NS: u64 = 60_000_000_000;
 /// Default for [`ConnectionPool::set_tx_timestamp_timeout`]
 pub const DEFAULT_TX_TIMESTAMP_TIMEOUT: Duration = Duration::from_millis(10);
 
+/// Default timeout for a non-blocking TCP reconnect handshake (5 seconds)
+const CONNECT_TIMEOUT_NS: u64 = 5_000_000_000;
+
 /// Most timed-out request IDs a connection remembers to recognise their late
 /// responses; the oldest are forgotten first
 const TIMED_OUT_MEMORY: usize = 4096;
@@ -143,6 +146,7 @@ struct DeferredResponse {
     recv_ts: Timestamp,
     bytes: usize,
     received_ns: u64,
+    connect_start_ts: Option<Timestamp>,
 }
 
 impl DeferredResponse {
@@ -154,7 +158,13 @@ impl DeferredResponse {
         tx: Option<KernelTimestamp>,
     ) -> DeferredSample {
         let send_ts = tx.map_or(self.send_ts, |kernel| self.send_ts.with_kernel(kernel));
-        let breakdown = LatencyBreakdown::between(&send_ts, &self.recv_ts);
+        let mut breakdown = LatencyBreakdown::between(&send_ts, &self.recv_ts);
+        if let Some(cs) = self.connect_start_ts {
+            breakdown = breakdown.with_connect(
+                send_ts.cycles_duration_since(&cs),
+                self.recv_ts.cycles_duration_since(&cs),
+            );
+        }
         DeferredSample {
             group_id,
             connection_id,
@@ -228,6 +238,15 @@ pub struct SentRequest {
     pub measured: bool,
 }
 
+/// Metadata for a request being queued onto a connection
+struct QueueMeta<ReqId> {
+    req_id: ReqId,
+    intended_ns: Option<u64>,
+    is_warmup: bool,
+    is_setup: bool,
+    connect_start_ts: Option<Timestamp>,
+}
+
 /// A request queued on a connection whose last byte the transport has not
 /// taken yet
 #[derive(Debug)]
@@ -239,6 +258,7 @@ struct QueuedRequest<ReqId> {
     intended_ns: Option<u64>,
     is_warmup: bool,
     is_setup: bool,
+    connect_start_ts: Option<Timestamp>,
 }
 
 /// Pending request tracking
@@ -255,6 +275,25 @@ struct PendingRequest {
     tx_kernel_ts: Option<KernelTimestamp>,
     /// [`TxEntry::seq`] of the send, if it waits for a TX timestamp
     tx_seq: Option<u64>,
+    /// Cycles read when the reconnect handshake started for this request
+    connect_start_ts: Option<Timestamp>,
+}
+
+/// Connection lifecycle state for `max_requests_per_connection` reconnects
+#[derive(Debug, Clone, Copy)]
+enum ReconnectState {
+    Connected,
+    /// Waiting for deferred TX timestamps to drain before closing socket
+    DrainingForReconnect,
+    /// Socket closed; next scheduled send initiates async reconnect
+    NeedsReconnect,
+    /// Non-blocking TCP connect in progress
+    Connecting {
+        connect_start_ts: Timestamp,
+        deadline_ns: u64,
+        intended_ns: Option<u64>,
+        abandoned: bool,
+    },
 }
 
 /// A send whose transport reports TX timestamps, waiting for its stamp
@@ -401,6 +440,12 @@ pub struct ConnectionState<ReqId: Eq + Hash + Clone> {
     /// The transport took fewer bytes than queued: the rest waits for the
     /// connection to become writable, with write interest set
     write_blocked: bool,
+    /// Lifecycle state for periodic connection reconnects
+    reconnect_state: ReconnectState,
+    /// Maximum requests per connection before closing and reconnecting
+    max_requests_per_connection: Option<u64>,
+    /// Measurement/warmup requests queued on the current underlying connection
+    requests_sent_on_conn: u64,
 }
 
 impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
@@ -452,12 +497,82 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
             unsent: VecDeque::new(),
             staged: false,
             write_blocked: false,
+            reconnect_state: ReconnectState::Connected,
+            max_requests_per_connection: None,
+            requests_sent_on_conn: 0,
         }
     }
 
-    /// Check if this connection can accept more requests
+    /// Check if this connection can accept more requests (or initiate a reconnect)
     pub fn can_send(&self) -> bool {
-        !self.closed && self.pending_count() < self.max_pending_requests
+        if self.closed {
+            return false;
+        }
+        match self.reconnect_state {
+            ReconnectState::Connected => {
+                self.pending_count() < self.max_pending_requests
+                    && self
+                        .max_requests_per_connection
+                        .is_none_or(|limit| self.requests_sent_on_conn < limit)
+            }
+            ReconnectState::NeedsReconnect => self.pending_count() == 0,
+            ReconnectState::DrainingForReconnect | ReconnectState::Connecting { .. } => false,
+        }
+    }
+
+    /// Whether the connection is closed for reconnect and ready to dial on the next send
+    pub fn needs_reconnect(&self) -> bool {
+        !self.closed && matches!(self.reconnect_state, ReconnectState::NeedsReconnect)
+    }
+
+    /// Whether a non-blocking reconnect handshake is currently in progress
+    pub fn is_connecting(&self) -> bool {
+        !self.closed && matches!(self.reconnect_state, ReconnectState::Connecting { .. })
+    }
+
+    /// Whether the connection is draining deferred TX timestamps before closing for reconnect
+    pub fn is_draining_for_reconnect(&self) -> bool {
+        !self.closed && matches!(self.reconnect_state, ReconnectState::DrainingForReconnect)
+    }
+
+    /// Whether any completed response on this connection is still waiting for its TX timestamp
+    pub fn has_deferred(&self) -> bool {
+        !self.deferred.is_empty()
+    }
+
+    /// Whether the connection has sent its maximum requests and drained all pending replies
+    pub fn reached_request_limit(&self) -> bool {
+        !self.closed
+            && matches!(self.reconnect_state, ReconnectState::Connected)
+            && self.pending_count() == 0
+            && self
+                .max_requests_per_connection
+                .is_some_and(|limit| self.requests_sent_on_conn >= limit)
+    }
+
+    fn connecting_deadline_ns(&self) -> Option<u64> {
+        match self.reconnect_state {
+            ReconnectState::Connecting { deadline_ns, .. } => Some(deadline_ns),
+            _ => None,
+        }
+    }
+
+    /// Reset per-socket I/O state for a reconnect transition while reusing
+    /// the allocated receive buffer
+    fn reset_io_for_reconnect(&mut self, next_state: ReconnectState) {
+        self.recv_len = 0;
+        self.tx_pending_queue.clear();
+        self.next_tx_seq = 0;
+        self.absorbed_bytes = 0;
+        self.write_blocked = false;
+        self.out.clear();
+        self.out_head = 0;
+        self.queued_bytes = 0;
+        self.sent_bytes = 0;
+        self.unsent.clear();
+        self.staged = false;
+        self.requests_sent_on_conn = 0;
+        self.reconnect_state = next_state;
     }
 
     /// Get connection ID
@@ -556,17 +671,21 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
 
     /// Queue `data` after the bytes queued before it; `request` is the
     /// request it carries, if any
-    fn queue(&mut self, data: &[u8], request: Option<(ReqId, Option<u64>, bool, bool)>) {
+    fn queue(&mut self, data: &[u8], request: Option<QueueMeta<ReqId>>) {
         self.out.extend_from_slice(data);
         self.queued_bytes += data.len() as u64;
-        if let Some((req_id, intended_ns, is_warmup, is_setup)) = request {
+        if let Some(meta) = request {
+            if !meta.is_setup {
+                self.requests_sent_on_conn += 1;
+            }
             self.unsent.push_back(QueuedRequest {
                 end: self.queued_bytes,
                 len: data.len(),
-                req_id,
-                intended_ns,
-                is_warmup,
-                is_setup,
+                req_id: meta.req_id,
+                intended_ns: meta.intended_ns,
+                is_warmup: meta.is_warmup,
+                is_setup: meta.is_setup,
+                connect_start_ts: meta.connect_start_ts,
             });
         }
     }
@@ -577,12 +696,22 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
     /// Their bytes stay queued, so a partly written request still finishes,
     /// but they no longer count as sent when they go out, nor do their
     /// responses count. Closed-loop requests have no intended time and are
-    /// not counted.
+    /// not counted. Also counts an open-loop arrival waiting on an in-flight
+    /// async reconnect.
     pub fn abandon_unsent(&mut self) -> u64 {
         let mut abandoned = 0;
         for request in &mut self.unsent {
             if request.intended_ns.is_some() && !request.is_warmup && !request.is_setup {
                 request.is_warmup = true;
+                abandoned += 1;
+            }
+        }
+        if let ReconnectState::Connecting {
+            intended_ns: Some(_), abandoned: flag, ..
+        } = &mut self.reconnect_state
+        {
+            if !*flag {
+                *flag = true;
                 abandoned += 1;
             }
         }
@@ -596,6 +725,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         self.unsent.clear();
         self.out.clear();
         self.out_head = 0;
+        self.reconnect_state = ReconnectState::Connected;
     }
 
     /// Queued bytes the transport has not taken
@@ -634,7 +764,10 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
                 }
             });
             let lag = request.intended_ns.map(|intended| {
-                Duration::from_nanos(receipt.timestamp.clock_ns().saturating_sub(intended))
+                let start_ns = request
+                    .connect_start_ts
+                    .map_or_else(|| receipt.timestamp.clock_ns(), |cs| cs.clock_ns());
+                Duration::from_nanos(start_ns.saturating_sub(intended))
             });
             self.record_request(
                 request.req_id,
@@ -643,6 +776,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
                 tx,
                 request.is_warmup,
                 request.is_setup,
+                request.connect_start_ts,
             );
             sent.push(SentRequest {
                 group_id: self.group_id,
@@ -666,10 +800,11 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         tx: Option<TxRange>,
         is_warmup: bool,
     ) {
-        self.record_request(req_id, send_ts, send_lag, tx, is_warmup, false);
+        self.record_request(req_id, send_ts, send_lag, tx, is_warmup, false, None);
     }
 
     /// Record a sent request, marking connection setup requests
+    #[allow(clippy::too_many_arguments)]
     fn record_request(
         &mut self,
         req_id: ReqId,
@@ -678,6 +813,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         tx: Option<TxRange>,
         is_warmup: bool,
         is_setup: bool,
+        connect_start_ts: Option<Timestamp>,
     ) {
         let tx_seq = tx.map(|tx| {
             // Queue for TX timestamp correlation (ends increase monotonically)
@@ -706,6 +842,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
                 is_setup,
                 tx_kernel_ts: None,
                 tx_seq,
+                connect_start_ts,
             },
         );
     }
@@ -968,6 +1105,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
                             recv_ts,
                             bytes: self.absorbed_bytes,
                             received_ns,
+                            connect_start_ts: pending.connect_start_ts,
                         },
                     );
                     self.newly_deferred.push((seq, received_ns));
@@ -979,7 +1117,13 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
             }
             (None, None) => pending.send_ts,
         };
-        let breakdown = LatencyBreakdown::between(&send_ts, &recv_ts);
+        let mut breakdown = LatencyBreakdown::between(&send_ts, &recv_ts);
+        if let Some(cs) = pending.connect_start_ts {
+            breakdown = breakdown.with_connect(
+                send_ts.cycles_duration_since(&cs),
+                recv_ts.cycles_duration_since(&cs),
+            );
+        }
         let latency = pending.send_lag + breakdown.service;
         if pending.is_setup {
             self.finish_setup_request();
@@ -1194,6 +1338,16 @@ pub struct ConnectionPool<G: ConnectionGroup, ReqId: Eq + Hash + Clone> {
     deferred_deadlines: VecDeque<(u64, usize, u64)>,
     /// Samples of deferred responses not yet taken by [`Self::take_deferred`]
     deferred_samples: Vec<DeferredSample>,
+    /// Timeout for non-blocking reconnect handshakes
+    connect_timeout_ns: u64,
+    /// `(deadline_ns, connection_id)` of in-flight non-blocking reconnects,
+    /// in FIFO deadline order
+    connecting_deadlines: VecDeque<(u64, usize)>,
+    /// Number of connections currently waiting in `DrainingForReconnect`
+    draining_for_reconnect: usize,
+    /// `DrainingForReconnect` connections whose last deferred TX stamp just
+    /// resolved or expired and are ready to close for reconnect
+    ready_to_close_for_reconnect: Vec<usize>,
 }
 
 impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionPool<G, ReqId> {
@@ -1383,6 +1537,10 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
             tx_timestamp_timeout_ns: DEFAULT_TX_TIMESTAMP_TIMEOUT.as_nanos() as u64,
             deferred_deadlines: VecDeque::new(),
             deferred_samples: Vec::new(),
+            connect_timeout_ns: CONNECT_TIMEOUT_NS,
+            connecting_deadlines: VecDeque::new(),
+            draining_for_reconnect: 0,
+            ready_to_close_for_reconnect: Vec::new(),
         })
     }
 
@@ -1429,6 +1587,9 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
             }
             self.deferred_deadlines.pop_front();
             state.give_up_deferred(seq, &mut self.deferred_samples);
+            if state.is_draining_for_reconnect() && !state.has_deferred() {
+                self.ready_to_close_for_reconnect.push(connection_id);
+            }
         }
     }
 
@@ -1486,6 +1647,205 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
                 state.error_replies.abort = on_error == OnError::Abort;
             }
         }
+    }
+
+    /// Set the maximum requests per connection for traffic group `group_id`
+    /// before closing and reconnecting (`None` keeps connections persistent)
+    pub fn set_max_requests_per_connection(&mut self, group_id: usize, limit: Option<u64>) {
+        for state in self.connection_states.values_mut() {
+            if state.group_id == group_id {
+                state.max_requests_per_connection = limit;
+            }
+        }
+    }
+
+    /// Set the timeout for non-blocking reconnect handshakes
+    pub fn set_connect_timeout(&mut self, timeout: Duration) {
+        self.connect_timeout_ns = timeout.as_nanos().min(u64::MAX as u128) as u64;
+    }
+
+    /// Number of connections currently draining deferred TX timestamps before closing
+    pub fn draining_for_reconnect_count(&self) -> usize {
+        self.draining_for_reconnect
+    }
+
+    /// Whether any draining connection has finished draining and is ready to close
+    pub fn has_ready_to_close_for_reconnect(&self) -> bool {
+        !self.ready_to_close_for_reconnect.is_empty()
+    }
+
+    /// Take connections that finished draining deferred TX timestamps and are ready to close
+    pub fn take_ready_to_close_for_reconnect(&mut self, out: &mut Vec<usize>) {
+        out.clear();
+        std::mem::swap(out, &mut self.ready_to_close_for_reconnect);
+    }
+
+    /// Earliest deadline among in-flight non-blocking reconnects, if any
+    pub fn next_connect_deadline(&self) -> Option<u64> {
+        self.connecting_deadlines.iter().find_map(|&(deadline_ns, connection_id)| {
+            self.connection_states
+                .get(&connection_id)
+                .is_some_and(|state| {
+                    !state.is_closed() && state.connecting_deadline_ns() == Some(deadline_ns)
+                })
+                .then_some(deadline_ns)
+        })
+    }
+
+    /// Expire any in-flight non-blocking reconnect whose deadline passed by `now_ns`
+    pub fn expire_connects_at(&mut self, now_ns: u64, mut on_expired: impl FnMut(usize, usize)) {
+        while let Some(&(deadline_ns, connection_id)) = self.connecting_deadlines.front() {
+            let live = self.connection_states.get(&connection_id).is_some_and(|state| {
+                !state.is_closed() && state.connecting_deadline_ns() == Some(deadline_ns)
+            });
+            if !live {
+                self.connecting_deadlines.pop_front();
+                continue;
+            }
+            if deadline_ns > now_ns {
+                break;
+            }
+            self.connecting_deadlines.pop_front();
+            let group_id = self.connection_states[&connection_id].group_id;
+            on_expired(connection_id, group_id);
+        }
+    }
+
+    /// Initiate a reconnect on `connection_id`.
+    ///
+    /// Returns `Ok(Some(connect_start_ts))` if immediately connected, or
+    /// `Ok(None)` if the non-blocking handshake is in progress (wait for
+    /// `poll` + [`Self::finish_reconnect`]).
+    pub fn start_reconnect(
+        &mut self,
+        connection_id: usize,
+        intended_ns: Option<u64>,
+    ) -> Result<Option<Timestamp>> {
+        let target = self
+            .connection_states
+            .get(&connection_id)
+            .ok_or_else(|| crate::Error::Connection("Connection not found".to_string()))?
+            .target;
+        let connect_start_ts = Timestamp::now();
+        let started_ns = crate::timing::time_ns();
+
+        if self.group.start_reconnect(connection_id, &target)? {
+            let local_addr = self.group.local_addr(connection_id);
+            let state = self
+                .connection_states
+                .get_mut(&connection_id)
+                .expect("checked connection exists");
+            if state.is_draining_for_reconnect() {
+                self.draining_for_reconnect -= 1;
+            }
+            state.reset_io_for_reconnect(ReconnectState::Connected);
+            state.local_addr = local_addr;
+            Ok(Some(connect_start_ts))
+        } else {
+            let deadline_ns = started_ns.saturating_add(self.connect_timeout_ns);
+            let state = self
+                .connection_states
+                .get_mut(&connection_id)
+                .expect("checked connection exists");
+            if state.is_draining_for_reconnect() {
+                self.draining_for_reconnect -= 1;
+            }
+            state.reset_io_for_reconnect(ReconnectState::Connecting {
+                connect_start_ts,
+                deadline_ns,
+                intended_ns,
+                abandoned: false,
+            });
+            self.connecting_deadlines.push_back((deadline_ns, connection_id));
+            Ok(None)
+        }
+    }
+
+    /// Complete an in-progress non-blocking reconnect on `connection_id`.
+    ///
+    /// Returns `Ok(Some((connect_start_ts, intended_ns, abandoned)))` when
+    /// connected and ready for I/O, or `Ok(None)` if still connecting.
+    pub fn finish_reconnect(
+        &mut self,
+        connection_id: usize,
+    ) -> Result<Option<(Timestamp, Option<u64>, bool)>> {
+        if !self.group.finish_reconnect(connection_id)? {
+            return Ok(None);
+        }
+        let local_addr = self.group.local_addr(connection_id);
+        let state = self
+            .connection_states
+            .get_mut(&connection_id)
+            .ok_or_else(|| crate::Error::Connection("Connection not found".to_string()))?;
+        let ReconnectState::Connecting {
+            connect_start_ts, intended_ns, abandoned, ..
+        } = state.reconnect_state
+        else {
+            return Ok(None);
+        };
+        state.reset_io_for_reconnect(ReconnectState::Connected);
+        state.local_addr = local_addr;
+        // Prune finished entries from the front of connecting_deadlines
+        while let Some(&(deadline_ns, id)) = self.connecting_deadlines.front() {
+            let live = self
+                .connection_states
+                .get(&id)
+                .is_some_and(|s| !s.is_closed() && s.connecting_deadline_ns() == Some(deadline_ns));
+            if live {
+                break;
+            }
+            self.connecting_deadlines.pop_front();
+        }
+        Ok(Some((connect_start_ts, intended_ns, abandoned)))
+    }
+
+    /// Close the underlying socket for `connection_id` and mark the slot as
+    /// ready to reconnect on the next scheduled send (keeps slot and buffers).
+    pub fn close_for_reconnect(&mut self, connection_id: usize) -> Result<()> {
+        self.group.close(connection_id)?;
+        if let Some(state) = self.connection_states.get_mut(&connection_id) {
+            if state.is_draining_for_reconnect() {
+                self.draining_for_reconnect -= 1;
+            }
+            state.give_up_all_deferred(&mut self.deferred_samples);
+            let was_staged = state.staged;
+            state.reset_io_for_reconnect(ReconnectState::NeedsReconnect);
+            if was_staged {
+                self.staged.retain(|&id| id != connection_id);
+            }
+        }
+        Ok(())
+    }
+
+    /// Pause read/write interest on `connection_id` while waiting for pending
+    /// kernel TX timestamps to drain before closing for reconnect.
+    pub fn begin_drain_for_reconnect(&mut self, connection_id: usize) -> Result<()> {
+        self.group.pause_io(connection_id)?;
+        if let Some(state) = self.connection_states.get_mut(&connection_id) {
+            if !state.is_draining_for_reconnect() {
+                self.draining_for_reconnect += 1;
+            }
+            state.reconnect_state = ReconnectState::DrainingForReconnect;
+        }
+        Ok(())
+    }
+
+    /// Abort any in-flight non-blocking reconnects when entering post-window
+    /// drain so drain never waits on unsent requests.
+    pub fn abort_connecting_for_drain(&mut self) -> Result<()> {
+        let mut to_close = Vec::new();
+        while let Some((deadline_ns, connection_id)) = self.connecting_deadlines.pop_front() {
+            let live = self.connection_states.get(&connection_id).is_some_and(|state| {
+                !state.is_closed() && state.connecting_deadline_ns() == Some(deadline_ns)
+            });
+            if live {
+                to_close.push(connection_id);
+            }
+        }
+        for connection_id in to_close {
+            self.close_for_reconnect(connection_id)?;
+        }
+        Ok(())
     }
 
     /// The kind of an error reply received on `connection_id`, as numbered
@@ -1614,13 +1974,15 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         &mut self,
         connection_id: usize,
         data: &[u8],
-        request: Option<(ReqId, Option<u64>, bool, bool)>,
+        request: Option<QueueMeta<ReqId>>,
     ) -> Result<()> {
         let state = self
             .connection_states
             .get_mut(&connection_id)
             .ok_or_else(|| crate::Error::Connection("Connection not found".to_string()))?;
-        if request.is_some() && !state.can_send() {
+        if request.is_some()
+            && (!matches!(state.reconnect_state, ReconnectState::Connected) || !state.can_send())
+        {
             return Err(crate::Error::Connection(
                 "Connection cannot accept more requests".to_string(),
             ));
@@ -1689,7 +2051,31 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         is_warmup: bool,
         intended_ns: Option<u64>,
     ) -> Result<()> {
-        self.queue(connection_id, data, Some((req_id, intended_ns, is_warmup, false)))
+        self.queue_request_with_connect(connection_id, data, req_id, is_warmup, intended_ns, None)
+    }
+
+    /// Like [`Self::queue_request`], attaching the `connect_start_ts` of the
+    /// reconnect handshake that preceded this request
+    pub fn queue_request_with_connect(
+        &mut self,
+        connection_id: usize,
+        data: &[u8],
+        req_id: ReqId,
+        is_warmup: bool,
+        intended_ns: Option<u64>,
+        connect_start_ts: Option<Timestamp>,
+    ) -> Result<()> {
+        self.queue(
+            connection_id,
+            data,
+            Some(QueueMeta {
+                req_id,
+                intended_ns,
+                is_warmup,
+                is_setup: false,
+                connect_start_ts,
+            }),
+        )
     }
 
     /// Send protocol-driven data (see [`xylem_common::Outbox::data`]) on a
@@ -1734,7 +2120,17 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
     /// request arrives, the schedule starts afresh the next time the
     /// connection is scheduled.
     pub fn queue_setup(&mut self, connection_id: usize, data: &[u8], req_id: ReqId) -> Result<()> {
-        self.queue(connection_id, data, Some((req_id, None, true, true)))?;
+        self.queue(
+            connection_id,
+            data,
+            Some(QueueMeta {
+                req_id,
+                intended_ns: None,
+                is_warmup: true,
+                is_setup: true,
+                connect_start_ts: None,
+            }),
+        )?;
         if let Some(state) = self.connection_states.get_mut(&connection_id) {
             state.policy.reset();
         }
@@ -1807,20 +2203,34 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
     /// batched together in a single kernel acknowledgment.
     pub fn poll_tx_timestamps(&mut self) -> Result<usize> {
         self.group.poll_tx_timestamps(&mut self.tx_timestamps)?;
+        Ok(self.apply_polled_tx_timestamps())
+    }
+
+    /// Poll pending TX timestamps for a single connection in O(1)
+    pub fn poll_tx_timestamps_for(&mut self, connection_id: usize) -> Result<usize> {
+        self.group.poll_tx_timestamps_for(connection_id, &mut self.tx_timestamps)?;
+        Ok(self.apply_polled_tx_timestamps())
+    }
+
+    fn apply_polled_tx_timestamps(&mut self) -> usize {
         let mut count = 0;
 
         for tx_info in &self.tx_timestamps {
             if let Some(state) = self.connection_states.get_mut(&tx_info.conn_id) {
-                count += state.set_tx_timestamp(
+                let updated = state.set_tx_timestamp(
                     tx_info.tx_end,
                     tx_info.cumulative,
                     tx_info.timestamp,
                     &mut self.deferred_samples,
                 );
+                count += updated;
+                if updated > 0 && state.is_draining_for_reconnect() && !state.has_deferred() {
+                    self.ready_to_close_for_reconnect.push(tx_info.conn_id);
+                }
             }
         }
 
-        Ok(count)
+        count
     }
 
     /// Clean up stale TX queue entries across all connections
@@ -2155,6 +2565,9 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
     /// [`Self::give_up_deferred`].
     pub fn close(&mut self, connection_id: usize) -> Result<()> {
         if let Some(state) = self.connection_states.get_mut(&connection_id) {
+            if state.is_draining_for_reconnect() {
+                self.draining_for_reconnect -= 1;
+            }
             state.give_up_all_deferred(&mut self.deferred_samples);
             state.close();
         }
@@ -2171,6 +2584,9 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         for state in self.connection_states.values_mut() {
             state.close();
         }
+        self.draining_for_reconnect = 0;
+        self.connecting_deadlines.clear();
+        self.ready_to_close_for_reconnect.clear();
         self.connection_ids.clear();
         self.group.close_all()?;
         Ok(())
@@ -2979,8 +3395,26 @@ mod tests {
     #[test]
     fn requests_sharing_a_write_end_at_their_own_bytes_of_its_tx_range() {
         let mut state = state();
-        state.queue(&[0; 3], Some((1, None, false, false)));
-        state.queue(&[0; 5], Some((2, None, true, false)));
+        state.queue(
+            &[0; 3],
+            Some(QueueMeta {
+                req_id: 1,
+                intended_ns: None,
+                is_warmup: false,
+                is_setup: false,
+                connect_start_ts: None,
+            }),
+        );
+        state.queue(
+            &[0; 5],
+            Some(QueueMeta {
+                req_id: 2,
+                intended_ns: None,
+                is_warmup: true,
+                is_setup: false,
+                connect_start_ts: None,
+            }),
+        );
         let tx = Some(TxRange { start: 100, end: 108 });
         let receipt = xylem_transport::SendReceipt { timestamp: Timestamp::now(), tx };
         let mut sent = Vec::new();
@@ -3360,6 +3794,26 @@ pub(crate) mod test_support {
     use super::*;
     use std::sync::{Arc, Mutex};
 
+    /// How `FakeGroup::start_reconnect` / `finish_reconnect` behave in tests
+    #[derive(Debug, Clone, Copy, Default)]
+    pub enum ReconnectMode {
+        /// `start_reconnect` returns `Ok(true)` immediately
+        #[default]
+        Immediate,
+        /// `start_reconnect` returns `Ok(false)`; `poll` reports connecting
+        /// connections when `connecting_ready` is true and `finish_reconnect`
+        /// returns `Ok(true)`
+        Async,
+        /// `start_reconnect` returns `Ok(false)` and `finish_reconnect` always
+        /// returns `Ok(false)` (simulating a hung SYN)
+        HangAsync,
+        /// `start_reconnect` immediately returns this error
+        FailStart(fn() -> xylem_transport::Error),
+        /// `start_reconnect` returns `Ok(false)`, then `finish_reconnect`
+        /// returns this error once `connecting_ready` is true
+        FailFinish(fn() -> xylem_transport::Error),
+    }
+
     pub struct FakeIo {
         pub responses: VecDeque<xylem_transport::Result<Vec<u8>>>,
         pub sent: Vec<Vec<u8>>,
@@ -3371,6 +3825,7 @@ pub(crate) mod test_support {
         pub poll_times: Vec<u64>,
         pub tx_polls: usize,
         pub closed: bool,
+        pub closed_conns: Vec<usize>,
         pub timestamp: Timestamp,
         pub response_connection_id: usize,
         pub tx_timestamps: Vec<xylem_transport::TxTimestampInfo>,
@@ -3396,6 +3851,20 @@ pub(crate) mod test_support {
         pub connect_error: Option<fn() -> xylem_transport::Error>,
         /// `poll_tx_timestamps` fails with this, as reading an error queue can
         pub tx_error: Option<fn() -> xylem_transport::Error>,
+        /// Reconnect behavior for tests
+        pub reconnect_mode: ReconnectMode,
+        /// Connections currently mid-async-reconnect
+        pub connecting: Vec<usize>,
+        /// Whether `poll` reports `connecting` connections as ready
+        pub connecting_ready: bool,
+        /// Log of `start_reconnect` calls
+        pub reconnect_started: Vec<usize>,
+        /// Log of successful `finish_reconnect` calls
+        pub reconnect_finished: Vec<usize>,
+        /// Log of `pause_io` calls
+        pub paused_io: Vec<usize>,
+        /// Log of `poll_tx_timestamps_for` calls
+        pub tx_polls_for: Vec<usize>,
     }
 
     impl Default for FakeIo {
@@ -3409,6 +3878,7 @@ pub(crate) mod test_support {
                 poll_times: Vec::new(),
                 tx_polls: 0,
                 closed: false,
+                closed_conns: Vec::new(),
                 timestamp: Timestamp::now(),
                 response_connection_id: 0,
                 tx_timestamps: Vec::new(),
@@ -3422,6 +3892,13 @@ pub(crate) mod test_support {
                 writable: false,
                 connect_error: None,
                 tx_error: None,
+                reconnect_mode: ReconnectMode::Immediate,
+                connecting: Vec::new(),
+                connecting_ready: false,
+                reconnect_started: Vec::new(),
+                reconnect_finished: Vec::new(),
+                paused_io: Vec::new(),
+                tx_polls_for: Vec::new(),
             }
         }
     }
@@ -3568,6 +4045,11 @@ pub(crate) mod test_support {
                     io.write_interest.iter().copied().filter(|id| !ready.contains(id)).collect();
                 ready.extend(writable);
             }
+            if io.connecting_ready {
+                let connecting: Vec<usize> =
+                    io.connecting.iter().copied().filter(|id| !ready.contains(id)).collect();
+                ready.extend(connecting);
+            }
             Ok(())
         }
 
@@ -3585,12 +4067,89 @@ pub(crate) mod test_support {
             Ok(())
         }
 
+        fn poll_tx_timestamps_for(
+            &mut self,
+            conn_id: usize,
+            out: &mut Vec<xylem_transport::TxTimestampInfo>,
+        ) -> xylem_transport::Result<()> {
+            let mut io = self.io.lock().unwrap();
+            io.tx_polls_for.push(conn_id);
+            out.clear();
+            if let Some(error) = io.tx_error {
+                return Err(error());
+            }
+            let mut rest = Vec::new();
+            for ts in io.tx_timestamps.drain(..) {
+                if ts.conn_id == conn_id {
+                    out.push(ts);
+                } else {
+                    rest.push(ts);
+                }
+            }
+            io.tx_timestamps = rest;
+            Ok(())
+        }
+
+        fn start_reconnect(
+            &mut self,
+            conn_id: usize,
+            _target: &SocketAddr,
+        ) -> xylem_transport::Result<bool> {
+            self.check(conn_id)?;
+            let mut io = self.io.lock().unwrap();
+            io.reconnect_started.push(conn_id);
+            io.connecting.retain(|&id| id != conn_id);
+            match io.reconnect_mode {
+                ReconnectMode::Immediate => Ok(true),
+                ReconnectMode::Async | ReconnectMode::HangAsync | ReconnectMode::FailFinish(_) => {
+                    io.connecting.push(conn_id);
+                    Ok(false)
+                }
+                ReconnectMode::FailStart(err) => Err(err()),
+            }
+        }
+
+        fn finish_reconnect(&mut self, conn_id: usize) -> xylem_transport::Result<bool> {
+            self.check(conn_id)?;
+            let mut io = self.io.lock().unwrap();
+            if !io.connecting.contains(&conn_id) {
+                return Ok(true);
+            }
+            match io.reconnect_mode {
+                ReconnectMode::HangAsync => Ok(false),
+                ReconnectMode::FailFinish(err) => {
+                    if !io.connecting_ready {
+                        return Ok(false);
+                    }
+                    io.connecting.retain(|&id| id != conn_id);
+                    Err(err())
+                }
+                _ => {
+                    if !io.connecting_ready {
+                        return Ok(false);
+                    }
+                    io.connecting.retain(|&id| id != conn_id);
+                    io.reconnect_finished.push(conn_id);
+                    Ok(true)
+                }
+            }
+        }
+
+        fn pause_io(&mut self, conn_id: usize) -> xylem_transport::Result<()> {
+            self.check(conn_id)?;
+            self.io.lock().unwrap().paused_io.push(conn_id);
+            Ok(())
+        }
+
         fn len(&self) -> usize {
             self.connections
         }
 
-        fn close(&mut self, _: usize) -> xylem_transport::Result<()> {
-            self.io.lock().unwrap().closed = true;
+        fn close(&mut self, conn_id: usize) -> xylem_transport::Result<()> {
+            let mut io = self.io.lock().unwrap();
+            io.closed = true;
+            io.closed_conns.push(conn_id);
+            io.connecting.retain(|&id| id != conn_id);
             Ok(())
         }
 

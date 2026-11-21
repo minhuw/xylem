@@ -478,6 +478,24 @@ impl ProfileConfig {
                     group.name
                 ));
             }
+            if group.max_requests_per_connection == Some(0) {
+                errors.push(anyhow!(
+                    "Traffic group {} '{}' max_requests_per_connection must be >= 1",
+                    i,
+                    group.name
+                ));
+            }
+            if valid_transport
+                && group.max_requests_per_connection.is_some()
+                && group.transport != "tcp"
+            {
+                errors.push(anyhow!(
+                    "Traffic group {} '{}' max_requests_per_connection is only supported on the \
+                     tcp transport",
+                    i,
+                    group.name
+                ));
+            }
 
             // Rate-based policies need a positive rate. Pattern policies accept
             // zero, which pauses sending by design.
@@ -637,6 +655,16 @@ impl ProfileConfig {
                     continue;
                 }
             };
+            if let ProtocolConfig::Http(http_config) = &protocol_config {
+                if !http_config.keep_alive && group.max_requests_per_connection != Some(1) {
+                    errors.push(anyhow!(
+                        "Traffic group {} '{}' HTTP keep_alive = false requires \
+                         max_requests_per_connection = 1",
+                        i,
+                        group.name
+                    ));
+                }
+            }
             if group.transport == "udp" {
                 if let Err(error) = validate_udp_request_size(&protocol_config, i, &group.name) {
                     errors.push(error);
@@ -2246,6 +2274,86 @@ file = "results/test.json"
         assert_eq!(config.traffic_groups[0].on_error, OnError::Abort);
         let error = udp_profile("xylem-echo", "tcp", r#"on_error = "ignore""#).unwrap_err();
         assert!(error.to_string().contains("unknown variant `ignore`"), "{error}");
+    }
+
+    #[test]
+    fn max_requests_per_connection_and_http_keep_alive_are_validated() {
+        // Default is None (persistent connections)
+        let config = udp_profile("xylem-echo", "tcp", "").unwrap();
+        assert_eq!(config.traffic_groups[0].max_requests_per_connection, None);
+
+        // max_requests_per_connection = 0 is rejected
+        let error =
+            udp_profile("xylem-echo", "tcp", "max_requests_per_connection = 0").unwrap_err();
+        assert!(
+            error.to_string().contains("max_requests_per_connection must be >= 1"),
+            "{error}"
+        );
+
+        // Non-TCP transports reject max_requests_per_connection
+        for transport in ["udp", "unix"] {
+            let error = udp_profile("xylem-echo", transport, "max_requests_per_connection = 1")
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("max_requests_per_connection is only supported on the tcp transport"),
+                "{transport}: {error}"
+            );
+        }
+
+        // HTTP helper
+        let http_profile = |extra_group: &str, extra_proto: &str| {
+            let toml = format!(
+                r#"
+[experiment]
+name = "http-close"
+duration = "1s"
+
+[output]
+format = "human"
+file = "out.json"
+
+[[traffic_groups]]
+name = "api"
+protocol = "http"
+target = "127.0.0.1:8080"
+transport = "tcp"
+threads = [0]
+connections_per_thread = 1
+{extra_group}
+traffic_policy = {{ type = "closed-loop" }}
+protocol_config = {{ method = "GET", path = "/"{extra_proto} }}
+"#
+            );
+            let mut config: ProfileConfig = toml::from_str(&toml).unwrap();
+            config.validate()?;
+            Ok::<_, anyhow::Error>(config)
+        };
+
+        // keep_alive = false without max_requests_per_connection = 1 fails
+        for extra_group in ["", "max_requests_per_connection = 2"] {
+            let error = http_profile(extra_group, ", keep_alive = false").unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("HTTP keep_alive = false requires max_requests_per_connection = 1"),
+                "{extra_group}: {error}"
+            );
+        }
+
+        // keep_alive = false with max_requests_per_connection = 1 succeeds
+        let config =
+            http_profile("max_requests_per_connection = 1", ", keep_alive = false").unwrap();
+        assert_eq!(config.traffic_groups[0].max_requests_per_connection, Some(1));
+        assert!(matches!(
+            &config.protocol_configs[0],
+            ProtocolConfig::Http(http) if !http.keep_alive
+        ));
+
+        // keep_alive = true (default) with max_requests_per_connection >= 1 succeeds
+        let config = http_profile("max_requests_per_connection = 5", "").unwrap();
+        assert_eq!(config.traffic_groups[0].max_requests_per_connection, Some(5));
     }
 
     #[test]

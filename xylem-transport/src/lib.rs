@@ -346,6 +346,43 @@ pub trait ConnectionGroup {
         Ok(())
     }
 
+    /// Poll pending TX timestamps for a single connection.
+    ///
+    /// Default falls back to [`Self::poll_tx_timestamps`].
+    fn poll_tx_timestamps_for(
+        &mut self,
+        _conn_id: usize,
+        out: &mut Vec<TxTimestampInfo>,
+    ) -> Result<()> {
+        self.poll_tx_timestamps(out)
+    }
+
+    /// Close any existing socket at `conn_id` and initiate a non-blocking TCP
+    /// connect to `target` reusing slot `conn_id`.
+    ///
+    /// Returns `Ok(true)` if immediately connected and ready for I/O, or
+    /// `Ok(false)` if the handshake is in progress (poll will wake when ready,
+    /// then call [`Self::finish_reconnect`]).
+    fn start_reconnect(&mut self, _conn_id: usize, _target: &SocketAddr) -> Result<bool> {
+        Err(Error::Connection("Transport does not support reconnect".to_string()))
+    }
+
+    /// Complete an in-progress non-blocking reconnect once `poll()` reports
+    /// `conn_id` ready.
+    ///
+    /// Returns `Ok(true)` when ready for I/O, `Ok(false)` if still connecting,
+    /// or `Err(Error::Connection(_))` if the handshake failed.
+    fn finish_reconnect(&mut self, _conn_id: usize) -> Result<bool> {
+        Err(Error::Connection("Transport does not support reconnect".to_string()))
+    }
+
+    /// Silence readable/writable interest while keeping the socket open to
+    /// drain pending kernel TX timestamps from `MSG_ERRQUEUE` (avoids epoll
+    /// spin on peer FIN). Default is a no-op.
+    fn pause_io(&mut self, _conn_id: usize) -> Result<()> {
+        Ok(())
+    }
+
     /// How the group converted NIC timestamps to the [`time_ns`] clock, for
     /// groups that report [`KernelClock::NicCalibrated`] timestamps
     ///

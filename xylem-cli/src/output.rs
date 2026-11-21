@@ -140,6 +140,14 @@ pub struct LatencyBreakdownStats {
     /// sum, which the parts' percentiles do not give. Null when no request had
     /// a kernel split
     pub user_round_trip_us: Option<BreakdownPartStats>,
+    /// TCP handshake latency before sending the request (cycles, SW-only),
+    /// present only when connections reconnect (`max_requests_per_connection`)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_us: Option<BreakdownPartStats>,
+    /// Combined TCP handshake + request round trip (cycles, SW-only),
+    /// present only when connections reconnect (`max_requests_per_connection`)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_request_us: Option<BreakdownPartStats>,
 }
 
 impl LatencyBreakdownStats {
@@ -154,17 +162,26 @@ impl LatencyBreakdownStats {
             host_stack_us: summary.host_stack.as_ref().map(BreakdownPartStats::new),
             network_server_us: summary.network_server.as_ref().map(BreakdownPartStats::new),
             user_round_trip_us: summary.user_round_trip.as_ref().map(BreakdownPartStats::new),
+            connect_us: summary.connect.as_ref().map(BreakdownPartStats::new),
+            connect_request_us: summary.connect_request.as_ref().map(BreakdownPartStats::new),
         }
     }
 
     /// Each part with its label, in output order
-    pub(crate) fn parts(&self) -> [(&'static str, Option<&BreakdownPartStats>); 4] {
-        [
+    pub(crate) fn parts(&self) -> Vec<(&'static str, Option<&BreakdownPartStats>)> {
+        let mut parts = vec![
             ("Service", Some(&self.service_us)),
             ("Host stack", self.host_stack_us.as_ref()),
             ("Net+server", self.network_server_us.as_ref()),
             ("User RTT", self.user_round_trip_us.as_ref()),
-        ]
+        ];
+        if let Some(connect) = self.connect_us.as_ref() {
+            parts.push(("Connect", Some(connect)));
+        }
+        if let Some(connect_request) = self.connect_request_us.as_ref() {
+            parts.push(("Connect+req", Some(connect_request)));
+        }
+        parts
     }
 
     /// The clock as written in JSON, or `n/a`
@@ -1355,6 +1372,7 @@ mod latency_display_tests {
             threads: vec![0],
             connections_per_thread: 1,
             max_pending_per_connection: 1,
+            max_requests_per_connection: None,
             request_timeout: None,
             on_error: OnError::Count,
             timestamps: Default::default(),
@@ -1692,6 +1710,7 @@ mod raw_record_tests {
             threads: vec![0],
             connections_per_thread: 4,
             max_pending_per_connection: 1,
+            max_requests_per_connection: None,
             request_timeout: None,
             on_error: OnError::Count,
             timestamps: Default::default(),

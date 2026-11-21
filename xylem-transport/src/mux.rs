@@ -27,7 +27,9 @@ pub(crate) struct Interest {
 
 impl Interest {
     pub const READABLE: Interest = Interest { readable: true, writable: false };
+    pub const WRITABLE: Interest = Interest { readable: false, writable: true };
     pub const BOTH: Interest = Interest { readable: true, writable: true };
+    pub const NONE: Interest = Interest { readable: false, writable: false };
 }
 
 /// Event returned by `wait()`
@@ -128,7 +130,9 @@ impl Multiplexer {
                             | EpollFlags::EPOLLERR
                             | EpollFlags::EPOLLRDHUP,
                     ),
-                    writable: flags.contains(EpollFlags::EPOLLOUT),
+                    writable: flags.intersects(
+                        EpollFlags::EPOLLOUT | EpollFlags::EPOLLERR | EpollFlags::EPOLLHUP,
+                    ),
                 }
             })
             .collect())
@@ -174,7 +178,7 @@ impl Multiplexer {
             .map(|e| Event {
                 id: e.token().0,
                 readable: e.is_readable() || e.is_read_closed() || e.is_error(),
-                writable: e.is_writable(),
+                writable: e.is_writable() || e.is_write_closed() || e.is_error(),
             })
             .collect())
     }

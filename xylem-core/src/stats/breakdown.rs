@@ -112,6 +112,12 @@ pub struct LatencyBreakdown {
     pub kernel: Option<KernelSplit>,
     /// Why there is no kernel split; `None` exactly when `kernel` is set
     pub miss: Option<SplitMiss>,
+    /// TCP handshake duration before sending this request (user-space cycles),
+    /// present only on the first request after a reconnect
+    pub connect: Option<Duration>,
+    /// Combined TCP handshake + request round trip (user-space cycles),
+    /// present only on the first request after a reconnect
+    pub connect_request: Option<Duration>,
 }
 
 impl LatencyBreakdown {
@@ -135,6 +141,8 @@ impl LatencyBreakdown {
                         user_round_trip: user_rtt,
                     }),
                     miss: None,
+                    connect: None,
+                    connect_request: None,
                 };
             }
             (Some(_), Some(_)) => SplitMiss::ClockMismatch,
@@ -146,6 +154,8 @@ impl LatencyBreakdown {
             service: recv.cycles_duration_since(send),
             kernel: None,
             miss: Some(miss),
+            connect: None,
+            connect_request: None,
         }
     }
 
@@ -156,7 +166,17 @@ impl LatencyBreakdown {
             service,
             kernel: None,
             miss: Some(SplitMiss::TxAndRx),
+            connect: None,
+            connect_request: None,
         }
+    }
+
+    /// Attach TCP connect and combined connect+request durations (SW cycles)
+    #[inline]
+    pub fn with_connect(mut self, connect: Duration, connect_request: Duration) -> Self {
+        self.connect = Some(connect);
+        self.connect_request = Some(connect_request);
+        self
     }
 
     /// The clock the service latency was measured in
@@ -288,6 +308,10 @@ pub struct BreakdownStats {
     host_stack: PartStats,
     network_server: PartStats,
     user_round_trip: PartStats,
+    /// TCP connect latency (SW cycles), allocated lazily only when connections reconnect
+    connect: Option<PartStats>,
+    /// Combined TCP connect + request round trip (SW cycles), allocated lazily
+    connect_request: Option<PartStats>,
     /// Requests without a kernel split, by cause
     missing: SplitMissCounts,
 }
@@ -303,6 +327,14 @@ impl BreakdownStats {
             self.network_server.record(split.network_server);
             self.user_round_trip.record(split.user_round_trip);
         }
+        if let Some(connect) = breakdown.connect {
+            self.connect.get_or_insert_with(PartStats::default).record(connect);
+        }
+        if let Some(connect_request) = breakdown.connect_request {
+            self.connect_request
+                .get_or_insert_with(PartStats::default)
+                .record(connect_request);
+        }
         if let Some(miss) = breakdown.miss {
             self.missing.record(miss);
         }
@@ -315,6 +347,14 @@ impl BreakdownStats {
         self.host_stack.merge(&other.host_stack);
         self.network_server.merge(&other.network_server);
         self.user_round_trip.merge(&other.user_round_trip);
+        if let Some(other_connect) = &other.connect {
+            self.connect.get_or_insert_with(PartStats::default).merge(other_connect);
+        }
+        if let Some(other_connect_request) = &other.connect_request {
+            self.connect_request
+                .get_or_insert_with(PartStats::default)
+                .merge(other_connect_request);
+        }
         self.missing.merge(&other.missing);
     }
 
@@ -322,6 +362,9 @@ impl BreakdownStats {
     pub fn summary(&self) -> BreakdownSummary {
         let kernel_split_count = self.network_server.count;
         let split = |part: &PartStats| (kernel_split_count > 0).then(|| part.summary());
+        let opt_part = |part: &Option<PartStats>| {
+            part.as_ref().filter(|p| p.count > 0).map(PartStats::summary)
+        };
         BreakdownSummary {
             clock: BreakdownClock::from_bits(self.clocks),
             kernel_split_count,
@@ -330,6 +373,8 @@ impl BreakdownStats {
             host_stack: split(&self.host_stack),
             network_server: split(&self.network_server),
             user_round_trip: split(&self.user_round_trip),
+            connect: opt_part(&self.connect),
+            connect_request: opt_part(&self.connect_request),
         }
     }
 }
@@ -353,6 +398,12 @@ pub struct BreakdownSummary {
     /// [`KernelSplit::user_round_trip`]); `None` when no request had a
     /// kernel split
     pub user_round_trip: Option<PartSummary>,
+    /// TCP handshake latency before sending the request (SW cycles);
+    /// `None` when no request reconnected
+    pub connect: Option<PartSummary>,
+    /// Combined TCP handshake + request round trip (SW cycles);
+    /// `None` when no request reconnected
+    pub connect_request: Option<PartSummary>,
 }
 
 #[cfg(test)]
@@ -423,7 +474,9 @@ mod tests {
                 LatencyBreakdown {
                     service: user_rtt,
                     kernel: None,
-                    miss: Some(miss)
+                    miss: Some(miss),
+                    connect: None,
+                    connect_request: None,
                 },
                 "{send_clock:?} -> {recv_clock:?}"
             );
@@ -526,6 +579,8 @@ mod tests {
                 user_round_trip: Duration::from_micros(host_us + network_us),
             }),
             miss: None,
+            connect: None,
+            connect_request: None,
         }
     }
 
@@ -599,5 +654,41 @@ mod tests {
         let before = hw.summary();
         hw.merge(&BreakdownStats::default());
         assert_eq!(hw.summary(), before);
+    }
+
+    #[test]
+    fn connect_and_connect_request_are_lazy_and_merge_without_altering_network_server() {
+        let mut persistent = BreakdownStats::default();
+        persistent.record(&split(KernelClock::NicHardware, 5, 20));
+        let p = persistent.summary();
+        assert_eq!(p.connect, None);
+        assert_eq!(p.connect_request, None);
+
+        let mut a = BreakdownStats::default();
+        a.record(
+            &split(KernelClock::NicHardware, 5, 20)
+                .with_connect(Duration::from_micros(100), Duration::from_micros(125)),
+        );
+        let mut b = BreakdownStats::default();
+        b.record(
+            &split(KernelClock::NicHardware, 10, 40)
+                .with_connect(Duration::from_micros(200), Duration::from_micros(250)),
+        );
+        // Merge into an initially-persistent stats scope as well
+        persistent.merge(&a);
+        persistent.merge(&b);
+        let s = persistent.summary();
+        let connect = s.connect.unwrap();
+        assert_eq!(connect.sample_count, 2);
+        assert_eq!(connect.mean, Some(Duration::from_micros(150)));
+        assert_eq!(connect.max, Some(Duration::from_micros(200)));
+        let cr = s.connect_request.unwrap();
+        assert_eq!(cr.sample_count, 2);
+        assert_eq!(cr.mean, Some(Duration::from_nanos(187_500)));
+        assert_eq!(cr.max, Some(Duration::from_micros(250)));
+        // Pure HW request-only network_server is untouched by connect latency
+        let net = s.network_server.unwrap();
+        assert_eq!(net.sample_count, 3);
+        assert_eq!(net.max, Some(Duration::from_micros(40)));
     }
 }

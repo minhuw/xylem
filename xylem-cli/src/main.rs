@@ -542,17 +542,30 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
             .iter()
             .map(|(group_id, _)| (*group_id, config_for_worker.traffic_groups[*group_id].on_error))
             .collect();
+        // Maximum requests per connection before reconnecting (TCP groups only)
+        let max_requests_per_connection: Vec<_> = groups_for_thread
+            .iter()
+            .map(|(group_id, _)| {
+                (
+                    *group_id,
+                    config_for_worker.traffic_groups[*group_id].max_requests_per_connection,
+                )
+            })
+            .collect();
 
         // Helper function to wire the request dumper, request timeouts, error
-        // handling, busy polling and the setup timeout into a created worker,
-        // run it from the shared start time, and return its stats, its NIC
-        // clock calibration, if any, and its connections' local addresses.
+        // handling, reconnect limits, busy polling and the setup timeout into
+        // a created worker, run it from the shared start time, and return its
+        // stats, its NIC clock calibration, if any, and its connections' local
+        // addresses.
+        #[allow(clippy::too_many_arguments)]
         fn run_worker<G, S>(
             mut worker: Worker<G, xylem_cli::multi_protocol::MultiProtocol, S>,
             request_dumper: Option<&Arc<xylem_core::request_dump::RequestDumper>>,
             thread_idx: usize,
             request_timeouts: &[(usize, Option<std::time::Duration>)],
             on_errors: &[(usize, xylem_core::traffic_group::OnError)],
+            max_requests_per_connection: &[(usize, Option<u64>)],
             experiment: &config::ExperimentConfig,
             start: StartTicket,
         ) -> xylem_core::Result<(S, WorkerReport)>
@@ -569,6 +582,9 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
             }
             for &(group_id, on_error) in on_errors {
                 worker.set_on_error(group_id, on_error);
+            }
+            for &(group_id, limit) in max_requests_per_connection {
+                worker.set_max_requests_per_connection(group_id, limit);
             }
             worker.set_busy_poll(experiment.busy_poll());
             worker.set_setup_timeout(experiment.setup_timeout);
@@ -602,6 +618,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
                     thread_idx,
                     &request_timeouts,
                     &on_errors,
+                    &max_requests_per_connection,
                     &config_for_worker.experiment,
                     start,
                 )
@@ -624,6 +641,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
                     thread_idx,
                     &request_timeouts,
                     &on_errors,
+                    &max_requests_per_connection,
                     &config_for_worker.experiment,
                     start,
                 )
@@ -662,6 +680,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
                     thread_idx,
                     &request_timeouts,
                     &on_errors,
+                    &max_requests_per_connection,
                     &config_for_worker.experiment,
                     start,
                 )
@@ -697,6 +716,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
                             thread_idx,
                             &request_timeouts,
                             &on_errors,
+                            &max_requests_per_connection,
                             &config_for_worker.experiment,
                             start,
                         )
@@ -724,6 +744,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
                             thread_idx,
                             &request_timeouts,
                             &on_errors,
+                            &max_requests_per_connection,
                             &config_for_worker.experiment,
                             start,
                         )
@@ -754,6 +775,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
                             thread_idx,
                             &request_timeouts,
                             &on_errors,
+                            &max_requests_per_connection,
                             &config_for_worker.experiment,
                             start,
                         )

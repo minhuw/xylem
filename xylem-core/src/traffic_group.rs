@@ -41,6 +41,10 @@ pub struct TrafficGroupConfig {
     /// Maximum pending requests per connection
     #[serde(default = "default_max_pending")]
     pub max_pending_per_connection: usize,
+    /// Maximum requests per connection before closing and reconnecting.
+    /// `None` keeps connections persistent for the whole run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_requests_per_connection: Option<u64>,
     /// How long a request may wait for its response before it times out,
     /// frees its pipeline slot, and counts as timed out without a latency
     /// (e.g., "500ms"). Only for transport "udp", where it defaults to 1s;
@@ -685,6 +689,7 @@ mod tests {
             threads: vec![0, 1, 2],
             connections_per_thread: 10,
             max_pending_per_connection: 5,
+            max_requests_per_connection: None,
             request_timeout: None,
             on_error: OnError::Count,
             timestamps: TimestampSourceConfig::User,
@@ -712,6 +717,7 @@ mod tests {
                 threads: vec![0, 1],
                 connections_per_thread: 5,
                 max_pending_per_connection: 1,
+                max_requests_per_connection: None,
                 request_timeout: None,
                 on_error: OnError::Count,
                 timestamps: TimestampSourceConfig::User,
@@ -732,6 +738,7 @@ mod tests {
                 threads: vec![2, 3, 4],
                 connections_per_thread: 20,
                 max_pending_per_connection: 32,
+                max_requests_per_connection: None,
                 request_timeout: None,
                 on_error: OnError::Count,
                 timestamps: TimestampSourceConfig::User,
@@ -770,6 +777,7 @@ mod tests {
                 threads: vec![0, 1],
                 connections_per_thread: 5,
                 max_pending_per_connection: 1,
+                max_requests_per_connection: None,
                 request_timeout: None,
                 on_error: OnError::Count,
                 timestamps: TimestampSourceConfig::User,
@@ -785,6 +793,7 @@ mod tests {
                 threads: vec![2],
                 connections_per_thread: 10,
                 max_pending_per_connection: 1,
+                max_requests_per_connection: None,
                 request_timeout: None,
                 on_error: OnError::Count,
                 timestamps: TimestampSourceConfig::User,
@@ -810,6 +819,7 @@ mod tests {
                 threads: vec![2, 3], // Pin to cores 2, 3
                 connections_per_thread: 5,
                 max_pending_per_connection: 1,
+                max_requests_per_connection: None,
                 request_timeout: None,
                 on_error: OnError::Count,
                 timestamps: TimestampSourceConfig::User,
@@ -825,6 +835,7 @@ mod tests {
                 threads: vec![5], // Pin to core 5
                 connections_per_thread: 10,
                 max_pending_per_connection: 1,
+                max_requests_per_connection: None,
                 request_timeout: None,
                 on_error: OnError::Count,
                 timestamps: TimestampSourceConfig::User,
@@ -854,6 +865,7 @@ mod tests {
             threads,
             connections_per_thread: connections,
             max_pending_per_connection: 1,
+            max_requests_per_connection: None,
             request_timeout: None,
             on_error: OnError::Count,
             timestamps: TimestampSourceConfig::User,

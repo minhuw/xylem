@@ -411,7 +411,9 @@ fn probe_stats() -> (Value, Value) {
         service_us: part.clone(),
         host_stack_us: Some(part.clone()),
         network_server_us: Some(part.clone()),
-        user_round_trip_us: Some(part),
+        user_round_trip_us: Some(part.clone()),
+        connect_us: Some(part.clone()),
+        connect_request_us: Some(part),
     };
     let global = GlobalStats {
         total_requests: 0,
@@ -1049,6 +1051,8 @@ file = "unused"
                     service: latency,
                     kernel: Some(kernel),
                     miss: None,
+                    connect: None,
+                    connect_request: None,
                 },
             );
         }
@@ -1746,9 +1750,12 @@ nope = ["> 1"]
             numeric_paths(probe, &[], &mut paths);
             for path in paths {
                 // clamped_samples is written only for a bounded HDR histogram,
-                // kernel_split_missing only with kernel or hardware timestamps
+                // kernel_split_missing only with kernel or hardware timestamps,
+                // connect_us and connect_request_us only when connections reconnect
                 if path.last().unwrap() != "clamped_samples"
                     && !path.contains(&"kernel_split_missing".to_string())
+                    && !path.contains(&"connect_us".to_string())
+                    && !path.contains(&"connect_request_us".to_string())
                 {
                     assert!(lookup(&stats, &path).is_some(), "{path:?}");
                 }
@@ -2132,7 +2139,16 @@ error_latency = ["p99 > 4ms", "max < 1ms"]
                 host_stack: Duration::ZERO,
                 user_round_trip: latency,
             });
-            stats.record_breakdown(0, &LatencyBreakdown { service: latency, kernel, miss });
+            stats.record_breakdown(
+                0,
+                &LatencyBreakdown {
+                    service: latency,
+                    kernel,
+                    miss,
+                    connect: None,
+                    connect_request: None,
+                },
+            );
         }
         let results = results_of(&config, &stats);
         (config, results)

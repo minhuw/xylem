@@ -9,6 +9,7 @@
 //! kernel software timestamps on request. Configure via `TcpTimestampConfig`.
 
 use crate::group::{GroupCore, GroupSocket, TimestampConfig, TxCounter};
+use crate::mux::Interest;
 use crate::{
     ConnectionGroup, Error, RecvOutcome, Result, SendProgress, SendReceipt, Timestamp,
     TransportFactory,
@@ -37,6 +38,7 @@ pub type TcpTimestampConfig = TimestampConfig;
 pub(crate) struct TcpConn {
     stream: TcpStream,
     connected: bool,
+    connecting: bool,
     /// TX byte counter, present only when kernel timestamping is enabled
     tx: Option<TxCounter>,
 }
@@ -47,7 +49,18 @@ impl TcpConn {
         Self {
             stream,
             connected: true,
+            connecting: false,
             tx: timestamps_enabled.then(TxCounter::default),
+        }
+    }
+
+    /// A socket whose non-blocking TCP handshake is still in progress
+    fn new_connecting(stream: TcpStream) -> Self {
+        Self {
+            stream,
+            connected: false,
+            connecting: true,
+            tx: None,
         }
     }
 }
@@ -276,6 +289,136 @@ impl ConnectionGroup for TcpConnectionGroup {
     fn poll_tx_timestamps(&mut self, out: &mut Vec<crate::TxTimestampInfo>) -> Result<()> {
         // The kernel stamps the last segment sent together: cumulative
         self.core.poll_tx_timestamps(true, "TCP", out)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn poll_tx_timestamps_for(
+        &mut self,
+        conn_id: usize,
+        out: &mut Vec<crate::TxTimestampInfo>,
+    ) -> Result<()> {
+        self.core.poll_tx_timestamps_for(conn_id, true, "TCP", out)
+    }
+
+    fn start_reconnect(&mut self, conn_id: usize, target: &SocketAddr) -> Result<bool> {
+        // Graceful FIN on any previous socket; frees slot `conn_id`.
+        self.core.close(conn_id)?;
+
+        let domain = if target.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        };
+        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
+            .map_err(|e| Error::Connection(format!("Connection failed: {e}")))?;
+        socket.set_nonblocking(true)?;
+        socket.set_tcp_nodelay(true)?;
+
+        match socket.connect(&(*target).into()) {
+            Ok(()) => {
+                let stream: TcpStream = socket.into();
+                #[cfg(target_os = "linux")]
+                let timestamps_enabled = self.timestamp_config.configure_socket(
+                    stream.as_raw_fd(),
+                    self.timestamp_source,
+                    "TCP",
+                    conn_id,
+                )?;
+                #[cfg(not(target_os = "linux"))]
+                let timestamps_enabled = false;
+
+                self.core.register_readable(&stream, conn_id)?;
+                self.core.insert(conn_id, TcpConn::new(stream, timestamps_enabled));
+                Ok(true)
+            }
+            Err(e)
+                if e.raw_os_error() == Some(libc::EINPROGRESS)
+                    || e.kind() == io::ErrorKind::WouldBlock =>
+            {
+                let stream: TcpStream = socket.into();
+                self.core.register_writable(&stream, conn_id)?;
+                self.core.insert(conn_id, TcpConn::new_connecting(stream));
+                Ok(false)
+            }
+            Err(e) => Err(Error::Connection(format!("Connection failed: {e}"))),
+        }
+    }
+
+    fn finish_reconnect(&mut self, conn_id: usize) -> Result<bool> {
+        {
+            let conn = self.core.conn_mut(conn_id)?;
+            if !conn.connecting {
+                return Ok(true);
+            }
+            if let Some(err) = conn.stream.take_error()? {
+                let _ = self.core.close(conn_id);
+                return Err(Error::Connection(format!("Connection failed: {err}")));
+            }
+            match conn.stream.peer_addr() {
+                Ok(_) => {}
+                Err(e)
+                    if e.raw_os_error() == Some(libc::ENOTCONN)
+                        || e.raw_os_error() == Some(libc::EINPROGRESS)
+                        || e.kind() == io::ErrorKind::NotConnected =>
+                {
+                    if let Some(err) = conn.stream.take_error()? {
+                        let _ = self.core.close(conn_id);
+                        return Err(Error::Connection(format!("Connection failed: {err}")));
+                    }
+                    return Ok(false);
+                }
+                Err(e) => {
+                    let _ = self.core.close(conn_id);
+                    return Err(Error::Connection(format!("Connection failed: {e}")));
+                }
+            }
+        }
+
+        // Handshake succeeded: configure timestamping before the first send so
+        // the kernel's TX counter starts at zero.
+        #[cfg(target_os = "linux")]
+        let timestamps_enabled = {
+            let fd = self.core.conn_mut(conn_id)?.stream.as_raw_fd();
+            match self
+                .timestamp_config
+                .configure_socket(fd, self.timestamp_source, "TCP", conn_id)
+            {
+                Ok(enabled) => enabled,
+                Err(e) => {
+                    let _ = self.core.close(conn_id);
+                    return Err(e);
+                }
+            }
+        };
+        #[cfg(not(target_os = "linux"))]
+        let timestamps_enabled = false;
+
+        if let Err(e) = self.core.set_interest(conn_id, Interest::READABLE) {
+            let _ = self.core.close(conn_id);
+            return Err(e);
+        }
+
+        let conn = self.core.conn_mut(conn_id)?;
+        conn.connecting = false;
+        conn.connected = true;
+        if timestamps_enabled {
+            conn.tx = Some(TxCounter::default());
+            #[cfg(target_os = "linux")]
+            self.core.note_tx_stamping_enabled();
+        }
+        Ok(true)
+    }
+
+    fn pause_io(&mut self, conn_id: usize) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            self.core.set_interest(conn_id, Interest::NONE)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = conn_id;
+            Ok(())
+        }
     }
 
     fn len(&self) -> usize {
@@ -803,5 +946,141 @@ mod tests {
         let factory = TcpTransportFactory::default();
         let group = factory.create_group();
         assert!(group.is_ok());
+    }
+
+    fn complete_reconnect(
+        group: &mut TcpConnectionGroup,
+        conn_id: usize,
+        addr: &SocketAddr,
+        ready: &mut Vec<usize>,
+    ) -> Result<()> {
+        if group.start_reconnect(conn_id, addr)? {
+            return Ok(());
+        }
+        loop {
+            group.poll(Duration::from_millis(100), ready)?;
+            if ready.contains(&conn_id) && group.finish_reconnect(conn_id)? {
+                return Ok(());
+            }
+        }
+    }
+
+    fn recv_payload(
+        group: &mut TcpConnectionGroup,
+        conn_id: usize,
+        ready: &mut Vec<usize>,
+        buf: &mut [u8],
+    ) -> usize {
+        loop {
+            group.poll(Duration::from_millis(100), ready).unwrap();
+            if !ready.contains(&conn_id) {
+                continue;
+            }
+            match group.recv(conn_id, buf).unwrap() {
+                RecvOutcome::Data { len, .. } => return len,
+                RecvOutcome::WouldBlock => continue,
+                RecvOutcome::Eof => panic!("unexpected EOF before data"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_tcp_group_start_and_finish_reconnect_reuses_slot_and_reports_refused() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Accept 4 sequential connections, echo 4 bytes, and immediately close (FIN)
+        let server = thread::spawn(move || {
+            let mut peer_ports = Vec::new();
+            for _ in 0..4 {
+                let (mut stream, peer) = listener.accept().unwrap();
+                peer_ports.push(peer.port());
+                let mut buf = [0u8; 4];
+                stream.read_exact(&mut buf).unwrap();
+                stream.write_all(&buf).unwrap();
+                // Drop stream immediately -> FIN
+            }
+            peer_ports
+        });
+
+        let mut group = TcpConnectionGroup::new().unwrap();
+        let conn_id = group.add_connection(&addr).unwrap();
+        let mut ready = Vec::new();
+        let mut buf = [0u8; 16];
+
+        for round in 0u8..4 {
+            if round > 0 {
+                complete_reconnect(&mut group, conn_id, &addr, &mut ready).unwrap();
+            }
+            assert_eq!(group.len(), 1);
+            let payload = [b'a' + round; 4];
+            group.send(conn_id, &payload).unwrap();
+            let len = recv_payload(&mut group, conn_id, &mut ready, &mut buf);
+            assert_eq!(&buf[..len], &payload);
+        }
+
+        let peer_ports = server.join().unwrap();
+        assert_eq!(peer_ports.len(), 4);
+
+        // Reconnecting to a closed port must surface Error::Connection
+        let closed_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed_addr = closed_listener.local_addr().unwrap();
+        drop(closed_listener);
+
+        let outcome = complete_reconnect(&mut group, conn_id, &closed_addr, &mut ready);
+        assert!(
+            matches!(outcome, Err(Error::Connection(_))),
+            "expected Connection error, got {outcome:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_tcp_group_pause_io_and_poll_tx_timestamps_for_after_reconnect() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 8];
+                stream.read_exact(&mut buf).unwrap();
+                stream.write_all(&buf).unwrap();
+                // Immediately close -> sends FIN while client may still drain TX stamp
+            }
+        });
+
+        let config = TcpTimestampConfig::with_software_timestamps();
+        let mut group = TcpConnectionGroup::with_timestamp_config(config).unwrap();
+        let conn_id = group.add_connection(&addr).unwrap();
+        let mut ready = Vec::new();
+        let mut buf = [0u8; 16];
+        let mut stamps = Vec::new();
+
+        for round in 0..2 {
+            if round > 0 {
+                complete_reconnect(&mut group, conn_id, &addr, &mut ready).unwrap();
+            }
+            let receipt = group.send(conn_id, b"12345678").unwrap();
+            // Fresh socket restarts TX byte counter at 0
+            assert_eq!(receipt.tx, Some(TxRange { start: 0, end: 8 }));
+            let len = recv_payload(&mut group, conn_id, &mut ready, &mut buf);
+            assert_eq!(len, 8);
+            // Pause I/O so peer FIN doesn't spin epoll, then drain TX timestamp for conn_id
+            group.pause_io(conn_id).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                group.poll_tx_timestamps_for(conn_id, &mut stamps).unwrap();
+                if !stamps.is_empty() {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline, "no TX timestamp for conn {conn_id}");
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(stamps.len(), 1);
+            assert_eq!(stamps[0].conn_id, conn_id);
+            assert_eq!(stamps[0].tx_end, 8);
+        }
+
+        server.join().unwrap();
     }
 }

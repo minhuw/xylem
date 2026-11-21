@@ -216,6 +216,7 @@ fn test_tuple_stats_output_generation() {
         threads: vec![0],
         connections_per_thread: conn_count,
         max_pending_per_connection: 1,
+        max_requests_per_connection: None,
         request_timeout: None,
         on_error: xylem_core::traffic_group::OnError::Count,
         timestamps: Default::default(),
