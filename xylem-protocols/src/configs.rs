@@ -758,27 +758,58 @@ pub struct MasstreeConfig {
     pub insert_phase: Option<InsertPhaseConfig>,
 }
 
+/// Value size of an insert phase: a fixed byte count or a size distribution
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(untagged)]
+pub enum InsertValueSizeConfig {
+    /// Fixed size in bytes (`value_size = 128`)
+    Fixed(usize),
+    /// Size distribution (`value_size = { strategy = "weighted", ... }`)
+    Distribution(ValueSizeConfig),
+}
+
+impl From<usize> for InsertValueSizeConfig {
+    fn from(size: usize) -> Self {
+        Self::Fixed(size)
+    }
+}
+
+impl InsertValueSizeConfig {
+    /// The largest size this config can produce
+    pub fn max_size(&self) -> usize {
+        match self {
+            Self::Fixed(size) => *size,
+            Self::Distribution(dist) => dist.max_size(),
+        }
+    }
+}
+
 /// Insert phase configuration for populating data before measurement
 ///
-/// During the insert phase:
-/// - All requests are tagged as "warmup" (stats not collected)
-/// - Keys [0, key_count) are inserted sequentially
-/// - After all keys are inserted, normal measurement begins
+/// During the insert phase, requests are tagged as warmup (stats not collected)
+/// until `key_count` keys are inserted, after which measurement begins.
 ///
-/// Both fields are optional and default to values from the `keys` config:
-/// - `key_count` defaults to the keyspace size from keys config
-/// - `value_size` defaults to `keys.value_size`
+/// Both fields are optional:
+/// - `key_count` defaults to the keyspace size from `keys` (required for sequential keys)
+/// - `value_size` accepts a fixed byte count or (for Memcached) a [`ValueSizeConfig`]
+///   distribution; when omitted, Memcached inherits the workload's `value_size` if set
+///   and otherwise falls back to `keys.value_size`, while Redis and Masstree use
+///   `keys.value_size`.
 ///
 /// Example configurations:
 /// ```toml
-/// # Minimal - use defaults from keys config
+/// # Minimal - inherit defaults from protocol config
 /// insert_phase = {}
 ///
 /// # Override key count only (insert fewer keys than keyspace)
 /// insert_phase = { key_count = 100000 }
 ///
-/// # Override both
+/// # Override with a fixed value size
 /// insert_phase = { key_count = 100000, value_size = 128 }
+///
+/// # Override with a size distribution (Memcached)
+/// insert_phase = { key_count = 100000, value_size = { strategy = "uniform", min = 64, max = 512 } }
 /// ```
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -788,19 +819,60 @@ pub struct InsertPhaseConfig {
     /// Defaults to keyspace size from keys config (n for Zipfian, max for Random, etc.)
     #[serde(default)]
     pub key_count: Option<u64>,
-    /// Value size for inserted keys.
-    /// Defaults to keys.value_size if not specified.
+    /// Value size for inserted keys: a fixed byte count or (for Memcached) a
+    /// `ValueSizeConfig` distribution. Defaults to `value_size` (Memcached) or
+    /// `keys.value_size` if not specified.
     #[serde(default)]
-    pub value_size: Option<usize>,
+    pub value_size: Option<InsertValueSizeConfig>,
 }
 
 impl InsertPhaseConfig {
-    /// Resolve insertion defaults; unbounded keyspaces require an explicit count.
-    pub fn resolve(&self, keys: &KeysConfig) -> anyhow::Result<(u64, usize)> {
-        let count = self.key_count.or_else(|| keys.keyspace_size()).ok_or_else(|| {
+    fn resolve_key_count(&self, keys: &KeysConfig) -> anyhow::Result<u64> {
+        self.key_count.or_else(|| keys.keyspace_size()).ok_or_else(|| {
             anyhow::anyhow!("insert_phase.key_count is required for sequential keys")
-        })?;
-        Ok((count, self.value_size.unwrap_or_else(|| keys.value_size())))
+        })
+    }
+
+    /// Resolve insertion defaults for fixed-size insert phases (Redis, Masstree);
+    /// unbounded keyspaces require an explicit count.
+    pub fn resolve(&self, keys: &KeysConfig) -> anyhow::Result<(u64, usize)> {
+        let count = self.resolve_key_count(keys)?;
+        let size = match &self.value_size {
+            None => keys.value_size(),
+            Some(InsertValueSizeConfig::Fixed(size)) => *size,
+            Some(InsertValueSizeConfig::Distribution(_)) => anyhow::bail!(
+                "variable-size insert_phase.value_size is currently supported only for Memcached"
+            ),
+        };
+        Ok((count, size))
+    }
+
+    /// Resolve insertion key count and value size generator for protocols that
+    /// support variable-size insert phases (Memcached).
+    ///
+    /// Precedence for value sizes:
+    /// 1. Explicit `insert_phase.value_size` (fixed byte count or distribution)
+    /// 2. Workload `value_size` distribution if configured
+    /// 3. `keys.value_size`
+    pub fn resolve_value_sizes(
+        &self,
+        keys: &KeysConfig,
+        workload_value_size: Option<&ValueSizeConfig>,
+        seed: Option<u64>,
+    ) -> anyhow::Result<(u64, Box<dyn crate::workload::ValueSizeGenerator>)> {
+        let count = self.resolve_key_count(keys)?;
+        let insert_seed = seed.map(|s| xylem_core::seed::derive_seed(s, "insert_phase"));
+        let sizes: Box<dyn crate::workload::ValueSizeGenerator> = match &self.value_size {
+            Some(InsertValueSizeConfig::Fixed(size)) => {
+                Box::new(crate::workload::FixedSize::new(*size))
+            }
+            Some(InsertValueSizeConfig::Distribution(dist)) => dist.to_generator(insert_seed)?,
+            None => match workload_value_size {
+                Some(dist) => dist.to_generator(insert_seed)?,
+                None => Box::new(crate::workload::FixedSize::new(keys.value_size())),
+            },
+        };
+        Ok((count, sizes))
     }
 }
 

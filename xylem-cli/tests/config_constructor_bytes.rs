@@ -64,7 +64,10 @@ fn redis_weighted_config() -> RedisConfig {
         }),
         value_size: Some(ValueSizeConfig::Uniform { min: 2, max: 9 }),
         random_data: true,
-        insert_phase: Some(InsertPhaseConfig { key_count: Some(2), value_size: Some(4) }),
+        insert_phase: Some(InsertPhaseConfig {
+            key_count: Some(2),
+            value_size: Some(4.into()),
+        }),
         ..Default::default()
     }
 }
@@ -348,7 +351,10 @@ fn memcached_set_config() -> MemcachedConfig {
         operation: Some("set".into()),
         operations: None,
         value_size: None,
-        insert_phase: Some(InsertPhaseConfig { key_count: Some(2), value_size: Some(3) }),
+        insert_phase: Some(InsertPhaseConfig {
+            key_count: Some(2),
+            value_size: Some(3.into()),
+        }),
     }
 }
 

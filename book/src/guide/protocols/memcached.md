@@ -71,8 +71,10 @@ With `per_command`, `set`, `add` and `replace` take their own sizes.
 
 `insert_phase` SETs keys before anything is measured: `key_count` keys
 (default: the keyspace size of `keys`, required for sequential keys), drawn
-like the measured keys, with values of `value_size` bytes (default
-`keys.value_size`). Redis takes the same section, and so does Masstree,
+like the measured keys. `insert_phase.value_size` accepts either a fixed byte
+count or a `value_size` distribution; when omitted, it defaults to `value_size`
+if set, and otherwise to `keys.value_size`. Redis takes the same section
+(fixed sizes only), and so does Masstree,
 which inserts keys 0 to `key_count - 1`. Each thread
 inserts all of them, and its connections share the work. The inserts are
 [preload](../output-formats.md#run-phases): they go out as fast as the

@@ -22,11 +22,11 @@ pub mod xylem_echo;
 // Re-export commonly used types
 pub use clickhouse::{ClickHouseConfig, ClickHouseProtocol};
 pub use configs::{
-    CommandValueSizeConfig, HttpConfig, InsertPhaseConfig, KeysConfig, MasstreeCommandParams,
-    MasstreeConfig, MasstreeOperationsConfig, MasstreeScanConfig, MemcachedCommandParams,
-    MemcachedConfig, MemcachedOperationsConfig, OperationWeight, OperationsConfig, RedisAuthConfig,
-    RedisCommandParams, RedisCommandWeight, RedisConfig, RedisOperationsConfig, SizeWeight,
-    ValueSizeConfig, XylemEchoConfig,
+    CommandValueSizeConfig, HttpConfig, InsertPhaseConfig, InsertValueSizeConfig, KeysConfig,
+    MasstreeCommandParams, MasstreeConfig, MasstreeOperationsConfig, MasstreeScanConfig,
+    MemcachedCommandParams, MemcachedConfig, MemcachedOperationsConfig, OperationWeight,
+    OperationsConfig, RedisAuthConfig, RedisCommandParams, RedisCommandWeight, RedisConfig,
+    RedisOperationsConfig, SizeWeight, ValueSizeConfig, XylemEchoConfig,
 };
 pub use dns::{DnsConfig, DnsFraming, DnsProtocol};
 pub use http::HttpMethod;

@@ -196,6 +196,18 @@ impl MemcachedBinaryProtocol {
         self
     }
 
+    /// Set up insert phase with a value size generator for data population before measurement
+    pub fn with_insert_phase_sizes(
+        mut self,
+        key_count: u64,
+        value_sizes: Box<dyn ValueSizeGenerator>,
+    ) -> Self {
+        let insert_key_gen = self.workload.key_gen.clone();
+        self.insert_phase =
+            Some(InsertPhaseState::with_value_sizes(key_count, value_sizes, insert_key_gen));
+        self
+    }
+
     /// Check if currently in insert phase (warmup)
     pub fn is_in_insert_phase(&self) -> bool {
         self.insert_phase.as_ref().is_some_and(|p| !p.is_complete())
@@ -280,7 +292,7 @@ impl Protocol for MemcachedBinaryProtocol {
         // Phase 1: Insert phase (warmup) - populate data before measurement
         if let Some(ref mut insert_state) = self.insert_phase {
             if let Some(key) = insert_state.next_key() {
-                let value_size = insert_state.value_size;
+                let value_size = insert_state.next_value_size();
                 let seq = next_conn_seq(&mut self.conn_send_seq, conn_id);
                 let request_data = self.encode_store(CMD_SET, key, value_size);
                 let request_data = frame_udp_request(seq, request_data, self.udp.as_ref());

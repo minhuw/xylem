@@ -155,16 +155,29 @@ impl Workload {
 }
 
 /// Insert phase state for data population before measurement
-#[derive(Debug)]
 pub struct InsertPhaseState {
     /// Total number of keys to insert
     key_count: u64,
     /// Number of keys inserted so far
     inserted: u64,
-    /// Value size for inserts
+    /// Fixed value size for inserts (used when `value_sizes` is `None`)
     value_size: usize,
+    /// Optional variable value size generator for inserts
+    value_sizes: Option<Box<dyn ValueSizeGenerator>>,
     /// Key generator for inserts (clone of workload generator to preserve distribution/seed)
     key_gen: Option<crate::workload::KeyGeneration>,
+}
+
+impl std::fmt::Debug for InsertPhaseState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InsertPhaseState")
+            .field("key_count", &self.key_count)
+            .field("inserted", &self.inserted)
+            .field("value_size", &self.value_size)
+            .field("value_sizes", &self.value_sizes.as_ref().map(|_| "<generator>"))
+            .field("key_gen", &self.key_gen)
+            .finish()
+    }
 }
 
 impl InsertPhaseState {
@@ -178,6 +191,22 @@ impl InsertPhaseState {
             key_count,
             inserted: 0,
             value_size,
+            value_sizes: None,
+            key_gen,
+        }
+    }
+
+    /// Create new insert phase state with a value size generator
+    pub fn with_value_sizes(
+        key_count: u64,
+        value_sizes: Box<dyn ValueSizeGenerator>,
+        key_gen: Option<crate::workload::KeyGeneration>,
+    ) -> Self {
+        Self {
+            key_count,
+            inserted: 0,
+            value_size: 0,
+            value_sizes: Some(value_sizes),
             key_gen,
         }
     }
@@ -185,6 +214,14 @@ impl InsertPhaseState {
     /// Check if insert phase is complete
     pub fn is_complete(&self) -> bool {
         self.inserted >= self.key_count
+    }
+
+    /// Get next value size for an insert (`SET`) request
+    pub fn next_value_size(&mut self) -> usize {
+        match &mut self.value_sizes {
+            Some(sizes) => sizes.next_size_for_command("SET"),
+            None => self.value_size,
+        }
     }
 
     /// Get next key to insert, returns None if insert phase is complete

@@ -107,8 +107,9 @@ macro_rules! from_config {
             protocol = protocol.with_value_size_generator(sizes);
         }
         if let Some(insert) = &config.insert_phase {
-            let (count, size) = insert.resolve(&config.keys)?;
-            protocol = protocol.with_insert_phase(count, size);
+            let (count, sizes) =
+                insert.resolve_value_sizes(&config.keys, config.value_size.as_ref(), seed)?;
+            protocol = protocol.with_insert_phase_sizes(count, sizes);
         }
         Ok(protocol)
     }};
@@ -289,5 +290,222 @@ mod tests {
             assert!((share - weight).abs() < 0.03, "{command}: {share}");
         }
         assert_eq!(sizes, ["3", "5"].map(String::from).into());
+    }
+
+    fn ascii_set_value_len(data: &[u8]) -> usize {
+        let s = std::str::from_utf8(data).unwrap();
+        let (header, rest) = s.split_once("\r\n").unwrap();
+        assert!(header.starts_with("set "), "expected ASCII set, got {header:?}");
+        let len: usize = header.rsplit(' ').next().unwrap().parse().unwrap();
+        assert_eq!(rest.strip_suffix("\r\n").unwrap().len(), len);
+        len
+    }
+
+    fn binary_set_value_len(data: &[u8]) -> usize {
+        assert!(data.len() >= 24, "binary request shorter than header");
+        assert_eq!(data[0], 0x80, "expected request magic");
+        assert_eq!(data[1], 0x01, "expected binary SET opcode");
+        let key_len = u16::from_be_bytes([data[2], data[3]]) as usize;
+        let extra_len = usize::from(data[4]);
+        let body_len = u32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize;
+        assert_eq!(extra_len, 8);
+        assert_eq!(data.len(), 24 + body_len);
+        body_len - extra_len - key_len
+    }
+
+    fn collect_insert_sizes(cfg: &MemcachedConfig, seed: Option<u64>, count: usize) -> Vec<usize> {
+        use crate::Protocol;
+        let mut ascii = MemcachedAsciiProtocol::from_config(cfg, seed).unwrap();
+        let mut binary = MemcachedBinaryProtocol::from_config(cfg, seed).unwrap();
+        let mut ascii_sizes = Vec::with_capacity(count);
+        let mut binary_sizes = Vec::with_capacity(count);
+        for _ in 0..count {
+            let a = ascii.next_request(0);
+            let b = binary.next_request(0);
+            assert!(a.metadata.is_warmup);
+            assert!(b.metadata.is_warmup);
+            ascii_sizes.push(ascii_set_value_len(&a.data));
+            binary_sizes.push(binary_set_value_len(&b.data));
+        }
+        assert!(!ascii.next_request(0).metadata.is_warmup);
+        assert!(!binary.next_request(0).metadata.is_warmup);
+        assert_eq!(ascii_sizes, binary_sizes);
+        ascii_sizes
+    }
+
+    #[test]
+    fn insert_phase_inherits_workload_value_size_distributions() {
+        use serde_json::json;
+
+        // Weighted distribution inherited when insert_phase = {}
+        let weighted_cfg = config(json!({
+            "keys": { "strategy": "round-robin", "max": 60, "value_size": 8 },
+            "value_size": {
+                "strategy": "weighted",
+                "sizes": [{ "size": 16, "weight": 1.0 }, { "size": 256, "weight": 1.0 }]
+            },
+            "insert_phase": {},
+        }));
+        let sizes = collect_insert_sizes(&weighted_cfg, Some(7), 60);
+        let unique: std::collections::HashSet<_> = sizes.into_iter().collect();
+        assert_eq!(unique, [16, 256].into());
+
+        // Uniform distribution inherited when insert_phase = {}
+        let uniform_cfg = config(json!({
+            "keys": { "strategy": "round-robin", "max": 80, "value_size": 8 },
+            "value_size": { "strategy": "uniform", "min": 10, "max": 20 },
+            "insert_phase": {},
+        }));
+        let sizes = collect_insert_sizes(&uniform_cfg, Some(9), 80);
+        assert!(sizes.iter().all(|&s| (10..=20).contains(&s)));
+        assert!(sizes.iter().collect::<std::collections::HashSet<_>>().len() > 1);
+
+        // PerCommand selecting "SET"
+        let per_cmd_set_cfg = config(json!({
+            "keys": { "strategy": "round-robin", "max": 50, "value_size": 8 },
+            "value_size": {
+                "strategy": "per_command",
+                "commands": {
+                    "set": {
+                        "distribution": "weighted",
+                        "sizes": [{ "size": 32, "weight": 1.0 }, { "size": 64, "weight": 1.0 }]
+                    }
+                },
+                "default": { "strategy": "fixed", "size": 99 }
+            },
+            "insert_phase": {},
+        }));
+        let sizes = collect_insert_sizes(&per_cmd_set_cfg, Some(11), 50);
+        let unique: std::collections::HashSet<_> = sizes.into_iter().collect();
+        assert_eq!(unique, [32, 64].into());
+
+        // PerCommand falling back to default when "set" is not specified
+        let per_cmd_default_cfg = config(json!({
+            "keys": { "strategy": "round-robin", "max": 40, "value_size": 8 },
+            "value_size": {
+                "strategy": "per_command",
+                "commands": {
+                    "add": { "distribution": "fixed", "size": 500 }
+                },
+                "default": { "strategy": "uniform", "min": 40, "max": 45 }
+            },
+            "insert_phase": {},
+        }));
+        let sizes = collect_insert_sizes(&per_cmd_default_cfg, Some(13), 40);
+        assert!(sizes.iter().all(|&s| (40..=45).contains(&s)));
+        assert!(sizes.iter().collect::<std::collections::HashSet<_>>().len() > 1);
+    }
+
+    #[test]
+    fn insert_phase_value_size_fixed_and_explicit_distribution_override_workload() {
+        use serde_json::json;
+
+        // Fixed scalar override
+        let fixed_override = config(json!({
+            "keys": { "strategy": "round-robin", "max": 10, "value_size": 8 },
+            "value_size": { "strategy": "uniform", "min": 16, "max": 64 },
+            "insert_phase": { "value_size": 128 },
+        }));
+        let sizes = collect_insert_sizes(&fixed_override, Some(42), 10);
+        assert_eq!(sizes, vec![128; 10]);
+
+        // Explicit distribution override independent of config.value_size
+        let dist_override = config(json!({
+            "keys": { "strategy": "round-robin", "max": 50, "value_size": 8 },
+            "value_size": { "strategy": "fixed", "size": 999 },
+            "insert_phase": {
+                "value_size": {
+                    "strategy": "weighted",
+                    "sizes": [{ "size": 12, "weight": 1.0 }, { "size": 48, "weight": 1.0 }]
+                }
+            },
+        }));
+        let sizes = collect_insert_sizes(&dist_override, Some(42), 50);
+        let unique: std::collections::HashSet<_> = sizes.into_iter().collect();
+        assert_eq!(unique, [12, 48].into());
+    }
+
+    #[test]
+    fn insert_phase_seed_determinism_and_stream_independence() {
+        use crate::Protocol;
+        use serde_json::json;
+
+        let cfg = config(json!({
+            "keys": { "strategy": "round-robin", "max": 32, "value_size": 8 },
+            "operation": "SET",
+            "value_size": { "strategy": "uniform", "min": 10, "max": 1000 },
+            "insert_phase": {},
+        }));
+
+        // Same seed yields identical insert sizes
+        let first = collect_insert_sizes(&cfg, Some(12345), 32);
+        let second = collect_insert_sizes(&cfg, Some(12345), 32);
+        assert_eq!(first, second);
+
+        // Insert stream is independent of measurement value_size stream
+        let mut ascii = MemcachedAsciiProtocol::from_config(&cfg, Some(12345)).unwrap();
+        let mut binary = MemcachedBinaryProtocol::from_config(&cfg, Some(12345)).unwrap();
+        let insert_ascii: Vec<_> = (0..32)
+            .map(|_| {
+                let req = ascii.next_request(0);
+                assert!(req.metadata.is_warmup);
+                ascii_set_value_len(&req.data)
+            })
+            .collect();
+        let measure_ascii: Vec<_> = (0..32)
+            .map(|_| {
+                let req = ascii.next_request(0);
+                assert!(!req.metadata.is_warmup);
+                ascii_set_value_len(&req.data)
+            })
+            .collect();
+        let insert_binary: Vec<_> = (0..32)
+            .map(|_| {
+                let req = binary.next_request(0);
+                assert!(req.metadata.is_warmup);
+                binary_set_value_len(&req.data)
+            })
+            .collect();
+        let measure_binary: Vec<_> = (0..32)
+            .map(|_| {
+                let req = binary.next_request(0);
+                assert!(!req.metadata.is_warmup);
+                binary_set_value_len(&req.data)
+            })
+            .collect();
+        assert_eq!(insert_ascii, insert_binary);
+        assert_eq!(measure_ascii, measure_binary);
+        assert_ne!(insert_ascii, measure_ascii);
+    }
+
+    #[test]
+    fn non_memcached_protocols_reject_distribution_insert_phase_value_size() {
+        use crate::configs::{MasstreeConfig, RedisConfig};
+        use crate::{MasstreeProtocol, RedisProtocol};
+        use serde_json::json;
+
+        let redis_cfg: RedisConfig = serde_json::from_value(json!({
+            "keys": { "strategy": "round-robin", "max": 10, "value_size": 8 },
+            "insert_phase": {
+                "value_size": { "strategy": "uniform", "min": 8, "max": 64 }
+            }
+        }))
+        .unwrap();
+        let redis_err = RedisProtocol::from_config(&redis_cfg, Some(1)).err().unwrap().to_string();
+        assert!(redis_err.contains("Memcached"), "unexpected Redis error: {redis_err}");
+
+        let masstree_cfg: MasstreeConfig = serde_json::from_value(json!({
+            "keys": { "strategy": "round-robin", "max": 10, "value_size": 8 },
+            "insert_phase": {
+                "value_size": {
+                    "strategy": "weighted",
+                    "sizes": [{ "size": 16, "weight": 1.0 }]
+                }
+            }
+        }))
+        .unwrap();
+        let masstree_err =
+            MasstreeProtocol::from_config(&masstree_cfg, Some(1)).err().unwrap().to_string();
+        assert!(masstree_err.contains("Memcached"), "unexpected Masstree error: {masstree_err}");
     }
 }

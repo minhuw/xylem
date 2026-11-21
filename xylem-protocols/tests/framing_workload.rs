@@ -128,7 +128,10 @@ fn constructors_honor_keys_values_insertion_and_http_body() {
             value_size: 3,
             prefix: "item:".into(),
         },
-        insert_phase: Some(InsertPhaseConfig { key_count: Some(1), value_size: Some(5) }),
+        insert_phase: Some(InsertPhaseConfig {
+            key_count: Some(1),
+            value_size: Some(5.into()),
+        }),
         ..Default::default()
     };
     let mut ascii = MemcachedAsciiProtocol::from_config(&config, Some(42)).unwrap();
@@ -184,7 +187,10 @@ fn redis_constructor_retains_variable_sizes_random_data_and_per_command_keys() {
             default: Box::new(ValueSizeConfig::Fixed { size: 100 }),
         }),
         random_data: true,
-        insert_phase: Some(InsertPhaseConfig { key_count: Some(1), value_size: Some(9) }),
+        insert_phase: Some(InsertPhaseConfig {
+            key_count: Some(1),
+            value_size: Some(9.into()),
+        }),
         ..Default::default()
     };
     let mut first = RedisProtocol::from_config(&config, Some(42)).unwrap();

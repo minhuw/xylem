@@ -63,7 +63,10 @@ fn seeded_random_get_config() -> MemcachedConfig {
         operation: Some("GET".into()),
         operations: None,
         value_size: None,
-        insert_phase: Some(InsertPhaseConfig { key_count: Some(3), value_size: Some(5) }),
+        insert_phase: Some(InsertPhaseConfig {
+            key_count: Some(3),
+            value_size: Some(5.into()),
+        }),
     }
 }
 
@@ -78,7 +81,10 @@ fn seeded_zipfian_set_config() -> MemcachedConfig {
         operation: Some("SET".into()),
         operations: None,
         value_size: None,
-        insert_phase: Some(InsertPhaseConfig { key_count: Some(2), value_size: Some(2) }),
+        insert_phase: Some(InsertPhaseConfig {
+            key_count: Some(2),
+            value_size: Some(2.into()),
+        }),
     }
 }
 

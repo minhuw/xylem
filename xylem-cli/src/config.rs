@@ -834,7 +834,11 @@ fn validate_udp_request_size(config: &ProtocolConfig, index: usize, name: &str) 
         return Ok(());
     };
     let max = xylem_protocols::memcached::MAX_UDP_VALUE_SIZE;
-    let insert_size = config.insert_phase.as_ref().and_then(|insert| insert.value_size);
+    let insert_size = config
+        .insert_phase
+        .as_ref()
+        .and_then(|insert| insert.value_size.as_ref())
+        .map(xylem_protocols::InsertValueSizeConfig::max_size);
     let sizes = config.value_size.as_ref().map(|sizes| sizes.max_size());
     for size in [Some(config.keys.value_size()), insert_size, sizes].into_iter().flatten() {
         if size > max {
@@ -2275,6 +2279,19 @@ file = "results/test.json"
         };
         with(weighted(max)).unwrap();
         let error = with(weighted(max + 1)).unwrap_err().to_string();
+        assert!(error.contains(&format!("value size {} does not fit", max + 1)), "{error}");
+        let insert_fixed = |size: usize| serde_json::json!({ "insert_phase": { "key_count": 10, "value_size": size } });
+        with(insert_fixed(max)).unwrap();
+        let error = with(insert_fixed(max + 1)).unwrap_err().to_string();
+        assert!(error.contains(&format!("value size {} does not fit", max + 1)), "{error}");
+        let insert_dist = |size: usize| {
+            serde_json::json!({ "insert_phase": { "key_count": 10, "value_size": {
+                "strategy": "weighted",
+                "sizes": [{ "size": 1, "weight": 1.0 }, { "size": size, "weight": 0.001 }]
+            } } })
+        };
+        with(insert_dist(max)).unwrap();
+        let error = with(insert_dist(max + 1)).unwrap_err().to_string();
         assert!(error.contains(&format!("value size {} does not fit", max + 1)), "{error}");
         let mix = |name: &str| {
             serde_json::json!({ "operations": { "strategy": "weighted", "commands": [
