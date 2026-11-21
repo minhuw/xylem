@@ -1,13 +1,14 @@
 //! Config-aware Masstree construction.
-use crate::configs::{MasstreeCommandParams, MasstreeConfig, OperationsConfig};
+use crate::configs::{MasstreeCommandParams, MasstreeConfig, OperationsConfig, ValueSizeConfig};
 use crate::masstree::{MasstreeOp, MasstreeProtocol};
 use crate::workload::CommandSelector;
-use anyhow::Result;
+use anyhow::{bail, Result};
 
 impl MasstreeProtocol {
     /// Construct a workload with the configured operations, keys, prefix,
     /// value sizes, random data and insertion phase.
     pub fn from_config(config: &MasstreeConfig, seed: Option<u64>) -> Result<Self> {
+        let verify = config.validate_verify()?;
         let mut protocol = Self::with_workload_and_options(
             MasstreeOp::Get,
             config.keys.to_key_gen(seed)?,
@@ -28,11 +29,40 @@ impl MasstreeProtocol {
             protocol = protocol.with_insert_phase(count, size);
         }
 
+        if let Some((verify_seed, expected_size)) = verify {
+            protocol = protocol.with_verify(verify_seed, expected_size);
+        }
+
         Ok(protocol)
     }
 }
 
 impl MasstreeConfig {
+    /// Validate `verify` and `verify_seed`, returning `Some((seed, expected_size))`
+    /// when opt-in value verification is enabled.
+    pub fn validate_verify(&self) -> Result<Option<(u64, usize)>> {
+        if !self.verify {
+            if self.verify_seed.is_some() {
+                bail!("Masstree verify_seed requires verify = true");
+            }
+            return Ok(None);
+        }
+        let expected_size = match &self.value_size {
+            Some(ValueSizeConfig::Fixed { size }) => *size,
+            Some(_) => bail!("Masstree verify mode requires a fixed value_size"),
+            None => self.keys.value_size(),
+        };
+        if let Some(insert) = &self.insert_phase {
+            let (_, insert_size) = insert.resolve(&self.keys)?;
+            if insert_size != expected_size {
+                bail!(
+                    "Masstree verify mode requires insert_phase.value_size ({insert_size}) to \
+                     match expected value_size ({expected_size})"
+                );
+            }
+        }
+        Ok(Some((self.verify_seed.unwrap_or(0), expected_size)))
+    }
     /// The selector of the measurement operations: `operation`, or the
     /// `operations` mix (default get)
     pub fn operation_selector(
@@ -191,5 +221,79 @@ mod tests {
                 op(config.clone()).err().unwrap_or_else(|| panic!("{config}")).to_string();
             assert!(message.contains(error), "{config}: {message}");
         }
+    }
+
+    #[test]
+    fn verify_config_validation() {
+        // Default: disabled, ok
+        assert_eq!(config(json!({})).validate_verify().unwrap(), None);
+
+        // verify_seed without verify = true is rejected
+        let err = MasstreeProtocol::from_config(&config(json!({ "verify_seed": 42 })), None)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("verify_seed requires verify = true"), "{err}");
+
+        // Non-fixed value_size with verify = true is rejected
+        for vs in [
+            json!({ "strategy": "uniform", "min": 16, "max": 64 }),
+            json!({ "strategy": "normal", "mean": 64.0, "std_dev": 8.0, "min": 16, "max": 128 }),
+            json!({ "strategy": "weighted", "sizes": [{ "size": 64, "weight": 1.0 }] }),
+            json!({
+                "strategy": "per_command",
+                "commands": {},
+                "default": { "strategy": "fixed", "size": 64 }
+            }),
+        ] {
+            let cfg = config(json!({ "verify": true, "value_size": vs }));
+            let err = MasstreeProtocol::from_config(&cfg, None).err().unwrap().to_string();
+            assert!(err.contains("requires a fixed value_size"), "{vs}: {err}");
+        }
+
+        // Mismatched insert_phase.value_size is rejected
+        let cfg = config(json!({
+            "verify": true,
+            "keys": { "strategy": "round-robin", "max": 16, "value_size": 64 },
+            "insert_phase": { "key_count": 16, "value_size": 128 }
+        }));
+        let err = MasstreeProtocol::from_config(&cfg, None).err().unwrap().to_string();
+        assert!(
+            err.contains("insert_phase.value_size (128) to match expected value_size (64)"),
+            "{err}"
+        );
+
+        // Fixed value_size overriding keys.value_size with mismatched implicit insert_phase
+        let cfg = config(json!({
+            "verify": true,
+            "keys": { "strategy": "round-robin", "max": 16, "value_size": 64 },
+            "value_size": { "strategy": "fixed", "size": 512 },
+            "insert_phase": { "key_count": 16 }
+        }));
+        let err = MasstreeProtocol::from_config(&cfg, None).err().unwrap().to_string();
+        assert!(
+            err.contains("insert_phase.value_size (64) to match expected value_size (512)"),
+            "{err}"
+        );
+
+        // Matching fixed value_size and insert_phase succeeds
+        let cfg = config(json!({
+            "verify": true,
+            "verify_seed": 7,
+            "keys": { "strategy": "round-robin", "max": 16, "value_size": 64 },
+            "value_size": { "strategy": "fixed", "size": 512 },
+            "insert_phase": { "key_count": 16, "value_size": 512 }
+        }));
+        assert_eq!(cfg.validate_verify().unwrap(), Some((7, 512)));
+        assert!(MasstreeProtocol::from_config(&cfg, None).is_ok());
+
+        // Matching keys.value_size with default verify_seed = 0 succeeds
+        let cfg = config(json!({
+            "verify": true,
+            "keys": { "strategy": "round-robin", "max": 16, "value_size": 71 },
+            "insert_phase": {}
+        }));
+        assert_eq!(cfg.validate_verify().unwrap(), Some((0, 71)));
+        assert!(MasstreeProtocol::from_config(&cfg, None).is_ok());
     }
 }

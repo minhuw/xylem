@@ -976,7 +976,14 @@ fn parse_protocol_config(
             Ok(ProtocolConfig::Grpc(config))
         }
         ProtocolKind::Masstree => {
-            let config = parse_typed_config(pc, "Masstree", group_idx, group_name)?;
+            let config: xylem_protocols::MasstreeConfig =
+                parse_typed_config(pc, "Masstree", group_idx, group_name)?;
+            config.validate_verify().with_context(|| {
+                format!(
+                    "Traffic group {} '{}' has invalid Masstree protocol_config",
+                    group_idx, group_name
+                )
+            })?;
             Ok(ProtocolConfig::Masstree(config))
         }
         ProtocolKind::Dns => {

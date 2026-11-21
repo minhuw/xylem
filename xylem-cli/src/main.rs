@@ -182,11 +182,13 @@ fn exit_on_failed_verdict(verdict: Verdict) {
 }
 
 /// What a worker thread reports besides its stats: its NIC clock
-/// calibration, if any, and its thread ID with each connection's
-/// `(group_id, connection_id, local_addr)`
+/// calibration, if any, its thread ID with each connection's
+/// `(group_id, connection_id, local_addr)`, and any opt-in payload
+/// verification reports per group
 type WorkerReport = (
     Option<output::NicClockCalibration>,
     (usize, Vec<(usize, usize, Option<std::net::SocketAddr>)>),
+    Vec<(usize, xylem_common::VerificationReport)>,
 );
 
 fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict> {
@@ -595,7 +597,8 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
                 .clock_calibration()
                 .map(|report| output::NicClockCalibration::new(thread_idx, &report));
             let local_addrs = (thread_idx, worker.connection_local_addrs());
-            Ok((worker.into_stats(), (calibration, local_addrs)))
+            let verification = worker.verification_reports();
+            Ok((worker.into_stats(), (calibration, local_addrs, verification)))
         }
 
         // Select transport factory based on thread's transport
@@ -815,7 +818,28 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
     }
     let (results, mut worker_threads): (Vec<_>, Vec<_>) = results.into_iter().unzip();
     let (results, reports): (Vec<_>, Vec<_>) = results.into_iter().unzip();
-    let (calibrations, local_addrs): (Vec<_>, Vec<_>) = reports.into_iter().unzip();
+    let mut calibrations = Vec::new();
+    let mut local_addrs = Vec::new();
+    let mut verification_reports: std::collections::BTreeMap<
+        usize,
+        xylem_common::VerificationReport,
+    > = std::collections::BTreeMap::new();
+    for (calibration, addrs, verification) in reports {
+        if let Some(calibration) = calibration {
+            calibrations.push(calibration);
+        }
+        local_addrs.push(addrs);
+        for (group_id, report) in verification {
+            match verification_reports.entry(group_id) {
+                std::collections::btree_map::Entry::Vacant(e) => {
+                    e.insert(report);
+                }
+                std::collections::btree_map::Entry::Occupied(mut e) => {
+                    e.get_mut().merge(report);
+                }
+            }
+        }
+    }
     let stats = xylem_core::stats::TupleStatsCollector::merge(results);
 
     // Get transport summary from traffic groups
@@ -841,9 +865,10 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
         config.stats.include_records,
     );
     detailed_results.experiment.busy_poll_us = config.experiment.busy_poll_us;
-    detailed_results.nic_clock_calibration = calibrations.into_iter().flatten().collect();
+    detailed_results.nic_clock_calibration = calibrations;
     detailed_results.nic_clock_calibration.sort_by_key(|c| c.thread_id);
     detailed_results.set_connection_addrs(local_addrs);
+    detailed_results.set_verification_reports(verification_reports);
     worker_threads.sort_by_key(|thread| thread.thread_id);
     detailed_results.worker_threads = worker_threads;
     let verdict = thresholds::evaluate(&mut detailed_results, &config);

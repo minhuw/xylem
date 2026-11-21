@@ -1409,6 +1409,20 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
     pub fn clock_calibration(&self) -> Option<xylem_transport::ClockCalibrationReport> {
         self.pool.clock_calibration()
     }
+
+    /// Payload verification reports for traffic groups on this worker that
+    /// have opt-in verification enabled
+    pub fn verification_reports(&self) -> Vec<(usize, xylem_common::VerificationReport)> {
+        let mut reports: Vec<_> = self
+            .protocols
+            .iter()
+            .filter_map(|(&group_id, proto)| {
+                proto.verification_report().map(|report| (group_id, report))
+            })
+            .collect();
+        reports.sort_by_key(|(group_id, _)| *group_id);
+        reports
+    }
 }
 
 /// Specialized implementation for Unix domain sockets

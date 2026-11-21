@@ -17,5 +17,7 @@ pub use distributions::{
 };
 
 pub use hash::FastHashMap;
-pub use protocol::{ConnectionRole, ErrorReply, Outbox, Parsed, Protocol};
+pub use protocol::{
+    ConnectionRole, ErrorReply, Outbox, Parsed, Protocol, VerificationMismatch, VerificationReport,
+};
 pub use request::{Request, RequestMeta};

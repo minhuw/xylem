@@ -409,6 +409,45 @@ Benchmark the difference:
 
 For structured data with frequent partial updates, PUT is the right model.
 
+### Deterministic Value Verification
+
+Set `verify = true` (and optional `verify_seed`, default `0`) to check every `GET` response byte-for-byte against a deterministic function of `(verify_seed, key_bytes, value_size, col_idx)`. When enabled, `SET` (`REPLACE`), `PUT`, and `insert_phase` write that exact byte pattern, and verification requires a fixed value size (if `insert_phase` is configured, its resolved `value_size` must match):
+
+```toml
+[traffic_groups.protocol_config]
+keys = { strategy = "round-robin", max = 1000, value_size = 512 }
+insert_phase = {}
+verify = true
+verify_seed = 42
+operations = { strategy = "weighted", commands = [
+  { name = "get", weight = 0.8 },
+  { name = "set", weight = 0.2 },
+] }
+```
+
+#### Pattern Formula
+
+An external or synthetic responder can reproduce the exact byte sequence for `(seed: u64, key: &[u8], value_size: usize, col_idx: u32)` as follows:
+
+1. Hash `key` with 64-bit FNV-1a (offset basis `0xcbf29ce484222325`, prime `0x00000100000001b3`):
+   `h = fnv1a_64(key)`
+2. Define `splitmix64(x)`:
+   - `x = x.wrapping_add(0x9e3779b97f4a7c15)`
+   - `x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9)`
+   - `x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb)`
+   - return `x ^ (x >> 31)`
+3. Compute the per-key base word:
+   `base = splitmix64(seed ^ h ^ (value_size as u64).wrapping_mul(0x9e3779b97f4a7c15) ^ (col_idx as u64).wrapping_mul(0xbf58476d1ce4e5b9))`
+4. For each 8-byte chunk `w = 0, 1, 2, ...`, emit `splitmix64(base.wrapping_add(w.wrapping_mul(0x9e3779b97f4a7c15))).to_le_bytes()`, truncated to `value_size` bytes. `SET` (`REPLACE`), `insert_phase`, and `GET` column 0 use `col_idx = 0`; multi-column `PUT` uses each column's index `0..columns`.
+
+#### Verification Errors and Run Verdict
+
+Any `GET` mismatch is counted as a named error in `requests.errors` / `requests.errors_by_kind`, recorded in `traffic_groups[].verification` (including `verified`, `failures`, and `first_mismatch` with `kind`, `key`, `offset`, `expected`, `actual`, `expected_len`, `actual_len`, `detail`), and fails the `verification` validity check (`verdict = "invalid_run"`, exit code `3`):
+
+- `ValueMismatch` — a byte differs from the expected pattern, the column is longer than `value_size`, or the first GET column is not a MessagePack string/binary value.
+- `ShortValue` — the returned value is shorter than `value_size`.
+- `UnexpectedMiss` — the server echoed `[seq, 3, key]` (Masstree `mtd` miss response).
+
 ## Wrapping Up
 
 Masstree benchmarking focuses on MVCC behavior and transactional semantics. Xylem provides the configuration primitives: operation mixes, key distributions, value sizes, column-based updates, range queries. The goal is modeling your actual database workload.

@@ -764,6 +764,14 @@ pub struct MasstreeConfig {
     /// need pre-populated data (e.g., GET workloads).
     #[serde(default)]
     pub insert_phase: Option<InsertPhaseConfig>,
+    /// Verify GET response values byte-for-byte against a deterministic
+    /// function of (verify_seed, key, value_size); PUT/REPLACE/insert_phase
+    /// write that exact pattern. Requires a fixed value size.
+    #[serde(default)]
+    pub verify: bool,
+    /// Seed for deterministic value verification (default 0 when `verify = true`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_seed: Option<u64>,
 }
 
 /// Value size of an insert phase: a fixed byte count or a size distribution

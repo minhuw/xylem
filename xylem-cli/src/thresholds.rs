@@ -12,7 +12,7 @@
 use crate::config::ProfileConfig;
 use crate::output::{
     BreakdownPartStats, DetailedExperimentResults, GlobalStats, GroupStats, LatencyBreakdownStats,
-    LatencyStats, SendLagStats,
+    LatencyStats, SendLagStats, VerificationStats,
 };
 use anyhow::{bail, Result};
 use schemars::JsonSchema;
@@ -116,6 +116,9 @@ pub enum ValidityCheck {
     /// Fraction of the completed requests of a group with kernel or hardware
     /// timestamps that had a kernel split; fails at zero
     KernelSplit,
+    /// Fraction of verified responses that failed opt-in payload verification;
+    /// fails on any mismatch
+    Verification,
 }
 
 impl ValidityCheck {
@@ -125,6 +128,7 @@ impl ValidityCheck {
             ValidityCheck::Unsent => "unsent",
             ValidityCheck::LateSends => "late_sends",
             ValidityCheck::KernelSplit => "kernel_split",
+            ValidityCheck::Verification => "verification",
         }
     }
 }
@@ -192,7 +196,7 @@ pub struct ValidityConfig {
     /// intended send time by more than 100 µs (default 0.01)
     #[serde(default = "default_max_late_send_ratio")]
     pub max_late_send_ratio: f64,
-    /// Checks to leave out: "unsent", "late_sends", "kernel_split"
+    /// Checks to leave out: "unsent", "late_sends", "kernel_split", "verification"
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skip: Vec<ValidityCheck>,
 }
@@ -245,6 +249,7 @@ impl ValidityConfig {
             (ValidityCheck::Unsent, self.max_unsent_ratio),
             (ValidityCheck::LateSends, self.max_late_send_ratio),
             (ValidityCheck::KernelSplit, 0.0),
+            (ValidityCheck::Verification, 0.0),
         ]
         .into_iter()
         .filter(|(check, _)| !self.skip.contains(check))
@@ -801,43 +806,105 @@ fn check_validity(
     let checks = validity.checks();
     let mut outcomes = Vec::new();
     for (id, group) in groups.iter().enumerate() {
-        let stats = results.traffic_groups.iter().find(|g| g.id == id).map(|g| &g.stats);
+        let group_result = results.traffic_groups.iter().find(|g| g.id == id);
+        let stats = group_result.map(|g| &g.stats);
         // A closed loop sends when a response frees its pipeline, so it has
         // no schedule to fall behind.
         let closed_loop = matches!(group.traffic_policy, PolicyConfig::ClosedLoop);
         for &(check, limit) in &checks {
-            if check == ValidityCheck::KernelSplit || closed_loop {
+            if matches!(check, ValidityCheck::KernelSplit | ValidityCheck::Verification)
+                || closed_loop
+            {
                 continue;
             }
             let requests = stats.map(|stats| &stats.requests);
             outcomes.push(check_group_validity(check, limit, &group.name, requests));
         }
-        let Some(breakdown) = stats.map(|stats| &stats.latency_breakdown) else {
-            continue;
-        };
-        let Some(split) = kernel_split(group, breakdown) else {
-            continue;
-        };
-        let checked = checks.iter().any(|&(check, _)| check == ValidityCheck::KernelSplit);
-        if let Some(reason) = &split.reason {
-            if split.observed > 0.0 || !checked {
-                tracing::warn!("Traffic group '{}': {}", group.name, reason);
-            } else {
-                tracing::error!("Invalid run: traffic group '{}': {}", group.name, reason);
-            }
+        if let Some(outcome) = check_kernel_split_validity(
+            group,
+            stats.map(|stats| &stats.latency_breakdown),
+            checks.iter().any(|&(check, _)| check == ValidityCheck::KernelSplit),
+        ) {
+            outcomes.push(outcome);
         }
-        if checked {
-            outcomes.push(ValidityResult {
-                check: ValidityCheck::KernelSplit,
-                group: Some(group.name.clone()),
-                observed: Some(split.observed),
-                limit: 0.0,
-                ok: split.observed > 0.0,
-                reason: split.reason.filter(|_| split.observed == 0.0),
-            });
+        if let Some(outcome) = check_verification_validity(
+            group,
+            group_result.and_then(|g| g.verification.as_ref()),
+            checks.iter().any(|&(check, _)| check == ValidityCheck::Verification),
+        ) {
+            outcomes.push(outcome);
         }
     }
     outcomes
+}
+
+/// Evaluate and log the kernel split validity check for one traffic group
+fn check_kernel_split_validity(
+    group: &TrafficGroupConfig,
+    breakdown: Option<&LatencyBreakdownStats>,
+    checked: bool,
+) -> Option<ValidityResult> {
+    let split = kernel_split(group, breakdown?)?;
+    if let Some(reason) = &split.reason {
+        if split.observed > 0.0 || !checked {
+            tracing::warn!("Traffic group '{}': {}", group.name, reason);
+        } else {
+            tracing::error!("Invalid run: traffic group '{}': {}", group.name, reason);
+        }
+    }
+    checked.then(|| ValidityResult {
+        check: ValidityCheck::KernelSplit,
+        group: Some(group.name.clone()),
+        observed: Some(split.observed),
+        limit: 0.0,
+        ok: split.observed > 0.0,
+        reason: split.reason.filter(|_| split.observed == 0.0),
+    })
+}
+
+/// Evaluate and log the opt-in payload verification validity check for one traffic group
+fn check_verification_validity(
+    group: &TrafficGroupConfig,
+    verification: Option<&VerificationStats>,
+    checked: bool,
+) -> Option<ValidityResult> {
+    let v = verification?;
+    let total = v.verified + v.failures;
+    let observed = Some(if total == 0 {
+        0.0
+    } else {
+        v.failures as f64 / total as f64
+    });
+    let ok = v.failures == 0;
+    let reason = (!ok).then(|| format_verification_failure(v));
+    if let Some(ref reason) = reason {
+        if checked {
+            tracing::error!("Invalid run: traffic group '{}': {}", group.name, reason);
+        } else {
+            tracing::warn!("Traffic group '{}': {}", group.name, reason);
+        }
+    }
+    checked.then(|| ValidityResult {
+        check: ValidityCheck::Verification,
+        group: Some(group.name.clone()),
+        observed,
+        limit: 0.0,
+        ok,
+        reason,
+    })
+}
+
+/// Format a human-readable failure reason for a traffic group's verification report
+fn format_verification_failure(v: &VerificationStats) -> String {
+    if let Some(ref m) = v.first_mismatch {
+        let key = m.key.as_deref().unwrap_or("<none>");
+        format!(
+            "{} verification failure(s) (first: {} key={} offset={}: {})",
+            v.failures, m.kind, key, m.offset, m.detail
+        )
+    } else {
+        format!("{} verification failure(s)", v.failures)
+    }
 }
 
 /// A group's kernel split: the fraction of its completed requests that had
@@ -951,7 +1018,9 @@ fn check_group_validity(
     let (count, total) = match check {
         ValidityCheck::Unsent => (requests.unsent, requests.sent + requests.unsent),
         ValidityCheck::LateSends => (requests.late_sends, requests.sent),
-        ValidityCheck::KernelSplit => unreachable!("check_validity checks kernel splits"),
+        ValidityCheck::KernelSplit | ValidityCheck::Verification => {
+            unreachable!("check_validity checks kernel splits and verification")
+        }
     };
     let observed = if total == 0 {
         0.0
@@ -981,7 +1050,9 @@ fn check_group_validity(
             percent(observed),
             percent(limit),
         ),
-        ValidityCheck::KernelSplit => unreachable!("check_validity checks kernel splits"),
+        ValidityCheck::KernelSplit | ValidityCheck::Verification => {
+            unreachable!("check_validity checks kernel splits and verification")
+        }
     };
     outcome(Some(observed), Some(reason))
 }
@@ -2296,5 +2367,68 @@ error_latency = ["p99 > 4ms", "max < 1ms"]
             let error = format!("{:#}", profile(&format!("[validity]\n{validity}")).unwrap_err());
             assert!(error.contains(expected), "{validity}: {error}");
         }
+    }
+
+    #[test]
+    fn verification_validity_check_fails_run_on_mismatch_and_is_absent_when_disabled() {
+        use crate::output::VerificationMismatchStats;
+
+        // Without verification enabled, no Verification validity check is emitted
+        let config = profile("").unwrap();
+        let mut results = results(&config);
+        assert_eq!(evaluate(&mut results, &config), Verdict::Pass);
+        assert!(results.validity.iter().all(|c| c.check != ValidityCheck::Verification));
+
+        // With verification enabled and zero failures, Verification passes
+        results.traffic_groups[1].verification = Some(VerificationStats {
+            verified: 100,
+            failures: 0,
+            first_mismatch: None,
+        });
+        assert_eq!(evaluate(&mut results, &config), Verdict::Pass);
+        let check = results
+            .validity
+            .iter()
+            .find(|c| c.check == ValidityCheck::Verification)
+            .expect("verification check");
+        assert!(check.ok);
+        assert_eq!(check.group.as_deref(), Some("batch"));
+        assert_eq!(check.observed, Some(0.0));
+        assert_eq!(check.limit, 0.0);
+        assert_eq!(check.reason, None);
+
+        // With a mismatch, verdict becomes InvalidRun with failure details
+        results.traffic_groups[1].verification = Some(VerificationStats {
+            verified: 99,
+            failures: 1,
+            first_mismatch: Some(VerificationMismatchStats {
+                kind: "ValueMismatch".into(),
+                key: Some("key:42".into()),
+                offset: 17,
+                expected: Some(0xaa),
+                actual: Some(0xbb),
+                expected_len: Some(64),
+                actual_len: Some(64),
+                detail: "GET value mismatch".into(),
+            }),
+        });
+        assert_eq!(evaluate(&mut results, &config), Verdict::InvalidRun);
+        let check = results
+            .validity
+            .iter()
+            .find(|c| c.check == ValidityCheck::Verification)
+            .expect("verification check");
+        assert!(!check.ok);
+        assert_eq!(check.observed, Some(0.01));
+        let reason = check.reason.as_deref().unwrap();
+        assert!(reason.contains("1 verification failure(s)"), "{reason}");
+        assert!(reason.contains("ValueMismatch"), "{reason}");
+        assert!(reason.contains("key=key:42"), "{reason}");
+        assert!(reason.contains("offset=17"), "{reason}");
+
+        // Can be skipped explicitly via [validity] skip = ["verification"]
+        let skip_cfg = profile("[validity]\nskip = [\"verification\"]").unwrap();
+        assert_eq!(evaluate(&mut results, &skip_cfg), Verdict::Pass);
+        assert!(results.validity.iter().all(|c| c.check != ValidityCheck::Verification));
     }
 }

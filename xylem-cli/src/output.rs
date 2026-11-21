@@ -7,11 +7,13 @@ use crate::thresholds::{ThresholdResult, ValidityResult, Verdict};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
+use xylem_common::{VerificationMismatch, VerificationReport};
 use xylem_core::stats::{
     AggregatedStats, BreakdownClock, BreakdownSummary, PartSummary, RequestCounts, SendLagSummary,
     SplitMissCounts, TupleStatsCollector, LATE_SEND_THRESHOLD,
@@ -477,6 +479,58 @@ pub struct GlobalStats {
     pub latency_breakdown: LatencyBreakdownStats,
 }
 
+/// First payload verification mismatch recorded in a traffic group
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerificationMismatchStats {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    pub offset: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_len: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_len: Option<usize>,
+    pub detail: String,
+}
+
+impl From<VerificationMismatch> for VerificationMismatchStats {
+    fn from(m: VerificationMismatch) -> Self {
+        Self {
+            kind: m.kind,
+            key: m.key,
+            offset: m.offset,
+            expected: m.expected,
+            actual: m.actual,
+            expected_len: m.expected_len,
+            actual_len: m.actual_len,
+            detail: m.detail,
+        }
+    }
+}
+
+/// Payload verification summary for a traffic group with opt-in verification
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerificationStats {
+    pub verified: u64,
+    pub failures: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_mismatch: Option<VerificationMismatchStats>,
+}
+
+impl From<VerificationReport> for VerificationStats {
+    fn from(r: VerificationReport) -> Self {
+        Self {
+            verified: r.verified,
+            failures: r.failures,
+            first_mismatch: r.first_mismatch.map(VerificationMismatchStats::from),
+        }
+    }
+}
+
 /// Per-traffic-group results
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrafficGroupResults {
@@ -497,6 +551,9 @@ pub struct TrafficGroupResults {
     /// key of `records`), with its local socket address
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub connection_addrs: Vec<ConnectionAddr>,
+    /// Payload verification summary when opt-in verification is enabled on this group
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<VerificationStats>,
 }
 
 /// The local socket address of one connection
@@ -560,6 +617,15 @@ impl DetailedExperimentResults {
         }
         for group in &mut self.traffic_groups {
             group.connection_addrs.sort_by_key(|addr| (addr.thread_id, addr.connection_id));
+        }
+    }
+
+    /// Record each traffic group's merged payload verification report.
+    pub fn set_verification_reports(&mut self, reports: BTreeMap<usize, VerificationReport>) {
+        for (group_id, report) in reports {
+            if let Some(group) = self.traffic_groups.iter_mut().find(|group| group.id == group_id) {
+                group.verification = Some(VerificationStats::from(report));
+            }
         }
     }
 
@@ -679,6 +745,7 @@ impl DetailedExperimentResults {
                     },
                     protocol_metadata: None,
                     connection_addrs: Vec::new(),
+                    verification: None,
                 };
 
                 traffic_groups.push(group_result);
@@ -1016,6 +1083,10 @@ impl DetailedExperimentResults {
             println!();
             Self::print_breakdown(&group.stats.latency_breakdown, "  ");
 
+            if let Some(ref v) = group.verification {
+                Self::print_verification(v);
+            }
+
             if let Some(ref metadata) = group.protocol_metadata {
                 println!();
                 println!("  Protocol Metadata:");
@@ -1057,6 +1128,26 @@ impl DetailedExperimentResults {
 
         self.print_checks();
         println!("{}", "=".repeat(70));
+    }
+
+    /// Print payload verification summary for one traffic group
+    fn print_verification(v: &VerificationStats) {
+        println!();
+        println!("  Verification:  {} verified, {} failures", v.verified, v.failures);
+        let Some(ref m) = v.first_mismatch else {
+            return;
+        };
+        let key_part = m.key.as_deref().unwrap_or("<none>");
+        println!(
+            "    First mismatch: {} key={} offset={}: {}",
+            m.kind, key_part, m.offset, m.detail
+        );
+        if let (Some(exp), Some(act)) = (m.expected, m.actual) {
+            println!("      byte: expected=0x{exp:02x} actual=0x{act:02x}");
+        }
+        if m.expected_len.is_some() || m.actual_len.is_some() {
+            println!("      len:  expected={:?} actual={:?}", m.expected_len, m.actual_len);
+        }
     }
 
     /// Print the verdict with every validity check and threshold

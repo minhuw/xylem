@@ -688,6 +688,7 @@ mod optional_latency_display_tests {
             },
             protocol_metadata: None,
             connection_addrs: Vec::new(),
+            verification: None,
         }
     }
 

@@ -42,7 +42,216 @@ use crate::{ErrorReply, Parsed, Protocol};
 use anyhow::{anyhow, bail, ensure, Result};
 use rmp::encode;
 use std::io::Write;
-use xylem_common::FastHashMap;
+use std::ops::Range;
+use xylem_common::{FastHashMap, VerificationMismatch, VerificationReport};
+
+const FNV1A_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV1A_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut h = FNV1A_OFFSET_BASIS;
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(FNV1A_PRIME);
+    }
+    h
+}
+
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
+fn pattern_base(seed: u64, key: &[u8], value_size: usize, col_idx: u32) -> u64 {
+    splitmix64(
+        seed ^ fnv1a_64(key)
+            ^ (value_size as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            ^ u64::from(col_idx).wrapping_mul(0xbf58_476d_1ce4_e5b9),
+    )
+}
+
+/// Fill `out` with the deterministic Masstree verification pattern for
+/// `(seed, key, value_size, col_idx)`.
+pub fn fill_verify_pattern(seed: u64, key: &[u8], value_size: usize, col_idx: u32, out: &mut [u8]) {
+    let base = pattern_base(seed, key, value_size, col_idx);
+    let mut off = 0usize;
+    let mut w = 0u64;
+    while off < out.len() {
+        let word = splitmix64(base.wrapping_add(w.wrapping_mul(0x9e37_79b9_7f4a_7c15)));
+        let bytes = word.to_le_bytes();
+        let n = (out.len() - off).min(8);
+        out[off..off + n].copy_from_slice(&bytes[..n]);
+        off += n;
+        w += 1;
+    }
+}
+
+/// Compare `actual` against the expected verification pattern; returns
+/// `Some((offset, expected, actual))` on the first differing byte.
+pub fn check_verify_pattern(
+    seed: u64,
+    key: &[u8],
+    value_size: usize,
+    col_idx: u32,
+    actual: &[u8],
+) -> Option<(u64, u8, u8)> {
+    let base = pattern_base(seed, key, value_size, col_idx);
+    let mut off = 0usize;
+    let mut w = 0u64;
+    while off < actual.len() {
+        let word = splitmix64(base.wrapping_add(w.wrapping_mul(0x9e37_79b9_7f4a_7c15)));
+        let bytes = word.to_le_bytes();
+        let n = (actual.len() - off).min(8);
+        if actual[off..off + n] != bytes[..n] {
+            for i in 0..n {
+                if actual[off + i] != bytes[i] {
+                    return Some(((off + i) as u64, bytes[i], actual[off + i]));
+                }
+            }
+        }
+        off += n;
+        w += 1;
+    }
+    None
+}
+
+/// Opt-in payload verification state for [`MasstreeProtocol`]
+struct VerifyState {
+    seed: u64,
+    expected_size: usize,
+    pending_gets: FastHashMap<usize, FastHashMap<u16, u64>>,
+    report: VerificationReport,
+}
+
+impl VerifyState {
+    fn new(seed: u64, expected_size: usize) -> Self {
+        Self {
+            seed,
+            expected_size,
+            pending_gets: FastHashMap::default(),
+            report: VerificationReport::default(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_failure(
+        &mut self,
+        kind: &'static str,
+        key: &str,
+        offset: u64,
+        expected: Option<u8>,
+        actual: Option<u8>,
+        expected_len: Option<usize>,
+        actual_len: Option<usize>,
+        detail: &'static str,
+    ) -> ErrorReply<'static> {
+        self.report.failures += 1;
+        if self.report.first_mismatch.is_none() {
+            self.report.first_mismatch = Some(VerificationMismatch {
+                kind: kind.to_string(),
+                key: Some(key.to_string()),
+                offset,
+                expected,
+                actual,
+                expected_len,
+                actual_len,
+                detail: detail.to_string(),
+            });
+        }
+        ErrorReply::new(kind, detail)
+    }
+
+    fn verify_get(
+        &mut self,
+        conn_id: usize,
+        seq: u16,
+        key_prefix: &str,
+        key_buf: &mut String,
+        first_col: Option<&[u8]>,
+        col_count: u32,
+    ) -> Option<ErrorReply<'static>> {
+        let key_num = self.pending_gets.get_mut(&conn_id)?.remove(&seq)?;
+        let key_str = format_key_into(key_prefix, key_num, key_buf);
+        let key_bytes = key_str.as_bytes();
+        let expected_size = self.expected_size;
+
+        let Some(actual) = first_col else {
+            return Some(self.record_failure(
+                "ValueMismatch",
+                key_str,
+                0,
+                None,
+                None,
+                Some(expected_size),
+                None,
+                "GET column is not a byte string",
+            ));
+        };
+
+        if col_count == 1
+            && actual == key_bytes
+            && (actual.len() != expected_size
+                || check_verify_pattern(self.seed, key_bytes, expected_size, 0, actual).is_some())
+        {
+            return Some(self.record_failure(
+                "UnexpectedMiss",
+                key_str,
+                0,
+                None,
+                None,
+                Some(expected_size),
+                Some(actual.len()),
+                "GET key not found (miss)",
+            ));
+        }
+
+        if actual.len() < expected_size {
+            return Some(self.record_failure(
+                "ShortValue",
+                key_str,
+                actual.len() as u64,
+                None,
+                None,
+                Some(expected_size),
+                Some(actual.len()),
+                "GET value shorter than expected",
+            ));
+        }
+
+        if let Some((offset, expected, actual_byte)) =
+            check_verify_pattern(self.seed, key_bytes, expected_size, 0, &actual[..expected_size])
+        {
+            return Some(self.record_failure(
+                "ValueMismatch",
+                key_str,
+                offset,
+                Some(expected),
+                Some(actual_byte),
+                Some(expected_size),
+                Some(actual.len()),
+                "GET value mismatch",
+            ));
+        }
+
+        if actual.len() > expected_size {
+            return Some(self.record_failure(
+                "ValueMismatch",
+                key_str,
+                expected_size as u64,
+                None,
+                Some(actual[expected_size]),
+                Some(expected_size),
+                Some(actual.len()),
+                "GET value longer than expected",
+            ));
+        }
+
+        self.report.verified += 1;
+        None
+    }
+}
 
 // Masstree command codes
 const CMD_GET: u8 = 2;
@@ -185,6 +394,8 @@ pub struct MasstreeProtocol {
     insert_phase: Option<InsertPhaseState>,
     /// The last formatted key, kept for its allocation
     key_buf: String,
+    /// Opt-in deterministic value verification state (`None` when disabled)
+    verify: Option<VerifyState>,
 }
 
 impl MasstreeProtocol {
@@ -201,6 +412,7 @@ impl MasstreeProtocol {
             rng: None,
             insert_phase: None,
             key_buf: String::new(),
+            verify: None,
         }
     }
 
@@ -254,6 +466,7 @@ impl MasstreeProtocol {
             rng,
             insert_phase,
             key_buf: String::new(),
+            verify: None,
         }
     }
 
@@ -274,6 +487,12 @@ impl MasstreeProtocol {
     /// Set the insert phase configuration
     pub fn with_insert_phase(mut self, key_count: u64, value_size: usize) -> Self {
         self.insert_phase = Some(InsertPhaseState::new(key_count, value_size));
+        self
+    }
+
+    /// Enable opt-in deterministic value verification for GET/SET/PUT/insert_phase
+    pub fn with_verify(mut self, seed: u64, expected_size: usize) -> Self {
+        self.verify = Some(VerifyState::new(seed, expected_size));
         self
     }
 
@@ -452,21 +671,44 @@ impl Default for MasstreeProtocol {
 impl MasstreeProtocol {
     /// Encode the request of `op` on `key`
     /// Note: Caller should check handshake state before calling this
-    fn encode(&mut self, op: &MasstreeOp, seq: u16, key: u64) -> Result<Vec<u8>> {
+    fn encode(&mut self, conn_id: usize, op: &MasstreeOp, seq: u16, key: u64) -> Result<Vec<u8>> {
         // Format key with configurable prefix
         let key_str = self.format_key(key);
         let request = match op {
-            MasstreeOp::Get => self.build_get_request(seq, &key_str),
+            MasstreeOp::Get => {
+                if let Some(ref mut v) = self.verify {
+                    v.pending_gets.entry(conn_id).or_default().insert(seq, key);
+                }
+                self.build_get_request(seq, &key_str)
+            }
             MasstreeOp::Set => {
                 let size = self.next_value_size(op);
-                let value = self.generate_value(size);
+                let value = if let Some(ref v) = self.verify {
+                    let mut val = vec![0u8; size];
+                    fill_verify_pattern(v.seed, key_str.as_bytes(), size, 0, &mut val);
+                    val
+                } else {
+                    self.generate_value(size)
+                };
                 self.build_set_request(seq, &key_str, &value)
             }
             MasstreeOp::Put { columns } => {
                 let values: Vec<_> = (0..*columns)
-                    .map(|_| {
+                    .map(|col_idx| {
                         let size = self.next_value_size(op);
-                        self.generate_value(size)
+                        if let Some(ref v) = self.verify {
+                            let mut val = vec![0u8; size];
+                            fill_verify_pattern(
+                                v.seed,
+                                key_str.as_bytes(),
+                                size,
+                                col_idx,
+                                &mut val,
+                            );
+                            val
+                        } else {
+                            self.generate_value(size)
+                        }
                     })
                     .collect();
                 self.build_put_request(seq, &key_str, &values)
@@ -500,7 +742,13 @@ impl Protocol for MasstreeProtocol {
                 let value_size = insert_state.value_size;
                 let seq = self.next_send_seq(conn_id);
                 let key_str = self.format_key(key);
-                let value = self.generate_value(value_size);
+                let value = if let Some(ref v) = self.verify {
+                    let mut val = vec![0u8; value_size];
+                    fill_verify_pattern(v.seed, key_str.as_bytes(), value_size, 0, &mut val);
+                    val
+                } else {
+                    self.generate_value(value_size)
+                };
                 let request = self
                     .build_set_request(seq, &key_str, &value)
                     .expect("Failed to build SET request for insert phase");
@@ -520,7 +768,7 @@ impl Protocol for MasstreeProtocol {
         };
         let seq = self.next_send_seq(conn_id);
         let request = self
-            .encode(&op, seq, key)
+            .encode(conn_id, &op, seq, key)
             .unwrap_or_else(|e| panic!("Failed to build {} request: {e}", op.name()));
         crate::Request::measurement(request, (conn_id, seq))
     }
@@ -535,9 +783,26 @@ impl Protocol for MasstreeProtocol {
         };
         let id = (conn_id, response.seq as u16);
         let error = match response.body {
+            Body::Get { first_col, col_count } => self.verify.as_mut().and_then(|v| {
+                v.verify_get(
+                    conn_id,
+                    response.seq as u16,
+                    &self.key_prefix,
+                    &mut self.key_buf,
+                    first_col.map(|r| &data[r]),
+                    col_count,
+                )
+            }),
             Body::Done => None,
             Body::Result(code) => result_error(code),
-            Body::Unsupported => Some(ErrorReply::new("Unsupported", "Unsupported command")),
+            Body::Unsupported => {
+                if let Some(ref mut v) = self.verify {
+                    if let Some(m) = v.pending_gets.get_mut(&conn_id) {
+                        m.remove(&(response.seq as u16));
+                    }
+                }
+                Some(ErrorReply::new("Unsupported", "Unsupported command"))
+            }
             Body::Handshake(Ok(())) => {
                 self.mark_handshake_done(conn_id);
                 None
@@ -547,6 +812,10 @@ impl Protocol for MasstreeProtocol {
             }
         };
         Ok(Parsed::Complete { consumed: response.len, id, error })
+    }
+
+    fn verification_report(&self) -> Option<VerificationReport> {
+        self.verify.as_ref().map(|v| v.report.clone())
     }
 
     fn name(&self) -> &'static str {
@@ -562,6 +831,10 @@ impl Protocol for MasstreeProtocol {
         }
         if let Some(sizes) = &mut self.value_sizes {
             sizes.reset();
+        }
+        if let Some(ref mut v) = self.verify {
+            v.pending_gets.clear();
+            v.report = VerificationReport::default();
         }
     }
 
@@ -588,6 +861,14 @@ impl Protocol for MasstreeProtocol {
         // The connections share the insert phase
         self.insert_phase.as_ref().is_some_and(|insert| !insert.is_complete())
     }
+}
+
+/// Format `prefix` + decimal `key` into `buf` without allocating.
+fn format_key_into<'a>(prefix: &str, key: u64, buf: &'a mut String) -> &'a str {
+    buf.clear();
+    buf.push_str(prefix);
+    push_decimal(buf, key);
+    buf.as_str()
 }
 
 /// Append `n` in decimal to `out`, as `{n}` formats it
@@ -617,7 +898,13 @@ struct Response {
 /// What a response says
 #[derive(Debug, PartialEq)]
 enum Body {
-    /// GET, SCAN, REMOVE and CHECKPOINT: done, whatever they found
+    /// GET: byte range of element 2 (first column or echoed key) in `data` if it
+    /// is a msgpack `str` or `bin`, plus the number of trailing elements
+    Get {
+        first_col: Option<Range<usize>>,
+        col_count: u32,
+    },
+    /// SCAN, REMOVE and CHECKPOINT: done, whatever they found
     Done,
     /// PUT and REPLACE: a result code
     Result(i64),
@@ -654,7 +941,10 @@ impl Response {
             // [seq, 3, column...] for a hit, the request echoed for a miss
             3 => {
                 ensure!(array_len >= 3, "Invalid GET response: {array_len} elements");
-                Body::Done
+                let Some(first_col) = reader.next_bytes_range()? else {
+                    return Ok(None);
+                };
+                Body::Get { first_col, col_count: array_len - 2 }
             }
             // [seq, 5, key, value, ...]
             5 => {
@@ -850,6 +1140,26 @@ impl<'a> Reader<'a> {
             }
         }
         Ok(Some(found))
+    }
+
+    /// Read the next element, returning its payload byte range in `self.data`
+    /// if it is a msgpack `str` or `bin`, or `None` if it is another valid
+    /// msgpack type. Returns `Ok(None)` when the element is incomplete.
+    fn next_bytes_range(&mut self) -> Result<Option<Option<Range<usize>>>> {
+        let start = self.pos;
+        let Some(end) = skip_value(self.data, start)? else {
+            return Ok(None);
+        };
+        let range = match self.data[start] {
+            0xa0..=0xbf => Some(start + 1..end),
+            0xd9 | 0xc4 => Some(start + 2..end),
+            0xda | 0xc5 => Some(start + 3..end),
+            0xdb | 0xc6 => Some(start + 5..end),
+            _ => None,
+        };
+        self.pos = end;
+        self.read += 1;
+        Ok(Some(range))
     }
 
     /// Skip the next element, whatever it is
@@ -1459,5 +1769,349 @@ mod tests {
         let mut proto = proto
             .with_operations(Box::new(FixedCommandSelector::new(MasstreeOp::Put { columns: 1 })));
         assert!(proto.next_request(0).data.ends_with(b"\xa2xx"));
+    }
+
+    fn build_get_response_str(seq: u32, col: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        encode::write_array_len(&mut buf, 3).unwrap();
+        encode::write_uint(&mut buf, u64::from(seq)).unwrap();
+        encode::write_uint(&mut buf, 3).unwrap();
+        encode::write_str_len(&mut buf, col.len() as u32).unwrap();
+        buf.extend_from_slice(col);
+        buf
+    }
+
+    fn build_get_response_bin(seq: u32, col: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        encode::write_array_len(&mut buf, 3).unwrap();
+        encode::write_uint(&mut buf, u64::from(seq)).unwrap();
+        encode::write_uint(&mut buf, 3).unwrap();
+        encode::write_bin(&mut buf, col).unwrap();
+        buf
+    }
+
+    #[test]
+    fn verify_pattern_matches_fixed_reference_vectors() {
+        let mut buf = [0u8; 16];
+        fill_verify_pattern(0, b"key:0", 16, 0, &mut buf);
+        assert_eq!(
+            buf,
+            [
+                0x56, 0x96, 0x68, 0xf3, 0x49, 0xbb, 0x71, 0x14, 0x1f, 0x4e, 0xd0, 0xa2, 0x9d, 0x44,
+                0x67, 0x07
+            ]
+        );
+        assert_eq!(check_verify_pattern(0, b"key:0", 16, 0, &buf), None);
+
+        fill_verify_pattern(42, b"key:7", 16, 0, &mut buf);
+        assert_eq!(
+            buf,
+            [
+                0x8b, 0xf6, 0x5f, 0x1d, 0xd6, 0x79, 0xce, 0xa9, 0x4d, 0x64, 0x53, 0xfe, 0xf9, 0x50,
+                0x90, 0x84
+            ]
+        );
+
+        fill_verify_pattern(0, b"key:0", 16, 1, &mut buf);
+        assert_eq!(
+            buf,
+            [
+                0x9a, 0x78, 0xd6, 0x50, 0x84, 0x13, 0x3c, 0xfb, 0xd0, 0xc3, 0x4f, 0xda, 0x7a, 0x77,
+                0xda, 0x77
+            ]
+        );
+
+        let mut buf71 = [0u8; 71];
+        fill_verify_pattern(0, b"key:0", 71, 0, &mut buf71);
+        assert_eq!(
+            &buf71[..16],
+            &[
+                0xc4, 0x4d, 0xf1, 0x40, 0x9f, 0x37, 0x21, 0x16, 0x88, 0x54, 0xbe, 0x22, 0xff, 0x1b,
+                0xb4, 0x66
+            ]
+        );
+        assert_eq!(&buf71[63..], &[0x61, 0xd4, 0xc8, 0xf1, 0x07, 0x75, 0x99, 0x28]);
+        assert_eq!(check_verify_pattern(0, b"key:0", 71, 0, &buf71), None);
+    }
+
+    #[test]
+    fn verify_writes_identical_col0_for_set_put_and_insert_phase() {
+        use crate::workload::KeyGeneration;
+        let seed = 1337u64;
+        for value_size in [64usize, 71, 512, 4096] {
+            let mut expected_val = vec![0u8; value_size];
+            fill_verify_pattern(seed, b"key:0", value_size, 0, &mut expected_val);
+
+            // SET (REPLACE)
+            let mut set_proto = MasstreeProtocol::with_workload(
+                MasstreeOp::Set,
+                KeyGeneration::sequential(0),
+                value_size,
+            )
+            .with_verify(seed, value_size);
+            set_proto.mark_handshake_done(0);
+            let set_req = set_proto.next_request(0);
+            assert!(
+                set_req.data.ends_with(&expected_val),
+                "SET value did not match expected pattern for size {value_size}"
+            );
+
+            // insert_phase (also REPLACE)
+            let mut ins_proto = MasstreeProtocol::with_workload(
+                MasstreeOp::Get,
+                KeyGeneration::sequential(0),
+                value_size,
+            )
+            .with_insert_phase(1, value_size)
+            .with_verify(seed, value_size);
+            ins_proto.mark_handshake_done(0);
+            let ins_req = ins_proto.next_request(0);
+            assert_eq!(ins_req.data, set_req.data, "insert_phase must match SET byte-for-byte");
+
+            // PUT (1 column => col 0)
+            let mut put_proto = MasstreeProtocol::with_workload(
+                MasstreeOp::Put { columns: 1 },
+                KeyGeneration::sequential(0),
+                value_size,
+            )
+            .with_verify(seed, value_size);
+            put_proto.mark_handshake_done(0);
+            let put_req = put_proto.next_request(0);
+            assert!(
+                put_req.data.ends_with(&expected_val),
+                "PUT col 0 value did not match expected pattern for size {value_size}"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_get_accepts_valid_values_across_sizes_and_str_or_bin() {
+        use crate::workload::KeyGeneration;
+        let seed = 99u64;
+        for value_size in [64usize, 71, 512, 4096] {
+            let mut proto = MasstreeProtocol::with_workload(
+                MasstreeOp::Get,
+                KeyGeneration::sequential(10),
+                value_size,
+            )
+            .with_verify(seed, value_size);
+            proto.mark_handshake_done(0);
+
+            for (i, use_bin) in [false, true].into_iter().enumerate() {
+                let req = proto.next_request(0);
+                let seq = req.request_id.1;
+                let key = format!("key:{}", 10 + i);
+                let mut val = vec![0u8; value_size];
+                fill_verify_pattern(seed, key.as_bytes(), value_size, 0, &mut val);
+                let resp = if use_bin {
+                    build_get_response_bin(u32::from(seq), &val)
+                } else {
+                    build_get_response_str(u32::from(seq), &val)
+                };
+                assert_eq!(
+                    proto.parse_response(0, &resp).unwrap(),
+                    Parsed::ok(resp.len(), (0, seq)),
+                    "size={value_size} bin={use_bin}"
+                );
+            }
+
+            let report = proto.verification_report().unwrap();
+            assert_eq!(report.verified, 2);
+            assert_eq!(report.failures, 0);
+            assert_eq!(report.first_mismatch, None);
+        }
+    }
+
+    #[test]
+    fn verify_detects_bit_corruption_at_start_middle_and_end() {
+        use crate::workload::KeyGeneration;
+        let seed = 55u64;
+        let value_size = 71usize;
+        for bad_offset in [0usize, 35, value_size - 1] {
+            let mut proto = MasstreeProtocol::with_workload(
+                MasstreeOp::Get,
+                KeyGeneration::sequential(7),
+                value_size,
+            )
+            .with_verify(seed, value_size);
+            proto.mark_handshake_done(0);
+
+            let req = proto.next_request(0);
+            let seq = req.request_id.1;
+            let mut val = vec![0u8; value_size];
+            fill_verify_pattern(seed, b"key:7", value_size, 0, &mut val);
+            let expected_byte = val[bad_offset];
+            let actual_byte = expected_byte ^ 0x01;
+            val[bad_offset] = actual_byte;
+            let resp = build_get_response_str(u32::from(seq), &val);
+
+            assert_eq!(
+                proto.parse_response(0, &resp).unwrap(),
+                Parsed::error(
+                    resp.len(),
+                    (0, seq),
+                    ErrorReply::new("ValueMismatch", "GET value mismatch")
+                )
+            );
+            let report = proto.verification_report().unwrap();
+            assert_eq!(report.verified, 0);
+            assert_eq!(report.failures, 1);
+            assert_eq!(
+                report.first_mismatch,
+                Some(VerificationMismatch {
+                    kind: "ValueMismatch".to_string(),
+                    key: Some("key:7".to_string()),
+                    offset: bad_offset as u64,
+                    expected: Some(expected_byte),
+                    actual: Some(actual_byte),
+                    expected_len: Some(value_size),
+                    actual_len: Some(value_size),
+                    detail: "GET value mismatch".to_string(),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn verify_detects_short_long_miss_and_non_bytes() {
+        use crate::workload::KeyGeneration;
+        let seed = 11u64;
+        let value_size = 64usize;
+
+        // 1. ShortValue
+        {
+            let mut proto = MasstreeProtocol::with_workload(
+                MasstreeOp::Get,
+                KeyGeneration::sequential(1),
+                value_size,
+            )
+            .with_verify(seed, value_size);
+            proto.mark_handshake_done(0);
+            let seq = proto.next_request(0).request_id.1;
+            let mut val = vec![0u8; value_size];
+            fill_verify_pattern(seed, b"key:1", value_size, 0, &mut val);
+            val.truncate(20);
+            let resp = build_get_response_str(u32::from(seq), &val);
+            assert_eq!(
+                proto.parse_response(0, &resp).unwrap(),
+                Parsed::error(
+                    resp.len(),
+                    (0, seq),
+                    ErrorReply::new("ShortValue", "GET value shorter than expected")
+                )
+            );
+            let m = proto.verification_report().unwrap().first_mismatch.unwrap();
+            assert_eq!(m.kind, "ShortValue");
+            assert_eq!(m.key.as_deref(), Some("key:1"));
+            assert_eq!(m.offset, 20);
+            assert_eq!(m.expected_len, Some(64));
+            assert_eq!(m.actual_len, Some(20));
+        }
+
+        // 2. Overly long value (valid prefix + extra byte)
+        {
+            let mut proto = MasstreeProtocol::with_workload(
+                MasstreeOp::Get,
+                KeyGeneration::sequential(2),
+                value_size,
+            )
+            .with_verify(seed, value_size);
+            proto.mark_handshake_done(0);
+            let seq = proto.next_request(0).request_id.1;
+            let mut val = vec![0u8; value_size];
+            fill_verify_pattern(seed, b"key:2", value_size, 0, &mut val);
+            val.push(0xab);
+            let resp = build_get_response_str(u32::from(seq), &val);
+            assert_eq!(
+                proto.parse_response(0, &resp).unwrap(),
+                Parsed::error(
+                    resp.len(),
+                    (0, seq),
+                    ErrorReply::new("ValueMismatch", "GET value longer than expected")
+                )
+            );
+            let m = proto.verification_report().unwrap().first_mismatch.unwrap();
+            assert_eq!(m.kind, "ValueMismatch");
+            assert_eq!(m.offset, 64);
+            assert_eq!(m.expected, None);
+            assert_eq!(m.actual, Some(0xab));
+            assert_eq!(m.expected_len, Some(64));
+            assert_eq!(m.actual_len, Some(65));
+        }
+
+        // 3. UnexpectedMiss (server echoes [seq, 3, key])
+        {
+            let mut proto = MasstreeProtocol::with_workload(
+                MasstreeOp::Get,
+                KeyGeneration::sequential(3),
+                value_size,
+            )
+            .with_verify(seed, value_size);
+            proto.mark_handshake_done(0);
+            let seq = proto.next_request(0).request_id.1;
+            let resp = build_get_response_str(u32::from(seq), b"key:3");
+            assert_eq!(
+                proto.parse_response(0, &resp).unwrap(),
+                Parsed::error(
+                    resp.len(),
+                    (0, seq),
+                    ErrorReply::new("UnexpectedMiss", "GET key not found (miss)")
+                )
+            );
+            let m = proto.verification_report().unwrap().first_mismatch.unwrap();
+            assert_eq!(m.kind, "UnexpectedMiss");
+            assert_eq!(m.key.as_deref(), Some("key:3"));
+            assert_eq!(m.offset, 0);
+            assert_eq!(m.expected_len, Some(64));
+            assert_eq!(m.actual_len, Some(5));
+        }
+
+        // 4. Non-bytes element in GET column
+        {
+            let mut proto = MasstreeProtocol::with_workload(
+                MasstreeOp::Get,
+                KeyGeneration::sequential(4),
+                value_size,
+            )
+            .with_verify(seed, value_size);
+            proto.mark_handshake_done(0);
+            let seq = proto.next_request(0).request_id.1;
+            let mut resp = Vec::new();
+            encode::write_array_len(&mut resp, 3).unwrap();
+            encode::write_uint(&mut resp, u64::from(seq)).unwrap();
+            encode::write_uint(&mut resp, 3).unwrap();
+            encode::write_uint(&mut resp, 123).unwrap();
+            assert_eq!(
+                proto.parse_response(0, &resp).unwrap(),
+                Parsed::error(
+                    resp.len(),
+                    (0, seq),
+                    ErrorReply::new("ValueMismatch", "GET column is not a byte string")
+                )
+            );
+            let m = proto.verification_report().unwrap().first_mismatch.unwrap();
+            assert_eq!(m.kind, "ValueMismatch");
+            assert_eq!(m.actual_len, None);
+        }
+
+        // 5. Reset clears verification counts and disabled verify returns None
+        {
+            let disabled = MasstreeProtocol::new(MasstreeOp::Get);
+            assert_eq!(disabled.verification_report(), None);
+
+            let mut proto = MasstreeProtocol::with_workload(
+                MasstreeOp::Get,
+                KeyGeneration::sequential(0),
+                value_size,
+            )
+            .with_verify(seed, value_size);
+            proto.mark_handshake_done(0);
+            let seq = proto.next_request(0).request_id.1;
+            let resp = build_get_response_str(u32::from(seq), b"key:0");
+            proto.parse_response(0, &resp).unwrap();
+            assert_eq!(proto.verification_report().unwrap().failures, 1);
+            proto.reset();
+            assert_eq!(proto.verification_report(), Some(VerificationReport::default()));
+        }
     }
 }

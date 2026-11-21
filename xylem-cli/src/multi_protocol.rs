@@ -1,6 +1,6 @@
 use crate::config::ProtocolConfig;
 use anyhow::Result;
-use xylem_common::{ConnectionRole, Outbox, Parsed, Request};
+use xylem_common::{ConnectionRole, Outbox, Parsed, Request, VerificationReport};
 use xylem_protocols::Protocol;
 
 /// Multi-protocol wrapper that can dispatch to any supported protocol
@@ -283,6 +283,21 @@ impl Protocol for MultiProtocol {
             MultiProtocol::NvmeTcp(p) => p.drain_outbox(conn_id, outbox),
             MultiProtocol::Http2(p) | MultiProtocol::Grpc(p) => p.drain_outbox(conn_id, outbox),
             MultiProtocol::ClickHouse(p) => p.drain_outbox(conn_id, outbox),
+        }
+    }
+
+    fn verification_report(&self) -> Option<VerificationReport> {
+        match self {
+            MultiProtocol::Redis(p) => p.verification_report(),
+            MultiProtocol::MemcachedBinary(p) => p.verification_report(),
+            MultiProtocol::MemcachedAscii(p) => p.verification_report(),
+            MultiProtocol::Http(p) => p.verification_report(),
+            MultiProtocol::XylemEcho(p) => p.verification_report(),
+            MultiProtocol::Masstree(p) => p.verification_report(),
+            MultiProtocol::Dns(p) => p.verification_report(),
+            MultiProtocol::NvmeTcp(p) => p.verification_report(),
+            MultiProtocol::Http2(p) | MultiProtocol::Grpc(p) => p.verification_report(),
+            MultiProtocol::ClickHouse(p) => p.verification_report(),
         }
     }
 }

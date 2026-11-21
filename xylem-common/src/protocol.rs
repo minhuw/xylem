@@ -127,6 +127,37 @@ impl Outbox {
     }
 }
 
+/// First payload verification mismatch observed by a protocol
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerificationMismatch {
+    pub kind: String,
+    pub key: Option<String>,
+    pub offset: u64,
+    pub expected: Option<u8>,
+    pub actual: Option<u8>,
+    pub expected_len: Option<usize>,
+    pub actual_len: Option<usize>,
+    pub detail: String,
+}
+
+/// Aggregated payload verification summary for one protocol instance / group
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VerificationReport {
+    pub verified: u64,
+    pub failures: u64,
+    pub first_mismatch: Option<VerificationMismatch>,
+}
+
+impl VerificationReport {
+    pub fn merge(&mut self, other: Self) {
+        self.verified += other.verified;
+        self.failures += other.failures;
+        if self.first_mismatch.is_none() {
+            self.first_mismatch = other.first_mismatch;
+        }
+    }
+}
+
 /// Application protocol trait for generating requests and parsing responses
 /// with request ID tracking
 pub trait Protocol: Send {
@@ -291,6 +322,11 @@ pub trait Protocol: Send {
     ///
     /// Default implementation leaves `outbox` empty.
     fn drain_outbox(&mut self, _conn_id: usize, _outbox: &mut Outbox) {}
+
+    /// Payload verification summary if opt-in verification is enabled on this protocol
+    fn verification_report(&self) -> Option<VerificationReport> {
+        None
+    }
 
     /// Protocol name
     fn name(&self) -> &'static str;
