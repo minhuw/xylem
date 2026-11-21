@@ -1038,6 +1038,15 @@
           "default": 10,
           "minimum": 0
         },
+        "max_requests_per_connection": {
+          "description": "Maximum requests per connection before closing and reconnecting.\n`None` keeps connections persistent for the whole run.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
         "name": {
           "description": "Group name for identification",
           "type": "string"
