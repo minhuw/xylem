@@ -10,7 +10,7 @@
 use crate::connection::{ConnectionPool, DeferredSample, SentRequest, TrafficGroupConfig};
 use crate::request_dump::RequestDumper;
 use crate::stats::{ReceivedAt, StatsRecorder, TupleStatsCollector, UNSENT_WALK_CAP};
-use crate::threading::{PreloadTicket, PreloadWait, StartTicket};
+use crate::threading::{IdleHoldBarrier, IdleHoldGuard, PreloadTicket, PreloadWait, StartTicket};
 use crate::timing;
 use crate::traffic_group::OnError;
 use crate::Result;
@@ -148,7 +148,7 @@ pub struct Worker<G: ConnectionGroup, P: Protocol, S: StatsRecorder = TupleStats
     /// Optional quiescent hold after the last response is drained, before closing
     idle_hold: Duration,
     /// Optional barrier synchronizing all worker threads entering `idle_hold`
-    idle_hold_barrier: Option<Arc<std::sync::Barrier>>,
+    idle_hold_barrier: Option<Arc<IdleHoldBarrier>>,
     /// True when no fixed duration bounds the measurement loop (stops once
     /// every protocol reports `is_done()` and all writes/responses are drained)
     unbounded_duration: bool,
@@ -354,8 +354,10 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
 
     /// Set quiescent hold duration after draining responses and before closing
     /// connections (default `0s`). When `barrier` is provided, all worker
-    /// threads wait on it before starting the hold timer.
-    pub fn set_idle_hold(&mut self, idle_hold: Duration, barrier: Option<Arc<std::sync::Barrier>>) {
+    /// threads wait on it before starting the hold timer; if any peer aborts
+    /// the barrier (e.g., on error), waiting workers skip the hold and close
+    /// immediately.
+    pub fn set_idle_hold(&mut self, idle_hold: Duration, barrier: Option<Arc<IdleHoldBarrier>>) {
         self.idle_hold = idle_hold;
         self.idle_hold_barrier = barrier;
     }
@@ -442,6 +444,9 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         preload: Option<PreloadBarrier>,
         mut wall_clock_us: impl FnMut() -> Option<u64>,
     ) -> Result<()> {
+        let idle_hold_guard = (!self.idle_hold.is_zero())
+            .then(|| self.idle_hold_barrier.as_ref().map(IdleHoldBarrier::guard))
+            .flatten();
         self.pool.set_preloading(preload.is_some());
         self.anchor_schedules(start_ns);
         self.arm_setup_deadlines();
@@ -602,7 +607,7 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         self.check_setup_done()?;
 
         // Optional quiescent hold before tearing down connections
-        self.run_idle_hold()?;
+        self.run_idle_hold(idle_hold_guard)?;
 
         // Close all connections
         self.pool.close_all()?;
@@ -644,13 +649,18 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
 
     /// Quiescent post-run hold: keeps connections open while polling the
     /// transport and discarding any inbound bytes until `idle_hold` elapses.
-    fn run_idle_hold(&mut self) -> Result<()> {
+    fn run_idle_hold(&mut self, barrier_guard: Option<IdleHoldGuard>) -> Result<()> {
         if self.idle_hold.is_zero() {
+            if let Some(mut guard) = barrier_guard {
+                guard.disarm();
+            }
             return Ok(());
         }
         self.pool.clear_write_interest_all();
-        if let Some(barrier) = &self.idle_hold_barrier {
-            barrier.wait();
+        if let Some(guard) = barrier_guard {
+            if !guard.arrive() {
+                return Ok(());
+            }
         }
         let hold_ns = self.idle_hold.as_nanos().min(u64::MAX as u128) as u64;
         let hold_end_ns = timing::time_ns().saturating_add(hold_ns);
@@ -5018,5 +5028,60 @@ mod tests {
         let agg = worker.stats.aggregate_global(Duration::from_secs(1));
         assert_eq!(agg.tx_bytes, 64);
         assert_eq!(agg.rx_bytes, 0);
+    }
+
+    #[test]
+    fn idle_hold_barrier_abort_unblocks_waiting_peer_without_deadlock() {
+        let barrier = Arc::new(IdleHoldBarrier::new(2));
+        let peer_barrier = Arc::clone(&barrier);
+
+        let factory = FakeFactory::default();
+        let io = factory.0.clone();
+        let mut stats = TupleStatsCollector::default();
+        stats.register_group_policy(0, SamplingPolicy::None);
+        let config = WorkerConfig {
+            target: "127.0.0.1:1".parse().unwrap(),
+            duration: Duration::from_millis(10),
+            conn_count: 1,
+            max_pending_per_conn: 1,
+            drain_timeout: FAKE_DRAIN_TIMEOUT,
+        };
+        let proto = OneWayProtocol {
+            chunk_size: 64,
+            limit: Some(64),
+            ..Default::default()
+        };
+        let mut worker = Worker::new(
+            &factory,
+            proto,
+            stats,
+            config,
+            Box::new(UniformPolicyScheduler::closed_loop()),
+        )
+        .unwrap();
+        // Long idle_hold ensures we verify the worker skips the hold once aborted.
+        worker.set_idle_hold(Duration::from_secs(5), Some(peer_barrier));
+
+        let guard = barrier.guard();
+        let started = std::time::Instant::now();
+        let handle = std::thread::spawn(move || {
+            worker.run().unwrap();
+        });
+
+        // Give the worker time to finish sending and enter the barrier, then
+        // simulate a peer failing by dropping its RAII guard without arriving.
+        std::thread::sleep(Duration::from_millis(25));
+        drop(guard);
+
+        handle.join().expect("peer worker must unblock cleanly on barrier abort");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "aborted idle_hold must skip hold and return immediately, elapsed={elapsed:?}"
+        );
+        assert!(
+            io.lock().unwrap().closed,
+            "connections must still close cleanly after aborted idle_hold"
+        );
     }
 }

@@ -6,7 +6,9 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use xylem_core::threading::{CpuPinning, StartTicket, ThreadingRuntime, Worker, WorkerConfig};
+use xylem_core::threading::{
+    CpuPinning, IdleHoldBarrier, StartTicket, ThreadingRuntime, Worker, WorkerConfig,
+};
 use xylem_transport::{TcpTransportFactory, UdpTransportFactory};
 
 use xylem_cli::{completions, config, output, thresholds};
@@ -273,7 +275,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
     let thread_ids = thread_assignment.thread_ids();
     let _num_threads = thread_ids.len();
     let idle_hold_barrier = (!config.experiment.idle_hold.is_zero() && thread_ids.len() > 1)
-        .then(|| Arc::new(std::sync::Barrier::new(thread_ids.len())));
+        .then(|| Arc::new(IdleHoldBarrier::new(thread_ids.len())));
 
     // Configure CPU pinning based on thread IDs
     // Thread IDs are used directly as CPU core IDs for pinning
@@ -401,6 +403,9 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
     // Each thread connects, then waits at the start gate: every thread starts
     // at the same time, which anchors every schedule and the stats' buckets.
     let results = runtime.run_workers_with_start(move |thread_idx, start| {
+        // Abort the idle_hold barrier if this thread fails or unwinds before
+        // reaching idle_hold, so peers waiting at the barrier unblock cleanly.
+        let mut idle_hold_guard = idle_hold_barrier.as_ref().map(IdleHoldBarrier::guard);
         // Pinned and, with experiment.numa_membind, bound already
         let worker_thread = output::WorkerThread::new(
             thread_idx,
@@ -581,7 +586,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
             on_errors: &[(usize, xylem_core::traffic_group::OnError)],
             max_requests_per_connection: &[(usize, Option<u64>)],
             experiment: &config::ExperimentConfig,
-            idle_hold_barrier: Option<Arc<std::sync::Barrier>>,
+            idle_hold_barrier: Option<Arc<IdleHoldBarrier>>,
             start: StartTicket,
         ) -> xylem_core::Result<(S, WorkerReport)>
         where
@@ -815,6 +820,11 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
             }
             other => Err(xylem_core::Error::Config(format!("Unsupported transport: {}", other)))?,
         };
+        if result.is_ok() {
+            if let Some(guard) = idle_hold_guard.as_mut() {
+                guard.disarm();
+            }
+        }
         result.map(|report| (report, worker_thread))
     })?;
 

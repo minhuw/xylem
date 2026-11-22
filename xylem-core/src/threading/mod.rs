@@ -186,6 +186,94 @@ impl Drop for PreloadTicket {
     }
 }
 
+/// Abortable barrier synchronizing worker threads entering `idle_hold`.
+///
+/// Unlike [`std::sync::Barrier`], any thread that fails or unwinds before
+/// reaching `idle_hold` can call [`Self::abort`] (typically via an RAII
+/// [`IdleHoldGuard`] from [`Self::guard`]), waking every waiting peer
+/// immediately so they skip the idle hold and close cleanly instead of
+/// deadlocking.
+pub struct IdleHoldBarrier {
+    total: usize,
+    state: Mutex<(usize, bool)>,
+    condvar: Condvar,
+}
+
+impl IdleHoldBarrier {
+    /// Create an abortable barrier for `total` worker threads.
+    pub fn new(total: usize) -> Self {
+        Self {
+            total,
+            state: Mutex::new((0, false)),
+            condvar: Condvar::new(),
+        }
+    }
+
+    /// Wait until all `total` threads arrive or [`Self::abort`] is called.
+    ///
+    /// Returns `true` if every thread arrived cleanly, or `false` if the
+    /// barrier was aborted.
+    pub fn arrive(&self) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.1 {
+            return false;
+        }
+        state.0 += 1;
+        if state.0 >= self.total {
+            self.condvar.notify_all();
+            return true;
+        }
+        while !state.1 && state.0 < self.total {
+            state = self.condvar.wait(state).unwrap_or_else(PoisonError::into_inner);
+        }
+        state.0 >= self.total
+    }
+
+    /// Abort the barrier, immediately waking any threads waiting in [`Self::arrive`].
+    pub fn abort(&self) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.1 = true;
+        self.condvar.notify_all();
+    }
+
+    /// Create an RAII guard that calls [`Self::abort`] on drop unless
+    /// [`IdleHoldGuard::arrive`] or [`IdleHoldGuard::disarm`] is called first.
+    pub fn guard(self: &Arc<Self>) -> IdleHoldGuard {
+        IdleHoldGuard { barrier: Some(Arc::clone(self)) }
+    }
+}
+
+/// RAII guard for a participant in an [`IdleHoldBarrier`].
+///
+/// Dropping the guard without calling [`Self::arrive`] or [`Self::disarm`]
+/// aborts the barrier so peers waiting in `idle_hold` wake immediately.
+pub struct IdleHoldGuard {
+    barrier: Option<Arc<IdleHoldBarrier>>,
+}
+
+impl IdleHoldGuard {
+    /// Arrive at the barrier, disarming this guard.
+    pub fn arrive(mut self) -> bool {
+        match self.barrier.take() {
+            Some(barrier) => barrier.arrive(),
+            None => true,
+        }
+    }
+
+    /// Disarm this guard so dropping it does not abort the barrier.
+    pub fn disarm(&mut self) {
+        self.barrier = None;
+    }
+}
+
+impl Drop for IdleHoldGuard {
+    fn drop(&mut self) {
+        if let Some(barrier) = self.barrier.take() {
+            barrier.abort();
+        }
+    }
+}
+
 /// Where the threads of a run pin themselves and bind their memory, and
 /// the first failure among them
 struct ThreadPreparation {

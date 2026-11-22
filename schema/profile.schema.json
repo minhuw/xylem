@@ -187,8 +187,16 @@
           "default": "1s"
         },
         "duration": {
-          "description": "Experiment duration",
-          "type": "string"
+          "description": "Experiment duration. Optional when every traffic group is a `\"stream\"`\ngroup with a finite `bytes` limit; when both `duration` and `bytes` are\nset, whichever is reached first ends the measurement window.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "idle_hold": {
+          "description": "Optional quiescent hold after the last response is drained, before\nclosing connections (default 0s). Keeps connections open while polling\nthe transport without sending new requests.",
+          "type": "string",
+          "default": "0s"
         },
         "name": {
           "description": "Experiment name",
@@ -218,12 +226,16 @@
           "description": "With kernel or hardware timestamps, how long the latency sample of a\nresponse that arrived before its request's TX timestamp waits for\nthe stamp, counted from the receive (default 10ms). The request\ncompletes at once; a sample whose stamp has not arrived by then is\nmeasured in cycles and counts in `kernel_split_missing.tx`",
           "type": "string",
           "default": "10ms"
+        },
+        "warmup": {
+          "description": "Optional time-based warm-up before the measurement window begins\n(default 0s). Traffic sent/received during warm-up is excluded from\nstatistics; byte streams remain continuous across the boundary.",
+          "type": "string",
+          "default": "0s"
         }
       },
       "additionalProperties": false,
       "required": [
-        "name",
-        "duration"
+        "name"
       ]
     },
     "HtmlOutputConfig": {
@@ -1057,7 +1069,7 @@
           "default": "count"
         },
         "protocol": {
-          "description": "Protocol for this group (redis, memcached-binary, memcached-ascii, http, http2, grpc, masstree, dns, nvme-tcp, clickhouse, xylem-echo)",
+          "description": "Protocol for this group (redis, memcached-binary, memcached-ascii, http, http2, grpc, masstree, dns, nvme-tcp, clickhouse, xylem-echo, stream)",
           "type": "string"
         },
         "protocol_config": {
@@ -1133,6 +1145,11 @@
           "description": "Fraction of the completed requests of a group with kernel or hardware\ntimestamps that had a kernel split; fails at zero",
           "type": "string",
           "const": "kernel_split"
+        },
+        {
+          "description": "Fraction of verified responses that failed opt-in payload verification;\nfails on any mismatch",
+          "type": "string",
+          "const": "verification"
         }
       ]
     },
@@ -1158,7 +1175,7 @@
           "default": 0.001
         },
         "skip": {
-          "description": "Checks to leave out: \"unsent\", \"late_sends\", \"kernel_split\"",
+          "description": "Checks to leave out: \"unsent\", \"late_sends\", \"kernel_split\", \"verification\"",
           "type": "array",
           "items": {
             "$ref": "#/$defs/ValidityCheck"
