@@ -305,6 +305,18 @@ pub struct AggregatedStats {
     pub clamped_samples: Option<u64>,
     pub throughput_rps: f64,
     pub throughput_mbps: f64,
+    /// Total transmitted bytes inside the measurement window
+    #[serde(default)]
+    pub tx_bytes: u64,
+    /// Total received bytes inside the measurement window
+    #[serde(default)]
+    pub rx_bytes: u64,
+    /// Transmitted bandwidth in Mbps inside the measurement window
+    #[serde(default)]
+    pub tx_mbps: f64,
+    /// Received bandwidth in Mbps inside the measurement window
+    #[serde(default)]
+    pub rx_mbps: f64,
     /// Requests completed inside the measurement window, which throughput
     /// counts. Requests completed during the drain are excluded.
     pub total_requests: u64,

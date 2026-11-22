@@ -5,7 +5,7 @@
 /// This struct provides additional information about a request that the
 /// protocol generates, allowing the worker to make decisions about how to
 /// handle the request (e.g., whether to collect stats).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestMeta {
     /// True if this is a warm-up request (stats should not be collected).
     /// Warm-up requests are used for:
@@ -19,26 +19,70 @@ pub struct RequestMeta {
     /// dump and they do not advance the connection's intended send schedule,
     /// which restarts once the connection's setup replies have arrived.
     pub is_setup: bool,
+    /// True if the server sends a response to this request (the default).
+    /// False for one-way fire-and-forget writes such as bulk stream chunks:
+    /// the worker does not insert them into the pending response map or arm
+    /// response timeouts.
+    pub expects_response: bool,
+}
+
+impl Default for RequestMeta {
+    #[inline]
+    fn default() -> Self {
+        Self::measurement()
+    }
 }
 
 impl RequestMeta {
     /// Create metadata for a normal measurement request.
     #[inline]
     pub fn measurement() -> Self {
-        Self { is_warmup: false, is_setup: false }
+        Self {
+            is_warmup: false,
+            is_setup: false,
+            expects_response: true,
+        }
     }
 
     /// Create metadata for a warm-up request (stats not collected).
     #[inline]
     pub fn warmup() -> Self {
-        Self { is_warmup: true, is_setup: false }
+        Self {
+            is_warmup: true,
+            is_setup: false,
+            expects_response: true,
+        }
     }
 
     /// Create metadata for a connection setup request (stats not collected,
     /// not dumped, not scheduled).
     #[inline]
     pub fn setup() -> Self {
-        Self { is_warmup: true, is_setup: true }
+        Self {
+            is_warmup: true,
+            is_setup: true,
+            expects_response: true,
+        }
+    }
+
+    /// Create metadata for a one-way measurement write (expects no response).
+    #[inline]
+    pub fn one_way() -> Self {
+        Self {
+            is_warmup: false,
+            is_setup: false,
+            expects_response: false,
+        }
+    }
+
+    /// Create metadata for a one-way warm-up write (expects no response, stats not collected).
+    #[inline]
+    pub fn one_way_warmup() -> Self {
+        Self {
+            is_warmup: true,
+            is_setup: false,
+            expects_response: false,
+        }
     }
 }
 
@@ -86,6 +130,24 @@ impl<ReqId> Request<ReqId> {
             data,
             request_id,
             metadata: RequestMeta::setup(),
+        }
+    }
+
+    /// Create a one-way measurement request that expects no server response.
+    pub fn one_way(data: Vec<u8>, request_id: ReqId) -> Self {
+        Self {
+            data,
+            request_id,
+            metadata: RequestMeta::one_way(),
+        }
+    }
+
+    /// Create a one-way warm-up request that expects no server response.
+    pub fn one_way_warmup(data: Vec<u8>, request_id: ReqId) -> Self {
+        Self {
+            data,
+            request_id,
+            metadata: RequestMeta::one_way_warmup(),
         }
     }
 }

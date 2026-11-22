@@ -65,10 +65,24 @@ pub struct ExperimentConfig {
     /// Random seed for reproducibility (None = use entropy)
     #[serde(default)]
     pub seed: Option<u64>,
-    /// Experiment duration
-    #[serde(with = "humantime_serde")]
+    /// Experiment duration. Optional when every traffic group is a `"stream"`
+    /// group with a finite `bytes` limit; when both `duration` and `bytes` are
+    /// set, whichever is reached first ends the measurement window.
+    #[serde(default, with = "humantime_serde", skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<String>")]
+    pub duration: Option<Duration>,
+    /// Optional time-based warm-up before the measurement window begins
+    /// (default 0s). Traffic sent/received during warm-up is excluded from
+    /// statistics; byte streams remain continuous across the boundary.
+    #[serde(with = "humantime_serde", default)]
     #[schemars(with = "String")]
-    pub duration: Duration,
+    pub warmup: Duration,
+    /// Optional quiescent hold after the last response is drained, before
+    /// closing connections (default 0s). Keeps connections open while polling
+    /// the transport without sending new requests.
+    #[serde(with = "humantime_serde", default)]
+    #[schemars(with = "String")]
+    pub idle_hold: Duration,
     /// Longest wait for pending responses after the measurement window
     /// (default 1s). Requests still pending then count as timed out.
     #[serde(with = "humantime_serde", default = "default_drain_timeout")]
@@ -248,12 +262,13 @@ enum ProtocolKind {
     Dns,
     NvmeTcp,
     ClickHouse,
+    Stream,
     XylemEcho,
 }
 
 /// Every accepted traffic group protocol name. The invalid-protocol error lists
 /// the names in this order.
-const PROTOCOLS: [(&str, ProtocolKind); 11] = [
+const PROTOCOLS: [(&str, ProtocolKind); 12] = [
     ("redis", ProtocolKind::Redis),
     ("memcached-binary", ProtocolKind::MemcachedBinary),
     ("memcached-ascii", ProtocolKind::MemcachedAscii),
@@ -264,6 +279,7 @@ const PROTOCOLS: [(&str, ProtocolKind); 11] = [
     ("dns", ProtocolKind::Dns),
     ("nvme-tcp", ProtocolKind::NvmeTcp),
     ("clickhouse", ProtocolKind::ClickHouse),
+    ("stream", ProtocolKind::Stream),
     ("xylem-echo", ProtocolKind::XylemEcho), // Test protocol
 ];
 
@@ -281,6 +297,7 @@ pub enum ProtocolConfig {
     Dns(xylem_protocols::DnsConfig),
     NvmeTcp(xylem_protocols::NvmeTcpConfig),
     ClickHouse(xylem_protocols::ClickHouseConfig),
+    Stream(xylem_protocols::StreamConfig),
     XylemEcho(xylem_protocols::XylemEchoConfig),
 }
 
@@ -360,8 +377,10 @@ impl ProfileConfig {
         if self.experiment.name.is_empty() {
             errors.push(anyhow!("Experiment name cannot be empty"));
         }
-        if self.experiment.duration.as_secs() == 0 {
-            errors.push(anyhow!("Experiment duration must be > 0"));
+        if let Some(duration) = self.experiment.duration {
+            if duration.is_zero() {
+                errors.push(anyhow!("Experiment duration must be > 0"));
+            }
         }
         if self.experiment.setup_timeout.is_zero() {
             errors.push(anyhow!("experiment.setup_timeout must be > 0"));
@@ -671,6 +690,19 @@ impl ProfileConfig {
                 }
             }
             protocol_configs.push(protocol_config);
+        }
+
+        if self.experiment.duration.is_none() {
+            let all_byte_limited = !protocol_configs.is_empty()
+                && protocol_configs.len() == self.traffic_groups.len()
+                && protocol_configs
+                    .iter()
+                    .all(|pc| matches!(pc, ProtocolConfig::Stream(s) if s.bytes.is_some()));
+            if !all_byte_limited {
+                errors.push(anyhow!(
+                    "experiment.duration is required unless all traffic groups have a finite byte limit"
+                ));
+            }
         }
 
         // Validate thread assignment
@@ -1025,6 +1057,17 @@ fn parse_protocol_config(
                 )
             })?;
             Ok(ProtocolConfig::ClickHouse(config))
+        }
+        ProtocolKind::Stream => {
+            let config: xylem_protocols::StreamConfig =
+                parse_typed_config(pc, "Stream", group_idx, group_name)?;
+            config.validate().with_context(|| {
+                format!(
+                    "Traffic group {} '{}' has invalid Stream protocol_config",
+                    group_idx, group_name
+                )
+            })?;
+            Ok(ProtocolConfig::Stream(config))
         }
         ProtocolKind::XylemEcho => {
             let config = parse_typed_config(pc, "XylemEcho", group_idx, group_name)?;
@@ -1416,7 +1459,7 @@ mod tests {
     #[test]
     fn tdigest_errors_are_aggregated_before_group_validation_continues() {
         let mut config = redis_bench_profile();
-        config.experiment.duration = Duration::ZERO;
+        config.experiment.duration = Some(Duration::ZERO);
         config.stats.sampling_policy = Some(SamplingPolicy::TDigest { compression: 0 });
         for group in &mut config.traffic_groups {
             group.sampling_policy = SamplingPolicy::TDigest { compression: 0 };
@@ -1578,7 +1621,7 @@ mod tests {
 
         assert_eq!(config.experiment.name, "redis-get-zipfian");
         assert_eq!(config.experiment.seed, Some(42));
-        assert_eq!(config.experiment.duration, Duration::from_secs(30));
+        assert_eq!(config.experiment.duration, Some(Duration::from_secs(30)));
 
         assert_eq!(config.traffic_groups.len(), 1);
         assert_eq!(config.traffic_groups[0].name, "main");
@@ -1596,7 +1639,7 @@ mod tests {
 
         assert_eq!(config.experiment.name, "memcached-ramp-load");
         assert_eq!(config.experiment.seed, Some(12345));
-        assert_eq!(config.experiment.duration, Duration::from_secs(60));
+        assert_eq!(config.experiment.duration, Some(Duration::from_secs(60)));
 
         assert_eq!(config.traffic_groups.len(), 1);
         assert_eq!(config.traffic_groups[0].protocol, "memcached-binary");
@@ -1611,7 +1654,7 @@ mod tests {
 
         assert_eq!(config.experiment.name, "http-spike-test");
         assert_eq!(config.experiment.seed, Some(99999));
-        assert_eq!(config.experiment.duration, Duration::from_secs(120));
+        assert_eq!(config.experiment.duration, Some(Duration::from_secs(120)));
 
         assert_eq!(config.traffic_groups.len(), 1);
         assert_eq!(config.traffic_groups[0].protocol, "http");
@@ -1639,7 +1682,7 @@ mod tests {
 
         assert_eq!(config.experiment.name, "closed-loop-max-throughput");
         assert_eq!(config.experiment.seed, Some(1234567890));
-        assert_eq!(config.experiment.duration, Duration::from_secs(30));
+        assert_eq!(config.experiment.duration, Some(Duration::from_secs(30)));
 
         assert_eq!(config.traffic_groups.len(), 1);
         assert_eq!(config.traffic_groups[0].protocol, "memcached-binary");
@@ -1654,7 +1697,7 @@ mod tests {
 
         assert_eq!(config.experiment.name, "latency-agent-separation");
         assert_eq!(config.experiment.seed, Some(42));
-        assert_eq!(config.experiment.duration, Duration::from_secs(10));
+        assert_eq!(config.experiment.duration, Some(Duration::from_secs(10)));
 
         assert_eq!(config.traffic_groups[0].protocol, "redis");
 
@@ -1690,7 +1733,7 @@ mod tests {
 
         assert_eq!(config.experiment.name, "redis-bench");
         assert_eq!(config.experiment.seed, Some(42));
-        assert_eq!(config.experiment.duration, Duration::from_secs(30));
+        assert_eq!(config.experiment.duration, Some(Duration::from_secs(30)));
 
         assert_eq!(config.traffic_groups.len(), 2);
         assert_eq!(config.traffic_groups[0].protocol, "redis");
@@ -1731,7 +1774,7 @@ mod tests {
         .expect("Failed to apply overrides");
 
         assert_eq!(config.traffic_groups[0].target, "192.168.1.100:6379");
-        assert_eq!(config.experiment.duration, Duration::from_secs(60));
+        assert_eq!(config.experiment.duration, Some(Duration::from_secs(60)));
         assert_eq!(config.experiment.seed, Some(999));
 
         assert_eq!(config.experiment.name, "redis-get-zipfian");
@@ -2794,7 +2837,7 @@ file = "test.json"
         tmpfile.flush().unwrap();
 
         let config = ProfileConfig::from_file(tmpfile.path()).unwrap();
-        assert_eq!(config.experiment.duration, Duration::from_secs(150));
+        assert_eq!(config.experiment.duration, Some(Duration::from_secs(150)));
     }
 
     #[test]
@@ -2924,7 +2967,7 @@ duration = "10s""#,
         .unwrap();
 
         assert_eq!(config.traffic_groups[0].target, "192.168.1.100:6379");
-        assert_eq!(config.experiment.duration, Duration::from_secs(300));
+        assert_eq!(config.experiment.duration, Some(Duration::from_secs(300)));
         assert_eq!(config.experiment.seed, Some(999));
         assert_eq!(config.traffic_groups[0].connections_per_thread, 8);
     }
@@ -3002,8 +3045,8 @@ duration = "10s""#,
                 "experiment.duraton=1s",
                 "Invalid --set experiment.duraton=1s: unknown field `duraton` in experiment \
                  (did you mean `duration`?); expected one of `busy_poll_us`, `description`, \
-                 `drain_timeout`, `duration`, `name`, `numa_membind`, `seed`, `setup_timeout`, \
-                 `tx_timestamp_timeout`",
+                 `drain_timeout`, `duration`, `idle_hold`, `name`, `numa_membind`, `seed`, \
+                 `setup_timeout`, `tx_timestamp_timeout`, `warmup`",
             ),
             ("experimnt.seed=1", "unknown field `experimnt` at the top level (did you mean `experiment`?)"),
             ("traffic_groups.1.traffic_policy.rat=5", "in traffic_groups[1].traffic_policy (did you mean `rate`?)"),
@@ -3573,7 +3616,7 @@ protocol_config = {}
             &["experiment.duration=2h".to_string()],
         )
         .unwrap();
-        assert_eq!(config.experiment.duration, Duration::from_secs(7200));
+        assert_eq!(config.experiment.duration, Some(Duration::from_secs(7200)));
     }
 
     #[test]
@@ -3587,7 +3630,7 @@ protocol_config = {}
             format!("{err:#}").contains(
                 "Invalid protocol 'redis-cluster' for traffic group 0 'main'. Valid options: \
                  redis, memcached-binary, memcached-ascii, http, http2, grpc, masstree, dns, \
-                 nvme-tcp, clickhouse, xylem-echo. \
+                 nvme-tcp, clickhouse, stream, xylem-echo. \
                  Redis Cluster support was removed"
             ),
             "{err:#}"
@@ -3900,5 +3943,69 @@ directory = "/tmp/dumps"
         assert_eq!(dump_config.encoding, xylem_core::request_dump::DataEncoding::Hex);
         assert_eq!(dump_config.rotation, xylem_core::request_dump::RotationPolicy::Never);
         assert_eq!(dump_config.max_files, None);
+    }
+
+    #[test]
+    fn stream_config_validation_and_optional_duration() {
+        // Omitting duration is valid when all groups are byte-limited streams
+        let valid_byte_limited = r#"
+[experiment]
+name = "stream-bytes"
+warmup = "100ms"
+idle_hold = "250ms"
+
+[[traffic_groups]]
+name = "sink"
+protocol = "stream"
+target = "127.0.0.1:9000"
+transport = "tcp"
+threads = [0]
+connections_per_thread = 1
+
+[traffic_groups.traffic_policy]
+type = "closed-loop"
+
+[traffic_groups.protocol_config]
+direction = "send"
+chunk_size = 65536
+bytes = 1048576
+
+[output]
+format = "json"
+file = "out.json"
+"#;
+        let mut config: ProfileConfig = toml::from_str(valid_byte_limited).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.experiment.duration, None);
+        assert_eq!(config.experiment.warmup, Duration::from_millis(100));
+        assert_eq!(config.experiment.idle_hold, Duration::from_millis(250));
+
+        // Omitting duration fails if stream has no bytes limit
+        let missing_limit = valid_byte_limited.replace("bytes = 1048576\n", "");
+        let mut config: ProfileConfig = toml::from_str(&missing_limit).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("experiment.duration is required unless all traffic groups have a finite byte limit"),
+            "{err}"
+        );
+
+        // Stream over UDP is rejected
+        let udp_stream = valid_byte_limited.replace("transport = \"tcp\"", "transport = \"udp\"");
+        let mut config: ProfileConfig = toml::from_str(&udp_stream).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("does not support transport 'udp'"), "{err}");
+
+        // Sub-second duration is accepted; zero duration is rejected
+        let subsecond = valid_byte_limited
+            .replace("name = \"stream-bytes\"", "name = \"stream-bytes\"\nduration = \"150ms\"")
+            .replace("bytes = 1048576\n", "");
+        let mut config: ProfileConfig = toml::from_str(&subsecond).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.experiment.duration, Some(Duration::from_millis(150)));
+
+        let zero_dur = subsecond.replace("duration = \"150ms\"", "duration = \"0s\"");
+        let mut config: ProfileConfig = toml::from_str(&zero_dur).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("Experiment duration must be > 0"), "{err}");
     }
 }

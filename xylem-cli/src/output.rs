@@ -462,6 +462,18 @@ pub struct GlobalStats {
     pub total_requests: u64,
     pub throughput_rps: f64,
     pub throughput_mbps: f64,
+    /// Total transmitted bytes inside the measurement window
+    #[serde(default)]
+    pub tx_bytes: u64,
+    /// Total received bytes inside the measurement window
+    #[serde(default)]
+    pub rx_bytes: u64,
+    /// Transmitted bandwidth in Mbps inside the measurement window
+    #[serde(default)]
+    pub tx_mbps: f64,
+    /// Received bandwidth in Mbps inside the measurement window
+    #[serde(default)]
+    pub rx_mbps: f64,
     /// Latencies of every request completed by a successful response,
     /// including those completed during the drain after the window
     pub latency: LatencyStats,
@@ -574,6 +586,18 @@ pub struct GroupStats {
     pub total_requests: u64,
     pub throughput_rps: f64,
     pub throughput_mbps: f64,
+    /// Total transmitted bytes inside the measurement window
+    #[serde(default)]
+    pub tx_bytes: u64,
+    /// Total received bytes inside the measurement window
+    #[serde(default)]
+    pub rx_bytes: u64,
+    /// Transmitted bandwidth in Mbps inside the measurement window
+    #[serde(default)]
+    pub tx_mbps: f64,
+    /// Received bandwidth in Mbps inside the measurement window
+    #[serde(default)]
+    pub rx_mbps: f64,
     /// Latencies of every request completed by a successful response,
     /// including those completed during the drain after the window
     pub latency: LatencyStats,
@@ -703,6 +727,10 @@ impl DetailedExperimentResults {
             total_requests: global_aggregated.total_requests,
             throughput_rps: global_aggregated.throughput_rps,
             throughput_mbps: global_aggregated.throughput_mbps,
+            tx_bytes: global_aggregated.tx_bytes,
+            rx_bytes: global_aggregated.rx_bytes,
+            tx_mbps: global_aggregated.tx_mbps,
+            rx_mbps: global_aggregated.rx_mbps,
             latency: Self::latency_stats(&global_aggregated),
             error_latency: Self::latency_stats(&tuple_stats.error_latency_global()),
             requests: tuple_stats.request_counts_global(),
@@ -734,6 +762,10 @@ impl DetailedExperimentResults {
                         total_requests: aggregated.total_requests,
                         throughput_rps: aggregated.throughput_rps,
                         throughput_mbps: aggregated.throughput_mbps,
+                        tx_bytes: aggregated.tx_bytes,
+                        rx_bytes: aggregated.rx_bytes,
+                        tx_mbps: aggregated.tx_mbps,
+                        rx_mbps: aggregated.rx_mbps,
                         latency: Self::latency_stats(aggregated),
                         error_latency: Self::latency_stats(&tuple_stats.error_latency(group_id)),
                         requests: tuple_stats.request_counts(group_id),
@@ -1036,6 +1068,16 @@ impl DetailedExperimentResults {
         println!("Total Requests:  {}", self.global.total_requests);
         println!("Throughput:      {:.2} req/s", self.global.throughput_rps);
         println!("Bandwidth:       {:.2} Mbps", self.global.throughput_mbps);
+        if self.global.tx_bytes > 0 || self.global.rx_bytes > 0 {
+            println!(
+                "TX:              {} bytes ({:.2} Mbps)",
+                self.global.tx_bytes, self.global.tx_mbps
+            );
+            println!(
+                "RX:              {} bytes ({:.2} Mbps)",
+                self.global.rx_bytes, self.global.rx_mbps
+            );
+        }
         println!();
         println!("Latency (μs):");
         print!("{}", Self::format_latency(&self.global.latency, "  "));
@@ -1070,6 +1112,16 @@ impl DetailedExperimentResults {
             println!("  Requests:      {}", group.stats.total_requests);
             println!("  Throughput:    {:.2} req/s", group.stats.throughput_rps);
             println!("  Bandwidth:     {:.2} Mbps", group.stats.throughput_mbps);
+            if group.stats.tx_bytes > 0 || group.stats.rx_bytes > 0 {
+                println!(
+                    "  TX:            {} bytes ({:.2} Mbps)",
+                    group.stats.tx_bytes, group.stats.tx_mbps
+                );
+                println!(
+                    "  RX:            {} bytes ({:.2} Mbps)",
+                    group.stats.rx_bytes, group.stats.rx_mbps
+                );
+            }
             println!();
             println!("  Latency (μs):");
             print!("{}", Self::format_latency(&group.stats.latency, "    "));

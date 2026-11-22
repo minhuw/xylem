@@ -20,6 +20,19 @@ use xylem_transport::{
     TxRange, TxTimestampInfo,
 };
 
+/// TX counter subrange for a request ending at `request_end` inside a write
+/// that advanced `sent_bytes` from `before` to `after`.
+fn tx_subrange(range: TxRange, request_end: u64, after: u64, before: u64) -> TxRange {
+    if request_end == after {
+        range
+    } else {
+        TxRange {
+            start: range.start,
+            end: range.start.wrapping_add((request_end - before) as u32),
+        }
+    }
+}
+
 /// Wrapping less-than-or-equal comparison for u32 counters
 ///
 /// Returns true if `a <= b` accounting for wrapping.
@@ -117,6 +130,10 @@ pub struct Completion<ReqId> {
     /// `breakdown` are then the ones measured so far, in cycles, which only
     /// the traffic policy gets.
     pub deferred: bool,
+    /// True when this completion came from an unsolicited server payload on a
+    /// protocol where [`Protocol::accepts_unsolicited_responses`] is true and
+    /// no matching request was in `pending_map`.
+    pub unsolicited: bool,
 }
 
 /// The latency sample of a measurement request whose successful response
@@ -236,6 +253,8 @@ pub struct SentRequest {
     pub lag: Option<Duration>,
     /// Whether it is a measurement request: no warmup or setup request
     pub measured: bool,
+    /// Whether a server response is expected (false for one-way writes)
+    pub expects_response: bool,
 }
 
 /// Metadata for a request being queued onto a connection
@@ -244,6 +263,7 @@ struct QueueMeta<ReqId> {
     intended_ns: Option<u64>,
     is_warmup: bool,
     is_setup: bool,
+    expects_response: bool,
     connect_start_ts: Option<Timestamp>,
 }
 
@@ -258,6 +278,7 @@ struct QueuedRequest<ReqId> {
     intended_ns: Option<u64>,
     is_warmup: bool,
     is_setup: bool,
+    expects_response: bool,
     connect_start_ts: Option<Timestamp>,
 }
 
@@ -435,6 +456,8 @@ pub struct ConnectionState<ReqId: Eq + Hash + Clone> {
     sent_bytes: u64,
     /// Queued requests whose last byte the transport has not taken, in order
     unsent: VecDeque<QueuedRequest<ReqId>>,
+    /// Number of entries in `unsent` with `expects_response == false`
+    unsent_one_way: usize,
     /// On the pool's list of connections to write at its next flush
     staged: bool,
     /// The transport took fewer bytes than queued: the rest waits for the
@@ -495,6 +518,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
             queued_bytes: 0,
             sent_bytes: 0,
             unsent: VecDeque::new(),
+            unsent_one_way: 0,
             staged: false,
             write_blocked: false,
             reconnect_state: ReconnectState::Connected,
@@ -511,6 +535,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         match self.reconnect_state {
             ReconnectState::Connected => {
                 self.pending_count() < self.max_pending_requests
+                    && self.unsent_one_way == 0
                     && self
                         .max_requests_per_connection
                         .is_none_or(|limit| self.requests_sent_on_conn < limit)
@@ -570,6 +595,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         self.queued_bytes = 0;
         self.sent_bytes = 0;
         self.unsent.clear();
+        self.unsent_one_way = 0;
         self.staged = false;
         self.requests_sent_on_conn = 0;
         self.reconnect_state = next_state;
@@ -600,6 +626,11 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
     /// Whether queued bytes wait for the connection to become writable
     pub fn is_write_blocked(&self) -> bool {
         self.write_blocked
+    }
+
+    /// Whether any bytes remain queued in the outbound buffer
+    pub fn has_queued_writes(&self) -> bool {
+        !self.unsent_bytes().is_empty()
     }
 
     /// Get maximum pending requests allowed
@@ -678,6 +709,9 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
             if !meta.is_setup {
                 self.requests_sent_on_conn += 1;
             }
+            if !meta.expects_response {
+                self.unsent_one_way += 1;
+            }
             self.unsent.push_back(QueuedRequest {
                 end: self.queued_bytes,
                 len: data.len(),
@@ -685,6 +719,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
                 intended_ns: meta.intended_ns,
                 is_warmup: meta.is_warmup,
                 is_setup: meta.is_setup,
+                expects_response: meta.expects_response,
                 connect_start_ts: meta.connect_start_ts,
             });
         }
@@ -723,6 +758,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         self.closed = true;
         self.pending_map.clear();
         self.unsent.clear();
+        self.unsent_one_way = 0;
         self.out.clear();
         self.out_head = 0;
         self.reconnect_state = ReconnectState::Connected;
@@ -755,35 +791,36 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         let receipt = progress.receipt;
         while self.unsent.front().is_some_and(|request| request.end <= self.sent_bytes) {
             let request = self.unsent.pop_front().expect("checked the front");
-            let tx = receipt.tx.map(|range| {
-                if request.end == self.sent_bytes {
-                    range
-                } else {
-                    let end = range.start.wrapping_add((request.end - before) as u32);
-                    TxRange { start: range.start, end }
-                }
-            });
+            if !request.expects_response {
+                self.unsent_one_way = self.unsent_one_way.saturating_sub(1);
+            }
             let lag = request.intended_ns.map(|intended| {
                 let start_ns = request
                     .connect_start_ts
                     .map_or_else(|| receipt.timestamp.clock_ns(), |cs| cs.clock_ns());
                 Duration::from_nanos(start_ns.saturating_sub(intended))
             });
-            self.record_request(
-                request.req_id,
-                receipt.timestamp,
-                lag.unwrap_or_default(),
-                tx,
-                request.is_warmup,
-                request.is_setup,
-                request.connect_start_ts,
-            );
+            if request.expects_response {
+                let tx = receipt
+                    .tx
+                    .map(|range| tx_subrange(range, request.end, self.sent_bytes, before));
+                self.record_request(
+                    request.req_id,
+                    receipt.timestamp,
+                    lag.unwrap_or_default(),
+                    tx,
+                    request.is_warmup,
+                    request.is_setup,
+                    request.connect_start_ts,
+                );
+            }
             sent.push(SentRequest {
                 group_id: self.group_id,
                 connection_id: self.connection_id,
                 bytes: request.len,
                 lag,
                 measured: !request.is_warmup && !request.is_setup,
+                expects_response: request.expects_response,
             });
         }
     }
@@ -1068,6 +1105,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         req_id: ReqId,
         recv_ts: Timestamp,
         datagram: bool,
+        accepts_unsolicited: bool,
         error: Option<ErrorKindId>,
     ) -> Result<Option<Completion<ReqId>>> {
         let Some(pending) = self.pending_map.remove(&req_id) else {
@@ -1076,6 +1114,18 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
                     self.late_responses += 1;
                 }
                 return Ok(None);
+            }
+            if accepts_unsolicited {
+                return Ok(Some(Completion {
+                    id: req_id,
+                    latency: Duration::ZERO,
+                    is_warmup: false,
+                    bytes_consumed: std::mem::take(&mut self.absorbed_bytes),
+                    error,
+                    breakdown: LatencyBreakdown::between(&recv_ts, &recv_ts),
+                    deferred: false,
+                    unsolicited: true,
+                }));
             }
             if datagram {
                 tracing::debug!(?req_id, "Dropping a datagram response for no pending request");
@@ -1136,6 +1186,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
             error,
             breakdown,
             deferred,
+            unsolicited: false,
         }))
     }
 
@@ -1155,7 +1206,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
             self.recv_buffer.resize(needed, 0);
         }
         self.recv_buffer[self.recv_len..needed].copy_from_slice(data);
-        self.process_received(data.len(), recv_ts, process_fn)
+        self.process_received(data.len(), recv_ts, false, process_fn)
     }
 
     /// Unparsed bytes buffered from earlier reads
@@ -1189,6 +1240,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         &mut self,
         len: usize,
         recv_ts: Timestamp,
+        accepts_unsolicited: bool,
         mut process_fn: F,
     ) -> Result<Vec<Completion<ReqId>>>
     where
@@ -1228,7 +1280,9 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
             let error = error
                 .map(|error| self.error_replies.report(self.group_id, self.connection_id, &error))
                 .transpose()?;
-            if let Some(completion) = self.complete(req_id, recv_ts, false, error)? {
+            if let Some(completion) =
+                self.complete(req_id, recv_ts, false, accepts_unsolicited, error)?
+            {
                 responses.push(completion);
             }
         }
@@ -1250,6 +1304,7 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
         &mut self,
         len: usize,
         recv_ts: Timestamp,
+        accepts_unsolicited: bool,
         mut process_fn: F,
     ) -> Result<Vec<Completion<ReqId>>>
     where
@@ -1280,7 +1335,9 @@ impl<ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionState<ReqId> {
             let error = error
                 .map(|error| self.error_replies.report(self.group_id, self.connection_id, &error))
                 .transpose()?;
-            if let Some(completion) = self.complete(req_id, recv_ts, true, error)? {
+            if let Some(completion) =
+                self.complete(req_id, recv_ts, true, accepts_unsolicited, error)?
+            {
                 responses.push(completion);
             }
         }
@@ -2073,6 +2130,36 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
                 intended_ns,
                 is_warmup,
                 is_setup: false,
+                expects_response: true,
+                connect_start_ts,
+            }),
+        )
+    }
+
+    /// Queue a one-way write that expects no server response (see
+    /// [`xylem_common::RequestMeta::expects_response`]).
+    ///
+    /// When the transport takes its last byte, it is reported via
+    /// [`Self::take_sent`] with `expects_response = false`, without inserting
+    /// into `pending_map` or arming a response timeout.
+    pub fn queue_one_way(
+        &mut self,
+        connection_id: usize,
+        data: &[u8],
+        req_id: ReqId,
+        is_warmup: bool,
+        intended_ns: Option<u64>,
+        connect_start_ts: Option<Timestamp>,
+    ) -> Result<()> {
+        self.queue(
+            connection_id,
+            data,
+            Some(QueueMeta {
+                req_id,
+                intended_ns,
+                is_warmup,
+                is_setup: false,
+                expects_response: false,
                 connect_start_ts,
             }),
         )
@@ -2128,6 +2215,7 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
                 intended_ns: None,
                 is_warmup: true,
                 is_setup: true,
+                expects_response: true,
                 connect_start_ts: None,
             }),
         )?;
@@ -2152,6 +2240,21 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
     where
         F: for<'a> FnMut(&'a [u8]) -> Result<Parsed<'a, ReqId>>,
     {
+        self.recv_responses_with_options(connection_id, false, process_fn)
+    }
+
+    /// Like [`Self::recv_responses`], allowing protocols with
+    /// [`Protocol::accepts_unsolicited_responses`] to emit unsolicited
+    /// completions when `pending_map` has no matching request ID.
+    pub fn recv_responses_with_options<F>(
+        &mut self,
+        connection_id: usize,
+        accepts_unsolicited: bool,
+        process_fn: F,
+    ) -> Result<Vec<Completion<ReqId>>>
+    where
+        F: for<'a> FnMut(&'a [u8]) -> Result<Parsed<'a, ReqId>>,
+    {
         let state = self
             .connection_states
             .get_mut(&connection_id)
@@ -2161,10 +2264,10 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         // partial frame left by earlier reads.
         let responses = match self.group.recv(connection_id, state.recv_spare())? {
             RecvOutcome::Data { len, timestamp } if self.datagram => {
-                state.process_datagram(len, timestamp, process_fn)?
+                state.process_datagram(len, timestamp, accepts_unsolicited, process_fn)?
             }
             RecvOutcome::Data { len, timestamp } => {
-                state.process_received(len, timestamp, process_fn)?
+                state.process_received(len, timestamp, accepts_unsolicited, process_fn)?
             }
             RecvOutcome::WouldBlock => return Ok(Vec::new()),
             RecvOutcome::Eof => {
@@ -2180,7 +2283,7 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
         // waiting for the TX timestamp would delay the policy's feedback
         for response in &responses {
             // A fast error reply would make an adaptive policy speed up
-            if !response.is_warmup && response.error.is_none() {
+            if !response.is_warmup && !response.unsolicited && response.error.is_none() {
                 match state.dispatcher {
                     Some(dispatcher) => self.dispatchers[dispatcher].on_response(response.latency),
                     None => state.policy.on_response(response.latency),
@@ -2188,6 +2291,43 @@ impl<G: ConnectionGroup, ReqId: Eq + Hash + Clone + std::fmt::Debug> ConnectionP
             }
         }
         Ok(responses)
+    }
+
+    /// Clear write interest on every open connection that was write-blocked
+    /// (used before entering quiescent `idle_hold` so poll does not spin on
+    /// writability).
+    pub fn clear_write_interest_all(&mut self) {
+        for &connection_id in &self.connection_ids {
+            if let Some(state) = self.connection_states.get_mut(&connection_id) {
+                if !state.closed && state.write_blocked {
+                    state.write_blocked = false;
+                    let _ = self.group.set_write_interest(connection_id, false);
+                }
+            }
+        }
+    }
+
+    /// Drain and discard inbound bytes on `connection_id` without parsing
+    /// responses or recording statistics (used during post-run `idle_hold`).
+    ///
+    /// Closes the connection on peer EOF or connection error so level-triggered
+    /// pollers do not spin.
+    pub fn discard_inbound(&mut self, connection_id: usize) -> Result<()> {
+        let Some(state) = self.connection_states.get_mut(&connection_id) else {
+            return Ok(());
+        };
+        if state.closed {
+            return Ok(());
+        }
+        state.recv_len = 0;
+        match self.group.recv(connection_id, state.recv_spare()) {
+            Ok(RecvOutcome::Data { .. } | RecvOutcome::WouldBlock) => Ok(()),
+            Ok(RecvOutcome::Eof) | Err(xylem_transport::Error::Connection(_)) => {
+                let _ = self.close(connection_id);
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Poll for and process TX timestamps from the transport layer
@@ -2843,6 +2983,7 @@ mod tests {
                 error: None,
                 breakdown,
                 deferred: false,
+                unsolicited: false,
             }]
         );
         assert_eq!(pool.get_state(0).unwrap().pending_count(), 0);
@@ -3318,6 +3459,7 @@ mod tests {
             bytes: 2,
             lag: None,
             measured: false,
+            expects_response: true,
         };
         assert_eq!(sent[1], second);
         assert_eq!((sent.len(), sent[0].bytes, sent[0].measured), (2, 1, true));
@@ -3378,6 +3520,7 @@ mod tests {
             bytes: 3,
             lag: None,
             measured: true,
+            expects_response: true,
         };
         assert_eq!(sent, [request]);
         let state = pool.get_state(0).unwrap();
@@ -3402,6 +3545,7 @@ mod tests {
                 intended_ns: None,
                 is_warmup: false,
                 is_setup: false,
+                expects_response: true,
                 connect_start_ts: None,
             }),
         );
@@ -3412,6 +3556,7 @@ mod tests {
                 intended_ns: None,
                 is_warmup: true,
                 is_setup: false,
+                expects_response: true,
                 connect_start_ts: None,
             }),
         );

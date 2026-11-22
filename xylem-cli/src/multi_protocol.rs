@@ -17,6 +17,7 @@ pub enum MultiProtocol {
     Dns(xylem_protocols::DnsProtocol),
     NvmeTcp(xylem_protocols::NvmeTcpProtocol),
     ClickHouse(xylem_protocols::ClickHouseProtocol),
+    Stream(xylem_protocols::StreamProtocol),
 }
 
 impl MultiProtocol {
@@ -96,6 +97,9 @@ impl MultiProtocol {
             ProtocolConfig::ClickHouse(ch_config) => {
                 Self::ClickHouse(xylem_protocols::ClickHouseProtocol::from_config(ch_config, seed)?)
             }
+            ProtocolConfig::Stream(stream_config) => {
+                Self::Stream(xylem_protocols::StreamProtocol::from_config(stream_config)?)
+            }
             ProtocolConfig::XylemEcho(_echo_config) => create_xylem_echo_protocol(),
         };
         Ok(protocol)
@@ -136,6 +140,7 @@ impl Protocol for MultiProtocol {
                 Request::new(request.data, (conn, u64::from(stream)), request.metadata)
             }
             MultiProtocol::ClickHouse(p) => p.next_request(conn_id),
+            MultiProtocol::Stream(p) => p.next_request(conn_id),
         }
     }
 
@@ -163,6 +168,7 @@ impl Protocol for MultiProtocol {
                 .parse_response(conn_id, data)?
                 .map_id(|(conn, stream)| (conn, u64::from(stream)))),
             MultiProtocol::ClickHouse(p) => p.parse_response(conn_id, data),
+            MultiProtocol::Stream(p) => p.parse_response(conn_id, data),
         }
     }
 
@@ -178,6 +184,7 @@ impl Protocol for MultiProtocol {
             MultiProtocol::NvmeTcp(p) => p.name(),
             MultiProtocol::Http2(p) | MultiProtocol::Grpc(p) => p.name(),
             MultiProtocol::ClickHouse(p) => p.name(),
+            MultiProtocol::Stream(p) => p.name(),
         }
     }
 
@@ -193,6 +200,7 @@ impl Protocol for MultiProtocol {
             MultiProtocol::NvmeTcp(p) => p.reset(),
             MultiProtocol::Http2(p) | MultiProtocol::Grpc(p) => p.reset(),
             MultiProtocol::ClickHouse(p) => p.reset(),
+            MultiProtocol::Stream(p) => p.reset(),
         }
     }
 
@@ -208,6 +216,7 @@ impl Protocol for MultiProtocol {
             MultiProtocol::NvmeTcp(p) => p.can_send(conn_id),
             MultiProtocol::Http2(p) | MultiProtocol::Grpc(p) => p.can_send(conn_id),
             MultiProtocol::ClickHouse(p) => p.can_send(conn_id),
+            MultiProtocol::Stream(p) => p.can_send(conn_id),
         }
     }
 
@@ -223,6 +232,7 @@ impl Protocol for MultiProtocol {
             MultiProtocol::NvmeTcp(p) => p.setup_pending(conn_id),
             MultiProtocol::Http2(p) | MultiProtocol::Grpc(p) => p.setup_pending(conn_id),
             MultiProtocol::ClickHouse(p) => p.setup_pending(conn_id),
+            MultiProtocol::Stream(p) => p.setup_pending(conn_id),
         }
     }
 
@@ -238,6 +248,7 @@ impl Protocol for MultiProtocol {
             MultiProtocol::NvmeTcp(p) => p.preload_pending(conn_id),
             MultiProtocol::Http2(p) | MultiProtocol::Grpc(p) => p.preload_pending(conn_id),
             MultiProtocol::ClickHouse(p) => p.preload_pending(conn_id),
+            MultiProtocol::Stream(p) => p.preload_pending(conn_id),
         }
     }
 
@@ -253,6 +264,7 @@ impl Protocol for MultiProtocol {
             MultiProtocol::NvmeTcp(p) => p.connection_roles(load),
             MultiProtocol::Http2(p) | MultiProtocol::Grpc(p) => p.connection_roles(load),
             MultiProtocol::ClickHouse(p) => p.connection_roles(load),
+            MultiProtocol::Stream(p) => p.connection_roles(load),
         }
     }
 
@@ -268,6 +280,7 @@ impl Protocol for MultiProtocol {
             MultiProtocol::NvmeTcp(p) => p.bind_connections(conn_ids),
             MultiProtocol::Http2(p) | MultiProtocol::Grpc(p) => p.bind_connections(conn_ids),
             MultiProtocol::ClickHouse(p) => p.bind_connections(conn_ids),
+            MultiProtocol::Stream(p) => p.bind_connections(conn_ids),
         }
     }
 
@@ -283,6 +296,7 @@ impl Protocol for MultiProtocol {
             MultiProtocol::NvmeTcp(p) => p.drain_outbox(conn_id, outbox),
             MultiProtocol::Http2(p) | MultiProtocol::Grpc(p) => p.drain_outbox(conn_id, outbox),
             MultiProtocol::ClickHouse(p) => p.drain_outbox(conn_id, outbox),
+            MultiProtocol::Stream(p) => p.drain_outbox(conn_id, outbox),
         }
     }
 
@@ -298,6 +312,55 @@ impl Protocol for MultiProtocol {
             MultiProtocol::NvmeTcp(p) => p.verification_report(),
             MultiProtocol::Http2(p) | MultiProtocol::Grpc(p) => p.verification_report(),
             MultiProtocol::ClickHouse(p) => p.verification_report(),
+            MultiProtocol::Stream(p) => p.verification_report(),
+        }
+    }
+
+    fn accepts_unsolicited_responses(&self) -> bool {
+        match self {
+            MultiProtocol::Redis(p) => p.accepts_unsolicited_responses(),
+            MultiProtocol::MemcachedBinary(p) => p.accepts_unsolicited_responses(),
+            MultiProtocol::MemcachedAscii(p) => p.accepts_unsolicited_responses(),
+            MultiProtocol::Http(p) => p.accepts_unsolicited_responses(),
+            MultiProtocol::XylemEcho(p) => p.accepts_unsolicited_responses(),
+            MultiProtocol::Masstree(p) => p.accepts_unsolicited_responses(),
+            MultiProtocol::Dns(p) => p.accepts_unsolicited_responses(),
+            MultiProtocol::NvmeTcp(p) => p.accepts_unsolicited_responses(),
+            MultiProtocol::Http2(p) | MultiProtocol::Grpc(p) => p.accepts_unsolicited_responses(),
+            MultiProtocol::ClickHouse(p) => p.accepts_unsolicited_responses(),
+            MultiProtocol::Stream(p) => p.accepts_unsolicited_responses(),
+        }
+    }
+
+    fn is_done(&self) -> bool {
+        match self {
+            MultiProtocol::Redis(p) => p.is_done(),
+            MultiProtocol::MemcachedBinary(p) => p.is_done(),
+            MultiProtocol::MemcachedAscii(p) => p.is_done(),
+            MultiProtocol::Http(p) => p.is_done(),
+            MultiProtocol::XylemEcho(p) => p.is_done(),
+            MultiProtocol::Masstree(p) => p.is_done(),
+            MultiProtocol::Dns(p) => p.is_done(),
+            MultiProtocol::NvmeTcp(p) => p.is_done(),
+            MultiProtocol::Http2(p) | MultiProtocol::Grpc(p) => p.is_done(),
+            MultiProtocol::ClickHouse(p) => p.is_done(),
+            MultiProtocol::Stream(p) => p.is_done(),
+        }
+    }
+
+    fn on_measurement_start(&mut self) {
+        match self {
+            MultiProtocol::Redis(p) => p.on_measurement_start(),
+            MultiProtocol::MemcachedBinary(p) => p.on_measurement_start(),
+            MultiProtocol::MemcachedAscii(p) => p.on_measurement_start(),
+            MultiProtocol::Http(p) => p.on_measurement_start(),
+            MultiProtocol::XylemEcho(p) => p.on_measurement_start(),
+            MultiProtocol::Masstree(p) => p.on_measurement_start(),
+            MultiProtocol::Dns(p) => p.on_measurement_start(),
+            MultiProtocol::NvmeTcp(p) => p.on_measurement_start(),
+            MultiProtocol::Http2(p) | MultiProtocol::Grpc(p) => p.on_measurement_start(),
+            MultiProtocol::ClickHouse(p) => p.on_measurement_start(),
+            MultiProtocol::Stream(p) => p.on_measurement_start(),
         }
     }
 }

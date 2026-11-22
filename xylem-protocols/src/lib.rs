@@ -16,6 +16,7 @@ pub mod masstree;
 pub mod memcached;
 pub mod nvme_tcp;
 pub mod redis;
+pub mod stream;
 pub mod workload;
 pub mod xylem_echo;
 
@@ -26,7 +27,8 @@ pub use configs::{
     MasstreeCommandParams, MasstreeConfig, MasstreeOperationsConfig, MasstreeScanConfig,
     MemcachedCommandParams, MemcachedConfig, MemcachedOperationsConfig, OperationWeight,
     OperationsConfig, RedisAuthConfig, RedisCommandParams, RedisCommandWeight, RedisConfig,
-    RedisOperationsConfig, SizeWeight, ValueSizeConfig, XylemEchoConfig,
+    RedisOperationsConfig, SizeWeight, StreamConfig, StreamDirection, ValueSizeConfig,
+    XylemEchoConfig,
 };
 pub use dns::{DnsConfig, DnsFraming, DnsProtocol};
 pub use http::HttpMethod;
@@ -37,6 +39,7 @@ pub use memcached::{MemcachedAsciiProtocol, MemcachedBinaryProtocol};
 pub use nvme_tcp::{NvmeAccess, NvmeTcpConfig, NvmeTcpProtocol};
 pub use redis::command_template::CommandTemplate;
 pub use redis::{RedisOp, RedisProtocol};
+pub use stream::{check_stream_pattern, fill_stream_pattern, stream_pattern_word, StreamProtocol};
 pub use workload::selector::{
     CommandSelector, FixedCommandSelector, KeyGenerator, WeightedCommandSelector,
 };

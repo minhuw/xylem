@@ -200,6 +200,7 @@ fn protocol_schema(protocol: ProtocolKind) -> Schema {
         ProtocolKind::Dns => Schema::of::<xylem_protocols::DnsConfig>(),
         ProtocolKind::NvmeTcp => Schema::of::<xylem_protocols::NvmeTcpConfig>(),
         ProtocolKind::ClickHouse => Schema::of::<xylem_protocols::ClickHouseConfig>(),
+        ProtocolKind::Stream => Schema::of::<xylem_protocols::StreamConfig>(),
         ProtocolKind::XylemEcho => Schema::of::<xylem_protocols::XylemEchoConfig>(),
     }
 }

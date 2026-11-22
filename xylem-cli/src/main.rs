@@ -215,7 +215,17 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
     if let Some(seed) = config.experiment.seed {
         tracing::info!("Seed: {} (reproducible mode)", seed);
     }
-    tracing::info!("Duration: {:?}", config.experiment.duration);
+    if let Some(duration) = config.experiment.duration {
+        tracing::info!("Duration: {:?}", duration);
+    } else {
+        tracing::info!("Duration: unbounded (byte-limited stream)");
+    }
+    if !config.experiment.warmup.is_zero() {
+        tracing::info!("Warmup: {:?}", config.experiment.warmup);
+    }
+    if !config.experiment.idle_hold.is_zero() {
+        tracing::info!("Idle hold: {:?}", config.experiment.idle_hold);
+    }
 
     // Display traffic groups information
     tracing::info!("Traffic groups: {}", config.traffic_groups.len());
@@ -262,6 +272,8 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
         xylem_core::traffic_group::ThreadGroupAssignment::from_configs(&config.traffic_groups);
     let thread_ids = thread_assignment.thread_ids();
     let _num_threads = thread_ids.len();
+    let idle_hold_barrier = (!config.experiment.idle_hold.is_zero() && thread_ids.len() > 1)
+        .then(|| Arc::new(std::sync::Barrier::new(thread_ids.len())));
 
     // Configure CPU pinning based on thread IDs
     // Thread IDs are used directly as CPU core IDs for pinning
@@ -525,7 +537,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
 
         let worker_config = WorkerConfig {
             target: default_target,
-            duration,
+            duration: duration.unwrap_or(std::time::Duration::ZERO),
             conn_count: total_conn_count,
             max_pending_per_conn: 1, // This will be overridden per-group
             drain_timeout: config_for_worker.experiment.drain_timeout,
@@ -569,6 +581,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
             on_errors: &[(usize, xylem_core::traffic_group::OnError)],
             max_requests_per_connection: &[(usize, Option<u64>)],
             experiment: &config::ExperimentConfig,
+            idle_hold_barrier: Option<Arc<std::sync::Barrier>>,
             start: StartTicket,
         ) -> xylem_core::Result<(S, WorkerReport)>
         where
@@ -591,6 +604,9 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
             worker.set_busy_poll(experiment.busy_poll());
             worker.set_setup_timeout(experiment.setup_timeout);
             worker.set_tx_timestamp_timeout(experiment.tx_timestamp_timeout);
+            worker.set_warmup(experiment.warmup);
+            worker.set_idle_hold(experiment.idle_hold, idle_hold_barrier);
+            worker.set_unbounded_duration(experiment.duration.is_none());
 
             worker.run_with_start(start)?;
             let calibration = worker
@@ -600,6 +616,8 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
             let verification = worker.verification_reports();
             Ok((worker.into_stats(), (calibration, local_addrs, verification)))
         }
+
+        let idle_hold_barrier = idle_hold_barrier.clone();
 
         // Select transport factory based on thread's transport
         let result = match thread_transport {
@@ -623,6 +641,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
                     &on_errors,
                     &max_requests_per_connection,
                     &config_for_worker.experiment,
+                    idle_hold_barrier,
                     start,
                 )
             }
@@ -646,6 +665,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
                     &on_errors,
                     &max_requests_per_connection,
                     &config_for_worker.experiment,
+                    idle_hold_barrier,
                     start,
                 )
             }
@@ -685,6 +705,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
                     &on_errors,
                     &max_requests_per_connection,
                     &config_for_worker.experiment,
+                    idle_hold_barrier,
                     start,
                 )
             }
@@ -721,6 +742,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
                             &on_errors,
                             &max_requests_per_connection,
                             &config_for_worker.experiment,
+                            idle_hold_barrier,
                             start,
                         )
                     }
@@ -749,6 +771,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
                             &on_errors,
                             &max_requests_per_connection,
                             &config_for_worker.experiment,
+                            idle_hold_barrier,
                             start,
                         )
                     }
@@ -780,6 +803,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
                             &on_errors,
                             &max_requests_per_connection,
                             &config_for_worker.experiment,
+                            idle_hold_barrier,
                             start,
                         )
                     }
@@ -852,6 +876,8 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
     };
 
     // Build detailed results (used for all formats except Human)
+    let reported_duration =
+        duration.unwrap_or_else(|| stats.measured_duration().unwrap_or(std::time::Duration::ZERO));
     let mut detailed_results = output::DetailedExperimentResults::from_tuple_stats(
         config.experiment.name.clone(),
         config.experiment.description.clone(),
@@ -859,7 +885,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
         target_address_string,
         output_protocol,
         output_transport,
-        duration,
+        reported_duration,
         &stats,
         &config.traffic_groups,
         config.stats.include_records,

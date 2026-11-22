@@ -32,6 +32,7 @@ fn page_protocol(path: &Path) -> &'static str {
         Some("dns") => "dns",
         Some("masstree") => "masstree",
         Some("memcached") => "memcached-ascii",
+        Some("stream") => "stream",
         _ => "redis",
     }
 }

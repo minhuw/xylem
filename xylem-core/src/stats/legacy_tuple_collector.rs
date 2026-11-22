@@ -1468,6 +1468,18 @@ impl TupleStatsCollector {
             } else {
                 0.0
             },
+            tx_bytes: total_tx_bytes,
+            rx_bytes: total_rx_bytes,
+            tx_mbps: if duration_secs > 0.0 {
+                (total_tx_bytes as f64 * 8.0) / (duration_secs * 1_000_000.0)
+            } else {
+                0.0
+            },
+            rx_mbps: if duration_secs > 0.0 {
+                (total_rx_bytes as f64 * 8.0) / (duration_secs * 1_000_000.0)
+            } else {
+                0.0
+            },
             total_requests,
         }
     }

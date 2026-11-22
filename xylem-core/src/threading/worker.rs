@@ -141,6 +141,17 @@ pub struct Worker<G: ConnectionGroup, P: Protocol, S: StatsRecorder = TupleStats
     /// start of the run, in deadline order. Entries of connections whose
     /// setup finished are pruned once their deadline passes.
     setup_deadlines: VecDeque<(u64, usize)>,
+    /// Optional time-based warm-up before the measurement window starts
+    warmup: Duration,
+    /// Whether the worker is currently inside the time-based warm-up loop
+    in_warmup: bool,
+    /// Optional quiescent hold after the last response is drained, before closing
+    idle_hold: Duration,
+    /// Optional barrier synchronizing all worker threads entering `idle_hold`
+    idle_hold_barrier: Option<Arc<std::sync::Barrier>>,
+    /// True when no fixed duration bounds the measurement loop (stops once
+    /// every protocol reports `is_done()` and all writes/responses are drained)
+    unbounded_duration: bool,
 }
 
 impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
@@ -240,6 +251,11 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             last_io_ns: 0,
             setup_timeout: DEFAULT_SETUP_TIMEOUT,
             setup_deadlines: VecDeque::new(),
+            warmup: Duration::ZERO,
+            in_warmup: false,
+            idle_hold: Duration::ZERO,
+            idle_hold_barrier: None,
+            unbounded_duration: false,
         }
     }
 
@@ -326,6 +342,28 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
     /// without it.
     pub fn set_busy_poll(&mut self, budget: Option<Duration>) {
         self.busy_poll_ns = budget.map(|budget| budget.as_nanos().min(u64::MAX as u128) as u64);
+    }
+
+    /// Set time-based warm-up duration before measurement starts (default `0s`).
+    /// During warm-up, requests are sent and responses polled normally without
+    /// recording stats; `Protocol::on_measurement_start()` is invoked when the
+    /// measurement window begins.
+    pub fn set_warmup(&mut self, warmup: Duration) {
+        self.warmup = warmup;
+    }
+
+    /// Set quiescent hold duration after draining responses and before closing
+    /// connections (default `0s`). When `barrier` is provided, all worker
+    /// threads wait on it before starting the hold timer.
+    pub fn set_idle_hold(&mut self, idle_hold: Duration, barrier: Option<Arc<std::sync::Barrier>>) {
+        self.idle_hold = idle_hold;
+        self.idle_hold_barrier = barrier;
+    }
+
+    /// Disable the fixed experiment duration timer (for byte-limited runs that
+    /// terminate once every protocol reports [`Protocol::is_done`]).
+    pub fn set_unbounded_duration(&mut self, unbounded: bool) {
+        self.unbounded_duration = unbounded;
     }
 
     /// `timeout`, or no wait while busy polling at `now_ns`
@@ -426,24 +464,91 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
                 measure_ns
             }
         };
-        self.stats.start_measurement(start_ns);
+        let warmup_ns = self.warmup.as_nanos().min(u64::MAX as u128) as u64;
+        let measure_start_ns = if warmup_ns > 0 {
+            let warmup_end_ns = start_ns.saturating_add(warmup_ns);
+            self.in_warmup = true;
+            let warmup_result = loop {
+                let now_ns = timing::time_ns();
+                if now_ns >= warmup_end_ns {
+                    break Ok(());
+                }
+                if self.unbounded_duration && self.all_connections_closed() {
+                    break Err(crate::Error::Connection(
+                        "All connections closed during warm-up".to_string(),
+                    ));
+                }
+                match self.send_requests_before(warmup_end_ns) {
+                    Ok(0) => {}
+                    Ok(_) => self.last_io_ns = now_ns,
+                    Err(error) => break Err(error),
+                }
+                let now_ns = timing::time_ns();
+                let poll_timeout = self.poll_timeout(now_ns, warmup_end_ns);
+                let poll_timeout = self.busy_poll_timeout(poll_timeout, now_ns);
+                if let Err(error) = self.process_responses(poll_timeout) {
+                    break Err(error);
+                }
+                if !self.ready_ids.is_empty() {
+                    self.last_io_ns = now_ns;
+                }
+                let now_ns = timing::time_ns();
+                if let Err(error) = self.expire_requests(now_ns) {
+                    break Err(error);
+                }
+                if let Err(error) = self.check_setup_deadlines(now_ns) {
+                    break Err(error);
+                }
+            };
+            self.in_warmup = false;
+            warmup_result?;
+            warmup_end_ns
+        } else {
+            start_ns
+        };
+
+        for protocol in self.protocols.values_mut() {
+            protocol.on_measurement_start();
+        }
+        self.reschedule_all_connections();
+
+        self.stats.start_measurement(measure_start_ns);
         let actual_start_us = wall_clock_us();
 
-        let duration_ns = self.config.duration.as_nanos().min(u64::MAX as u128) as u64;
-        let end_ns = start_ns.saturating_add(duration_ns);
+        let end_ns = if self.unbounded_duration {
+            u64::MAX
+        } else {
+            let duration_ns = self.config.duration.as_nanos().min(u64::MAX as u128) as u64;
+            measure_start_ns.saturating_add(duration_ns)
+        };
 
+        let mut stopped_early = false;
         let loop_result = loop {
             let now_ns = timing::time_ns();
 
-            // Check if duration exceeded
-            if now_ns >= end_ns {
+            // Check if duration exceeded or all protocols completed their work quota
+            if !self.unbounded_duration && now_ns >= end_ns {
                 break Ok(());
+            }
+            if self.all_protocols_done() {
+                stopped_early = true;
+                break Ok(());
+            }
+            if self.unbounded_duration && self.all_connections_closed() {
+                break Err(crate::Error::Connection(
+                    "All connections closed before work completed".to_string(),
+                ));
             }
 
             match self.send_requests_before(end_ns) {
                 Ok(0) => {}
                 Ok(_) => self.last_io_ns = now_ns,
                 Err(error) => break Err(error),
+            }
+
+            if self.all_protocols_done() {
+                stopped_early = true;
+                break Ok(());
             }
 
             // RECEIVE PHASE: Poll all connections for responses (single syscall)
@@ -457,6 +562,10 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             }
             if !self.ready_ids.is_empty() {
                 self.last_io_ns = now_ns;
+            }
+            if self.all_protocols_done() {
+                stopped_early = true;
+                break Ok(());
             }
             let now_ns = timing::time_ns();
             if let Err(error) = self.expire_requests(now_ns) {
@@ -478,9 +587,11 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         let actual_end_us = wall_clock_us();
         self.stats.record_actual_load_loop_samples(actual_start_us, actual_end_us);
         loop_result?;
-        self.window_closed_ns = Some(timing::time_ns());
-        self.stats.end_measurement(end_ns);
-        self.record_unsent(end_ns);
+        let now_closed_ns = timing::time_ns();
+        let actual_end_ns = if stopped_early { now_closed_ns } else { end_ns };
+        self.window_closed_ns = Some(now_closed_ns);
+        self.stats.end_measurement(actual_end_ns);
+        self.record_unsent(actual_end_ns);
 
         // Stop sending and wait for the responses still pending, and for the
         // TX timestamps of those that came first
@@ -490,10 +601,81 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         self.record_deferred();
         self.check_setup_done()?;
 
+        // Optional quiescent hold before tearing down connections
+        self.run_idle_hold()?;
+
         // Close all connections
         self.pool.close_all()?;
 
         Ok(())
+    }
+
+    /// Reschedule every connection whose pool state and protocol allow sending
+    fn reschedule_all_connections(&mut self) {
+        for connection_id in self.pool.connection_ids().to_vec() {
+            let Some(state) = self.pool.get_state(connection_id) else {
+                continue;
+            };
+            let protocol =
+                self.protocols.get(&state.group_id()).expect("Protocol not found for group_id");
+            self.pool.try_schedule_connection(connection_id, protocol);
+        }
+    }
+
+    /// True when every protocol has completed its configured work quota and no
+    /// connection still has queued writes or pending responses.
+    fn all_protocols_done(&self) -> bool {
+        !self.protocols.is_empty()
+            && self.protocols.values().all(Protocol::is_done)
+            && self.pool.connection_ids().iter().all(|&id| {
+                self.pool
+                    .get_state(id)
+                    .is_none_or(|s| s.pending_count() == 0 && !s.has_queued_writes())
+            })
+    }
+
+    /// True when every connection in the pool has been closed.
+    fn all_connections_closed(&self) -> bool {
+        self.pool
+            .connection_ids()
+            .iter()
+            .all(|&id| self.pool.get_state(id).is_none_or(|s| s.is_closed()))
+    }
+
+    /// Quiescent post-run hold: keeps connections open while polling the
+    /// transport and discarding any inbound bytes until `idle_hold` elapses.
+    fn run_idle_hold(&mut self) -> Result<()> {
+        if self.idle_hold.is_zero() {
+            return Ok(());
+        }
+        self.pool.clear_write_interest_all();
+        if let Some(barrier) = &self.idle_hold_barrier {
+            barrier.wait();
+        }
+        let hold_ns = self.idle_hold.as_nanos().min(u64::MAX as u128) as u64;
+        let hold_end_ns = timing::time_ns().saturating_add(hold_ns);
+        let mut ready_ids = std::mem::take(&mut self.ready_ids);
+        let result = loop {
+            let now_ns = timing::time_ns();
+            if now_ns >= hold_end_ns {
+                break Ok(());
+            }
+            let remaining_ns = hold_end_ns.saturating_sub(now_ns);
+            let poll_timeout = Duration::from_nanos(remaining_ns.min(10_000_000));
+            if let Err(err) = self.pool.poll(poll_timeout, &mut ready_ids) {
+                break Err(err);
+            }
+            for &connection_id in &ready_ids {
+                if let Err(err) = self.pool.discard_inbound(connection_id) {
+                    ready_ids.clear();
+                    self.ready_ids = ready_ids;
+                    return Err(err);
+                }
+            }
+        };
+        ready_ids.clear();
+        self.ready_ids = ready_ids;
+        result
     }
 
     /// Whether a connection has preload work; see [`Protocol::preload_pending`]
@@ -623,6 +805,7 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         // With N connections and depth D, we should need at most N*D sends to fill all pipelines
         let max_sends_per_iteration = self.pool.connection_count() * 16; // Allow generous headroom
         let mut sends_this_iteration = 0;
+        let mut saw_one_way = false;
         // The round's first connection, until its requests went out
         let mut first_connection = None;
 
@@ -644,13 +827,14 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             let group_id = state.group_id();
             let needs_reconnect = state.needs_reconnect();
             let preloading = self.pool.is_preloading();
-            if preloading {
-                // The protocol's state may have changed since the connection
-                // was scheduled: another connection may have taken the last
-                // of a shared insert phase
+            {
                 let protocol =
                     self.protocols.get(&group_id).expect("Protocol not found for group_id");
-                if !protocol.setup_pending(connection_id)
+                if protocol.is_done() {
+                    continue;
+                }
+                if preloading
+                    && !protocol.setup_pending(connection_id)
                     && !protocol.preload_pending(connection_id)
                 {
                     // Held until the measured run starts
@@ -682,8 +866,9 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
                 }
             }
 
-            let was_setup =
+            let (was_setup, is_one_way) =
                 self.queue_next_request(connection_id, group_id, intended_ns, connect_start_ts)?;
+            saw_one_way |= is_one_way;
 
             if !was_setup && !preloading {
                 self.pool.on_request_sent(pick, timing::time_ns());
@@ -700,11 +885,16 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             self.pool.try_schedule_connection(connection_id, protocol);
 
             sends_this_iteration += 1;
+            if saw_one_way && end_ns != u64::MAX && timing::time_ns() >= end_ns {
+                break;
+            }
             if sends_this_iteration >= max_sends_per_iteration {
-                eprintln!(
-                    "[WARN] Hit send limit ({}) in one iteration - forcing receive phase",
-                    max_sends_per_iteration
-                );
+                if !saw_one_way {
+                    eprintln!(
+                        "[WARN] Hit send limit ({}) in one iteration - forcing receive phase",
+                        max_sends_per_iteration
+                    );
+                }
                 break;
             }
         }
@@ -745,14 +935,14 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
     }
 
     /// Ask `group_id`'s protocol for its next request on `connection_id` and
-    /// queue it on the pool. Returns `true` if it was a setup request.
+    /// queue it on the pool. Returns `(was_setup, is_one_way)`.
     fn queue_next_request(
         &mut self,
         connection_id: usize,
         group_id: usize,
         intended_ns: Option<u64>,
         connect_start_ts: Option<xylem_transport::Timestamp>,
-    ) -> Result<bool> {
+    ) -> Result<(bool, bool)> {
         let is_control = self
             .pool
             .get_state(connection_id)
@@ -782,7 +972,7 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             // Connection setup (a handshake, AUTH, ...) may carry
             // credentials: it is never dumped, measured or scheduled.
             self.pool.queue_setup(connection_id, &request.data, request.request_id)?;
-            Ok(true)
+            Ok((true, false))
         } else {
             // Record request to dump file if enabled
             if let Some(ref dumper) = self.request_dumper {
@@ -790,19 +980,32 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
                 self.record_request(dumper, group_id, connection_id, &request.data, &req_id_str);
             }
 
-            // Queue the request (track warmup status for response
-            // handling); it is sent, and its stats recorded, when the
-            // transport takes it. An open-loop request's latency starts
-            // at its intended send time. Preload follows no schedule.
-            self.pool.queue_request_with_connect(
-                connection_id,
-                &request.data,
-                request.request_id,
-                request.metadata.is_warmup,
-                intended_ns,
-                connect_start_ts,
-            )?;
-            Ok(false)
+            let is_warmup = request.metadata.is_warmup || self.in_warmup;
+            if !request.metadata.expects_response {
+                self.pool.queue_one_way(
+                    connection_id,
+                    &request.data,
+                    request.request_id,
+                    is_warmup,
+                    intended_ns,
+                    connect_start_ts,
+                )?;
+                Ok((false, true))
+            } else {
+                // Queue the request (track warmup status for response
+                // handling); it is sent, and its stats recorded, when the
+                // transport takes it. An open-loop request's latency starts
+                // at its intended send time. Preload follows no schedule.
+                self.pool.queue_request_with_connect(
+                    connection_id,
+                    &request.data,
+                    request.request_id,
+                    is_warmup,
+                    intended_ns,
+                    connect_start_ts,
+                )?;
+                Ok((false, false))
+            }
         }
     }
 
@@ -814,14 +1017,29 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         flushed
     }
 
-    /// Record the stats of the measurement requests the transport took
+    /// Record the stats of the measurement requests the transport took, and
+    /// reschedule connections whose one-way writes completed
     fn record_sent(&mut self) {
         self.pool.take_sent(&mut self.sent);
+        let mut reschedule = Vec::new();
         for sent in &self.sent {
-            if sent.measured {
-                self.stats.record_tx_bytes(sent.group_id, sent.connection_id, sent.bytes);
-                self.stats.record_sent(sent.group_id, sent.connection_id, sent.lag);
+            if sent.expects_response {
+                if sent.measured {
+                    self.stats.record_tx_bytes(sent.group_id, sent.connection_id, sent.bytes);
+                    self.stats.record_sent(sent.group_id, sent.connection_id, sent.lag);
+                }
+            } else {
+                if sent.measured && !self.in_warmup && self.window_closed_ns.is_none() {
+                    self.stats.record_tx_bytes(sent.group_id, sent.connection_id, sent.bytes);
+                }
+                if self.window_closed_ns.is_none() {
+                    reschedule.push((sent.connection_id, sent.group_id));
+                }
             }
+        }
+        for (connection_id, group_id) in reschedule {
+            let protocol = self.protocols.get(&group_id).expect("Protocol not found for group_id");
+            self.pool.try_schedule_connection(connection_id, protocol);
         }
     }
 
@@ -847,7 +1065,11 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             end_ns
         };
         let end_ns = self.setup_deadlines.front().map_or(end_ns, |&(next, _)| next.min(end_ns));
-        let remaining_ns = end_ns.saturating_sub(now_ns);
+        let remaining_ns = if end_ns == u64::MAX {
+            100_000_000
+        } else {
+            end_ns.saturating_sub(now_ns)
+        };
         let wait_ns = if self.pool.has_ready(now_ns) {
             0
         } else {
@@ -913,24 +1135,44 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
                 _ => continue,
             };
 
-            // Skip connections with no pending requests. A datagram connection
-            // is still read, so late or stray datagrams do not keep it ready.
-            if state.pending_count() == 0 && !self.pool.is_datagram() {
+            // Skip connections with no pending requests unless the protocol
+            // accepts unsolicited server payloads (e.g. receive-only stream)
+            // or is still in setup. A datagram connection is always read so
+            // late or stray datagrams do not keep it ready.
+            let group_id = state.group_id();
+            let (accepts_unsolicited, setup_pending) = {
+                let protocol =
+                    self.protocols.get(&group_id).expect("Protocol not found for group_id");
+                (protocol.accepts_unsolicited_responses(), protocol.setup_pending(connection_id))
+            };
+            if state.pending_count() == 0
+                && !setup_pending
+                && !accepts_unsolicited
+                && !self.pool.is_datagram()
+            {
                 continue;
             }
-
-            let group_id = state.group_id();
 
             let responses = {
                 let protocol =
                     self.protocols.get_mut(&group_id).expect("Protocol not found for group_id");
                 let preloading = self.pool.is_preloading();
-                match self.pool.recv_responses(connection_id, |data| {
-                    let name = protocol.name();
-                    let parsed = protocol.parse_response(connection_id, data);
-                    reject_preload_error(preloading, parsed, group_id, connection_id, name)
-                }) {
+                let outcome = self.pool.recv_responses_with_options(
+                    connection_id,
+                    accepts_unsolicited,
+                    |data| {
+                        let name = protocol.name();
+                        let parsed = protocol.parse_response(connection_id, data);
+                        reject_preload_error(preloading, parsed, group_id, connection_id, name)
+                    },
+                );
+                let done = accepts_unsolicited && protocol.is_done();
+                match outcome {
                     Ok(responses) => responses,
+                    Err(crate::Error::Connection(_)) if done => {
+                        let _ = self.pool.close(connection_id);
+                        continue;
+                    }
                     Err(e @ crate::Error::Connection(_)) => {
                         self.close_failed(connection_id, group_id, e)?;
                         continue;
@@ -942,6 +1184,10 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             };
 
             for response in responses {
+                if response.unsolicited {
+                    self.record_unsolicited_response(group_id, connection_id, &response);
+                    continue;
+                }
                 // A deferred response is recorded once its TX timestamp arrives
                 if response.is_warmup || response.deferred {
                     continue;
@@ -1022,6 +1268,23 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         self.expire_connects(timing::time_ns())?;
 
         Ok(())
+    }
+
+    /// Record an unsolicited response payload (e.g. receive-only stream)
+    fn record_unsolicited_response(
+        &mut self,
+        group_id: usize,
+        connection_id: usize,
+        response: &crate::connection::Completion<P::RequestId>,
+    ) {
+        if self.in_warmup || self.window_closed_ns.is_some() {
+            return;
+        }
+        self.stats.record_rx_bytes(group_id, connection_id, response.bytes_consumed);
+        if let Some(kind) = response.error {
+            let kind = self.pool.error_kind(connection_id, kind);
+            self.stats.record_error_reply(group_id, connection_id, kind, Duration::ZERO);
+        }
     }
 
     /// Complete an in-progress non-blocking reconnect once `poll()` reports it ready.
@@ -1138,6 +1401,7 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         sent?;
         // Before the measured run, nothing is recorded
         if !self.pool.is_preloading()
+            && !self.in_warmup
             && self.pool.get_state(connection_id).is_some_and(|state| !state.is_control())
         {
             self.stats.record_tx_bytes(group_id, connection_id, len);
@@ -4523,5 +4787,236 @@ mod tests {
             assert!(!worker.pool.get_state(0).unwrap().is_connecting());
             assert!(worker.stats.request_counts_global().unsent >= 1, "{scheduler_kind}");
         }
+    }
+
+    #[derive(Default)]
+    struct OneWayProtocol {
+        next_id: u64,
+        chunk_size: usize,
+        limit: Option<u64>,
+        in_measurement: bool,
+        measured_bytes: u64,
+        measurement_starts: usize,
+    }
+
+    impl Protocol for OneWayProtocol {
+        type RequestId = u64;
+
+        fn next_request(&mut self, _: usize) -> Request<u64> {
+            let id = self.next_id;
+            self.next_id += 1;
+            let len = if self.in_measurement {
+                self.limit.map_or(self.chunk_size, |l| {
+                    (self.chunk_size as u64).min(l.saturating_sub(self.measured_bytes)) as usize
+                })
+            } else {
+                self.chunk_size
+            };
+            if self.in_measurement {
+                self.measured_bytes += len as u64;
+            }
+            let data = vec![0x5Au8; len];
+            if self.in_measurement {
+                Request::one_way(data, id)
+            } else {
+                Request::one_way_warmup(data, id)
+            }
+        }
+
+        fn parse_response<'a>(&mut self, _: usize, _: &'a [u8]) -> anyhow::Result<Parsed<'a, u64>> {
+            Ok(Parsed::Incomplete)
+        }
+
+        fn can_send(&self, _: usize) -> bool {
+            !(self.in_measurement && self.limit.is_some_and(|l| self.measured_bytes >= l))
+        }
+
+        fn is_done(&self) -> bool {
+            self.in_measurement && self.limit.is_some_and(|l| self.measured_bytes >= l)
+        }
+
+        fn on_measurement_start(&mut self) {
+            self.in_measurement = true;
+            self.measured_bytes = 0;
+            self.measurement_starts += 1;
+        }
+
+        fn name(&self) -> &'static str {
+            "OneWay"
+        }
+
+        fn reset(&mut self) {
+            self.next_id = 0;
+            self.in_measurement = false;
+            self.measured_bytes = 0;
+        }
+    }
+
+    #[test]
+    fn one_way_request_completes_without_pending_map_and_reschedules_under_backpressure() {
+        let factory = FakeFactory::default();
+        let io = factory.0.clone();
+        // Allow only 4 bytes initially so the first 16-byte one-way chunk hits backpressure
+        io.lock().unwrap().capacity = Some(4);
+
+        let mut stats = TupleStatsCollector::default();
+        stats.register_group_policy(0, SamplingPolicy::None);
+        let config = WorkerConfig {
+            target: "127.0.0.1:1".parse().unwrap(),
+            duration: Duration::from_secs(1),
+            conn_count: 1,
+            max_pending_per_conn: 16,
+            drain_timeout: FAKE_DRAIN_TIMEOUT,
+        };
+        let mut proto = OneWayProtocol {
+            chunk_size: 16,
+            limit: Some(32),
+            ..Default::default()
+        };
+        proto.on_measurement_start();
+        let mut worker = Worker::new(
+            &factory,
+            proto,
+            stats,
+            config,
+            Box::new(UniformPolicyScheduler::closed_loop()),
+        )
+        .unwrap();
+        worker.anchor_schedules(timing::time_ns());
+
+        // First send round queues one chunk, writes 4 bytes, blocks on backpressure
+        worker.send_requests().unwrap();
+        let state = worker.pool.get_state(0).unwrap();
+        assert!(state.is_write_blocked());
+        // Must not insert into pending_map and must not accept another chunk while blocked
+        assert_eq!(state.measured_pending_count(), 0);
+        assert_eq!(state.pending_count(), 1);
+        assert!(!state.can_send());
+        // No tx_bytes counted until the chunk actually completes writing
+        assert_eq!(worker.stats.aggregate_global(Duration::from_secs(1)).tx_bytes, 0);
+
+        // Unblock transport: process_responses writes remaining 12 bytes, records tx_bytes,
+        // and reschedules conn 0 even though pending_count() drops to 0!
+        {
+            let mut guard = io.lock().unwrap();
+            guard.capacity = None;
+            guard.writable = true;
+        }
+        worker.process_responses(Duration::ZERO).unwrap();
+        let state = worker.pool.get_state(0).unwrap();
+        assert!(!state.is_write_blocked());
+        assert_eq!(state.pending_count(), 0);
+        assert!(state.is_on_heap(), "one-way completion must reschedule connection");
+        assert_eq!(worker.stats.aggregate_global(Duration::from_secs(1)).tx_bytes, 16);
+
+        // Second send round completes the remaining 16 bytes and hits byte limit
+        worker.send_requests().unwrap();
+        assert!(worker.all_protocols_done());
+        assert_eq!(worker.stats.aggregate_global(Duration::from_secs(1)).tx_bytes, 32);
+        assert_eq!(worker.stats.request_counts_global().sent, 0);
+    }
+
+    #[test]
+    fn time_based_warmup_suppresses_stats_and_invokes_on_measurement_start() {
+        let factory = FakeFactory::default();
+        let mut stats = TupleStatsCollector::default();
+        stats.register_group_policy(0, SamplingPolicy::None);
+        let config = WorkerConfig {
+            target: "127.0.0.1:1".parse().unwrap(),
+            duration: Duration::from_secs(5),
+            conn_count: 1,
+            max_pending_per_conn: 1,
+            drain_timeout: FAKE_DRAIN_TIMEOUT,
+        };
+        let proto = OneWayProtocol {
+            chunk_size: 1024,
+            limit: Some(4096),
+            ..Default::default()
+        };
+        let mut worker = Worker::new(
+            &factory,
+            proto,
+            stats,
+            config,
+            Box::new(UniformPolicyScheduler::closed_loop()),
+        )
+        .unwrap();
+        worker.set_warmup(Duration::from_millis(30));
+        worker.set_unbounded_duration(true);
+        worker.run().unwrap();
+
+        let proto = worker.protocols.get(&0).unwrap();
+        assert_eq!(proto.measurement_starts, 1);
+        assert!(proto.is_done());
+
+        // Total bytes sent on the wire must exceed 4096 (warmup + 4096 measured)
+        let wire_bytes: usize = factory.0.lock().unwrap().sent.iter().map(Vec::len).sum();
+        assert!(
+            wire_bytes > 4096,
+            "expected warmup traffic before measurement, got {wire_bytes}"
+        );
+
+        // Measured stats must contain ONLY the 4096 measurement bytes
+        let agg = worker.stats.aggregate_global(Duration::from_secs(1));
+        assert_eq!(agg.tx_bytes, 4096);
+    }
+
+    #[test]
+    fn idle_hold_waits_polls_and_discards_inbound_without_late_responses() {
+        let factory = FakeFactory::default();
+        let io = factory.0.clone();
+        // Queue a stray inbound frame that arrives during idle_hold
+        io.lock().unwrap().responses.push_back(Ok(vec![1, 2, 3, 4, 5, 6, 7, 8]));
+
+        let mut stats = TupleStatsCollector::default();
+        stats.register_group_policy(0, SamplingPolicy::None);
+        let config = WorkerConfig {
+            target: "127.0.0.1:1".parse().unwrap(),
+            duration: Duration::from_millis(10),
+            conn_count: 1,
+            max_pending_per_conn: 1,
+            drain_timeout: FAKE_DRAIN_TIMEOUT,
+        };
+        let proto = OneWayProtocol {
+            chunk_size: 64,
+            limit: Some(64),
+            ..Default::default()
+        };
+        let mut worker = Worker::new(
+            &factory,
+            proto,
+            stats,
+            config,
+            Box::new(UniformPolicyScheduler::closed_loop()),
+        )
+        .unwrap();
+        worker.set_idle_hold(Duration::from_millis(40), None);
+        let started = std::time::Instant::now();
+        worker.run().unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(35),
+            "expected idle_hold >= 35ms, elapsed={elapsed:?}"
+        );
+        let guard = io.lock().unwrap();
+        assert!(guard.closed, "connections must close after idle_hold");
+        assert!(guard.responses.is_empty(), "inbound data must be drained during idle_hold");
+        assert!(
+            guard
+                .timeouts
+                .iter()
+                .any(|&t| t > Duration::ZERO && t <= Duration::from_millis(10)),
+            "idle_hold must poll with capped timeout <= 10ms, got {:?}",
+            guard.timeouts
+        );
+        drop(guard);
+
+        let counts = worker.stats.request_counts_global();
+        assert_eq!(counts.late_responses, 0);
+        assert_eq!(counts.errors, 0);
+        let agg = worker.stats.aggregate_global(Duration::from_secs(1));
+        assert_eq!(agg.tx_bytes, 64);
+        assert_eq!(agg.rx_bytes, 0);
     }
 }

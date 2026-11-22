@@ -328,6 +328,24 @@ pub trait Protocol: Send {
         None
     }
 
+    /// Whether this protocol wants the worker to read from a connection even
+    /// when `pending_count() == 0` (e.g. unidirectional server -> client stream).
+    fn accepts_unsolicited_responses(&self) -> bool {
+        false
+    }
+
+    /// Whether this protocol has completed its configured work quota (e.g. a
+    /// byte-limited bulk stream). The worker stops early once every group is
+    /// done and has no queued writes or pending responses.
+    fn is_done(&self) -> bool {
+        false
+    }
+
+    /// Called when the worker transitions from preload/warmup into the
+    /// measurement window. Allows stateful streaming protocols to anchor
+    /// measurement byte accounting without resetting TCP stream offsets.
+    fn on_measurement_start(&mut self) {}
+
     /// Protocol name
     fn name(&self) -> &'static str;
 

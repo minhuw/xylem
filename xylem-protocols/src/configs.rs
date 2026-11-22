@@ -929,6 +929,72 @@ fn default_scan_count() -> usize {
     10
 }
 
+/// Direction of a bulk byte stream (`protocol = "stream"`)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum StreamDirection {
+    /// Client streams deterministic bytes to the server (one-way TX).
+    #[default]
+    Send,
+    /// Server streams deterministic bytes to the client (unsolicited RX).
+    Recv,
+}
+
+fn default_stream_chunk_size() -> usize {
+    65536
+}
+
+/// Bulk byte stream ("sink") protocol configuration (`protocol = "stream"`)
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct StreamConfig {
+    /// Stream direction: `"send"` (client -> server, default) or `"recv"` (server -> client).
+    #[serde(default)]
+    pub direction: StreamDirection,
+    /// Chunk size in bytes generated per one-way write in `"send"` mode (default 65536).
+    #[serde(default = "default_stream_chunk_size")]
+    pub chunk_size: usize,
+    /// Optional measurement byte limit. When set, the measurement phase ends
+    /// once this many bytes have been transferred (or `experiment.duration`
+    /// elapses first). May be used without `experiment.duration`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    /// Deterministic byte-pattern seed shared between client and server (default 0).
+    #[serde(default)]
+    pub seed: u64,
+    /// Verify received bytes against the deterministic stream pattern in `"recv"` mode
+    /// (default true; ignored in `"send"` mode).
+    #[serde(default = "default_true")]
+    pub verify: bool,
+}
+
+impl Default for StreamConfig {
+    fn default() -> Self {
+        Self {
+            direction: StreamDirection::default(),
+            chunk_size: default_stream_chunk_size(),
+            bytes: None,
+            seed: 0,
+            verify: true,
+        }
+    }
+}
+
+impl StreamConfig {
+    /// Validate stream protocol configuration.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.chunk_size == 0 {
+            anyhow::bail!("stream.chunk_size must be >= 1");
+        }
+        if self.bytes == Some(0) {
+            anyhow::bail!("stream.bytes must be >= 1");
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
