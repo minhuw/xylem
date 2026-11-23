@@ -7,7 +7,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use xylem_core::threading::{
-    CpuPinning, IdleHoldBarrier, StartTicket, ThreadingRuntime, Worker, WorkerConfig,
+    CpuPinning, IdleHoldBarrier, MeasurementHook, StartTicket, ThreadingRuntime, Worker,
+    WorkerConfig,
 };
 use xylem_transport::{TcpTransportFactory, UdpTransportFactory};
 
@@ -324,9 +325,6 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
                 tracing::info!("Waiting for evalsync start signal...");
                 evalsync::wait_for_start().expect("Failed to wait for evalsync start");
                 tracing::info!("Received evalsync start signal");
-                // xylem has no warmup phase, so measurement starts with the workload;
-                // end() below closes the measurement window together with the workload.
-                evalsync::measure_start().expect("Failed to signal evalsync measurement start");
                 true
             }
             Err(e) => {
@@ -335,6 +333,31 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
             }
         }
     };
+
+    #[cfg(feature = "evalsync")]
+    let measurement_hook = evalsync_enabled.then(|| {
+        Arc::new(MeasurementHook::new(
+            thread_ids.len(),
+            || {
+                evalsync::measure_start().map_err(|e| {
+                    xylem_core::Error::Other(format!(
+                        "Failed to signal evalsync measurement start: {e}"
+                    ))
+                })?;
+                tracing::info!("Signaled evalsync measurement start");
+                Ok(())
+            },
+            || {
+                if let Err(e) = evalsync::measure_end() {
+                    tracing::warn!("Failed to signal evalsync measurement end: {}", e);
+                } else {
+                    tracing::info!("Signaled evalsync measurement end");
+                }
+            },
+        ))
+    });
+    #[cfg(not(feature = "evalsync"))]
+    let measurement_hook: Option<Arc<MeasurementHook>> = None;
 
     tracing::info!("Starting experiment...");
 
@@ -402,7 +425,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
     // Support multiple traffic groups per thread with per-group protocols.
     // Each thread connects, then waits at the start gate: every thread starts
     // at the same time, which anchors every schedule and the stats' buckets.
-    let results = runtime.run_workers_with_start(move |thread_idx, start| {
+    let run_result = runtime.run_workers_with_start(move |thread_idx, start| {
         // Abort the idle_hold barrier if this thread fails or unwinds before
         // reaching idle_hold, so peers waiting at the barrier unblock cleanly.
         let mut idle_hold_guard = idle_hold_barrier.as_ref().map(IdleHoldBarrier::guard);
@@ -587,6 +610,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
             max_requests_per_connection: &[(usize, Option<u64>)],
             experiment: &config::ExperimentConfig,
             idle_hold_barrier: Option<Arc<IdleHoldBarrier>>,
+            measurement_hook: Option<Arc<MeasurementHook>>,
             start: StartTicket,
         ) -> xylem_core::Result<(S, WorkerReport)>
         where
@@ -611,6 +635,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
             worker.set_tx_timestamp_timeout(experiment.tx_timestamp_timeout);
             worker.set_warmup(experiment.warmup);
             worker.set_idle_hold(experiment.idle_hold, idle_hold_barrier);
+            worker.set_measurement_hook(measurement_hook);
             worker.set_unbounded_duration(experiment.duration.is_none());
 
             worker.run_with_start(start)?;
@@ -623,6 +648,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
         }
 
         let idle_hold_barrier = idle_hold_barrier.clone();
+        let measurement_hook = measurement_hook.clone();
 
         // Select transport factory based on thread's transport
         let result = match thread_transport {
@@ -647,6 +673,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
                     &max_requests_per_connection,
                     &config_for_worker.experiment,
                     idle_hold_barrier,
+                    measurement_hook,
                     start,
                 )
             }
@@ -671,6 +698,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
                     &max_requests_per_connection,
                     &config_for_worker.experiment,
                     idle_hold_barrier,
+                    measurement_hook,
                     start,
                 )
             }
@@ -711,6 +739,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
                     &max_requests_per_connection,
                     &config_for_worker.experiment,
                     idle_hold_barrier,
+                    measurement_hook,
                     start,
                 )
             }
@@ -748,6 +777,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
                             &max_requests_per_connection,
                             &config_for_worker.experiment,
                             idle_hold_barrier,
+                            measurement_hook,
                             start,
                         )
                     }
@@ -777,6 +807,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
                             &max_requests_per_connection,
                             &config_for_worker.experiment,
                             idle_hold_barrier,
+                            measurement_hook,
                             start,
                         )
                     }
@@ -809,6 +840,7 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
                             &max_requests_per_connection,
                             &config_for_worker.experiment,
                             idle_hold_barrier,
+                            measurement_hook,
                             start,
                         )
                     }
@@ -826,7 +858,22 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
             }
         }
         result.map(|report| (report, worker_thread))
-    })?;
+    });
+
+    let results = match run_result {
+        Ok(results) => results,
+        Err(e) => {
+            #[cfg(feature = "evalsync")]
+            if evalsync_enabled {
+                if let Err(abort_err) = evalsync::abort() {
+                    tracing::warn!("Failed to signal evalsync abort: {}", abort_err);
+                } else {
+                    tracing::info!("Signaled evalsync abort");
+                }
+            }
+            return Err(e.into());
+        }
+    };
 
     // Signal evalsync end if it was enabled
     #[cfg(feature = "evalsync")]

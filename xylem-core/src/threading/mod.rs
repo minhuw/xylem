@@ -4,6 +4,7 @@
 
 use crate::Result;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Condvar, Mutex, PoisonError};
 use std::thread;
 
@@ -270,6 +271,61 @@ impl Drop for IdleHoldGuard {
     fn drop(&mut self) {
         if let Some(barrier) = self.barrier.take() {
             barrier.abort();
+        }
+    }
+}
+
+/// Cross-thread hook invoked once when all worker threads enter and leave
+/// the timed measurement window.
+///
+/// The last thread to call [`Self::notify_start`] runs `on_start`
+/// synchronously before entering its measurement loop, and the last thread to
+/// call [`Self::notify_end`] runs `on_end` synchronously after exiting its
+/// measurement loop (before post-measurement draining, `idle_hold`, and
+/// teardown). Because the last thread to start cannot reach [`Self::notify_end`]
+/// until `on_start` has returned `Ok(())`, `on_start` strictly happens-before
+/// `on_end`, and if `on_start` returns an error then `on_end` is never invoked.
+pub struct MeasurementHook {
+    remaining_start: AtomicUsize,
+    remaining_end: AtomicUsize,
+    on_start: Box<dyn Fn() -> Result<()> + Send + Sync>,
+    on_end: Box<dyn Fn() + Send + Sync>,
+}
+
+impl MeasurementHook {
+    /// Create a measurement hook synchronized across `total_threads` workers.
+    ///
+    /// # Panics
+    /// Panics if `total_threads == 0`.
+    pub fn new<S, E>(total_threads: usize, on_start: S, on_end: E) -> Self
+    where
+        S: Fn() -> Result<()> + Send + Sync + 'static,
+        E: Fn() + Send + Sync + 'static,
+    {
+        assert!(total_threads > 0, "MeasurementHook requires at least one thread");
+        Self {
+            remaining_start: AtomicUsize::new(total_threads),
+            remaining_end: AtomicUsize::new(total_threads),
+            on_start: Box::new(on_start),
+            on_end: Box::new(on_end),
+        }
+    }
+
+    /// Record that a worker thread has reached the start of its measurement
+    /// window (after preload and warm-up). The last thread invokes `on_start`.
+    pub fn notify_start(&self) -> Result<()> {
+        if self.remaining_start.fetch_sub(1, Ordering::AcqRel) == 1 {
+            (self.on_start)()?;
+        }
+        Ok(())
+    }
+
+    /// Record that a worker thread has finished its timed measurement window
+    /// (before draining, `idle_hold`, and closing connections). The last
+    /// thread invokes `on_end`.
+    pub fn notify_end(&self) {
+        if self.remaining_end.fetch_sub(1, Ordering::AcqRel) == 1 {
+            (self.on_end)();
         }
     }
 }

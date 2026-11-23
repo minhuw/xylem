@@ -10,7 +10,9 @@
 use crate::connection::{ConnectionPool, DeferredSample, SentRequest, TrafficGroupConfig};
 use crate::request_dump::RequestDumper;
 use crate::stats::{ReceivedAt, StatsRecorder, TupleStatsCollector, UNSENT_WALK_CAP};
-use crate::threading::{IdleHoldBarrier, IdleHoldGuard, PreloadTicket, PreloadWait, StartTicket};
+use crate::threading::{
+    IdleHoldBarrier, IdleHoldGuard, MeasurementHook, PreloadTicket, PreloadWait, StartTicket,
+};
 use crate::timing;
 use crate::traffic_group::OnError;
 use crate::Result;
@@ -149,6 +151,9 @@ pub struct Worker<G: ConnectionGroup, P: Protocol, S: StatsRecorder = TupleStats
     idle_hold: Duration,
     /// Optional barrier synchronizing all worker threads entering `idle_hold`
     idle_hold_barrier: Option<Arc<IdleHoldBarrier>>,
+    /// Optional hook invoked when all worker threads enter and leave the timed
+    /// measurement window
+    measurement_hook: Option<Arc<MeasurementHook>>,
     /// True when no fixed duration bounds the measurement loop (stops once
     /// every protocol reports `is_done()` and all writes/responses are drained)
     unbounded_duration: bool,
@@ -255,6 +260,7 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             in_warmup: false,
             idle_hold: Duration::ZERO,
             idle_hold_barrier: None,
+            measurement_hook: None,
             unbounded_duration: false,
         }
     }
@@ -360,6 +366,13 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
     pub fn set_idle_hold(&mut self, idle_hold: Duration, barrier: Option<Arc<IdleHoldBarrier>>) {
         self.idle_hold = idle_hold;
         self.idle_hold_barrier = barrier;
+    }
+
+    /// Set a hook invoked once all worker threads enter the timed measurement
+    /// window (after preload and warm-up) and once all leave it (before
+    /// draining responses, `idle_hold`, and closing connections).
+    pub fn set_measurement_hook(&mut self, hook: Option<Arc<MeasurementHook>>) {
+        self.measurement_hook = hook;
     }
 
     /// Disable the fixed experiment duration timer (for byte-limited runs that
@@ -517,6 +530,10 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         }
         self.reschedule_all_connections();
 
+        if let Some(ref hook) = self.measurement_hook {
+            hook.notify_start()?;
+        }
+
         self.stats.start_measurement(measure_start_ns);
         let actual_start_us = wall_clock_us();
 
@@ -597,6 +614,10 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
         self.window_closed_ns = Some(now_closed_ns);
         self.stats.end_measurement(actual_end_ns);
         self.record_unsent(actual_end_ns);
+
+        if let Some(ref hook) = self.measurement_hook {
+            hook.notify_end();
+        }
 
         // Stop sending and wait for the responses still pending, and for the
         // TX timestamps of those that came first
@@ -5083,5 +5104,266 @@ mod tests {
             io.lock().unwrap().closed,
             "connections must still close cleanly after aborted idle_hold"
         );
+    }
+
+    #[test]
+    fn measurement_hook_fires_once_after_all_threads_preload_and_after_measurement() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = listener.local_addr().unwrap();
+        let runtime = crate::threading::ThreadingRuntime::new(2);
+        let server =
+            thread::spawn(move || recording_echo_server(listener, 4, 2, Duration::from_millis(30)));
+
+        let start_count = Arc::new(AtomicUsize::new(0));
+        let end_count = Arc::new(AtomicUsize::new(0));
+        let start_at = Arc::new(std::sync::Mutex::new(None));
+        let end_at = Arc::new(std::sync::Mutex::new(None));
+
+        let hook = Arc::new(MeasurementHook::new(
+            2,
+            {
+                let start_count = Arc::clone(&start_count);
+                let start_at = Arc::clone(&start_at);
+                move || {
+                    start_count.fetch_add(1, Ordering::SeqCst);
+                    *start_at.lock().unwrap() = Some(std::time::Instant::now());
+                    Ok(())
+                }
+            },
+            {
+                let end_count = Arc::clone(&end_count);
+                let end_at = Arc::clone(&end_at);
+                move || {
+                    end_count.fetch_add(1, Ordering::SeqCst);
+                    *end_at.lock().unwrap() = Some(std::time::Instant::now());
+                }
+            },
+        ));
+
+        runtime
+            .run_workers_with_start(move |_, start| {
+                let mut stats = TupleStatsCollector::default();
+                stats.register_group_policy(0, SamplingPolicy::Unlimited);
+                let protocol = FakeProtocol { preload: 2, ..Default::default() };
+                let config = WorkerConfig {
+                    target,
+                    duration: Duration::from_millis(40),
+                    conn_count: 2,
+                    max_pending_per_conn: 4,
+                    drain_timeout: DEFAULT_DRAIN_TIMEOUT,
+                };
+                let factory = TcpTransportFactory::default();
+                let mut worker = Worker::with_closed_loop(&factory, protocol, stats, config)?;
+                worker.set_measurement_hook(Some(Arc::clone(&hook)));
+                worker.run_with_start(start)?;
+                Ok(())
+            })
+            .unwrap();
+
+        let log = server.join().unwrap();
+        let log = log.lock().unwrap();
+        let last_preload_reply = log.iter().filter(|e| e.0 < 2).map(|e| e.2).max().unwrap();
+        let first_measured_req = log.iter().filter(|e| e.0 >= 2).map(|e| e.1).min().unwrap();
+        let last_measured_reply = log.iter().filter(|e| e.0 >= 2).map(|e| e.2).max().unwrap();
+        assert_eq!(log.iter().filter(|e| e.0 < 2).count(), 4, "each thread preloads 2 requests");
+
+        assert_eq!(start_count.load(Ordering::SeqCst), 1, "on_start must fire exactly once");
+        assert_eq!(end_count.load(Ordering::SeqCst), 1, "on_end must fire exactly once");
+
+        let start_at = start_at.lock().unwrap().expect("on_start recorded a timestamp");
+        let end_at = end_at.lock().unwrap().expect("on_end recorded a timestamp");
+        assert!(
+            start_at >= last_preload_reply,
+            "on_start fired before every thread finished preloading"
+        );
+        assert!(
+            start_at < last_measured_reply,
+            "on_start must fire before measurement responses finish"
+        );
+        assert!(end_at > start_at, "on_end must fire after on_start");
+        assert!(end_at >= first_measured_req, "on_end must fire after measurement traffic began");
+    }
+
+    #[test]
+    fn measurement_hook_fires_after_warmup_and_before_idle_hold_and_close() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+        let factory = FakeFactory::default();
+        let io = factory.0.clone();
+        let mut stats = TupleStatsCollector::default();
+        stats.register_group_policy(0, SamplingPolicy::None);
+        let warmup = Duration::from_millis(30);
+        let duration = Duration::from_millis(20);
+        let idle_hold = Duration::from_millis(50);
+        let config = WorkerConfig {
+            target: "127.0.0.1:1".parse().unwrap(),
+            duration,
+            conn_count: 1,
+            max_pending_per_conn: 1,
+            drain_timeout: FAKE_DRAIN_TIMEOUT,
+        };
+        let proto = OneWayProtocol { chunk_size: 64, ..Default::default() };
+        let mut worker = Worker::new(
+            &factory,
+            proto,
+            stats,
+            config,
+            Box::new(UniformPolicyScheduler::closed_loop()),
+        )
+        .unwrap();
+        worker.set_warmup(warmup);
+        worker.set_idle_hold(idle_hold, None);
+
+        let start_count = Arc::new(AtomicUsize::new(0));
+        let end_count = Arc::new(AtomicUsize::new(0));
+        let start_ns = Arc::new(AtomicU64::new(0));
+        let end_ns = Arc::new(AtomicU64::new(0));
+        let closed_at_end = Arc::new(AtomicBool::new(true));
+
+        let hook = Arc::new(MeasurementHook::new(
+            1,
+            {
+                let start_count = Arc::clone(&start_count);
+                let start_ns = Arc::clone(&start_ns);
+                move || {
+                    start_count.fetch_add(1, Ordering::SeqCst);
+                    start_ns.store(timing::time_ns(), Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+            {
+                let end_count = Arc::clone(&end_count);
+                let end_ns = Arc::clone(&end_ns);
+                let closed_at_end = Arc::clone(&closed_at_end);
+                let io = Arc::clone(&io);
+                move || {
+                    end_count.fetch_add(1, Ordering::SeqCst);
+                    end_ns.store(timing::time_ns(), Ordering::SeqCst);
+                    closed_at_end.store(io.lock().unwrap().closed, Ordering::SeqCst);
+                }
+            },
+        ));
+        worker.set_measurement_hook(Some(hook));
+
+        let run_start_ns = timing::time_ns();
+        worker.run_at(run_start_ns).unwrap();
+        let run_end_ns = timing::time_ns();
+
+        assert_eq!(start_count.load(Ordering::SeqCst), 1);
+        assert_eq!(end_count.load(Ordering::SeqCst), 1);
+
+        let start_hook_ns = start_ns.load(Ordering::SeqCst);
+        let end_hook_ns = end_ns.load(Ordering::SeqCst);
+        assert!(
+            start_hook_ns.saturating_sub(run_start_ns) >= warmup.as_nanos() as u64,
+            "on_start must fire after warmup elapses"
+        );
+        assert!(end_hook_ns >= start_hook_ns, "on_end must fire after on_start");
+        assert!(
+            run_end_ns.saturating_sub(end_hook_ns) >= idle_hold.as_nanos() as u64,
+            "on_end must fire before idle_hold elapses"
+        );
+        assert!(
+            !closed_at_end.load(Ordering::SeqCst),
+            "on_end must fire before connections close"
+        );
+        assert!(io.lock().unwrap().closed, "connections must close after idle_hold completes");
+    }
+
+    #[test]
+    fn measurement_hook_is_not_invoked_when_preload_fails() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let factory = FakeFactory::default();
+        let mut worker = preload_worker(&factory);
+        worker.protocols.get_mut(&0).unwrap().errors.insert(0, "NOT_STORED");
+        factory.0.lock().unwrap().responses.push_back(Ok(0u64.to_le_bytes().to_vec()));
+
+        let start_count = Arc::new(AtomicUsize::new(0));
+        let end_count = Arc::new(AtomicUsize::new(0));
+        let hook = Arc::new(MeasurementHook::new(
+            1,
+            {
+                let start_count = Arc::clone(&start_count);
+                move || {
+                    start_count.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+            {
+                let end_count = Arc::clone(&end_count);
+                move || {
+                    end_count.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        ));
+        worker.set_measurement_hook(Some(hook));
+
+        let err = worker.run().unwrap_err();
+        assert!(err.to_string().contains("during preload"), "unexpected error: {err}");
+        assert_eq!(
+            start_count.load(Ordering::SeqCst),
+            0,
+            "on_start must not fire on preload error"
+        );
+        assert_eq!(end_count.load(Ordering::SeqCst), 0, "on_end must not fire on preload error");
+    }
+
+    #[test]
+    fn measurement_hook_start_error_fails_run_and_skips_on_end() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let start_count = Arc::new(AtomicUsize::new(0));
+        let end_count = Arc::new(AtomicUsize::new(0));
+        let hook = Arc::new(MeasurementHook::new(
+            2,
+            {
+                let start_count = Arc::clone(&start_count);
+                move || {
+                    start_count.fetch_add(1, Ordering::SeqCst);
+                    Err(crate::Error::Other("evalsync measure_start failed".into()))
+                }
+            },
+            {
+                let end_count = Arc::clone(&end_count);
+                move || {
+                    end_count.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        ));
+
+        let runtime = crate::threading::ThreadingRuntime::new(2);
+        let result = runtime.run_workers_with_start(move |_, start| {
+            let factory = FakeFactory::default();
+            let mut stats = TupleStatsCollector::default();
+            stats.register_group_policy(0, SamplingPolicy::None);
+            let config = WorkerConfig {
+                target: "127.0.0.1:1".parse().unwrap(),
+                duration: Duration::from_millis(10),
+                conn_count: 1,
+                max_pending_per_conn: 1,
+                drain_timeout: FAKE_DRAIN_TIMEOUT,
+            };
+            let proto = OneWayProtocol { chunk_size: 64, ..Default::default() };
+            let mut worker = Worker::new(
+                &factory,
+                proto,
+                stats,
+                config,
+                Box::new(UniformPolicyScheduler::closed_loop()),
+            )?;
+            worker.set_measurement_hook(Some(Arc::clone(&hook)));
+            worker.run_with_start(start)
+        });
+
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Other(ref msg) if msg == "evalsync measure_start failed"),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(start_count.load(Ordering::SeqCst), 1);
+        assert_eq!(end_count.load(Ordering::SeqCst), 0, "on_end must not fire if on_start fails");
     }
 }
