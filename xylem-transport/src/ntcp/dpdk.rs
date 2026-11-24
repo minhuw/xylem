@@ -63,8 +63,9 @@ impl NtcpBackend for HostedQueue {
 pub struct NtcpDpdkMember {
     /// The member's own address, steered to its queue
     pub local_ip: Ipv4Addr,
-    /// Connections the member opens: sizes its stack and its share of the
-    /// neighbour table's held output
+    /// Total connections the member opens, including protocol control
+    /// connections (such as NVMe/TCP admin queues): sizes its stack and its
+    /// share of the neighbour table's held output
     pub max_connections: usize,
     /// Most requests in flight on one of its connections: sizes the TX
     /// timestamp records of NIC timestamps

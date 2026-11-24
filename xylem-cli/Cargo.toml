@@ -47,12 +47,17 @@ toml.workspace = true
 # Optional evalsync integration for coordinated benchmarking
 evalsync = { version = "0.2", optional = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+ntcp-native = { git = "https://github.com/minhuw/ntcp", rev = "208759a0af7f6c3bf797e2ce5d7bdfc45eb90fc9", optional = true }
+ntcp-io = { git = "https://github.com/minhuw/ntcp", rev = "208759a0af7f6c3bf797e2ce5d7bdfc45eb90fc9", optional = true }
+ntcp-io-dpdk = { git = "https://github.com/minhuw/ntcp", rev = "208759a0af7f6c3bf797e2ce5d7bdfc45eb90fc9", optional = true }
+
 [features]
 evalsync = ["dep:evalsync"]
 # User-space TCP transport "ntcp" (Linux only)
 ntcp = ["xylem-transport/ntcp"]
 # ntcp over DPDK ports (Linux only; needs the DPDK SDK of the nix dev shell)
-ntcp-dpdk = ["ntcp", "xylem-transport/ntcp-dpdk"]
+ntcp-dpdk = ["ntcp", "xylem-transport/ntcp-dpdk", "dep:ntcp-native", "dep:ntcp-io", "dep:ntcp-io-dpdk"]
 # ntcp over AF_XDP sockets (Linux only; needs the nix dev shell's libbpf and
 # BPF clang)
 ntcp-af-xdp = ["ntcp", "xylem-transport/ntcp-af-xdp"]

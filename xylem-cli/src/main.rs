@@ -967,6 +967,33 @@ fn run_experiment(profile: PathBuf, set: Vec<String>) -> anyhow::Result<Verdict>
     Ok(verdict)
 }
 
+/// Total connections an ntcp DPDK or AF_XDP member opens on its thread,
+/// including protocol control connections (`Protocol::connection_roles`).
+#[cfg_attr(
+    not(all(target_os = "linux", any(feature = "ntcp-dpdk", feature = "ntcp-af-xdp"))),
+    allow(dead_code)
+)]
+fn member_max_connections(
+    config: &ProfileConfig,
+    groups: &[(usize, xylem_core::traffic_group::TrafficGroup)],
+) -> anyhow::Result<usize> {
+    let mut total = 0;
+    for (group_id, g) in groups {
+        let group_config = &config.traffic_groups[*group_id];
+        let protocol = xylem_cli::multi_protocol::MultiProtocol::from_config(
+            &config.protocol_configs[*group_id],
+            &group_config.target,
+            &group_config.transport,
+            g.max_pending_per_connection,
+            None,
+        )?;
+        total +=
+            xylem_core::threading::Protocol::connection_roles(&protocol, g.connections_per_thread)
+                .len();
+    }
+    Ok(total)
+}
+
 /// Start the DPDK port of the ntcp "dpdk" backend, if a thread uses it: one
 /// member per ntcp thread, in ascending thread order like `local_ips`
 #[cfg(all(target_os = "linux", feature = "ntcp-dpdk"))]
@@ -991,9 +1018,9 @@ fn start_ntcp_dpdk(
         .zip(&dpdk.local_ips)
         .map(|(&thread, &local_ip)| {
             let groups = assignment.get_groups_for_thread(thread).expect("ntcp threads run groups");
-            NtcpDpdkMember {
+            Ok(NtcpDpdkMember {
                 local_ip,
-                max_connections: groups.iter().map(|(_, g)| g.connections_per_thread).sum(),
+                max_connections: member_max_connections(config, groups)?,
                 max_pending: groups
                     .iter()
                     .map(|(_, g)| g.max_pending_per_connection)
@@ -1002,9 +1029,9 @@ fn start_ntcp_dpdk(
                 nic_timestamps: groups.iter().any(|(id, _)| {
                     config.traffic_groups[*id].timestamps == TimestampSourceConfig::Nic
                 }),
-            }
+            })
         })
-        .collect();
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let port = NtcpDpdkPort::start(NtcpDpdkConfig {
         device: dpdk.device.clone(),
         eal_args: dpdk.eal_args.clone(),
@@ -1043,14 +1070,14 @@ fn start_ntcp_af_xdp(
         .enumerate()
         .map(|(queue, (&thread, &local_ip))| {
             let groups = assignment.get_groups_for_thread(thread).expect("ntcp threads run groups");
-            NtcpAfXdpMember {
+            Ok(NtcpAfXdpMember {
                 local_ip,
                 // The i-th ntcp thread takes the interface's queue i
                 queue: queue as u32,
-                max_connections: groups.iter().map(|(_, g)| g.connections_per_thread).sum(),
-            }
+                max_connections: member_max_connections(config, groups)?,
+            })
         })
-        .collect();
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let port = NtcpAfXdpPort::start(NtcpAfXdpConfig {
         interface: af_xdp.ifname.clone(),
         mode: match af_xdp.mode {
@@ -1178,5 +1205,117 @@ mod tests {
             assert!(bash.contains(word.as_str()), "bash completion is missing {}", word);
             assert!(zsh.contains(word.as_str()), "zsh completion is missing {}", word);
         }
+    }
+
+    fn validated_profile(
+        groups_toml: &str,
+    ) -> (ProfileConfig, xylem_core::traffic_group::ThreadGroupAssignment) {
+        let toml_str = format!(
+            r#"
+[experiment]
+name = "member-max-connections"
+duration = "1s"
+
+[output]
+format = "json"
+file = "results.json"
+
+{groups_toml}
+"#
+        );
+        let mut config: ProfileConfig = toml::from_str(&toml_str).expect("parse profile");
+        config.validate().expect("validate profile");
+        let assignment =
+            xylem_core::traffic_group::ThreadGroupAssignment::from_configs(&config.traffic_groups);
+        (config, assignment)
+    }
+
+    #[test]
+    fn member_max_connections_nvme_tcp_single_conn() {
+        let (config, assignment) = validated_profile(
+            r#"
+[[traffic_groups]]
+name = "nvme"
+protocol = "nvme-tcp"
+target = "10.0.0.1:4420"
+threads = [0]
+connections_per_thread = 1
+max_pending_per_connection = 8
+traffic_policy = { type = "closed-loop" }
+protocol_config = { subnqn = "nqn.2016-06.io.spdk:test" }
+"#,
+        );
+        let groups = assignment.get_groups_for_thread(0).unwrap();
+        // 1 admin queue + 1 I/O queue
+        assert_eq!(member_max_connections(&config, groups).unwrap(), 2);
+    }
+
+    #[test]
+    fn member_max_connections_nvme_tcp_two_conns_single_controller() {
+        let (config, assignment) = validated_profile(
+            r#"
+[[traffic_groups]]
+name = "nvme"
+protocol = "nvme-tcp"
+target = "10.0.0.1:4420"
+threads = [0]
+connections_per_thread = 2
+max_pending_per_connection = 16
+traffic_policy = { type = "closed-loop" }
+protocol_config = { subnqn = "nqn.2016-06.io.spdk:test" }
+"#,
+        );
+        let groups = assignment.get_groups_for_thread(0).unwrap();
+        // 1 admin queue + 2 I/O queues
+        assert_eq!(member_max_connections(&config, groups).unwrap(), 3);
+    }
+
+    #[test]
+    fn member_max_connections_nvme_tcp_two_conns_one_io_queue_per_controller() {
+        let (config, assignment) = validated_profile(
+            r#"
+[[traffic_groups]]
+name = "nvme"
+protocol = "nvme-tcp"
+target = "10.0.0.1:4420"
+threads = [0]
+connections_per_thread = 2
+max_pending_per_connection = 16
+traffic_policy = { type = "closed-loop" }
+protocol_config = { subnqn = "nqn.2016-06.io.spdk:test", io_queues_per_controller = 1 }
+"#,
+        );
+        let groups = assignment.get_groups_for_thread(0).unwrap();
+        // 2 admin queues + 2 I/O queues
+        assert_eq!(member_max_connections(&config, groups).unwrap(), 4);
+    }
+
+    #[test]
+    fn member_max_connections_mixed_groups() {
+        let (config, assignment) = validated_profile(
+            r#"
+[[traffic_groups]]
+name = "nvme"
+protocol = "nvme-tcp"
+target = "10.0.0.1:4420"
+threads = [0]
+connections_per_thread = 2
+max_pending_per_connection = 8
+traffic_policy = { type = "closed-loop" }
+protocol_config = { subnqn = "nqn.2016-06.io.spdk:test" }
+
+[[traffic_groups]]
+name = "web"
+protocol = "http"
+target = "10.0.0.1:8080"
+threads = [0]
+connections_per_thread = 3
+max_pending_per_connection = 1
+traffic_policy = { type = "closed-loop" }
+"#,
+        );
+        let groups = assignment.get_groups_for_thread(0).unwrap();
+        // nvme-tcp (1 admin + 2 I/O = 3) + http (3) = 6
+        assert_eq!(member_max_connections(&config, groups).unwrap(), 6);
     }
 }

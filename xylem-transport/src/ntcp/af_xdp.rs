@@ -55,8 +55,9 @@ pub struct NtcpAfXdpMember {
     pub local_ip: Ipv4Addr,
     /// The interface queue pair the member's socket binds to
     pub queue: u32,
-    /// Connections the member opens: sizes its stack and its share of the
-    /// neighbour table's held output
+    /// Total connections the member opens, including protocol control
+    /// connections (such as NVMe/TCP admin queues): sizes its stack and its
+    /// share of the neighbour table's held output
     pub max_connections: usize,
 }
 
