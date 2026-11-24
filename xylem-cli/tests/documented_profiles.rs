@@ -30,6 +30,7 @@ fn load(profile: &str, dir: &Path) -> anyhow::Result<Option<ProfileConfig>> {
 fn page_protocol(path: &Path) -> &'static str {
     match path.file_stem().and_then(|stem| stem.to_str()) {
         Some("dns") => "dns",
+        Some("http") => "http",
         Some("masstree") => "masstree",
         Some("memcached") => "memcached-ascii",
         Some("stream") => "stream",

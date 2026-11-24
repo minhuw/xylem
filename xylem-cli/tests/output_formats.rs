@@ -145,6 +145,14 @@ const MEASURED_LABELS: [&str; 47] = [
     "    Split reqs:  ",
 ];
 
+/// Summary lines with `<bytes> bytes (<mbps> Mbps)`, by their label.
+const MEASURED_BYTE_LINES: [&str; 4] = [
+    "TX:              ",
+    "RX:              ",
+    "  TX:            ",
+    "  RX:            ",
+];
+
 /// Summary rows of measured values in columns, by their label.
 const MEASURED_ROWS: [&str; 2] = ["  Service:       ", "    Service:     "];
 
@@ -185,6 +193,21 @@ fn mask_summary(stdout: &str) -> (String, Vec<String>) {
                 .collect();
             lines.push(format!("{label}{}", row.concat().trim_end()));
             continue;
+        }
+        if let Some(label) = MEASURED_BYTE_LINES.iter().find(|label| line.starts_with(**label)) {
+            let rest = &line[label.len()..];
+            if let Some((bytes, tail)) = rest.split_once(" bytes (") {
+                if let Some(mbps) = tail.strip_suffix(" Mbps)") {
+                    values.push(bytes.to_string());
+                    values.push(mbps.to_string());
+                    lines.push(format!(
+                        "{label}{} bytes ({} Mbps)",
+                        mask_number(bytes),
+                        mask_number(mbps)
+                    ));
+                    continue;
+                }
+            }
         }
         let Some(label) = MEASURED_LABELS.iter().find(|label| line.starts_with(**label)) else {
             lines.push(line.to_string());
@@ -229,6 +252,8 @@ GLOBAL STATISTICS
 Total Requests:  #
 Throughput:      #.## req/s
 Bandwidth:       #.## Mbps
+TX:              # bytes (#.## Mbps)
+RX:              # bytes (#.## Mbps)
 
 Latency (μs):
   Mean:          #.##
@@ -280,6 +305,8 @@ Statistics:
   Requests:      #
   Throughput:    #.## req/s
   Bandwidth:     #.## Mbps
+  TX:            # bytes (#.## Mbps)
+  RX:            # bytes (#.## Mbps)
 
   Latency (μs):
     Mean:        #.##
@@ -371,6 +398,11 @@ fn summary_values(json_text: &str) -> Vec<String> {
             let value: f64 = raw_number(section, key).parse().unwrap();
             values.push(format!("{value:.2}"));
         }
+        for (bytes_key, mbps_key) in [("tx_bytes", "tx_mbps"), ("rx_bytes", "rx_mbps")] {
+            values.push(raw_number(section, bytes_key).to_string());
+            let mbps: f64 = raw_number(section, mbps_key).parse().unwrap();
+            values.push(format!("{mbps:.2}"));
+        }
         for key in [
             "mean_us",
             "min_us",
@@ -415,7 +447,7 @@ fn summary_values(json_text: &str) -> Vec<String> {
 }
 
 /// JSON fields whose values are measured.
-const MEASURED_KEYS: [&str; 25] = [
+const MEASURED_KEYS: [&str; 29] = [
     "measured_duration_secs",
     "actual_load_loop_start_unix_us",
     "actual_load_loop_end_unix_us",
@@ -426,6 +458,10 @@ const MEASURED_KEYS: [&str; 25] = [
     "sample_count",
     "throughput_rps",
     "throughput_mbps",
+    "tx_bytes",
+    "rx_bytes",
+    "tx_mbps",
+    "rx_mbps",
     "mean_us",
     "p50_us",
     "p95_us",
@@ -490,6 +526,10 @@ const MASKED_JSON: &str = r#"{
     "total_requests": #,
     "throughput_rps": #,
     "throughput_mbps": #,
+    "tx_bytes": #,
+    "rx_bytes": #,
+    "tx_mbps": #,
+    "rx_mbps": #,
     "latency": {
       "min_us": #,
       "max_us": #,
@@ -571,6 +611,10 @@ const MASKED_JSON: &str = r#"{
         "total_requests": #,
         "throughput_rps": #,
         "throughput_mbps": #,
+        "tx_bytes": #,
+        "rx_bytes": #,
+        "tx_mbps": #,
+        "rx_mbps": #,
         "latency": {
           "min_us": #,
           "max_us": #,
