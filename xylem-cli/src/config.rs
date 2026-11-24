@@ -979,7 +979,14 @@ fn parse_protocol_config(
             Ok(ProtocolConfig::MemcachedAscii(config))
         }
         ProtocolKind::Http => {
-            let config = parse_typed_config(pc, "HTTP", group_idx, group_name)?;
+            let config: xylem_protocols::HttpConfig =
+                parse_typed_config(pc, "HTTP", group_idx, group_name)?;
+            config.validate_verify().with_context(|| {
+                format!(
+                    "Traffic group {} '{}' has invalid HTTP protocol_config",
+                    group_idx, group_name
+                )
+            })?;
             Ok(ProtocolConfig::Http(config))
         }
         ProtocolKind::Http2 => {

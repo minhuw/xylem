@@ -149,11 +149,14 @@ fn constructors_honor_keys_values_insertion_and_http_body() {
     let get = binary.next_request(0);
     assert!(!get.metadata.is_warmup);
     assert_eq!(&get.data[24..], b"item:25");
-    let mut http = HttpProtocol::from_config(&HttpConfig {
-        method: "POST".into(),
-        body_size: 7,
-        ..Default::default()
-    })
+    let mut http = HttpProtocol::from_config(
+        &HttpConfig {
+            method: "POST".into(),
+            body_size: 7,
+            ..Default::default()
+        },
+        None,
+    )
     .unwrap();
     let post = http.next_request(0);
     assert!(post.data.ends_with(b"\r\n\r\nxxxxxxx"));

@@ -346,6 +346,13 @@ pub trait Protocol: Send {
     /// measurement byte accounting without resetting TCP stream offsets.
     fn on_measurement_start(&mut self) {}
 
+    /// Called when a connection closes unexpectedly (e.g. EOF or I/O error).
+    /// Protocols tracking an in-flight streaming response can clean up per-connection
+    /// state and optionally report a named error reply (e.g. `ShortBody`).
+    fn on_connection_closed(&mut self, _conn_id: usize) -> Option<ErrorReply<'static>> {
+        None
+    }
+
     /// Protocol name
     fn name(&self) -> &'static str;
 

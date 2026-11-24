@@ -1493,6 +1493,18 @@ impl<G: ConnectionGroup, P: Protocol, S: StatsRecorder> Worker<G, P, S> {
             let _ = self.pool.close(connection_id);
             return Err(failure);
         }
+        let close_error = self
+            .protocols
+            .get_mut(&group_id)
+            .and_then(|protocol| protocol.on_connection_closed(connection_id));
+        if let Some(error_reply) = close_error {
+            self.stats.record_error_reply(
+                group_id,
+                connection_id,
+                error_reply.kind,
+                Duration::ZERO,
+            );
+        }
         tracing::warn!(connection_id, "Connection disconnected: {}", error);
         if let Some(state) = self.pool.get_state_mut(connection_id) {
             let failed = state.measured_pending_count() as u64;

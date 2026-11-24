@@ -690,6 +690,19 @@ pub struct HttpConfig {
     /// Whether to send `Connection: keep-alive` (true) or `Connection: close` (false)
     #[serde(default = "default_true")]
     pub keep_alive: bool,
+    /// Verify GET response bodies byte-for-byte against a deterministic
+    /// function of `(verify_seed, path, verify_body_size)`.
+    #[serde(default)]
+    pub verify: bool,
+    /// Seed for deterministic response body verification (default 0 when `verify = true`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_seed: Option<u64>,
+    /// Expected HTTP response body size in bytes when `verify = true` (must be > 0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_body_size: Option<usize>,
+    /// Optional key generator appended to `path` as `{path}{prefix}{key_num}` per request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys: Option<KeysConfig>,
 }
 
 fn default_http_method() -> String {
@@ -716,6 +729,10 @@ impl Default for HttpConfig {
             host: None,
             body_size: default_body_size(),
             keep_alive: true,
+            verify: false,
+            verify_seed: None,
+            verify_body_size: None,
+            keys: None,
         }
     }
 }

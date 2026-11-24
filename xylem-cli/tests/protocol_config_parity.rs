@@ -152,7 +152,7 @@ fn real_cli_http_honors_body_size_and_host_fallback() {
         };
         let (target, requests) = cli_requests("http", serde_json::to_value(&config).unwrap());
         config.host.get_or_insert(target);
-        let mut protocol = HttpProtocol::from_config(&config).unwrap();
+        let mut protocol = HttpProtocol::from_config(&config, None).unwrap();
         for request in requests {
             assert_eq!(request, protocol.next_request(0).data);
         }

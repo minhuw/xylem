@@ -605,7 +605,7 @@ fn http_default_and_default_config_get_root_from_localhost() {
     let get = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n";
     for mut protocol in [
         HttpProtocol::default(),
-        HttpProtocol::from_config(&HttpConfig::default()).unwrap(),
+        HttpProtocol::from_config(&HttpConfig::default(), None).unwrap(),
     ] {
         assert_requests(
             &mut protocol,
@@ -715,7 +715,7 @@ fn http_from_config_post_uses_body_size_and_localhost() {
     };
     let post = b"POST /submit HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\
         Content-Length: 2\r\nContent-Type: application/octet-stream\r\n\r\nxx";
-    let mut protocol = HttpProtocol::from_config(&config).unwrap();
+    let mut protocol = HttpProtocol::from_config(&config, None).unwrap();
     assert_requests(
         &mut protocol,
         vec![

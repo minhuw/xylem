@@ -1,6 +1,6 @@
 use crate::config::ProtocolConfig;
 use anyhow::Result;
-use xylem_common::{ConnectionRole, Outbox, Parsed, Request, VerificationReport};
+use xylem_common::{ConnectionRole, ErrorReply, Outbox, Parsed, Request, VerificationReport};
 use xylem_protocols::Protocol;
 
 /// Multi-protocol wrapper that can dispatch to any supported protocol
@@ -69,7 +69,7 @@ impl MultiProtocol {
             ProtocolConfig::Http(http_config) => {
                 let mut http_config = http_config.clone();
                 http_config.host.get_or_insert_with(|| target.to_string());
-                Self::Http(xylem_protocols::HttpProtocol::from_config(&http_config)?)
+                Self::Http(xylem_protocols::HttpProtocol::from_config(&http_config, seed)?)
             }
             ProtocolConfig::Http2(http2_config) => {
                 Self::Http2(xylem_protocols::Http2Protocol::from_config(http2_config, authority)?)
@@ -361,6 +361,22 @@ impl Protocol for MultiProtocol {
             MultiProtocol::Http2(p) | MultiProtocol::Grpc(p) => p.on_measurement_start(),
             MultiProtocol::ClickHouse(p) => p.on_measurement_start(),
             MultiProtocol::Stream(p) => p.on_measurement_start(),
+        }
+    }
+
+    fn on_connection_closed(&mut self, conn_id: usize) -> Option<ErrorReply<'static>> {
+        match self {
+            MultiProtocol::Redis(p) => p.on_connection_closed(conn_id),
+            MultiProtocol::MemcachedBinary(p) => p.on_connection_closed(conn_id),
+            MultiProtocol::MemcachedAscii(p) => p.on_connection_closed(conn_id),
+            MultiProtocol::Http(p) => p.on_connection_closed(conn_id),
+            MultiProtocol::XylemEcho(p) => p.on_connection_closed(conn_id),
+            MultiProtocol::Masstree(p) => p.on_connection_closed(conn_id),
+            MultiProtocol::Dns(p) => p.on_connection_closed(conn_id),
+            MultiProtocol::NvmeTcp(p) => p.on_connection_closed(conn_id),
+            MultiProtocol::Http2(p) | MultiProtocol::Grpc(p) => p.on_connection_closed(conn_id),
+            MultiProtocol::ClickHouse(p) => p.on_connection_closed(conn_id),
+            MultiProtocol::Stream(p) => p.on_connection_closed(conn_id),
         }
     }
 }
