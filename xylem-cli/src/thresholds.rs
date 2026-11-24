@@ -9,7 +9,7 @@
 //! Paths are checked at load against [`probe_stats`], stats with every field
 //! present, so a misspelled metric fails before the run.
 
-use crate::config::ProfileConfig;
+use crate::config::{ProfileConfig, ProtocolConfig};
 use crate::output::{
     BreakdownPartStats, DetailedExperimentResults, GlobalStats, GroupStats, LatencyBreakdownStats,
     LatencyStats, SendLagStats, VerificationStats,
@@ -109,6 +109,9 @@ impl ThresholdResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ValidityCheck {
+    /// Whether a traffic group sent at least one request (or transferred at
+    /// least one byte for `stream` groups) during the measurement window
+    RequestsSent,
     /// Fraction of a rate-driven group's intended sends that never went out
     Unsent,
     /// Fraction of a rate-driven group's sends that went out late
@@ -117,7 +120,7 @@ pub enum ValidityCheck {
     /// timestamps that had a kernel split; fails at zero
     KernelSplit,
     /// Fraction of verified responses that failed opt-in payload verification;
-    /// fails on any mismatch
+    /// fails on any mismatch or when zero responses were verified
     Verification,
 }
 
@@ -125,6 +128,7 @@ impl ValidityCheck {
     /// The check's name in the profile and the results
     pub fn name(self) -> &'static str {
         match self {
+            ValidityCheck::RequestsSent => "requests_sent",
             ValidityCheck::Unsent => "unsent",
             ValidityCheck::LateSends => "late_sends",
             ValidityCheck::KernelSplit => "kernel_split",
@@ -139,10 +143,10 @@ pub struct ValidityResult {
     pub check: ValidityCheck,
     /// Traffic group checked; null for a check of the whole run
     pub group: Option<String>,
-    /// The fraction measured; null when the group recorded nothing
+    /// The fraction or count measured; null when the group recorded nothing
     pub observed: Option<f64>,
-    /// Largest fraction that passes; for `kernel_split`, the fraction the
-    /// observed one must exceed (0)
+    /// Largest fraction that passes; for `kernel_split` and `requests_sent`,
+    /// the threshold the observed value must exceed (0)
     pub limit: f64,
     pub ok: bool,
     /// Why the check failed; omitted when it passed
@@ -161,27 +165,35 @@ impl ValidityResult {
         scoped(self.check.name(), self.group.as_deref())
     }
 
-    /// The observed fraction as a percentage, or `n/a`
+    /// The observed fraction as a percentage (or count for `requests_sent`),
+    /// or `n/a`
     pub fn observed_text(&self) -> String {
-        self.observed.map_or_else(|| "n/a".to_string(), percent)
+        match (self.check, self.observed) {
+            (_, None) => "n/a".to_string(),
+            (ValidityCheck::RequestsSent, Some(value)) => format!("{value:.0}"),
+            (_, Some(value)) => percent(value),
+        }
     }
 
-    /// The limit as a percentage; `> 0.00%` for `kernel_split`, which the
-    /// observed fraction must exceed
+    /// The limit as a percentage; `> 0.00%` for `kernel_split` and `> 0` for
+    /// `requests_sent`, which the observed value must exceed
     pub fn limit_text(&self) -> String {
         match self.check {
             ValidityCheck::KernelSplit => format!("> {}", percent(self.limit)),
+            ValidityCheck::RequestsSent => format!("> {:.0}", self.limit),
             _ => percent(self.limit),
         }
     }
 }
 
 /// Checks that a run applied the load it was configured with, and measured
-/// it with the timestamps it was configured with. "unsent" and "late_sends"
-/// apply to every traffic group with a rate-driven traffic policy (a closed
-/// loop has no schedule to fall behind); "kernel_split" to every traffic
-/// group with `timestamps = "kernel"` or `{ hardware = ... }` that
-/// completed a request: it fails when none of them had a kernel split.
+/// it with the timestamps it was configured with. "requests_sent" applies to
+/// every traffic group and fails when it sent no requests (or transferred no
+/// bytes for `stream` groups). "unsent" and "late_sends" apply to every
+/// traffic group with a rate-driven traffic policy (a closed loop has no
+/// schedule to fall behind); "kernel_split" to every traffic group with
+/// `timestamps = "kernel"` or `{ hardware = ... }` that completed a request:
+/// it fails when none of them had a kernel split.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ValidityConfig {
@@ -196,7 +208,7 @@ pub struct ValidityConfig {
     /// intended send time by more than 100 µs (default 0.01)
     #[serde(default = "default_max_late_send_ratio")]
     pub max_late_send_ratio: f64,
-    /// Checks to leave out: "unsent", "late_sends", "kernel_split", "verification"
+    /// Checks to leave out: "requests_sent", "unsent", "late_sends", "kernel_split", "verification"
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skip: Vec<ValidityCheck>,
 }
@@ -246,6 +258,7 @@ impl ValidityConfig {
             return Vec::new();
         }
         [
+            (ValidityCheck::RequestsSent, 0.0),
             (ValidityCheck::Unsent, self.max_unsent_ratio),
             (ValidityCheck::LateSends, self.max_late_send_ratio),
             (ValidityCheck::KernelSplit, 0.0),
@@ -786,7 +799,8 @@ pub fn evaluate(results: &mut DetailedExperimentResults, config: &ProfileConfig)
             }
         })
         .collect();
-    let validity = check_validity(results, &config.validity, &config.traffic_groups);
+    let validity =
+        check_validity(results, &config.validity, &config.traffic_groups, &config.protocol_configs);
 
     let verdict = if validity.iter().any(|check| !check.ok) {
         Verdict::InvalidRun
@@ -810,18 +824,31 @@ fn check_validity(
     results: &DetailedExperimentResults,
     validity: &ValidityConfig,
     groups: &[TrafficGroupConfig],
+    protocol_configs: &[ProtocolConfig],
 ) -> Vec<ValidityResult> {
     let checks = validity.checks();
+    let check_requests_sent = checks.iter().any(|&(check, _)| check == ValidityCheck::RequestsSent);
     let mut outcomes = Vec::new();
     for (id, group) in groups.iter().enumerate() {
         let group_result = results.traffic_groups.iter().find(|g| g.id == id);
         let stats = group_result.map(|g| &g.stats);
+        if check_requests_sent {
+            let outcome = check_requests_sent_validity(group, protocol_configs.get(id), stats);
+            if let Some(ref reason) = outcome.reason {
+                tracing::error!("Invalid run: traffic group '{}': {}", group.name, reason);
+            }
+            outcomes.push(outcome);
+        }
         // A closed loop sends when a response frees its pipeline, so it has
         // no schedule to fall behind.
         let closed_loop = matches!(group.traffic_policy, PolicyConfig::ClosedLoop);
         for &(check, limit) in &checks {
-            if matches!(check, ValidityCheck::KernelSplit | ValidityCheck::Verification)
-                || closed_loop
+            if matches!(
+                check,
+                ValidityCheck::RequestsSent
+                    | ValidityCheck::KernelSplit
+                    | ValidityCheck::Verification
+            ) || closed_loop
             {
                 continue;
             }
@@ -844,6 +871,48 @@ fn check_validity(
         }
     }
     outcomes
+}
+
+/// Evaluate the non-empty activity validity check for one traffic group
+fn check_requests_sent_validity(
+    group: &TrafficGroupConfig,
+    protocol_config: Option<&ProtocolConfig>,
+    stats: Option<&GroupStats>,
+) -> ValidityResult {
+    let is_stream = matches!(protocol_config, Some(ProtocolConfig::Stream(_)))
+        || group.protocol.eq_ignore_ascii_case("stream");
+    let outcome = |observed: Option<f64>, reason: Option<String>| ValidityResult {
+        check: ValidityCheck::RequestsSent,
+        group: Some(group.name.clone()),
+        observed,
+        limit: 0.0,
+        ok: reason.is_none(),
+        reason,
+    };
+    let Some(stats) = stats else {
+        let msg = if is_stream {
+            "the group transferred no data"
+        } else {
+            "the group recorded no requests"
+        };
+        return outcome(None, Some(msg.into()));
+    };
+    if is_stream {
+        let transferred = stats.tx_bytes.saturating_add(stats.rx_bytes);
+        if stats.requests.sent == 0 && transferred == 0 {
+            return outcome(Some(0.0), Some("the group transferred no data".into()));
+        }
+        let observed = if transferred > 0 {
+            transferred as f64
+        } else {
+            stats.requests.sent as f64
+        };
+        return outcome(Some(observed), None);
+    }
+    if stats.requests.sent == 0 {
+        return outcome(Some(0.0), Some("the group sent no requests".into()));
+    }
+    outcome(Some(stats.requests.sent as f64), None)
 }
 
 /// Evaluate and log the kernel split validity check for one traffic group
@@ -878,13 +947,18 @@ fn check_verification_validity(
 ) -> Option<ValidityResult> {
     let v = verification?;
     let total = v.verified + v.failures;
-    let observed = Some(if total == 0 {
-        0.0
+    let (observed, ok, reason) = if total == 0 {
+        (
+            None,
+            false,
+            Some("verification enabled but no responses were verified".to_string()),
+        )
     } else {
-        v.failures as f64 / total as f64
-    });
-    let ok = v.failures == 0;
-    let reason = (!ok).then(|| format_verification_failure(v));
+        let ratio = v.failures as f64 / total as f64;
+        let ok = v.failures == 0;
+        let reason = (!ok).then(|| format_verification_failure(v));
+        (Some(ratio), ok, reason)
+    };
     if let Some(ref reason) = reason {
         if checked {
             tracing::error!("Invalid run: traffic group '{}': {}", group.name, reason);
@@ -1026,8 +1100,8 @@ fn check_group_validity(
     let (count, total) = match check {
         ValidityCheck::Unsent => (requests.unsent, requests.sent + requests.unsent),
         ValidityCheck::LateSends => (requests.late_sends, requests.sent),
-        ValidityCheck::KernelSplit | ValidityCheck::Verification => {
-            unreachable!("check_validity checks kernel splits and verification")
+        ValidityCheck::RequestsSent | ValidityCheck::KernelSplit | ValidityCheck::Verification => {
+            unreachable!("check_validity checks requests_sent, kernel splits and verification")
         }
     };
     let observed = if total == 0 {
@@ -1058,8 +1132,8 @@ fn check_group_validity(
             percent(observed),
             percent(limit),
         ),
-        ValidityCheck::KernelSplit | ValidityCheck::Verification => {
-            unreachable!("check_validity checks kernel splits and verification")
+        ValidityCheck::RequestsSent | ValidityCheck::KernelSplit | ValidityCheck::Verification => {
+            unreachable!("check_validity checks requests_sent, kernel splits and verification")
         }
     };
     outcome(Some(observed), Some(reason))
@@ -1265,6 +1339,7 @@ error_latency = ["p99 < 1ms", "mean == 5us"]
             collector.record_latency(0, 0, latency);
             collector.record_error_reply(0, 0, "error", latency);
         }
+        collector.record_tx_bytes(1, 0, 1);
         let mut results = results_of(&config, &collector);
         for summary in [
             &results.global.latency,
@@ -1306,6 +1381,7 @@ error_latency = ["p99 < 1us", "mean == 0us"]
         collector.register_group_policy(0, policy);
         collector.record_latency(0, 0, Duration::ZERO);
         collector.record_error_reply(0, 0, "error", Duration::ZERO);
+        collector.record_tx_bytes(1, 0, 1);
         let mut results = results_of(&config, &collector);
         assert_eq!(evaluate(&mut results, &config), Verdict::Pass);
         assert!(results.thresholds.iter().all(|t| t.observed == Some(0.0) && t.ok));
@@ -1532,6 +1608,7 @@ error_latency = ["p99 < 1us", "mean == 0us"]
         config.threshold_checks = parse_thresholds(&checks, &config.traffic_groups).unwrap();
         let mut collector =
             TupleStatsCollector::new(SamplingPolicy::Unlimited, Duration::from_secs(1));
+        collector.record_tx_bytes(1, 0, 1);
         for count in 1..=2 {
             collector.record_latency(0, 0, Duration::ZERO);
             collector.record_error_reply(0, 0, "error", Duration::ZERO);
@@ -1578,6 +1655,7 @@ error_latency = ["p99 < 1us", "mean == 0us"]
             collector.record_latency(0, 0, duration);
             collector.record_error_reply(0, 0, "error", duration);
         }
+        collector.record_tx_bytes(1, 0, 1);
         let mut results = results_of(&config, &collector);
         let std_dev = results.global.latency.std_dev_us.unwrap();
         let ci = results.global.latency.confidence_interval_us.unwrap();
@@ -2098,6 +2176,9 @@ error_latency = ["p99 > 4ms", "max < 1ms"]
     fn a_metric_without_a_value_fails() {
         let config = profile(
             r#"
+[validity]
+enabled = false
+
 [thresholds]
 "send_lag" = ["p99 < 20us"]
 "requests.timed_out{group=batch}" = ["rate < 0.001"]
@@ -2163,8 +2244,10 @@ error_latency = ["p99 > 4ms", "max < 1ms"]
         assert_eq!(
             checks,
             [
+                ("requests_sent{group=api}".into(), Some(9_990.0), 0.0, true),
                 ("unsent{group=api}".into(), Some(0.001), 0.001, true),
                 ("late_sends{group=api}".into(), Some(99.0 / 9990.0), 0.01, true),
+                ("requests_sent{group=batch}".into(), Some(10.0), 0.0, true),
             ]
         );
         assert!(results.validity.iter().all(|c| c.reason.is_none()));
@@ -2173,7 +2256,7 @@ error_latency = ["p99 > 4ms", "max < 1ms"]
         (api.unsent, api.late_sends, api.unsent_capped) = (11, 100, true);
         assert_eq!(evaluate(&mut results, &config), Verdict::InvalidRun);
         let reasons: Vec<&str> =
-            results.validity.iter().map(|c| c.reason.as_deref().unwrap()).collect();
+            results.validity.iter().filter_map(|c| c.reason.as_deref()).collect();
         assert!(
             reasons[0].starts_with(
                 "11 (a lower bound) of 10001 intended sends never went out (0.11%, limit 0.10%)"
@@ -2188,7 +2271,9 @@ error_latency = ["p99 > 4ms", "max < 1ms"]
             "{}",
             reasons[1]
         );
-        let json = serde_json::to_value(&results.validity[0]).unwrap();
+        let unsent_check =
+            results.validity.iter().find(|c| c.check == ValidityCheck::Unsent).unwrap();
+        let json = serde_json::to_value(unsent_check).unwrap();
         assert_eq!(json["check"], "unsent");
         assert_eq!(json["group"], "api");
         assert_eq!(json["ok"], false);
@@ -2229,6 +2314,7 @@ error_latency = ["p99 > 4ms", "max < 1ms"]
                 },
             );
         }
+        stats.record_tx_bytes(1, 0, 1);
         let results = results_of(&config, &stats);
         (config, results)
     }
@@ -2278,7 +2364,11 @@ error_latency = ["p99 > 4ms", "max < 1ms"]
         let missing = serde_json::json!({ "tx": 8, "rx": 2, "clock_mismatch": 1 });
         assert_eq!(api["kernel_split_missing"], missing);
         assert_eq!(json["global"]["latency_breakdown"]["kernel_split_missing"], missing);
-        assert_eq!(json["validity"].as_array().unwrap().last().unwrap()["check"], "kernel_split");
+        assert!(json["validity"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["check"] == "kernel_split" && c["ok"] == false));
     }
 
     #[test]
@@ -2301,7 +2391,14 @@ error_latency = ["p99 > 4ms", "max < 1ms"]
         let hardware = TimestampSourceConfig::Hardware("data0".into());
         let (config, mut results) = kernel_results(hardware, "", &[Some(Rx); 3]);
         assert_eq!(evaluate(&mut results, &config), Verdict::InvalidRun);
-        let reason = results.validity.last().unwrap().reason.clone().unwrap();
+        let reason = results
+            .validity
+            .iter()
+            .find(|c| c.check == ValidityCheck::KernelSplit)
+            .unwrap()
+            .reason
+            .clone()
+            .unwrap();
         assert!(
             reason.starts_with(
                 "none of the 3 completed requests had a kernel split with timestamps = { \
@@ -2349,13 +2446,19 @@ error_latency = ["p99 > 4ms", "max < 1ms"]
             evaluate(&mut results, &config);
             results.validity.iter().map(|c| (c.check, c.ok)).collect::<Vec<_>>()
         };
-        use ValidityCheck::{LateSends, Unsent};
-        assert_eq!(invalid(""), [(Unsent, false), (LateSends, false)]);
+        use ValidityCheck::{LateSends, RequestsSent, Unsent};
+        assert_eq!(
+            invalid(""),
+            [(RequestsSent, true), (Unsent, false), (LateSends, false), (RequestsSent, true)]
+        );
         assert_eq!(
             invalid("[validity]\nmax_unsent_ratio = 0.1\nmax_late_send_ratio = 0.1"),
-            [(Unsent, true), (LateSends, true)]
+            [(RequestsSent, true), (Unsent, true), (LateSends, true), (RequestsSent, true)]
         );
-        assert_eq!(invalid("[validity]\nskip = [\"late_sends\"]"), [(Unsent, false)]);
+        assert_eq!(
+            invalid("[validity]\nskip = [\"late_sends\", \"requests_sent\"]"),
+            [(Unsent, false)]
+        );
         assert_eq!(invalid("[validity]\nenabled = false"), []);
 
         // A rate-driven group without results recorded nothing it was asked to
@@ -2363,7 +2466,15 @@ error_latency = ["p99 > 4ms", "max < 1ms"]
         let mut results = results(&config);
         results.traffic_groups.remove(0);
         assert_eq!(evaluate(&mut results, &config), Verdict::InvalidRun);
-        assert_eq!(results.validity[0].reason.as_deref(), Some("the group recorded no requests"));
+        let req_sent = results
+            .validity
+            .iter()
+            .find(|c| c.check == ValidityCheck::RequestsSent && c.group.as_deref() == Some("api"))
+            .unwrap();
+        assert!(!req_sent.ok);
+        assert_eq!(req_sent.reason.as_deref(), Some("the group recorded no requests"));
+        let unsent = results.validity.iter().find(|c| c.check == ValidityCheck::Unsent).unwrap();
+        assert_eq!(unsent.reason.as_deref(), Some("the group recorded no requests"));
 
         for (validity, expected) in [
             ("max_unsent_ratio = 1.5", "validity.max_unsent_ratio must be a fraction"),
@@ -2438,5 +2549,160 @@ error_latency = ["p99 > 4ms", "max < 1ms"]
         let skip_cfg = profile("[validity]\nskip = [\"verification\"]").unwrap();
         assert_eq!(evaluate(&mut results, &skip_cfg), Verdict::Pass);
         assert!(results.validity.iter().all(|c| c.check != ValidityCheck::Verification));
+    }
+
+    #[test]
+    fn zero_sent_closed_loop_group_is_invalid_run() {
+        let config = profile("").unwrap();
+        let mut results = results(&config);
+        // Closed-loop group "batch" sent nothing
+        results.traffic_groups[1].stats.requests.sent = 0;
+
+        let verdict = evaluate(&mut results, &config);
+        assert_eq!((verdict, verdict.exit_code()), (Verdict::InvalidRun, 3));
+        let check = results
+            .validity
+            .iter()
+            .find(|c| c.check == ValidityCheck::RequestsSent && c.group.as_deref() == Some("batch"))
+            .expect("requests_sent check for batch");
+        assert!(!check.ok);
+        assert_eq!(check.observed, Some(0.0));
+        assert_eq!(check.observed_text(), "0");
+        assert_eq!(check.limit_text(), "> 0");
+        assert_eq!(check.reason.as_deref(), Some("the group sent no requests"));
+    }
+
+    #[test]
+    fn zero_sent_open_loop_group_with_zero_unsent_is_invalid_run() {
+        let config = profile("").unwrap();
+        let mut results = results(&config);
+        // Open-loop group "api" sent 0 and had 0 unsent
+        let api = &mut results.traffic_groups[0].stats.requests;
+        (api.sent, api.unsent, api.late_sends) = (0, 0, 0);
+
+        let verdict = evaluate(&mut results, &config);
+        assert_eq!((verdict, verdict.exit_code()), (Verdict::InvalidRun, 3));
+        let check = results
+            .validity
+            .iter()
+            .find(|c| c.check == ValidityCheck::RequestsSent && c.group.as_deref() == Some("api"))
+            .expect("requests_sent check for api");
+        assert!(!check.ok);
+        assert_eq!(check.observed, Some(0.0));
+        assert_eq!(check.reason.as_deref(), Some("the group sent no requests"));
+    }
+
+    #[test]
+    fn verification_with_zero_verified_and_zero_failures_is_invalid_run() {
+        let config = profile("").unwrap();
+        let mut results = results(&config);
+        results.traffic_groups[1].verification = Some(VerificationStats {
+            verified: 0,
+            failures: 0,
+            first_mismatch: None,
+        });
+
+        let verdict = evaluate(&mut results, &config);
+        assert_eq!((verdict, verdict.exit_code()), (Verdict::InvalidRun, 3));
+        let check = results
+            .validity
+            .iter()
+            .find(|c| c.check == ValidityCheck::Verification)
+            .expect("verification check");
+        assert!(!check.ok);
+        assert_eq!(check.observed, None);
+        assert_eq!(check.observed_text(), "n/a");
+        assert_eq!(
+            check.reason.as_deref(),
+            Some("verification enabled but no responses were verified")
+        );
+    }
+
+    #[test]
+    fn stream_group_validity_allows_byte_transfers_and_rejects_zero_data() {
+        let stream_toml = r#"
+[experiment]
+name = "stream-validity"
+duration = "1s"
+
+[[traffic_groups]]
+name = "sink"
+target = "127.0.0.1:9"
+protocol = "stream"
+threads = [0]
+connections_per_thread = 1
+traffic_policy = { type = "closed-loop" }
+protocol_config = { direction = "send", chunk_size = 65536 }
+
+[output]
+file = "unused"
+"#;
+        let mut config: ProfileConfig = toml::from_str(stream_toml).unwrap();
+        config.validate().unwrap();
+        let build_results = |collector: &TupleStatsCollector| {
+            DetailedExperimentResults::from_tuple_stats(
+                "stream-validity".into(),
+                None,
+                None,
+                "127.0.0.1:9".into(),
+                "stream".into(),
+                "tcp".into(),
+                Duration::from_secs(1),
+                collector,
+                &config.traffic_groups,
+                false,
+            )
+        };
+
+        // 1. Stream with sent == 0, tx_bytes > 0 -> Pass
+        let mut tx_collector =
+            TupleStatsCollector::new(SamplingPolicy::default(), Duration::from_secs(1));
+        tx_collector.record_tx_bytes(0, 0, 65536);
+        let mut tx_results = build_results(&tx_collector);
+        assert_eq!(evaluate(&mut tx_results, &config), Verdict::Pass);
+        let check = tx_results
+            .validity
+            .iter()
+            .find(|c| c.check == ValidityCheck::RequestsSent)
+            .unwrap();
+        assert!(check.ok);
+        assert_eq!(check.observed, Some(65536.0));
+
+        // 2. Stream with sent == 0, rx_bytes > 0 -> Pass
+        let mut rx_collector =
+            TupleStatsCollector::new(SamplingPolicy::default(), Duration::from_secs(1));
+        rx_collector.record_rx_bytes(0, 0, 131072);
+        let mut rx_results = build_results(&rx_collector);
+        assert_eq!(evaluate(&mut rx_results, &config), Verdict::Pass);
+
+        // 3. Stream with sent == 0, tx_bytes == 0, rx_bytes == 0 (missing group stats) -> InvalidRun (exit 3)
+        let empty_collector =
+            TupleStatsCollector::new(SamplingPolicy::default(), Duration::from_secs(1));
+        let mut empty_results = build_results(&empty_collector);
+        let verdict = evaluate(&mut empty_results, &config);
+        assert_eq!((verdict, verdict.exit_code()), (Verdict::InvalidRun, 3));
+        let check = empty_results
+            .validity
+            .iter()
+            .find(|c| c.check == ValidityCheck::RequestsSent)
+            .unwrap();
+        assert!(!check.ok);
+        assert_eq!(check.observed, None);
+        assert_eq!(check.reason.as_deref(), Some("the group transferred no data"));
+
+        // 4. Stream with group stats present, sent == 0, tx_bytes == 0, rx_bytes == 0 -> InvalidRun (exit 3)
+        let mut zero_results = build_results(&tx_collector);
+        zero_results.traffic_groups[0].stats.tx_bytes = 0;
+        zero_results.traffic_groups[0].stats.rx_bytes = 0;
+        let verdict = evaluate(&mut zero_results, &config);
+        assert_eq!((verdict, verdict.exit_code()), (Verdict::InvalidRun, 3));
+        let check = zero_results
+            .validity
+            .iter()
+            .find(|c| c.check == ValidityCheck::RequestsSent)
+            .unwrap();
+        assert!(!check.ok);
+        assert_eq!(check.observed, Some(0.0));
+        assert_eq!(check.reason.as_deref(), Some("the group transferred no data"));
     }
 }

@@ -1367,6 +1367,8 @@ latency = ["mean == 5us", "p99 == 5us"]
             &config.traffic_groups,
             false,
         );
+        results.traffic_groups[0].stats.requests.sent = 1;
+        results.global.requests.sent = 1;
 
         for count in [0, 1, u32::MAX as u64, u32::MAX as u64 + 1, u32::MAX as u64 + 2, u64::MAX] {
             // Change only the aggregate count; no large number of samples is needed.

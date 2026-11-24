@@ -1132,6 +1132,11 @@
       "description": "Checks that a run applied its configured load, and measured it with\nits configured timestamps",
       "oneOf": [
         {
+          "description": "Whether a traffic group sent at least one request (or transferred at\nleast one byte for `stream` groups) during the measurement window",
+          "type": "string",
+          "const": "requests_sent"
+        },
+        {
           "description": "Fraction of a rate-driven group's intended sends that never went out",
           "type": "string",
           "const": "unsent"
@@ -1147,14 +1152,14 @@
           "const": "kernel_split"
         },
         {
-          "description": "Fraction of verified responses that failed opt-in payload verification;\nfails on any mismatch",
+          "description": "Fraction of verified responses that failed opt-in payload verification;\nfails on any mismatch or when zero responses were verified",
           "type": "string",
           "const": "verification"
         }
       ]
     },
     "ValidityConfig": {
-      "description": "Checks that a run applied the load it was configured with, and measured\nit with the timestamps it was configured with. \"unsent\" and \"late_sends\"\napply to every traffic group with a rate-driven traffic policy (a closed\nloop has no schedule to fall behind); \"kernel_split\" to every traffic\ngroup with `timestamps = \"kernel\"` or `{ hardware = ... }` that\ncompleted a request: it fails when none of them had a kernel split.",
+      "description": "Checks that a run applied the load it was configured with, and measured\nit with the timestamps it was configured with. \"requests_sent\" applies to\nevery traffic group and fails when it sent no requests (or transferred no\nbytes for `stream` groups). \"unsent\" and \"late_sends\" apply to every\ntraffic group with a rate-driven traffic policy (a closed loop has no\nschedule to fall behind); \"kernel_split\" to every traffic group with\n`timestamps = \"kernel\"` or `{ hardware = ... }` that completed a request:\nit fails when none of them had a kernel split.",
       "type": "object",
       "properties": {
         "enabled": {
@@ -1175,7 +1180,7 @@
           "default": 0.001
         },
         "skip": {
-          "description": "Checks to leave out: \"unsent\", \"late_sends\", \"kernel_split\", \"verification\"",
+          "description": "Checks to leave out: \"requests_sent\", \"unsent\", \"late_sends\", \"kernel_split\", \"verification\"",
           "type": "array",
           "items": {
             "$ref": "#/$defs/ValidityCheck"

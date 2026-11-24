@@ -229,6 +229,8 @@ enum ServerMode {
         value_size: usize,
         fault: Option<Fault>,
     },
+    /// Answer HANDSHAKE, then leave subsequent requests unanswered until EOF
+    StallAfterHandshake,
 }
 
 fn handle_get(mode: &ServerMode, store: &HashMap<Vec<u8>, Vec<u8>>, key: &[u8]) -> Vec<u8> {
@@ -252,6 +254,7 @@ fn handle_get(mode: &ServerMode, store: &HashMap<Vec<u8>, Vec<u8>>, key: &[u8]) 
             }
             payload
         }
+        ServerMode::StallAfterHandshake => unreachable!("stalled server does not answer GET"),
     }
 }
 
@@ -278,6 +281,7 @@ fn handle_masstree_request(
             write_mp_uint(out, 0);
             write_mp_str(out, b"Bag");
         }
+        _ if matches!(mode, ServerMode::StallAfterHandshake) => {}
         // REPLACE (SET): [seq, 8, key, value] -> [seq, 9, 1]
         8 => {
             let (MpValue::Bytes(key), MpValue::Bytes(value)) = (&items[2], &items[3]) else {
@@ -612,4 +616,232 @@ fn fault_injection_unexpected_miss_fails_with_unexpected_miss_error() {
     assert_eq!(first["offset"], 0);
     assert_eq!(first["expected_len"], value_size as u64);
     assert_eq!(first["actual_len"], 5);
+}
+
+#[test]
+fn large_values_64kib_and_128kib_pass_with_and_without_verify() {
+    for value_size in [65536usize, 131072] {
+        for verify in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut proto_cfg = serde_json::json!({
+                "keys": { "strategy": "round-robin", "max": 8, "value_size": value_size },
+                "insert_phase": {},
+                "operations": {
+                    "strategy": "weighted",
+                    "commands": [
+                        { "name": "get", "weight": 0.7 },
+                        { "name": "set", "weight": 0.3 }
+                    ]
+                }
+            });
+            if verify {
+                proto_cfg["verify"] = serde_json::json!(true);
+                proto_cfg["verify_seed"] = serde_json::json!(42);
+            }
+
+            let (output, json) = run_masstree_cli(proto_cfg, ServerMode::Store, dir.path());
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "size={value_size} verify={verify}\nstdout={}\nstderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(json["verdict"], "pass", "size={value_size} verify={verify}");
+            let group = &json["traffic_groups"][0];
+            assert_eq!(group["stats"]["requests"]["errors"], 0);
+            assert!(
+                group["stats"]["requests"]["completed"].as_u64().unwrap() > 0,
+                "expected completed > 0 for size={value_size} verify={verify}"
+            );
+            if verify {
+                assert!(
+                    group["verification"]["verified"].as_u64().unwrap() > 0,
+                    "expected verified > 0 for size={value_size}"
+                );
+                assert_eq!(group["verification"]["failures"], 0);
+                assert!(group["verification"].get("first_mismatch").is_none());
+            }
+        }
+    }
+}
+
+#[test]
+fn fault_injection_128kib_corrupted_byte_past_64kib_fails_with_exact_offset() {
+    let dir = tempfile::tempdir().unwrap();
+    let seed = 101u64;
+    let value_size = 131072usize;
+    let bad_offset = 70000usize;
+    let xor_mask = 0x20u8;
+    let expected_vec = synthetic_pattern(seed, b"key:1", value_size, 0);
+    let expected_byte = expected_vec[bad_offset];
+    let actual_byte = expected_byte ^ xor_mask;
+
+    let (output, json) = run_masstree_cli(
+        serde_json::json!({
+            "keys": { "strategy": "round-robin", "max": 4, "value_size": value_size },
+            "operation": "get",
+            "verify": true,
+            "verify_seed": seed
+        }),
+        ServerMode::Synthetic {
+            seed,
+            value_size,
+            fault: Some(Fault::CorruptByte {
+                target_key: b"key:1".to_vec(),
+                offset: bad_offset,
+                xor_mask,
+            }),
+        },
+        dir.path(),
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "expected exit 3 (InvalidRun)\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(json["verdict"], "invalid_run");
+    let group = &json["traffic_groups"][0];
+    assert!(group["stats"]["requests"]["errors_by_kind"]["ValueMismatch"].as_u64().unwrap() >= 1);
+    let ver = &group["verification"];
+    assert!(ver["failures"].as_u64().unwrap() >= 1);
+    let first = &ver["first_mismatch"];
+    assert_eq!(first["kind"], "ValueMismatch");
+    assert_eq!(first["key"], "key:1");
+    assert_eq!(first["offset"], bad_offset as u64);
+    assert_eq!(first["expected"], u64::from(expected_byte));
+    assert_eq!(first["actual"], u64::from(actual_byte));
+    assert_eq!(first["expected_len"], value_size as u64);
+    assert_eq!(first["actual_len"], value_size as u64);
+}
+
+#[test]
+fn stalled_closed_loop_masstree_sending_zero_measurement_requests_never_passes() {
+    for verify in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = listener.local_addr().unwrap().to_string();
+        listener.set_nonblocking(true).unwrap();
+        let server = serve_masstree(listener, ServerMode::StallAfterHandshake);
+
+        let profile = dir.path().join("profile.toml");
+        let results_path = dir.path().join("results.json");
+        let mut proto_cfg = serde_json::json!({
+            "keys": { "strategy": "round-robin", "max": 4, "value_size": 64 },
+            "operation": "get"
+        });
+        if verify {
+            proto_cfg["verify"] = serde_json::json!(true);
+        }
+        // A warmup GET fills the single closed-loop pipeline slot and stalls;
+        // during the measurement window 0 requests are sent.
+        let config = serde_json::json!({
+            "experiment": {
+                "name": "masstree-stalled",
+                "warmup": "100ms",
+                "duration": "200ms",
+                "seed": 123
+            },
+            "traffic_groups": [{
+                "name": "mt",
+                "threads": [0],
+                "connections_per_thread": 1,
+                "max_pending_per_connection": 1,
+                "target": target,
+                "protocol": "masstree",
+                "traffic_policy": { "type": "closed-loop" },
+                "protocol_config": proto_cfg
+            }],
+            "output": { "format": "json", "file": results_path }
+        });
+        std::fs::write(&profile, toml::to_string(&config).unwrap()).unwrap();
+
+        let output = Command::new(env!("CARGO_BIN_EXE_xylem"))
+            .arg("-P")
+            .arg(&profile)
+            .env("RUST_LOG", "off")
+            .output()
+            .unwrap();
+        server.join().expect("Masstree stub failed");
+
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "verify={verify}: stalled zero-send run must fail with exit 3 (InvalidRun)\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&results_path).unwrap()).unwrap();
+        assert_eq!(json["verdict"], "invalid_run", "verify={verify}");
+        assert_eq!(json["global"]["requests"]["sent"], 0, "verify={verify}");
+        let validity = json["validity"].as_array().unwrap();
+        assert!(
+            validity.iter().any(|c| c["check"] == "requests_sent" && c["ok"] == false),
+            "expected failing requests_sent check: {validity:?}"
+        );
+    }
+
+    // Also test a stalled closed-loop verify run with no warmup (1 GET sent, 0
+    // responses verified): must fail `verification` with exit 3.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = listener.local_addr().unwrap().to_string();
+        listener.set_nonblocking(true).unwrap();
+        let server = serve_masstree(listener, ServerMode::StallAfterHandshake);
+
+        let profile = dir.path().join("profile.toml");
+        let results_path = dir.path().join("results.json");
+        let config = serde_json::json!({
+            "experiment": {
+                "name": "masstree-stalled-verify",
+                "duration": "200ms",
+                "seed": 123
+            },
+            "traffic_groups": [{
+                "name": "mt",
+                "threads": [0],
+                "connections_per_thread": 1,
+                "max_pending_per_connection": 1,
+                "target": target,
+                "protocol": "masstree",
+                "traffic_policy": { "type": "closed-loop" },
+                "protocol_config": {
+                    "keys": { "strategy": "round-robin", "max": 4, "value_size": 64 },
+                    "operation": "get",
+                    "verify": true
+                }
+            }],
+            "output": { "format": "json", "file": results_path }
+        });
+        std::fs::write(&profile, toml::to_string(&config).unwrap()).unwrap();
+
+        let output = Command::new(env!("CARGO_BIN_EXE_xylem"))
+            .arg("-P")
+            .arg(&profile)
+            .env("RUST_LOG", "off")
+            .output()
+            .unwrap();
+        server.join().expect("Masstree stub failed");
+
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "stalled verify run with 0 verified responses must fail with exit 3\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&results_path).unwrap()).unwrap();
+        assert_eq!(json["verdict"], "invalid_run");
+        let validity = json["validity"].as_array().unwrap();
+        assert!(
+            validity.iter().any(|c| c["check"] == "verification" && c["ok"] == false),
+            "expected failing verification check: {validity:?}"
+        );
+    }
 }

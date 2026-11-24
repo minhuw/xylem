@@ -2812,4 +2812,66 @@ mod tests {
         assert_eq!(recv_exact(&mut group, id, 4), b"busy");
         group.close_all().unwrap();
     }
+
+    fn roundtrip_try_send_payload(
+        group: &mut NtcpConnectionGroup<Wire>,
+        id: usize,
+        data: &[u8],
+    ) -> bool {
+        let mut sent = group.try_send(id, data).unwrap().accepted;
+        let saw_partial = sent < data.len();
+        let mut write_blocked = saw_partial;
+        if write_blocked {
+            group.set_write_interest(id, true).unwrap();
+        }
+
+        let mut echo = Vec::with_capacity(data.len());
+        let mut buf = [0u8; 16_384];
+        let mut ready = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+
+        while echo.len() < data.len() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out for {}B: sent={sent}, echoed={}",
+                data.len(),
+                echo.len()
+            );
+            group.poll(Duration::from_millis(50), &mut ready).unwrap();
+            if !ready.contains(&id) {
+                continue;
+            }
+            if sent < data.len() {
+                sent += group.try_send(id, &data[sent..]).unwrap().accepted;
+                let now_blocked = sent < data.len();
+                if now_blocked != write_blocked {
+                    write_blocked = now_blocked;
+                    group.set_write_interest(id, now_blocked).unwrap();
+                }
+            }
+            while let RecvOutcome::Data { len, .. } = group.recv(id, &mut buf).unwrap() {
+                echo.extend_from_slice(&buf[..len]);
+            }
+        }
+        assert_eq!(sent, data.len());
+        assert!(!write_blocked);
+        assert!(echo == data, "echo mismatch for {}B payload", data.len());
+        saw_partial
+    }
+
+    #[test]
+    fn try_send_over_64kib_resumes_via_writable_and_echoes_all_bytes() {
+        let (a, b) = link();
+        let _server = EchoServer::start(b, true, ServerClose::OnEof);
+        let mut group = client(a);
+        let id = group.add_connection(&server_addr()).unwrap();
+
+        let mut saw_partial = false;
+        for payload_len in [65_600usize, 131_100usize, 524_288usize] {
+            let data: Vec<u8> = (0..payload_len).map(|i| ((i * 31 + 7) % 251) as u8).collect();
+            saw_partial |= roundtrip_try_send_payload(&mut group, id, &data);
+        }
+        assert!(saw_partial, "expected at least one payload to split across Writable resume");
+        group.close_all().unwrap();
+    }
 }
