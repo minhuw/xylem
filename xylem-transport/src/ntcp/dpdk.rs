@@ -253,7 +253,10 @@ impl NtcpDpdkPort {
         let mut flows = Vec::with_capacity(members);
         for (queue, member) in config.members.iter().enumerate() {
             match port.steer_ipv4(member.local_ip, queue as u16) {
-                Ok(flow) => flows.push(flow),
+                Ok(flow) => {
+                    tracing::info!("ntcp DPDK: steered {} to queue {queue}", member.local_ip);
+                    flows.push(flow);
+                }
                 // A single queue receives everything without isolation
                 Err(e) if members == 1 => tracing::info!(
                     "ntcp DPDK: no flow for {} ({e}); queue 0 receives all traffic",

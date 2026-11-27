@@ -1476,6 +1476,15 @@ impl<P: NtcpBackend> ConnectionGroup for NtcpConnectionGroup<P> {
 
     fn close_all(&mut self) -> Result<()> {
         let counters = self.network.counters();
+        tracing::info!(
+            "ntcp ({}): rx={} tx={} discarded={} arp_rx={} arp_tx={}",
+            self.network.config().local_address,
+            counters.received,
+            counters.transmitted,
+            counters.discarded,
+            counters.arp_received,
+            counters.arp_sent,
+        );
         self.report_memory(&counters);
         self.report_receive_memory(&counters);
         self.report_drops(&counters);

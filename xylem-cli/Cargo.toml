@@ -48,9 +48,9 @@ toml.workspace = true
 evalsync = { version = "0.2", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-ntcp-native = { git = "https://github.com/minhuw/ntcp", rev = "34725777c8d8a8393a9a79e86cb714fa2f3f2113", optional = true }
-ntcp-io = { git = "https://github.com/minhuw/ntcp", rev = "34725777c8d8a8393a9a79e86cb714fa2f3f2113", optional = true }
-ntcp-io-dpdk = { git = "https://github.com/minhuw/ntcp", rev = "34725777c8d8a8393a9a79e86cb714fa2f3f2113", optional = true }
+ntcp-native = { git = "https://github.com/minhuw/ntcp", rev = "ecad0fa068736e01f428355434076b727c7fe680", optional = true }
+ntcp-io = { git = "https://github.com/minhuw/ntcp", rev = "ecad0fa068736e01f428355434076b727c7fe680", optional = true }
+ntcp-io-dpdk = { git = "https://github.com/minhuw/ntcp", rev = "ecad0fa068736e01f428355434076b727c7fe680", optional = true }
 
 [features]
 evalsync = ["dep:evalsync"]
