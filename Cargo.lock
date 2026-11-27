@@ -658,10 +658,11 @@ dependencies = [
 [[package]]
 name = "ntcp"
 version = "0.0.1"
-source = "git+https://github.com/minhuw/ntcp?rev=208759a0af7f6c3bf797e2ce5d7bdfc45eb90fc9#208759a0af7f6c3bf797e2ce5d7bdfc45eb90fc9"
+source = "git+https://github.com/minhuw/ntcp?rev=34725777c8d8a8393a9a79e86cb714fa2f3f2113#34725777c8d8a8393a9a79e86cb714fa2f3f2113"
 dependencies = [
  "hmac",
  "ntcp-buffer",
+ "ntcp-ip-common",
  "ntcp-path",
  "sha2",
  "siphasher",
@@ -670,7 +671,7 @@ dependencies = [
 [[package]]
 name = "ntcp-arp"
 version = "0.0.1"
-source = "git+https://github.com/minhuw/ntcp?rev=208759a0af7f6c3bf797e2ce5d7bdfc45eb90fc9#208759a0af7f6c3bf797e2ce5d7bdfc45eb90fc9"
+source = "git+https://github.com/minhuw/ntcp?rev=34725777c8d8a8393a9a79e86cb714fa2f3f2113#34725777c8d8a8393a9a79e86cb714fa2f3f2113"
 dependencies = [
  "ntcp-ethernet",
 ]
@@ -678,12 +679,12 @@ dependencies = [
 [[package]]
 name = "ntcp-buffer"
 version = "0.0.1"
-source = "git+https://github.com/minhuw/ntcp?rev=208759a0af7f6c3bf797e2ce5d7bdfc45eb90fc9#208759a0af7f6c3bf797e2ce5d7bdfc45eb90fc9"
+source = "git+https://github.com/minhuw/ntcp?rev=34725777c8d8a8393a9a79e86cb714fa2f3f2113#34725777c8d8a8393a9a79e86cb714fa2f3f2113"
 
 [[package]]
 name = "ntcp-ethernet"
 version = "0.0.1"
-source = "git+https://github.com/minhuw/ntcp?rev=208759a0af7f6c3bf797e2ce5d7bdfc45eb90fc9#208759a0af7f6c3bf797e2ce5d7bdfc45eb90fc9"
+source = "git+https://github.com/minhuw/ntcp?rev=34725777c8d8a8393a9a79e86cb714fa2f3f2113#34725777c8d8a8393a9a79e86cb714fa2f3f2113"
 dependencies = [
  "ntcp-ip",
  "ntcp-ip-common",
@@ -693,7 +694,7 @@ dependencies = [
 [[package]]
 name = "ntcp-host"
 version = "0.0.1"
-source = "git+https://github.com/minhuw/ntcp?rev=208759a0af7f6c3bf797e2ce5d7bdfc45eb90fc9#208759a0af7f6c3bf797e2ce5d7bdfc45eb90fc9"
+source = "git+https://github.com/minhuw/ntcp?rev=34725777c8d8a8393a9a79e86cb714fa2f3f2113#34725777c8d8a8393a9a79e86cb714fa2f3f2113"
 dependencies = [
  "ntcp",
  "ntcp-arp",
@@ -709,7 +710,7 @@ dependencies = [
 [[package]]
 name = "ntcp-icmp"
 version = "0.0.1"
-source = "git+https://github.com/minhuw/ntcp?rev=208759a0af7f6c3bf797e2ce5d7bdfc45eb90fc9#208759a0af7f6c3bf797e2ce5d7bdfc45eb90fc9"
+source = "git+https://github.com/minhuw/ntcp?rev=34725777c8d8a8393a9a79e86cb714fa2f3f2113#34725777c8d8a8393a9a79e86cb714fa2f3f2113"
 dependencies = [
  "ntcp",
  "ntcp-ip",
@@ -720,7 +721,7 @@ dependencies = [
 [[package]]
 name = "ntcp-io"
 version = "0.0.1"
-source = "git+https://github.com/minhuw/ntcp?rev=208759a0af7f6c3bf797e2ce5d7bdfc45eb90fc9#208759a0af7f6c3bf797e2ce5d7bdfc45eb90fc9"
+source = "git+https://github.com/minhuw/ntcp?rev=34725777c8d8a8393a9a79e86cb714fa2f3f2113#34725777c8d8a8393a9a79e86cb714fa2f3f2113"
 dependencies = [
  "libc",
  "ntcp-buffer",
@@ -729,7 +730,7 @@ dependencies = [
 [[package]]
 name = "ntcp-io-af-xdp"
 version = "0.0.1"
-source = "git+https://github.com/minhuw/ntcp?rev=208759a0af7f6c3bf797e2ce5d7bdfc45eb90fc9#208759a0af7f6c3bf797e2ce5d7bdfc45eb90fc9"
+source = "git+https://github.com/minhuw/ntcp?rev=34725777c8d8a8393a9a79e86cb714fa2f3f2113#34725777c8d8a8393a9a79e86cb714fa2f3f2113"
 dependencies = [
  "libc",
  "ntcp-io",
@@ -739,7 +740,7 @@ dependencies = [
 [[package]]
 name = "ntcp-io-dpdk"
 version = "0.0.1"
-source = "git+https://github.com/minhuw/ntcp?rev=208759a0af7f6c3bf797e2ce5d7bdfc45eb90fc9#208759a0af7f6c3bf797e2ce5d7bdfc45eb90fc9"
+source = "git+https://github.com/minhuw/ntcp?rev=34725777c8d8a8393a9a79e86cb714fa2f3f2113#34725777c8d8a8393a9a79e86cb714fa2f3f2113"
 dependencies = [
  "cc",
  "ntcp-io",
@@ -750,7 +751,7 @@ dependencies = [
 [[package]]
 name = "ntcp-io-tun"
 version = "0.0.1"
-source = "git+https://github.com/minhuw/ntcp?rev=208759a0af7f6c3bf797e2ce5d7bdfc45eb90fc9#208759a0af7f6c3bf797e2ce5d7bdfc45eb90fc9"
+source = "git+https://github.com/minhuw/ntcp?rev=34725777c8d8a8393a9a79e86cb714fa2f3f2113#34725777c8d8a8393a9a79e86cb714fa2f3f2113"
 dependencies = [
  "libc",
  "ntcp-io",
@@ -759,7 +760,7 @@ dependencies = [
 [[package]]
 name = "ntcp-ip"
 version = "0.0.1"
-source = "git+https://github.com/minhuw/ntcp?rev=208759a0af7f6c3bf797e2ce5d7bdfc45eb90fc9#208759a0af7f6c3bf797e2ce5d7bdfc45eb90fc9"
+source = "git+https://github.com/minhuw/ntcp?rev=34725777c8d8a8393a9a79e86cb714fa2f3f2113#34725777c8d8a8393a9a79e86cb714fa2f3f2113"
 dependencies = [
  "ntcp",
  "ntcp-ip-common",
@@ -768,12 +769,15 @@ dependencies = [
 [[package]]
 name = "ntcp-ip-common"
 version = "0.0.1"
-source = "git+https://github.com/minhuw/ntcp?rev=208759a0af7f6c3bf797e2ce5d7bdfc45eb90fc9#208759a0af7f6c3bf797e2ce5d7bdfc45eb90fc9"
+source = "git+https://github.com/minhuw/ntcp?rev=34725777c8d8a8393a9a79e86cb714fa2f3f2113#34725777c8d8a8393a9a79e86cb714fa2f3f2113"
+dependencies = [
+ "cpufeatures",
+]
 
 [[package]]
 name = "ntcp-ip6"
 version = "0.0.1"
-source = "git+https://github.com/minhuw/ntcp?rev=208759a0af7f6c3bf797e2ce5d7bdfc45eb90fc9#208759a0af7f6c3bf797e2ce5d7bdfc45eb90fc9"
+source = "git+https://github.com/minhuw/ntcp?rev=34725777c8d8a8393a9a79e86cb714fa2f3f2113#34725777c8d8a8393a9a79e86cb714fa2f3f2113"
 dependencies = [
  "ntcp",
  "ntcp-ip-common",
@@ -782,7 +786,7 @@ dependencies = [
 [[package]]
 name = "ntcp-native"
 version = "0.0.1"
-source = "git+https://github.com/minhuw/ntcp?rev=208759a0af7f6c3bf797e2ce5d7bdfc45eb90fc9#208759a0af7f6c3bf797e2ce5d7bdfc45eb90fc9"
+source = "git+https://github.com/minhuw/ntcp?rev=34725777c8d8a8393a9a79e86cb714fa2f3f2113#34725777c8d8a8393a9a79e86cb714fa2f3f2113"
 dependencies = [
  "hmac",
  "ntcp",
@@ -799,7 +803,7 @@ dependencies = [
 [[package]]
 name = "ntcp-path"
 version = "0.0.1"
-source = "git+https://github.com/minhuw/ntcp?rev=208759a0af7f6c3bf797e2ce5d7bdfc45eb90fc9#208759a0af7f6c3bf797e2ce5d7bdfc45eb90fc9"
+source = "git+https://github.com/minhuw/ntcp?rev=34725777c8d8a8393a9a79e86cb714fa2f3f2113#34725777c8d8a8393a9a79e86cb714fa2f3f2113"
 dependencies = [
  "siphasher",
 ]

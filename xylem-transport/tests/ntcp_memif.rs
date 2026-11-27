@@ -322,7 +322,7 @@ fn memif_client_helper() {
     let mut group = port.factory(0).create_group().expect("client create_group");
     assert_eq!(
         group.network().backend().rx_frame_budget(),
-        Some(12_927),
+        Some(12_895),
         "unexpected rx_frame_budget for default mbufs_per_queue=16383 on single queue"
     );
 

@@ -1999,10 +1999,10 @@ mod tests {
         }
     }
 
-    /// Connections an echo server holds at once: more than the 174 that
+    /// Connections an echo server holds at once: more than the ~456 that
     /// fill the least buffer memory cap
     /// (`write_refused_memory_waits_like_a_full_socket`)
-    const SERVER_CONNECTIONS: usize = 256;
+    const SERVER_CONNECTIONS: usize = 1024;
 
     fn run_echo_server(wire: Wire, listen: bool, close: ServerClose, stop: &AtomicBool) {
         let mut config = network_config(SERVER);
