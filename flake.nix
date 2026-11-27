@@ -91,6 +91,58 @@
           tar -xJf ${rustSrcTarball} -C $out $(sed 's|/$||' needed)
         '';
 
+        # Shared package definition for xylem binaries
+        commonPackage = {
+          pname = "xylem";
+          version = "0.1.0";
+
+          src = ./.;
+
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+            # One hash covers every crate of a git repository at its pinned rev
+            outputHashes = {
+              "ntcp-native-0.0.1" = "sha256-4L7b1mJZApPeUD2fDIlWFaEneS7usfXjA9JkBzgjLuM=";
+            };
+          };
+
+          # Enable evalsync feature for coordinated benchmarking
+          buildFeatures = [ "xylem-cli/evalsync" ];
+
+          inherit buildInputs nativeBuildInputs;
+
+          # Skip tests that require external services (nginx) not available in sandbox
+          doCheck = false;
+
+          # Move DWARF into a separate `debug` output for profile symbolization. separateDebugInfo
+          # asks for it through NIX_RUSTFLAGS, which only nixpkgs' wrapped rustc reads, so the level
+          # is set in the cargo profile (the cargo build hook already turns its stripping off).
+          separateDebugInfo = true;
+          CARGO_PROFILE_RELEASE_DEBUG = "limited";
+
+          # Rhea's bench packaging contract: debug/share/rhea/sources/<name> is the source tree the build
+          # had at <build dir>/<name>, which DWARF paths refer to; profilers then need nothing else.
+          # Upstream remaps the standard library to /rustc/<commit> and its crates to /rust/deps.
+          postFixup = ''
+            sources=$debug/share/rhea/sources
+            mkdir -p $sources
+            commit=$(rustc -vV | sed -n 's/^commit-hash: //p')
+            [ -n "$commit" ] || { echo "rustc -vV gives no commit-hash" >&2; exit 1; }
+            ln -s ${rustStdSrc}/${rustSrcTop} $sources/$commit
+            ln -s ${rustStdSrc}/${rustSrcTop}/vendor $sources/deps
+            ln -s $cargoDeps $sources/$(stripHash $cargoDeps)
+            ln -s $src $sources/$(stripHash $src)
+          '';
+
+          meta = with pkgs.lib; {
+            description = "A simple, high-performance latency measurement tool for single-machine deployments";
+            homepage = "https://github.com/minhuw/xylem";
+            license = licenses.mit;
+            maintainers = [ ];
+            platforms = platforms.unix;
+          };
+        };
+
       in
       {
         # Development shell
@@ -186,56 +238,14 @@
           XYLEM_NVMF_TGT = "${pkgs.spdk}/bin/nvmf_tgt";
         });
 
-        # Package definition
-        packages.default = rustPlatform.buildRustPackage {
-          pname = "xylem";
-          version = "0.1.0";
-
-          src = ./.;
-
-          cargoLock = {
-            lockFile = ./Cargo.lock;
-            # One hash covers every crate of a git repository at its pinned rev
-            outputHashes = {
-              "ntcp-native-0.0.1" = "sha256-4L7b1mJZApPeUD2fDIlWFaEneS7usfXjA9JkBzgjLuM=";
-            };
-          };
-
-          # Enable evalsync feature for coordinated benchmarking
-          buildFeatures = [ "xylem-cli/evalsync" ];
-
-          inherit buildInputs nativeBuildInputs;
-
-          # Skip tests that require external services (nginx) not available in sandbox
-          doCheck = false;
-
-          # Move DWARF into a separate `debug` output for profile symbolization. separateDebugInfo
-          # asks for it through NIX_RUSTFLAGS, which only nixpkgs' wrapped rustc reads, so the level
-          # is set in the cargo profile (the cargo build hook already turns its stripping off).
-          separateDebugInfo = true;
-          CARGO_PROFILE_RELEASE_DEBUG = "limited";
-
-          # Rhea's bench packaging contract: debug/share/rhea/sources/<name> is the source tree the build
-          # had at <build dir>/<name>, which DWARF paths refer to; profilers then need nothing else.
-          # Upstream remaps the standard library to /rustc/<commit> and its crates to /rust/deps.
-          postFixup = ''
-            sources=$debug/share/rhea/sources
-            mkdir -p $sources
-            commit=$(rustc -vV | sed -n 's/^commit-hash: //p')
-            [ -n "$commit" ] || { echo "rustc -vV gives no commit-hash" >&2; exit 1; }
-            ln -s ${rustStdSrc}/${rustSrcTop} $sources/$commit
-            ln -s ${rustStdSrc}/${rustSrcTop}/vendor $sources/deps
-            ln -s $cargoDeps $sources/$(stripHash $cargoDeps)
-            ln -s $src $sources/$(stripHash $src)
-          '';
-
-          meta = with pkgs.lib; {
-            description = "A simple, high-performance latency measurement tool for single-machine deployments";
-            homepage = "https://github.com/minhuw/xylem";
-            license = licenses.mit;
-            maintainers = [ ];
-            platforms = platforms.unix;
-          };
+        # Package definitions
+        packages = {
+          default = rustPlatform.buildRustPackage commonPackage;
+        } // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
+          ntcp-dpdk = rustPlatform.buildRustPackage (commonPackage // {
+            buildFeatures = [ "xylem-cli/evalsync" "xylem-cli/ntcp-dpdk" ];
+            buildInputs = buildInputs ++ dpdkInputs;
+          });
         };
       }
     );
