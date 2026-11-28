@@ -531,6 +531,16 @@ pub struct NtcpConnectionGroup<P: NtcpBackend> {
     connect_timeout: Duration,
     send_timeout: Duration,
     close_linger: Duration,
+    /// Total `service()` iterations in `poll()`
+    polls: u64,
+    /// `poll()` iterations with no packet, reclaim, event, or readiness work
+    empty_polls: u64,
+    /// Cumulative nanoseconds spent in empty `poll()` iterations
+    empty_poll_ns: u64,
+    /// `last_tick` on first `poll()` entry
+    first_poll_ns: Option<u64>,
+    /// `last_tick` on most recent `poll()` exit
+    last_poll_ns: u64,
 }
 
 impl<P: NtcpBackend> NtcpConnectionGroup<P> {
@@ -591,6 +601,11 @@ impl<P: NtcpBackend> NtcpConnectionGroup<P> {
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             send_timeout: DEFAULT_SEND_TIMEOUT,
             close_linger: DEFAULT_CLOSE_LINGER,
+            polls: 0,
+            empty_polls: 0,
+            empty_poll_ns: 0,
+            first_poll_ns: None,
+            last_poll_ns: 0,
         })
     }
 
@@ -1431,15 +1446,40 @@ impl<P: NtcpBackend> ConnectionGroup for NtcpConnectionGroup<P> {
 
     fn poll(&mut self, timeout: Duration, ready: &mut Vec<usize>) -> Result<()> {
         let deadline = self.deadline_after(timeout);
+        if self.first_poll_ns.is_none() {
+            self.first_poll_ns = Some(self.last_tick);
+        }
         loop {
+            let before = self.last_tick;
             let (report, more_events) = self.service()?;
-            if self.slots.any_ready() || self.now() >= deadline {
-                break;
-            }
-            if !report.more_work && !more_events {
+            self.polls += 1;
+            let empty = report.received == 0
+                && report.transmitted == 0
+                && report.discarded == 0
+                && report.reclaimed == 0
+                && !report.more_work
+                && !report.events_pending
+                && !more_events
+                && !self.slots.any_ready();
+            if empty {
+                self.empty_polls += 1;
+                let after = self.now();
+                self.empty_poll_ns =
+                    self.empty_poll_ns.saturating_add(after.saturating_sub(before));
+                if after >= deadline {
+                    break;
+                }
                 self.wait(deadline)?;
+            } else {
+                if self.slots.any_ready() || self.now() >= deadline {
+                    break;
+                }
+                if !report.more_work && !more_events {
+                    self.wait(deadline)?;
+                }
             }
         }
+        self.last_poll_ns = self.last_tick;
         self.slots.collect_ready(ready);
         Ok(())
     }
@@ -1476,14 +1516,31 @@ impl<P: NtcpBackend> ConnectionGroup for NtcpConnectionGroup<P> {
 
     fn close_all(&mut self) -> Result<()> {
         let counters = self.network.counters();
+        let busy_polls_pct = if self.polls > 0 {
+            100.0 * (self.polls - self.empty_polls) as f64 / self.polls as f64
+        } else {
+            0.0
+        };
+        let poll_span_ns =
+            self.first_poll_ns.map_or(0, |first| self.last_poll_ns.saturating_sub(first));
+        let busy_time_pct = if poll_span_ns > 0 {
+            100.0 * poll_span_ns.saturating_sub(self.empty_poll_ns) as f64 / poll_span_ns as f64
+        } else {
+            0.0
+        };
         tracing::info!(
-            "ntcp ({}): rx={} tx={} discarded={} arp_rx={} arp_tx={}",
+            "ntcp ({}): rx={} tx={} discarded={} arp_rx={} arp_tx={} \
+             polls={} empty_polls={} busy_polls_pct={:.2} busy_time_pct={:.2}",
             self.network.config().local_address,
             counters.received,
             counters.transmitted,
             counters.discarded,
             counters.arp_received,
             counters.arp_sent,
+            self.polls,
+            self.empty_polls,
+            busy_polls_pct,
+            busy_time_pct,
         );
         self.report_memory(&counters);
         self.report_receive_memory(&counters);
@@ -2881,6 +2938,39 @@ mod tests {
             saw_partial |= roundtrip_try_send_payload(&mut group, id, &data);
         }
         assert!(saw_partial, "expected at least one payload to split across Writable resume");
+        group.close_all().unwrap();
+    }
+
+    #[test]
+    fn poll_counters_track_empty_and_busy_iterations() {
+        let (a, b) = link();
+        let _server = EchoServer::start(b, true, ServerClose::OnEof);
+        let mut group = client(a);
+        let id = group.add_connection(&server_addr()).unwrap();
+
+        let mut ready = Vec::new();
+        group.poll(Duration::from_millis(20), &mut ready).unwrap();
+        assert!(ready.is_empty());
+
+        group.send(id, b"ping").unwrap();
+        assert_eq!(recv_exact(&mut group, id, 4), b"ping");
+
+        assert!(group.empty_polls > 0, "expected empty polls, got {}", group.empty_polls);
+        assert!(
+            group.polls > group.empty_polls,
+            "expected busy polls: polls={} empty_polls={}",
+            group.polls,
+            group.empty_polls
+        );
+        let first = group.first_poll_ns.expect("first_poll_ns should be set after poll()");
+        let span = group.last_poll_ns.saturating_sub(first);
+        assert!(group.empty_poll_ns > 0, "expected nonzero empty_poll_ns");
+        assert!(
+            group.empty_poll_ns <= span,
+            "empty_poll_ns ({}) exceeded poll span ({})",
+            group.empty_poll_ns,
+            span
+        );
         group.close_all().unwrap();
     }
 }
